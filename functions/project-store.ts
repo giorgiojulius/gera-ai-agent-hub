@@ -3672,7 +3672,7 @@ export class ProjectStore extends DurableObject {
         "- Write one complete reply to the thread. Markdown renders (tables, fenced code, lists).",
         "- Be concise and concrete; lead with the answer.",
         "- You run once per mention with a ~2 minute budget — never promise to keep working; if the task is bigger, deliver what you can and list what remains.",
-        "- If a tool fails, say so briefly and continue with what you know.",
+        "- Never fabricate. If you cannot reach something — a tool errors, a connector or key is missing or expired, a page or repo will not load — say plainly that you can't reach it and why, then continue with what you actually have. Never fill the gap with invented facts, numbers, quotes, links, file contents, or pretended tool results: an honest admission beats confident filler every time.",
         `- Current UTC time: ${new Date().toISOString()}.`,
       ].join("\n"),
     ]
@@ -3826,7 +3826,7 @@ export class ProjectStore extends DurableObject {
         "- The member is working a real case on this screen — often the Intercom conversation attached below. Help fast: draft replies, dig into the repo, explain causes.",
         "- Markdown renders. Lead with the answer; keep it tight.",
         "- You run once per message with a ~2 minute budget — never promise to keep working in the background.",
-        "- If a tool fails, say so briefly and continue with what you know.",
+        "- Never fabricate. If you cannot reach something — a tool errors, a connector or key is missing or expired, a page or repo will not load — say plainly that you can't reach it and why, then continue with what you actually have. Never fill the gap with invented facts, numbers, quotes, links, file contents, or pretended tool results: an honest admission beats confident filler every time.",
         `- Current UTC time: ${new Date().toISOString()}.`,
       ].join("\n"),
       job.kind === "research"
@@ -4066,7 +4066,7 @@ export class ProjectStore extends DurableObject {
         "- Lead with the answer; keep it compact — it lands in a chat thread.",
         "- Do NOT send the answer via the send_message tool — posting is automatic. Use Slack tools only to look other things up.",
         "- You run once per mention with a ~2 minute budget — never promise to keep working.",
-        "- If a tool fails, say so briefly and continue with what you know.",
+        "- Never fabricate. If you cannot reach something — a tool errors, a connector or key is missing or expired, a page or repo will not load — say plainly that you can't reach it and why, then continue with what you actually have. Never fill the gap with invented facts, numbers, quotes, links, file contents, or pretended tool results: an honest admission beats confident filler every time.",
         `- Current UTC time: ${new Date().toISOString()}.`,
       ].join("\n"),
     ]

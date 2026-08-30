@@ -1,14 +1,14 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `8ac9ffc` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `ca29894` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
 credential hand-off + server contents preflight + structured pin across
 Research/Julius + repo access probe, truthful MCP health + durable OAuth
-grant sync/refresh, honesty rule in default system prompts, skills-as-guidance
+grant sync/refresh + server GitHub User-Agent fix, honesty rule in default system prompts, skills-as-guidance
 research fix + empty-question guard, Intercom attachments)
-Drift check: `git log --oneline 8ac9ffc..HEAD`, then compare against
+Drift check: `git log --oneline ca29894..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -167,6 +167,13 @@ Credential hand-off (2026-08-30): the browser resolves the credential at run
 start (PAT or device-flow sign-in) and injects it only into the authenticated
 run request (`injectGitHubRunAuth`); it is neither logged nor persisted in the
 run row. This immediate hand-off avoids relying on best-effort profile sync.
+Cloud REST transport now identifies EVERY native GitHub request with GitHub's
+mandatory User-Agent + API version. The missing header made GitHub reject all
+Worker calls — including `/user` — with 403 while the same credential passed in
+the browser, producing the false "token dead" diagnosis. Live control probe:
+no User-Agent → 403, identified request → 200. Error classification matches the
+browser: only 401 asks for a new credential; 403/429 keeps it and reports the
+actual rate-limit/SSO/org-policy cause. Regression: `github-run-flow.test.ts`.
 New chats start without a pin; signed out stays an honest unavailable state.
 
 Repo access probe (2026-08-30, `composer-repo-diagnose`): listing repos

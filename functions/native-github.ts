@@ -19,6 +19,51 @@ type GitHubViewer = {
   scopes: string[] | null;
 };
 
+const GITHUB_API = "https://api.github.com";
+const GITHUB_USER_AGENT = "Gera-AI-Agent-Hub/1.0";
+const GITHUB_API_VERSION = "2022-11-28";
+
+/** GitHub rejects server requests without an identifying User-Agent with 403. */
+function githubRequestHeaders(authorization: string, hasJsonBody = false): Record<string, string> {
+  return {
+    Authorization: authorization,
+    Accept: "application/vnd.github+json",
+    "User-Agent": GITHUB_USER_AGENT,
+    "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    ...(hasJsonBody ? { "Content-Type": "application/json" } : {}),
+  };
+}
+
+/** Only 401 proves a dead credential; 403 is policy, SSO, abuse protection, or rate limiting. */
+function githubApiError(response: Response, message: string): Error {
+  if (response.status === 401) {
+    return new Error('GitHub rejected the credential (401) — press "Sign in with GitHub" again, or paste a fresh PAT.');
+  }
+  if (response.status === 403 || response.status === 429) {
+    if (response.status === 429 || response.headers.get("x-ratelimit-remaining") === "0") {
+      const reset = Number.parseInt(response.headers.get("x-ratelimit-reset") ?? "", 10);
+      const at = Number.isFinite(reset)
+        ? ` (resets ${new Date(reset * 1000).toISOString().slice(11, 16)} UTC)`
+        : "";
+      return new Error(`GitHub rate limit reached${at}. Retry after the reset; the credential was kept.`);
+    }
+    const detail = message ? `: ${message}` : ".";
+    return new Error(
+      `GitHub refused the request (${response.status})${detail} The credential was kept; retry or review the organization/SSO policy.`,
+    );
+  }
+  return new Error(`GitHub returned ${response.status}${message ? `: ${message}` : "."}`);
+}
+
+async function githubErrorMessage(response: Response): Promise<string> {
+  try {
+    const data = (await response.json()) as { message?: unknown };
+    return typeof data.message === "string" ? data.message.slice(0, 500) : "";
+  } catch {
+    return "";
+  }
+}
+
 /** Parses GitHub's X-OAuth-Scopes header ("repo, read:org") into a scope list. */
 function parseOAuthScopes(header: string | null): string[] | null {
   if (header === null) {
@@ -31,15 +76,12 @@ function parseOAuthScopes(header: string | null): string[] | null {
 }
 
 /** Asks api.github.com who the token belongs to and which scopes it carries. */
-async function fetchGitHubViewer(authorization: string): Promise<GitHubViewer> {
-  const response = await fetch("https://api.github.com/user", {
-    headers: {
-      Authorization: authorization,
-      Accept: "application/vnd.github+json",
-    },
+export async function fetchGitHubViewer(authorization: string): Promise<GitHubViewer> {
+  const response = await fetch(`${GITHUB_API}/user`, {
+    headers: githubRequestHeaders(authorization),
   });
   if (!response.ok) {
-    throw new Error(`GitHub rejected the token (${response.status}) — sign in again in the app.`);
+    throw githubApiError(response, await githubErrorMessage(response));
   }
   const data = (await response.json()) as { login?: unknown; name?: unknown };
   const login = typeof data.login === "string" ? data.login : "";
@@ -52,8 +94,6 @@ async function fetchGitHubViewer(authorization: string): Promise<GitHubViewer> {
     scopes: parseOAuthScopes(response.headers.get("X-OAuth-Scopes")),
   };
 }
-
-const GITHUB_API = "https://api.github.com";
 
 /** Max characters of file content returned to the agent per read. */
 const MAX_FILE_CHARS = 12_000;
@@ -323,11 +363,7 @@ async function ghFetch(
   try {
     response = await fetch(url.toString(), {
       method: options.method ?? "GET",
-      headers: {
-        Authorization: auth,
-        Accept: "application/vnd.github+json",
-        ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
-      },
+      headers: githubRequestHeaders(auth, options.body !== undefined),
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
     });
   } catch {
@@ -346,24 +382,12 @@ async function ghFetch(
     // non-JSON error body
   }
 
-  if (response.status === 401) {
-    throw new Error('GitHub rejected the token — press "Sign in with GitHub" again, or paste a fresh PAT.');
-  }
-  if (response.status === 403 || response.status === 429) {
-    if (response.headers.get("x-ratelimit-remaining") === "0") {
-      const reset = Number.parseInt(response.headers.get("x-ratelimit-reset") ?? "", 10);
-      const at = Number.isFinite(reset) ? ` (resets ${new Date(reset * 1000).toISOString().slice(11, 16)} UTC)` : "";
-      throw new Error(`GitHub rate limit reached${at}. Try again in a bit.`);
-    }
-    // Org OAuth-app restrictions land here — surface GitHub's own words.
-    throw new Error(`GitHub refused the request${message ? `: ${message}` : "."}`);
-  }
   if (response.status === 404) {
     throw new Error(
       "Not found — or this token cannot see it. Private repos owned by an organization stay hidden until the org approves this OAuth app (see \"review org access\" on the GitHub card).",
     );
   }
-  throw new Error(`GitHub returned ${response.status}${message ? `: ${message}` : "."}`);
+  throw githubApiError(response, message);
 }
 
 /** Org logins visible to this token — an org missing here means it has not approved the OAuth app. */
@@ -987,7 +1011,7 @@ async function listRunJobs(auth: string, input: Record<string, unknown>): Promis
  */
 async function fetchJobLogText(auth: string, owner: string, repo: string, jobId: number): Promise<string> {
   const target = `${GITHUB_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/jobs/${jobId}/logs`;
-  const headers = { Authorization: auth, Accept: "application/vnd.github+json" };
+  const headers = githubRequestHeaders(auth);
   let response: Response;
   try {
     response = await fetch(target, { headers });
@@ -997,11 +1021,8 @@ async function fetchJobLogText(auth: string, owner: string, repo: string, jobId:
   if (response.status === 404) {
     throw new Error("No logs — they expire after 90 days, or the job_id is wrong (take it from list_run_jobs).");
   }
-  if (response.status === 401) {
-    throw new Error('GitHub rejected the token — press "Sign in with GitHub" again, or paste a fresh PAT.');
-  }
   if (!response.ok) {
-    throw new Error(`GitHub returned ${response.status} for job logs.`);
+    throw githubApiError(response, await githubErrorMessage(response));
   }
   return stripAnsi(await response.text());
 }

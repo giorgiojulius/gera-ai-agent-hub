@@ -700,12 +700,12 @@ export class RunManager {
         return;
       }
       try {
-        // Plain Julius used to receive web tools only, so a repo visible and
-        // pinned in the composer vanished at the panel boundary. The client
-        // sends only its scoped GitHub connector here; arm that native route
-        // once and share the stateless route with every candidate.
+        // Arm the scoped native GitHub route once for every Julius mode.
+        // Plain candidates can inspect it directly; research candidates use
+        // their deterministic preload, while the council Verifier still needs
+        // the same route to independently check their repository claims.
         let juliusMcp: McpRuntime = emptyMcpRuntime();
-        if (!juliusConfig.research && config.mcpServers.length > 0) {
+        if (config.mcpServers.length > 0) {
           const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
           const servers = cloudMcpServersForAutomation(config.mcpServers, null, oauthTokens).filter(
             (server) => server.kind === "github",

@@ -1,14 +1,14 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `ca29894` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `fb17507` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
 credential hand-off + server contents preflight + structured pin across
 Research/Julius + repo access probe, truthful MCP health + durable OAuth
-grant sync/refresh + server GitHub User-Agent fix, honesty rule in default system prompts, skills-as-guidance
-research fix + empty-question guard, Intercom attachments)
-Drift check: `git log --oneline ca29894..HEAD`, then compare against
+grant sync/refresh + server GitHub User-Agent fix + Julius Verifier GitHub hand-off, honesty rule in default system prompts,
+skills-as-guidance research fix + empty-question guard, Intercom attachments)
+Drift check: `git log --oneline fb17507..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -156,7 +156,10 @@ the repo short name with an X to unpin. Every run kind in the thread
 `githubRunRepoRefs` gives an explicitly named repo precedence and otherwise
 returns the pin; this fixes Research and Research × Julius, whose deterministic
 GitHub preload used to inspect only the typed question and therefore ignored
-the pin. Plain Julius now receives the scoped native GitHub routes too.
+the pin. Plain Julius candidates receive the scoped native GitHub routes too;
+the council Verifier now receives the same route in both Julius modes, rather
+than losing it at the debate boundary. Its tool list is enforced read-only —
+GitHub mutations are absent while it independently checks repository claims.
 Chat and resume force-arm GitHub past the tool router (like skill pins), then
 the worker performs a SAME-CREDENTIAL server preflight: repo metadata + root
 contents are read before the model answers and the real root listing is added
@@ -282,7 +285,10 @@ Composer toggle: parallel candidate answers compete, or the council
 quality-checks a single answer; after the ruling the chairman merges the
 best parts. Config popover: candidate count/models, decision mode — "I pick"
 (user chooses) vs "Council decides". Verdicts render as a dedicated panel
-in the thread (`JuliusPanel`).
+in the thread (`JuliusPanel`). The Verifier receives the run's scoped native
+GitHub route in plain Julius and Research × Julius, is explicitly told to
+inspect connected sources, and can execute read tools only (no issues, branches,
+files, comments, or PR writes). Regression: `github-run-flow.test.ts`.
 
 ## Media modes
 

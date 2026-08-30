@@ -151,12 +151,15 @@ function criticPrompt(count: number): string {
   return `You are the CRITIC (adversary) on a review board examining candidate answer(s) to a user request. Your fixed role: you ALWAYS attack. Hunt for logical flaws, factual errors, risky advice, omissions, vagueness, and unfounded claims — never praise anything, the Proponent handles that. Format: a short bold header per candidate letter with 2-4 bullet weaknesses, quoting short fragments as evidence. Be concise, specific, and ruthless.${closing}`;
 }
 
-function verifierTask(surfEnabled: boolean): string {
+function verifierTask(surfEnabled: boolean, mcpEnabled: boolean): string {
   const today = new Date().toISOString().slice(0, 10);
   const browser = surfEnabled
     ? ` If search snippets are dated or thin for a time-sensitive claim, open the live source directly with the SelfSurf browser: surf_open the official site, registry, docs, changelog, or price page; surf_follow links; surf_find text on the page. SelfSurf keeps cookies and follows redirects but does NOT run JavaScript — if a page needs JS, say so honestly instead of guessing.`
     : "";
-  return `You are the VERIFIER on a review board. Today is ${today}. Below are candidate answer(s) to a user request. Check the facts, numbers, dates, names, calculations, and whether each one actually fulfils the user's request. ALSO check FRESHNESS: for every time-sensitive claim (prices, versions, releases, rankings, schedules, laws, people in office, live stats) verify it still holds TODAY — use web_search with the "recency" filter for anything that changes.${browser} Format: a short bold header per candidate letter listing: verified claims (✓), wrong claims (✗ with the correction), stale claims (⏳ with the current value and its date), unverifiable claims (?), and any requirement violations. Stay neutral — no opinions on style or preference, facts only.`;
+  const connectors = mcpEnabled
+    ? ` Connected repository/account tools whose names start with mcp_ are available. When a candidate makes a claim about a connected source, inspect that source with the matching read tool instead of declaring it unreachable. Never perform writes while verifying.`
+    : "";
+  return `You are the VERIFIER on a review board. Today is ${today}. Below are candidate answer(s) to a user request. Check the facts, numbers, dates, names, calculations, and whether each one actually fulfils the user's request. ALSO check FRESHNESS: for every time-sensitive claim (prices, versions, releases, rankings, schedules, laws, people in office, live stats) verify it still holds TODAY — use web_search with the "recency" filter for anything that changes.${browser}${connectors} Format: a short bold header per candidate letter listing: verified claims (✓), wrong claims (✗ with the correction), stale claims (⏳ with the current value and its date), unverifiable claims (?), and any requirement violations. Stay neutral — no opinions on style or preference, facts only.`;
 }
 
 function chairmanPrompt(candidateCount: number, researchMode: boolean): string {
@@ -318,7 +321,7 @@ export type ServerJuliusParams = {
   prompt: string;
   settings: JuliusWireSettings;
   builtins: Record<BuiltinToolId, boolean>;
-  /** Native GitHub tools explicitly handed to plain Julius candidates. */
+  /** Native GitHub tools shared by plain candidates and the council verifier. */
   mcpToolDefs?: EngineToolDef[];
   mcpRoutes?: Map<string, McpRoute>;
   research?: ServerJuliusResearchRunner;
@@ -344,6 +347,23 @@ function webOnlyBuiltins(builtins: Record<BuiltinToolId, boolean>, surf: boolean
     generate_video: false,
     generate_audio: false,
   };
+}
+
+const VERIFIER_GITHUB_WRITE_SUFFIXES = [
+  "_create_issue",
+  "_add_issue_comment",
+  "_create_branch",
+  "_put_file",
+  "_delete_file",
+  "_create_pull",
+  "_update_pull",
+] as const;
+
+/** A fact-checker may inspect the connected repo, but can never mutate it. */
+function verifierMcpToolDefs(tools: EngineToolDef[]): EngineToolDef[] {
+  return tools.filter(
+    (tool) => !VERIFIER_GITHUB_WRITE_SUFFIXES.some((suffix) => tool.function.name.endsWith(suffix)),
+  );
 }
 
 /** Server-side Julius panel — candidates, council, chairman, synthesis. */
@@ -375,7 +395,10 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
     ...builtinToolDefs(webOnlyBuiltins(params.builtins, false)),
     ...(params.mcpToolDefs ?? []),
   ];
-  const verifierToolDefs: EngineToolDef[] = builtinToolDefs(webOnlyBuiltins(params.builtins, true));
+  const verifierToolDefs: EngineToolDef[] = [
+    ...builtinToolDefs(webOnlyBuiltins(params.builtins, true)),
+    ...verifierMcpToolDefs(params.mcpToolDefs ?? []),
+  ];
 
   const runEngineWith = async (input: {
     modelId: string;
@@ -588,11 +611,12 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
 
   const runVerifier = async (): Promise<void> => {
     const surfEnabled = verifierToolDefs.some((tool) => tool.function.name.startsWith("surf_"));
+    const mcpEnabled = verifierToolDefs.some((tool) => tool.function.name.startsWith("mcp_"));
     try {
       const result = await runEngineWith({
         modelId: verifier.modelId,
         history: [
-          { role: "user", content: `${verifierTask(surfEnabled)}\n\n${transcript}` },
+          { role: "user", content: `${verifierTask(surfEnabled, mcpEnabled)}\n\n${transcript}` },
         ],
         tools: verifierToolDefs,
         onText: (full) => {

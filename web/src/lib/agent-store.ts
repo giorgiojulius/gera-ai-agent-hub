@@ -1019,13 +1019,12 @@ export async function sendPrompt(params: {
           history: wireHistory,
           prompt,
           builtins: scoped.builtinTools,
-          // Plain Julius candidates need the same GitHub tools as chat. In
-          // Research × Julius each candidate uses the deterministic research
-          // preload below, so no duplicate native tool pool is needed.
+          // Every Julius mode carries the scoped GitHub connector. Plain
+          // candidates use it directly; Research × Julius candidates use the
+          // deterministic preload below, but its council Verifier still needs
+          // the same credential to check repository claims independently.
           mcpServers:
-            wantJulius && !wantResearch && githubServer
-              ? injectGitHubRunAuth([githubServer], githubAuth)
-              : [],
+            wantJulius && githubServer ? injectGitHubRunAuth([githubServer], githubAuth) : [],
           githubRepo: pinnedRepo || undefined,
           ...(wantResearch
             ? { research: { depth: settings.researchDepth, citations: "numeric", githubAuth } }

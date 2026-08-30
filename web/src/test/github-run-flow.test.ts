@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { armCloudMcp } from "../../../functions/automation-runner";
+import { armCloudMcp, type McpRoute } from "../../../functions/automation-runner";
+import type { EngineToolDef } from "../../../functions/agent-engine";
+import { runServerJulius } from "../../../functions/julius-runner";
 import { cloudMcpServersForAutomation } from "../../../functions/mcp-cloud";
 import {
   callGitHubNativeTool as callServerGitHubNativeTool,
@@ -53,6 +55,153 @@ describe("GitHub cloud run hand-off", () => {
     expect(serverGitHubRunRepoRefs("inspect other/service", "acme/private-app")).toEqual([
       { owner: "other", repo: "service" },
     ]);
+  });
+});
+
+describe("Julius GitHub verification", () => {
+  it("lets the council Verifier execute the same native GitHub route without exposing write tools", async () => {
+    const readTool = "mcp_github_whoami";
+    const writeTool = "mcp_github_create_issue";
+    const eventStream = (events: Array<Record<string, unknown>>): Response =>
+      new Response(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    const textStream = (model: string, content: string): Response =>
+      eventStream([{ model, choices: [{ delta: { content } }] }]);
+
+    let verifierCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      if (url === "https://api.github.com/user") {
+        const headers = new Headers(init?.headers);
+        expect(headers.get("authorization")).toBe("Bearer verifier-credential");
+        return new Response(JSON.stringify({ login: "octocat", name: "Mona" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "X-OAuth-Scopes": "repo, read:org" },
+        });
+      }
+      if (url.startsWith("https://api.github.com/user/orgs")) {
+        return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (!url.endsWith("/v2/vercel/v1/chat/completions")) {
+        throw new Error(`Unexpected fetch: ${url}`);
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        model?: string;
+        messages?: Array<{ role?: string; content?: unknown }>;
+        tools?: Array<{ function?: { name?: string } }>;
+      };
+      const model = body.model ?? "";
+      if (model === "test/candidate") {
+        return textStream(model, "The connected GitHub account is @octocat.");
+      }
+      if (model === "test/proponent") {
+        return textStream(model, "The answer is specific.");
+      }
+      if (model === "test/critic") {
+        return textStream(model, "The account claim needs checking.");
+      }
+      if (model === "test/verifier") {
+        verifierCalls += 1;
+        const toolNames = (body.tools ?? []).map((tool) => tool.function?.name ?? "");
+        expect(toolNames).toContain(readTool);
+        expect(toolNames).not.toContain(writeTool);
+        const prompt = (body.messages ?? [])
+          .map((message) => (typeof message.content === "string" ? message.content : ""))
+          .join("\n");
+        expect(prompt).toContain("inspect that source with the matching read tool");
+        const toolResult = (body.messages ?? []).find((message) => message.role === "tool");
+        if (!toolResult) {
+          return eventStream([
+            {
+              model,
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "verify-github-account",
+                        type: "function",
+                        function: { name: readTool, arguments: "{}" },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ]);
+        }
+        expect(String(toolResult.content)).toContain("Signed in as @octocat");
+        return textStream(model, "✓ GitHub independently verified @octocat.");
+      }
+      if (model === "test/chairman") {
+        const prompt = (body.messages ?? [])
+          .map((message) => (typeof message.content === "string" ? message.content : ""))
+          .join("\n");
+        return prompt.includes("final deliverable")
+          ? textStream(model, "Final answer after an independent GitHub check.")
+          : textStream(model, "VERDICT: Solid after the GitHub verification.");
+      }
+      throw new Error(`Unexpected model: ${model}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const mcpToolDefs: EngineToolDef[] = [readTool, writeTool].map((name) => ({
+      type: "function",
+      function: { name, description: name, parameters: { type: "object", properties: {} } },
+    }));
+    const mcpRoutes = new Map<string, McpRoute>([
+      [
+        readTool,
+        {
+          type: "native",
+          kind: "github",
+          auth: "Bearer verifier-credential",
+          toolName: "whoami",
+          serverName: "GitHub",
+        },
+      ],
+    ]);
+
+    const result = await runServerJulius({
+      authKey: "toolkit-key",
+      history: [{ role: "user", content: "Check the connected GitHub account." }],
+      prompt: "Check the connected GitHub account.",
+      settings: {
+        candidateModelIds: ["test/candidate"],
+        decision: "council",
+        proponentModelId: "test/proponent",
+        criticModelId: "test/critic",
+        verifierModelId: "test/verifier",
+        chairmanModelId: "test/chairman",
+      },
+      builtins: {
+        web_search: false,
+        fetch_url: false,
+        selfsurf: false,
+        generate_image: false,
+        generate_video: false,
+        generate_audio: false,
+      },
+      mcpToolDefs,
+      mcpRoutes,
+      onUpdate: () => undefined,
+    });
+
+    const verifier = result.julius.reviews.find((review) => review.role === "verifier");
+    expect(verifierCalls).toBe(2);
+    expect(verifier?.content).toContain("independently verified @octocat");
+    expect(verifier?.toolCalls).toEqual([
+      expect.objectContaining({
+        name: readTool,
+        status: "done",
+        result: expect.stringContaining("Signed in as @octocat"),
+      }),
+    ]);
+    expect(result.content).toBe("Final answer after an independent GitHub check.");
   });
 });
 

@@ -1,0 +1,575 @@
+export type ModelType =
+  | "language"
+  | "image"
+  | "video"
+  | "embedding"
+  | "speech"
+  | "transcription"
+  | "realtime"
+  | "reranking";
+
+export type CostTier = "value" | "standard" | "premium" | "flagship";
+
+/** What the composer creates: chat replies, images, video clips, or audio. */
+export type CreateMode = "chat" | "image" | "video" | "audio";
+
+export type ImageSize = "1024x1024" | "1536x1024" | "1024x1536";
+
+export type VideoAspect = "16:9" | "9:16" | "1:1";
+
+export type ModelPricing = {
+  input?: number;
+  output?: number;
+  /** Discounted rate for provider-cached prompt tokens (input_cache_read). */
+  inputCacheRead?: number;
+  image?: number;
+  videoPerSecond?: number;
+  videoPerMillionTokens?: number;
+  speechChar?: number;
+  audioInput?: number;
+  transcriptionPerSecond?: number;
+};
+
+export type GatewayModel = {
+  id: string;
+  name: string;
+  description?: string;
+  owned_by: string;
+  type: ModelType;
+  context_window?: number;
+  max_tokens?: number;
+  tags?: string[];
+  pricing?: ModelPricing;
+  modalities?: {
+    input?: string[];
+    output?: string[];
+  };
+};
+
+export type Attachment = {
+  id: string;
+  name: string;
+  mime: string;
+  dataUrl: string;
+  /** Extracted plain text for text-like files (md, csv, json, code…); absent for images. */
+  text?: string;
+};
+
+/**
+ * A follow-up captured while a run is still streaming — Cursor-style queue.
+ * Dispatched FIFO when the run settles; steered items are injected into the
+ * live agent loop at its next step without interrupting it.
+ */
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  attachments: Attachment[];
+  mode: CreateMode;
+  deepResearch: boolean;
+  /** Run as a Julius panel: several models answer in parallel. */
+  julius: boolean;
+  /** Handed to the live run — lands at its next step instead of waiting in line. */
+  steer?: boolean;
+  createdAt: number;
+};
+
+export type ToolCallStatus = "running" | "done" | "error";
+
+export type ToolCallRecord = {
+  id: string;
+  name: string;
+  arguments: string;
+  status: ToolCallStatus;
+  result?: string;
+};
+
+export type ResearchStepKind = "plan" | "search" | "read" | "browse" | "synthesize";
+
+/** Resource budget preset for a deep-research run: iterations, reads, live browsing. */
+export type ResearchDepth = "eco" | "balanced" | "max";
+
+export type ResearchStep = {
+  id: string;
+  kind: ResearchStepKind;
+  label: string;
+  detail?: string;
+  status: "running" | "done" | "error";
+};
+
+export type ResearchSource = {
+  url: string;
+  title: string;
+};
+
+/** Token tally for one model within a single assistant turn. */
+export type ModelTokens = {
+  prompt: number;
+  completion: number;
+  calls: number;
+  /** Provider-cached prompt tokens (subset of `prompt`, billed at the cache-read rate). */
+  cached?: number;
+  /** Reasoning tokens (subset of `completion` per the OpenAI-compatible spec). */
+  reasoning?: number;
+};
+
+/** Per-model media units generated within one turn (billed per asset, not tokens). */
+export type MediaTally = {
+  images?: number;
+  videoSeconds?: number;
+  speechChars?: number;
+  calls: number;
+};
+
+/**
+ * Usage aggregated across every call of one assistant turn — the chat loop
+ * plus Julius phases in `byModel`, internal helpers (tool router, research
+ * planner, thread titles) in `serviceByModel`, and per-asset media
+ * generation in `media`. Top-level token totals cover byModel + service.
+ */
+export type TurnUsage = {
+  prompt: number;
+  completion: number;
+  calls: number;
+  byModel: Record<string, ModelTokens>;
+  /** Internal helper calls (router, planner, titles) — kept out of model standings. */
+  serviceByModel?: Record<string, ModelTokens>;
+  /** Generated media units per model (images, video seconds, TTS characters). */
+  media?: Record<string, MediaTally>;
+};
+
+/** Live trail of a deep-research run, persisted with the message. */
+export type ResearchState = {
+  status: "running" | "done" | "error";
+  steps: ResearchStep[];
+  sources: ResearchSource[];
+  startedAt: number;
+  finishedAt?: number;
+};
+
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  attachments?: Attachment[];
+  images?: string[];
+  videos?: string[];
+  audioUrl?: string;
+  toolCalls?: ToolCallRecord[];
+  /**
+   * Web sources actually consulted this turn (from web_search / fetch_url),
+   * in citation order: a [n] marker in the content refers to sources[n-1].
+   * Collected by the tool layer, not the model — the list is a guarantee.
+   */
+  sources?: ResearchSource[];
+  /** Labels of tools auto-armed for this turn by the prompt router. */
+  toolPlan?: string[];
+  /**
+   * Model that actually wrote this reply when the gateway fell back from the
+   * picked one (outage, overload). Set only when it differs — the UI shows an
+   * honest "answered by" chip instead of letting a weaker model impersonate
+   * the picked flagship.
+   */
+  servedBy?: string;
+  /** Token tally for the whole turn; the UI prices it with gateway list rates. */
+  usage?: TurnUsage;
+  /** Deep-research trail when this reply was produced by research mode. */
+  research?: ResearchState;
+  /** Julius panel state when this reply was produced by parallel candidates. */
+  julius?: JuliusState;
+  /**
+   * True while a run is writing into this message. Persisted on purpose: a
+   * reload (app update, crash) that kills the run leaves the flag behind,
+   * and the next load turns it into an honest `interrupted` marker.
+   */
+  pending?: boolean;
+  /** Set on load when a reload cut this reply mid-run — offers Continue/Retry. */
+  interrupted?: boolean;
+  createdAt: number;
+};
+
+/** How a Julius panel picks the winning answer. */
+export type JuliusDecision = "manual" | "council";
+
+/** Debate roles reviewing the candidates before the chairman rules. */
+export type JuliusRole = "proponent" | "critic" | "verifier";
+
+/**
+ * "waiting" is legacy (old research-then-audit flow) — healed away on load.
+ * "synthesis": the chairman is writing the final merged deliverable after ruling.
+ */
+export type JuliusRunStatus =
+  | "waiting"
+  | "candidates"
+  | "debate"
+  | "synthesis"
+  | "choice"
+  | "done"
+  | "error";
+
+/** One parallel answer inside a Julius panel run. */
+export type JuliusCandidateState = {
+  id: string;
+  /** Model selection id that produced this answer. */
+  modelId: string;
+  /** Badge shown on the card, e.g. "Deep research" when this candidate ran research. */
+  label?: string;
+  content: string;
+  status: "running" | "done" | "error";
+  error?: string;
+  toolCalls?: ToolCallRecord[];
+  /** Per-candidate research trail when the panel runs in deep-research mode. */
+  research?: ResearchState;
+  /** Live reasoning tail while the model thinks silently; cleared when it settles. */
+  thinking?: string;
+  /** Set when the gateway answered with a DIFFERENT model — the card must disclose it. */
+  servedBy?: string;
+};
+
+/** A council member's streamed review of the candidates. */
+export type JuliusReviewState = {
+  role: JuliusRole;
+  modelId: string;
+  content: string;
+  status: "running" | "done" | "error";
+  toolCalls?: ToolCallRecord[];
+  /** Live reasoning tail while the model thinks silently; cleared when it settles. */
+  thinking?: string;
+  /** Set when the gateway answered with a DIFFERENT model — the row must disclose it. */
+  servedBy?: string;
+};
+
+/** Live/persisted state of one Julius panel run, stored with the message. */
+export type JuliusState = {
+  decision: JuliusDecision;
+  status: JuliusRunStatus;
+  candidates: JuliusCandidateState[];
+  /** Council reviews (proponent / critic / verifier) in council mode. */
+  reviews: JuliusReviewState[];
+  /** Chairman's ruling text, streamed live in council mode. */
+  verdict?: string;
+  chairmanModelId?: string;
+  /** Set when a gateway fallback wrote the ruling — the verdict box must disclose it. */
+  chairmanServedBy?: string;
+  /** Chairman's live reasoning tail while deliberating; cleared once ruled. */
+  chairmanThinking?: string;
+  /** Index of the winning candidate once decided. */
+  winner?: number;
+  decidedBy?: "user" | "chairman";
+  /**
+   * Candidate indices whose ```action hub ops were already applied — set on
+   * panel settle or a manual pick, so repeated picks never double-write.
+   */
+  hubOpsApplied?: number[];
+  /**
+   * Research mode: the shared deduped source list every candidate report
+   * cites after renumbering — sources[n-1] resolves marker [n] in candidate
+   * cards, council reviews, and the final merged report.
+   */
+  sources?: ResearchSource[];
+  startedAt: number;
+  finishedAt?: number;
+};
+
+/** Composer configuration for Julius panel runs. */
+export type JuliusSettings = {
+  /** Model selection ids answering in parallel (2-4). */
+  candidateModelIds: string[];
+  decision: JuliusDecision;
+  proponentModelId: string;
+  criticModelId: string;
+  verifierModelId: string;
+  chairmanModelId: string;
+};
+
+export type Conversation = {
+  id: string;
+  title: string;
+  modelId: string;
+  /** Agent profile driving this thread, when set. */
+  agentId?: string;
+  /** Set when this thread collects the runs of a scheduled automation. */
+  automationId?: string;
+  /** GitHub repository ("owner/repo") pinned from the composer — runs default their GitHub tools to it. */
+  githubRepo?: string;
+  /** Kept in the sidebar's Pinned section. */
+  pinned?: boolean;
+  /** Incognito thread: lives only in this tab — never persisted, never synced, no auto-memory. */
+  incognito?: boolean;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type MemoryFact = {
+  id: string;
+  text: string;
+  /** Loose grouping like "prefs", "health", "work", "people"; "" = none. */
+  category: string;
+  createdAt: number;
+};
+
+export type TrackerKind = "number" | "check";
+
+/** A user-defined thing to track: water, spending, weight, habits, mood… */
+export type Tracker = {
+  id: string;
+  name: string;
+  /** Unit label like "glass", "₽", "km"; "" for unitless or check trackers. */
+  unit: string;
+  kind: TrackerKind;
+  /** Daily goal; null = no goal. */
+  goal: number | null;
+  /** Index into the shared warm palette. */
+  color: number;
+  createdAt: number;
+};
+
+export type TrackerEntry = {
+  id: string;
+  trackerId: string;
+  value: number;
+  note?: string;
+  at: number;
+};
+
+export type PersonalTask = {
+  id: string;
+  text: string;
+  done: boolean;
+  /** Due timestamp; null = no due date. */
+  due: number | null;
+  createdAt: number;
+  completedAt?: number;
+};
+
+/** The personal assistant hub: memories, trackers, tasks — stored locally. */
+export type LifeState = {
+  memories: MemoryFact[];
+  trackers: Tracker[];
+  entries: TrackerEntry[];
+  tasks: PersonalTask[];
+  /** When true, every chat turn can read and update the hub. */
+  shareWithAgent: boolean;
+  /** Master memory switch: when false Gera neither saves new facts nor sees saved ones. Trackers and tasks are unaffected. */
+  memoryEnabled: boolean;
+};
+
+export type AutomationCadence = "interval" | "daily" | "weekly";
+
+/** Where an automation's scheduled fires happen. */
+export type AutomationRunOn = "browser" | "server";
+
+/** A scheduled prompt that runs in the background while the app is open. */
+export type Automation = {
+  id: string;
+  name: string;
+  prompt: string;
+  cadence: AutomationCadence;
+  /** Minutes between runs when cadence = "interval". */
+  intervalMinutes: number;
+  /** Local "HH:MM" fire time for daily/weekly cadences. */
+  time: string;
+  /** 0 (Sunday) - 6 (Saturday) for the weekly cadence. */
+  weekday: number;
+  /** Saved agent persona to run with; null = plain Gera. */
+  agentId: string | null;
+  /** null = every connected MCP server; otherwise allowed server/catalog ids — Cursor-style per-automation tool scoping. */
+  mcpServerIds: string[] | null;
+  /** null = every enabled skill; otherwise allowed skill ids — per-automation instruction packs. */
+  skillIds: string[] | null;
+  /** Incoming webhook trigger token (`wh_…`); null = off. POST /hooks/<token> on the backend fires this automation with the payload in the prompt. */
+  webhookToken: string | null;
+  /** Run as multi-wave deep research with a cited report. */
+  deepResearch: boolean;
+  enabled: boolean;
+  /** Fire a schedule missed while the tab was closed once on next launch. */
+  catchUp: boolean;
+  /** "browser" fires while the tab is open; "server" fires in the cloud via cron. */
+  runOn: AutomationRunOn;
+  /** Minutes behind UTC (Date.getTimezoneOffset) captured on save — lets cloud runs fire daily/weekly at the user's local time. */
+  tzOffsetMinutes: number;
+  /** Thread that collects every run of this automation. */
+  conversationId: string;
+  lastRunAt?: number;
+  nextRunAt: number;
+  createdAt: number;
+};
+
+export type BuiltinToolId =
+  | "web_search"
+  | "fetch_url"
+  | "selfsurf"
+  | "generate_image"
+  | "generate_video"
+  | "generate_audio";
+
+/** One document in an agent's knowledge base — plain text, retrieved per turn. */
+export type KnowledgeDoc = {
+  id: string;
+  name: string;
+  /** Full content for small files; a capped local preview when the full text lives in the cloud. */
+  text: string;
+  /** R2 object key when the full text is stored in the account's cloud space. */
+  r2Key?: string;
+  /** Character count of the cloud copy — honest size display and change detection. */
+  fullChars?: number;
+  addedAt: number;
+};
+
+/** Run kinds a skill can ride into: plain chat, Deep Research, Julius panels. */
+export type SkillSurface = "chat" | "research" | "julius";
+
+/**
+ * A reusable instruction pack (Cursor-style skill): written once, it rides
+ * into every run whose surface it targets — chat turns, Deep Research
+ * pipelines, and Julius panels. Profiles can narrow the set via `skillIds`.
+ */
+export type Skill = {
+  id: string;
+  name: string;
+  /** One-line "when to apply" hint shown to the model with the instructions. */
+  description: string;
+  /** The instructions themselves (markdown). */
+  content: string;
+  /**
+   * Optional folder for grouping skills with one-click per-surface bulk
+   * toggles. "" = explicitly ungrouped; an absent key marks a pre-folder blob
+   * that may adopt its catalog folder once (matched by template name).
+   */
+  folder?: string;
+  /** Master toggle — a disabled skill never reaches any run. */
+  enabled: boolean;
+  /** Which run kinds this skill applies to. */
+  surfaces: Record<SkillSurface, boolean>;
+  /**
+   * MCP connectors this skill arms: when the skill rides a chat run, these
+   * servers' tools are switched on regardless of the auto-router's guess.
+   * Explicit profile/automation narrowing still wins — pins only override
+   * the heuristic. Absent/empty = the skill brings no tools of its own.
+   */
+  mcpServerIds?: string[];
+  createdAt: number;
+};
+
+/** A saved teammate: persona instructions plus an allowed tool pool. */
+export type AgentProfile = {
+  id: string;
+  name: string;
+  tagline: string;
+  systemPrompt: string;
+  /** Empty string = use whatever model is picked in the composer. */
+  modelId: string;
+  /** null = every enabled builtin tool; otherwise the allowed subset. */
+  builtins: BuiltinToolId[] | null;
+  /** null = every connected MCP server; otherwise allowed server/catalog ids. */
+  mcpServerIds: string[] | null;
+  /** null = every enabled skill; otherwise the allowed skill ids. */
+  skillIds: string[] | null;
+  /** Knowledge files: the most relevant excerpts are injected every turn. */
+  knowledge: KnowledgeDoc[];
+  createdAt: number;
+};
+
+/**
+ * Auth strategy for an MCP server. "auto" (default) tries a pasted key, then
+ * custom headers, then a stored browser sign-in, then open access.
+ */
+export type McpAuthMode = "auto" | "none" | "bearer" | "headers" | "oauth";
+
+export type McpServerConfig = {
+  id: string;
+  name: string;
+  url: string;
+  headersJson: string;
+  token?: string;
+  /** Explicit auth choice for custom servers; catalog entries manage their own. */
+  authMode?: McpAuthMode;
+  catalogId?: string;
+  enabled: boolean;
+  status: "idle" | "connecting" | "connected" | "error";
+  error?: string;
+  /** Human-readable proof of the verified connection: workspace + admin for native connectors, server name for MCP. */
+  identity?: string;
+  /** Epoch ms of the last successful handshake + tool listing. */
+  verifiedAt?: number;
+  tools: McpToolInfo[];
+  disabledTools: string[];
+};
+
+export type McpToolInfo = {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+};
+
+/** Completion chime scope: never, only out-of-view finishes, or every finish. */
+export type NotifySoundPref = "off" | "background" | "always";
+
+export type AgentSettings = {
+  /** Active creation tab in the composer. */
+  mode: CreateMode;
+  /** Chat model selection id. */
+  modelId: string;
+  imageModelId: string;
+  videoModelId: string;
+  audioModelId: string;
+  imageSize: ImageSize;
+  /** Images generated per image-mode prompt (1-4); an explicit count typed in the prompt overrides it. */
+  imageCount: number;
+  videoAspect: VideoAspect;
+  /** Text-to-speech voice; "" = provider default. */
+  audioVoice: string;
+  /** Custom instructions appended to the base system prompt for every thread. */
+  systemPrompt: string;
+  /** When true, a fast router model picks relevant tools per prompt. */
+  autoTools: boolean;
+  builtinTools: Record<BuiltinToolId, boolean>;
+  mcpServers: McpServerConfig[];
+  /** Saved agent personas the user can chat with. */
+  agents: AgentProfile[];
+  /** Reusable instruction packs injected into matching runs (chat / research / Julius). */
+  skills: Skill[];
+  /** Scheduled prompts that run in the background while the app is open. */
+  automations: Automation[];
+  /** Julius panel configuration: candidates, decision mode, council models. */
+  julius: JuliusSettings;
+  /** Deep research budget preset — how much searching/reading one run may spend. */
+  researchDepth: ResearchDepth;
+  /** Chime when a reply finishes: off / when the thread is out of view / always. */
+  notifySound: NotifySoundPref;
+  /** Browser notification when a run finishes while the tab is hidden. */
+  notifyDesktop: boolean;
+  /** Desktop composer: Enter sends. When off, Enter is a newline and Ctrl/⌘+Enter sends. */
+  enterSends: boolean;
+  /** Home hero: project & screen shortcut chips above the greeting. */
+  homeShortcuts: boolean;
+  /** Hero composer: one-tap profile monograms at its top right. */
+  composerProfiles: boolean;
+};
+
+export type OpenAiChatMessage =
+  | {
+      role: "system" | "user" | "assistant" | "tool";
+      content: string | OpenAiContentPart[] | null;
+      tool_calls?: OpenAiToolCall[];
+      tool_call_id?: string;
+    };
+
+export type OpenAiContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
+export type OpenAiToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+export type OpenAiTool = {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+};

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- interactive-widget: Android resizes the layout when the keyboard opens, keeping the composer visible. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <title>Gera AI</title>
+    <meta name="description" content="Gera AI — an agent studio for every model, toolkit, and MCP server." />
+
+    <meta property="og:title" content="Gera AI" />
+    <meta property="og:description" content="Gera AI — an agent studio for every model, toolkit, and MCP server." />
+    <meta property="og:type" content="website" />
+
+    <meta name="theme-color" content="#EFEBED" />
+    <link rel="icon" type="image/png" href="/favicon.png?v=2" />
+    <link rel="apple-touch-icon" href="/icon.png?v=2" />
+    <script>
+      (function () {
+        var original = CanvasRenderingContext2D.prototype.drawImage;
+        CanvasRenderingContext2D.prototype.drawImage = function (image) {
+          if (
+            typeof OffscreenCanvas !== "undefined" &&
+            image instanceof OffscreenCanvas &&
+            (image.width === 0 || image.height === 0)
+          ) {
+            return;
+          }
+          return original.apply(this, arguments);
+        };
+        window.addEventListener("error", function (event) {
+          var message = event.message || "";
+          if (message.indexOf("OffscreenCanvas") !== -1 && message.indexOf("width or height of 0") !== -1) {
+            event.preventDefault();
+          }
+        });
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Golos+Text:wght@400;500;600;700&family=Onest:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

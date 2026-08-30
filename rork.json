@@ -1,0 +1,24 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "Gera AI",
+      "path": "web",
+      "framework": "web"
+    },
+    {
+      "name": "Functions",
+      "path": "functions",
+      "framework": "cloudflare"
+    }
+  ],
+  "crons": [
+    {
+      "name": "gera-automations",
+      "schedule": "*/5 * * * *",
+      "target": "https://gera-ai-agent-hub-backend.rork.app/cron/automations",
+      "payload": { "kind": "automations" },
+      "enabled": true
+    }
+  ]
+}

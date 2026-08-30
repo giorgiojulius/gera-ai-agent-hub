@@ -71,6 +71,7 @@ describe("GitHub MCP file bodies", () => {
           catalogId: "github",
           name: "GitHub",
           enabled: true,
+          status: "connected",
           token: "Bearer private-repo-token",
           disabledTools: [],
         },
@@ -221,7 +222,7 @@ describe("generic MCP file-content transport", () => {
       }),
     );
     const session: CloudMcpSession = {
-      url: "https://mcp.example.test",
+      url: "https://mcp.example.com",
       headers: { Authorization: "Bearer secret" },
       omitMcpHeaders: false,
       nextId: 0,
@@ -284,7 +285,7 @@ describe("generic MCP file-content transport", () => {
     const server: McpServerConfig = {
       id: "file-content-test-server",
       name: "Files",
-      url: "https://mcp.example.test",
+      url: "https://mcp.example.com",
       headersJson: "",
       authMode: "none",
       enabled: true,

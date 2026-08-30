@@ -1,3 +1,4 @@
+import { relayFetch } from "@/lib/backend";
 import { newId } from "@/lib/env";
 import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
@@ -9,6 +10,7 @@ import {
   hasOAuthRefreshToken,
   hasOAuthToken,
   oauthAuthHeader,
+  oauthTokenFingerprint,
 } from "@/lib/mcp-oauth";
 import { SLACK_NATIVE_TOOLS, callSlackNativeTool, verifySlackToken } from "@/lib/slack-native";
 import type { McpAuthMode, McpServerConfig, McpToolInfo, OpenAiTool } from "@/lib/types";
@@ -30,9 +32,13 @@ type JsonRpcResponse = {
 type McpSession = {
   configId: string;
   generation: number;
+  configFingerprint: string;
+  configUrl: string;
   url: string;
   headers: Record<string, string>;
   usedOAuth: boolean;
+  oauthFingerprint?: string;
+  protocolVersion: string;
   /** Skip custom MCP headers for hosts whose CORS preflight rejects them (Google). */
   omitMcpHeaders: boolean;
   sessionId?: string;
@@ -48,7 +54,32 @@ export function clearMcpSessionCache(): void {
   sessions.clear();
 }
 
+/** Drops one cached handshake when its URL/auth settings or credential changes. */
+export function clearMcpServerSession(serverId: string): void {
+  sessions.delete(serverId);
+}
+
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+function shortHash(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function mcpConfigFingerprint(config: McpServerConfig): string {
+  return [
+    config.id,
+    config.catalogId ?? "",
+    config.url.trim(),
+    config.authMode ?? "auto",
+    shortHash(config.token ?? ""),
+    shortHash(config.headersJson ?? ""),
+  ].join("|");
+}
 
 /** Auth is truly dead — a key or a fresh sign-in is required; not a transient failure. */
 export class McpAuthError extends Error {}
@@ -70,17 +101,14 @@ export function isSessionLostSignal(status: number, body: string, hasSession: bo
   if (!hasSession) {
     return false;
   }
-  if (status === 404) {
-    return true;
-  }
-  return status === 400 && /session/i.test(body);
+  return status === 404;
 }
 
 /**
- * JSON-RPC phrasing of the same condition ("Session not found", "session
- * expired", "Invalid session ID"). Deliberately strict — a call that failed
- * this way was never executed, so replaying it after a reconnect cannot
- * double-fire a side effect.
+ * Recognizes common non-standard JSON-RPC session wording for diagnostics.
+ * It is deliberately NOT used for automatic tool replay: unlike the MCP
+ * HTTP 404 signal, a tool may already have performed a side effect before
+ * returning an application-level error.
  */
 export function isSessionLostRpcMessage(message: string, hasSession: boolean): boolean {
   return (
@@ -90,26 +118,13 @@ export function isSessionLostRpcMessage(message: string, hasSession: boolean): b
   );
 }
 
-const FUNCTIONS_URL = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url === "string" && url.trim().length > 0) {
-    return url.trim().replace(/\/$/, "");
-  }
-  return "https://gera-ai-agent-hub-backend.rork.app";
-})();
-
-function mcpProxyUrl(target: string): string {
-  return `${FUNCTIONS_URL}/mcp-proxy?url=${encodeURIComponent(target)}`;
-}
-
 /**
- * Every MCP request goes through the Gera backend relay — never straight from
- * the browser. Most MCP servers omit CORS headers or reject preflights, so
- * direct browser calls fail unpredictably per server; the relay makes them all
- * behave the same and forwards auth headers untouched.
+ * Every MCP request goes through the authenticated Gera backend relay — never
+ * straight from the browser. Provider Authorization is separated from Gera's
+ * own JWT by relayFetch and restored only after the account gate.
  */
 async function mcpFetch(url: string, init: RequestInit): Promise<Response> {
-  return fetch(mcpProxyUrl(url), init);
+  return relayFetch("/mcp-proxy", url, init);
 }
 
 function parseCustomHeaders(config: McpServerConfig): Record<string, string> {
@@ -149,10 +164,10 @@ async function buildAuth(
     return { url, headers: {}, usedOAuth: false, omitMcpHeaders };
   }
   if (mode === "oauth") {
-    const hadRefreshableGrant = hasOAuthToken(config.id) && hasOAuthRefreshToken(config.id);
-    const oauth = await oauthAuthHeader(config.id);
+    const hadRefreshableGrant = hasOAuthToken(config.id, url) && hasOAuthRefreshToken(config.id);
+    const oauth = await oauthAuthHeader(config.id, url);
     if (!oauth) {
-      if (hadRefreshableGrant && hasOAuthToken(config.id)) {
+      if (hadRefreshableGrant && hasOAuthToken(config.id, url)) {
         throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
       }
       throw new McpAuthError("Sign-in required — press Sign in to authorize in the browser.");
@@ -168,6 +183,8 @@ async function buildAuth(
   if (token) {
     if (entry?.tokenUrlTemplate) {
       url = entry.tokenUrlTemplate.replace("{token}", encodeURIComponent(token));
+    } else if (entry?.tokenHeader) {
+      headers[entry.tokenHeader] = token;
     } else if (entry?.tokenQueryParam) {
       const glue = url.includes("?") ? "&" : "?";
       url = `${url}${glue}${entry.tokenQueryParam}=${encodeURIComponent(token)}`;
@@ -177,13 +194,13 @@ async function buildAuth(
     return { url, headers, usedOAuth: false, omitMcpHeaders };
   }
   if (!headers.Authorization) {
-    const hadRefreshableGrant = hasOAuthToken(config.id) && hasOAuthRefreshToken(config.id);
-    const oauth = await oauthAuthHeader(config.id);
+    const hadRefreshableGrant = hasOAuthToken(config.id, url) && hasOAuthRefreshToken(config.id);
+    const oauth = await oauthAuthHeader(config.id, url);
     if (oauth) {
       headers.Authorization = oauth;
       return { url, headers, usedOAuth: true, omitMcpHeaders };
     }
-    if (hadRefreshableGrant && hasOAuthToken(config.id)) {
+    if (hadRefreshableGrant && hasOAuthToken(config.id, url)) {
       throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
     }
   }
@@ -195,7 +212,7 @@ function mcpProtocolHeaders(session: McpSession): Record<string, string> {
     return {};
   }
   return {
-    "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    "MCP-Protocol-Version": session.protocolVersion,
     ...(session.sessionId ? { "Mcp-Session-Id": session.sessionId } : {}),
   };
 }
@@ -247,15 +264,85 @@ export function parseMcpRpcResponse(body: string, expectedId: number): JsonRpcRe
   throw new Error(`no JSON-RPC response for request ${expectedId}`);
 }
 
+const MAX_MCP_RESPONSE_CHARS = 2_000_000;
+const MCP_CONNECT_TIMEOUT_MS = 15_000;
+const MCP_CALL_TIMEOUT_MS = 45_000;
+
+async function readLimitedResponseText(response: Response): Promise<string> {
+  if (!response.body) {
+    const text = await response.text();
+    if (text.length > MAX_MCP_RESPONSE_CHARS) {
+      throw new Error("MCP response was too large.");
+    }
+    return text;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        text += decoder.decode();
+        return text;
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      if (text.length > MAX_MCP_RESPONSE_CHARS) {
+        throw new Error("MCP response was too large.");
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+}
+
+/** Stops reading a long-lived SSE connection as soon as our JSON-RPC result arrives. */
+async function readMcpRpcResponse(response: Response, expectedId: number): Promise<JsonRpcResponse> {
+  if (!response.body) {
+    return parseMcpRpcResponse(await readLimitedResponseText(response), expectedId);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        text += decoder.decode();
+        return parseMcpRpcResponse(text, expectedId);
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      if (text.length > MAX_MCP_RESPONSE_CHARS) {
+        throw new Error("MCP response was too large.");
+      }
+      try {
+        return parseMcpRpcResponse(text, expectedId);
+      } catch {
+        // The matching JSON/SSE event is not complete yet.
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+}
+
 async function rpc(session: McpSession, method: string, params?: unknown): Promise<unknown> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     // Sessions are cached across turns; re-resolve the header so a token
     // refreshed since connect (or by a parallel call) is actually used.
     if (session.usedOAuth) {
-      const header = await oauthAuthHeader(session.configId);
-      if (header) {
-        session.headers.Authorization = header;
+      const before = oauthTokenFingerprint(session.configId);
+      if (session.oauthFingerprint && before !== session.oauthFingerprint) {
+        sessions.delete(session.configId);
+        throw new McpSessionLostError();
       }
+      const header = await oauthAuthHeader(session.configId, session.configUrl);
+      if (!header) {
+        sessions.delete(session.configId);
+        throw new McpAuthError("Sign-in is missing or expired — authorize this server again.");
+      }
+      session.headers.Authorization = header;
+      session.oauthFingerprint = oauthTokenFingerprint(session.configId);
     }
 
     session.nextId += 1;
@@ -277,6 +364,7 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
           ...session.headers,
         },
         body: JSON.stringify(request),
+        signal: AbortSignal.timeout(method === "tools/call" || method === "resources/read" ? MCP_CALL_TIMEOUT_MS : MCP_CONNECT_TIMEOUT_MS),
       });
     } catch {
       throw new Error("Could not reach the Gera relay. Check your connection and try again.");
@@ -287,8 +375,8 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
       session.sessionId = sessionHeader;
     }
 
-    const text = await response.text();
     if (!response.ok) {
+      const text = await readLimitedResponseText(response);
       if (isSessionLostSignal(response.status, text, Boolean(session.sessionId))) {
         // The server forgot us while idle — drop the cache; callers replay once.
         sessions.delete(session.configId);
@@ -306,7 +394,7 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
         }
         if (session.usedOAuth) {
           sessions.delete(session.configId);
-          if (hasOAuthToken(session.configId) && hasOAuthRefreshToken(session.configId)) {
+          if (hasOAuthToken(session.configId, session.configUrl) && hasOAuthRefreshToken(session.configId)) {
             // The provider/relay may be temporarily unavailable. The rejected
             // access token cannot be used now, but its refresh grant may repair
             // the next attempt; deleting it here caused needless re-logins.
@@ -326,18 +414,16 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
 
     let parsed: JsonRpcResponse;
     try {
-      parsed = parseMcpRpcResponse(text, request.id);
-    } catch {
+      parsed = await readMcpRpcResponse(response, request.id);
+    } catch (error) {
+      if (error instanceof Error && /too large/i.test(error.message)) {
+        throw error;
+      }
       throw new Error("MCP server sent an unexpected response.");
     }
 
     if (parsed.error) {
-      const message = parsed.error.message || "MCP request failed.";
-      if (isSessionLostRpcMessage(message, Boolean(session.sessionId))) {
-        sessions.delete(session.configId);
-        throw new McpSessionLostError();
-      }
-      throw new Error(message);
+      throw new Error(parsed.error.message || "MCP request failed.");
     }
     return parsed.result;
   }
@@ -397,18 +483,25 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
   const session: McpSession = {
     configId: config.id,
     generation,
+    configFingerprint: mcpConfigFingerprint(config),
+    configUrl: config.url.trim(),
     url: auth.url,
     headers: auth.headers,
     usedOAuth: auth.usedOAuth,
+    oauthFingerprint: auth.usedOAuth ? oauthTokenFingerprint(config.id) : undefined,
+    protocolVersion: MCP_PROTOCOL_VERSION,
     omitMcpHeaders: auth.omitMcpHeaders,
     nextId: 0,
   };
 
   const initResult = (await rpc(session, "initialize", {
     protocolVersion: MCP_PROTOCOL_VERSION,
-    capabilities: { tools: {} },
+    capabilities: {},
     clientInfo: { name: "Gera AI", version: "1.0.0" },
-  })) as { serverInfo?: { name?: unknown; version?: unknown } } | null;
+  })) as { protocolVersion?: unknown; serverInfo?: { name?: unknown; version?: unknown } } | null;
+  if (typeof initResult?.protocolVersion === "string" && /^\d{4}-\d{2}-\d{2}$/.test(initResult.protocolVersion)) {
+    session.protocolVersion = initResult.protocolVersion;
+  }
 
   try {
     await mcpFetch(session.url, {
@@ -420,13 +513,26 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
         ...session.headers,
       },
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      signal: AbortSignal.timeout(6_000),
     });
   } catch {
     // notification is best-effort
   }
 
-  const listed = (await rpc(session, "tools/list", {})) as { tools?: Array<Record<string, unknown>> };
-  const tools: McpToolInfo[] = (listed.tools ?? []).map((tool) => ({
+  const rawTools: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 20 && rawTools.length < 500; page += 1) {
+    const listed = (await rpc(session, "tools/list", cursor ? { cursor } : {})) as {
+      tools?: Array<Record<string, unknown>>;
+      nextCursor?: unknown;
+    };
+    rawTools.push(...(listed.tools ?? []).slice(0, 500 - rawTools.length));
+    cursor = typeof listed.nextCursor === "string" && listed.nextCursor ? listed.nextCursor : undefined;
+    if (!cursor) {
+      break;
+    }
+  }
+  const tools: McpToolInfo[] = rawTools.map((tool) => ({
     name: String(tool.name ?? ""),
     description: typeof tool.description === "string" ? tool.description : undefined,
     inputSchema:
@@ -466,7 +572,10 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
     return callGitHubNativeTool(auth, name, args);
   }
   let session = sessions.get(config.id);
-  if (session && session.generation !== sessionGeneration) {
+  if (
+    session &&
+    (session.generation !== sessionGeneration || session.configFingerprint !== mcpConfigFingerprint(config))
+  ) {
     sessions.delete(config.id);
     session = undefined;
   }
@@ -540,12 +649,20 @@ export function mcpToolsToOpenAi(servers: McpServerConfig[]): OpenAiTool[] {
   return tools;
 }
 
-function compactId(id: string): string {
-  return id.replace(/-/g, "");
-}
-
 export function mcpFunctionName(serverId: string, toolName: string): string {
-  return `mcp_${compactId(serverId)}_${safeName(toolName)}`.slice(0, 64);
+  const serverPart = safeName(serverId, "server");
+  const toolPart = safeName(toolName, "tool");
+  const base = `mcp_${serverPart}_${toolPart}`;
+  const normalizedChanged =
+    serverPart !== serverId.toLowerCase() ||
+    toolPart !== toolName.toLowerCase() ||
+    serverId !== serverId.toLowerCase() ||
+    toolName !== toolName.toLowerCase();
+  if (!normalizedChanged && base.length <= 64) {
+    return base;
+  }
+  const suffix = shortHash(`${serverId}\u0000${toolName}`).slice(0, 7);
+  return `${base.slice(0, 63 - suffix.length)}_${suffix}`;
 }
 
 export function findServerForTool(servers: McpServerConfig[], functionName: string): {
@@ -555,13 +672,8 @@ export function findServerForTool(servers: McpServerConfig[], functionName: stri
   if (!functionName.startsWith("mcp_")) {
     return null;
   }
-  const rest = functionName.slice(4);
   for (const server of servers) {
     if (!server.enabled || server.status !== "connected") {
-      continue;
-    }
-    const prefix = `${compactId(server.id)}_`;
-    if (!rest.startsWith(prefix)) {
       continue;
     }
     const tool = (nativeToolTable(server) ?? server.tools).find(
@@ -589,8 +701,8 @@ export function newMcpServer(): McpServerConfig {
   };
 }
 
-function safeName(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "server";
+function safeName(value: string, fallback: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || fallback;
 }
 
 const MAX_RESOURCE_LINK_READS = 4;
@@ -652,8 +764,8 @@ export function stringifyMcpResult(result: unknown): string {
   const pieces = Array.isArray(result.content)
     ? result.content.map(stringifyContentPart).filter((part) => part.length > 0)
     : [];
-  if (pieces.length === 0 && result.structuredContent !== undefined) {
-    pieces.push(jsonText(result.structuredContent));
+  if (result.structuredContent !== undefined) {
+    pieces.push(`[Structured content]\n${jsonText(result.structuredContent)}`);
   }
   const text = pieces.join("\n");
   return result.isError === true ? `Tool reported an error${text ? `:\n${text}` : "."}` : text;
@@ -684,8 +796,14 @@ function stringifyResourceReadResult(result: unknown): string {
     .join("\n");
 }
 
+const MAX_MCP_RENDER_CHARS = 300_000;
+
 async function renderMcpResultWithResources(session: McpSession, result: unknown): Promise<string> {
-  const pieces = [stringifyMcpResult(result)];
+  const rendered = stringifyMcpResult(result);
+  if (isRecord(result) && result.isError === true) {
+    throw new Error(rendered || "MCP tool reported an error.");
+  }
+  const pieces = [rendered];
   for (const uri of resourceLinks(result)) {
     try {
       const resource = await rpc(session, "resources/read", { uri });
@@ -697,5 +815,8 @@ async function renderMcpResultWithResources(session: McpSession, result: unknown
       pieces.push(`[Could not read resource ${uri}: ${error instanceof Error ? error.message : "unknown error"}]`);
     }
   }
-  return pieces.filter((piece) => piece.length > 0).join("\n\n");
+  const output = pieces.filter((piece) => piece.length > 0).join("\n\n");
+  return output.length > MAX_MCP_RENDER_CHARS
+    ? `${output.slice(0, MAX_MCP_RENDER_CHARS)}\n… [MCP result truncated]`
+    : output;
 }

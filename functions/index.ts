@@ -3,15 +3,14 @@
 //
 // Intercom's REST API (api.intercom.io) sends no CORS headers, so the browser
 // app cannot call it directly (probed live). This Worker forwards an
-// allow-listed set of Intercom REST endpoints, passing the caller's
-// Authorization header through untouched and adding CORS on the way back.
+// allow-listed set of Intercom REST endpoints and adds CORS on the way back.
 // The /oauth-proxy route does the same for MCP OAuth discovery, dynamic
-// client registration, and token exchanges — several providers (Intercom's
-// mcp.intercom.com among them) CORS-block those endpoints while the MCP
-// endpoint itself is browser-reachable. Every MCP JSON-RPC request from the
-// app flows through /mcp-proxy — browsers enforce CORS and most MCP servers
-// never send those headers, so the relay is the single, predictable path.
-// Tokens are never stored or logged.
+// client registration, and token exchanges. Every MCP JSON-RPC request from
+// the app flows through /mcp-proxy because most servers reject browser CORS.
+// All three relays require an invited Gera identity: Gera's JWT remains in
+// Authorization for platform verification, while a provider credential rides
+// in a dedicated internal header and is restored only after that gate. Tokens
+// are never stored or logged.
 //
 // /access/* routes are invite-only gatekeeping: the platform verifies the
 // caller's Rork Auth JWT and stamps X-Rork-User-* headers; the entrypoint
@@ -56,6 +55,7 @@ import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute } from "./knowledge-storage";
 import { decodeSlackInstallState } from "./native-slack";
+import { isForbiddenHost } from "./network-safety";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
 import { chatShardId, migrateOwnerToShard, sweepGlobalMigrations } from "./shard-migration";
 
@@ -100,8 +100,10 @@ const ALLOWED_ROUTES: Array<{ method: string; pattern: RegExp }> = [
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Intercom-Region",
-  "Access-Control-Expose-Headers": "Mcp-Session-Id",
+  "Access-Control-Allow-Headers":
+    "Authorization, Content-Type, X-Intercom-Region, X-Gera-Upstream-Authorization, X-Gera-Upstream-Url",
+  "Access-Control-Expose-Headers":
+    "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate, X-Gera-Relay-Auth",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -112,13 +114,38 @@ function corsJson(data: unknown, status: number): Response {
   });
 }
 
-async function relayIntercom(request: Request, url: URL): Promise<Response> {
+function relayAuthRequired(): Response {
+  const response = corsJson({ error: "sign_in_required" }, 401);
+  response.headers.set("X-Gera-Relay-Auth", "required");
+  return response;
+}
+
+/** Browser-facing generic relays are available only to invited Gera accounts. */
+async function relayAccessProblem(request: Request, env: Env): Promise<Response | null> {
+  const userId = request.headers.get("X-Rork-User-Id");
+  const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
+  if (!userId || !email) {
+    return relayAuthRequired();
+  }
+  if (await isInvitedCached(env, request.url, email)) {
+    return null;
+  }
+  const response = corsJson({ error: "invite_required" }, 403);
+  response.headers.set("X-Gera-Relay-Auth", "forbidden");
+  return response;
+}
+
+async function relayIntercom(request: Request, url: URL, env: Env): Promise<Response> {
+  const accessProblem = await relayAccessProblem(request, env);
+  if (accessProblem) {
+    return accessProblem;
+  }
   const apiPath = url.pathname.slice("/intercom".length) || "/";
   const allowed = ALLOWED_ROUTES.some((route) => route.method === request.method && route.pattern.test(apiPath));
   if (!allowed) {
     return corsJson({ error: "path_not_allowed" }, 403);
   }
-  const authorization = request.headers.get("Authorization") ?? "";
+  const authorization = request.headers.get("X-Gera-Upstream-Authorization") ?? "";
   if (!authorization.startsWith("Bearer ")) {
     return corsJson({ error: "missing_token" }, 401);
   }
@@ -163,40 +190,18 @@ const OAUTH_DISCOVERY_PREFIXES = [
 
 const OAUTH_BODY_LIMIT = 16_384;
 
-function isForbiddenHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/\.$/, "");
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
-    return true;
-  }
-  if (host === "0.0.0.0" || host === "::" || host === "[::]" || host === "::1" || host === "[::1]") {
-    return true;
-  }
-  const ipv6 = host.replace(/^\[|\]$/g, "");
-  if (
-    /^(?:fc|fd)/i.test(ipv6) ||
-    /^fe[89ab]/i.test(ipv6) ||
-    /^::ffff:(?:7f[0-9a-f]{2}|a[0-9a-f]{2}|ac1[0-9a-f]|a9fe|c0a8):/i.test(ipv6) ||
-    /^::ffff:(?:127\.|10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.)/i.test(ipv6)
-  ) {
-    return true;
-  }
-  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) {
-    return true;
-  }
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
-    return true;
-  }
-  return false;
-}
-
 /**
  * Forwards OAuth discovery GETs and registration/token POSTs for the browser
  * app, adding CORS on the way back. No Authorization header is ever forwarded
  * (MCP OAuth uses public clients), bodies are size-capped, and only https
  * targets on public hosts are allowed. Bodies and tokens are never logged.
  */
-async function relayOAuth(request: Request, url: URL): Promise<Response> {
-  const target = url.searchParams.get("url") ?? "";
+async function relayOAuth(request: Request, url: URL, env: Env): Promise<Response> {
+  const accessProblem = await relayAccessProblem(request, env);
+  if (accessProblem) {
+    return accessProblem;
+  }
+  const target = request.headers.get("X-Gera-Upstream-Url") ?? url.searchParams.get("url") ?? "";
   let parsed: URL;
   try {
     parsed = new URL(target);
@@ -284,11 +289,16 @@ async function relayOAuth(request: Request, url: URL): Promise<Response> {
   }
 
   const text = await upstream.text();
-  console.log("oauth relay", request.method, parsed.hostname, parsed.pathname, upstream.status);
-  return new Response(text, {
-    status: upstream.status,
-    headers: { ...CORS_HEADERS, "Content-Type": upstream.headers.get("Content-Type") ?? "application/json" },
-  });
+  console.log("oauth relay", request.method, parsed.hostname, upstream.status);
+  const responseHeaders: Record<string, string> = {
+    ...CORS_HEADERS,
+    "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
+  };
+  const challenge = upstream.headers.get("WWW-Authenticate");
+  if (challenge) {
+    responseHeaders["WWW-Authenticate"] = challenge;
+  }
+  return new Response(text, { status: upstream.status, headers: responseHeaders });
 }
 
 /**
@@ -1794,9 +1804,12 @@ const MCP_DROP_HEADERS = new Set<string>([
   "cdn-loop",
   "priority",
   "dnt",
+  "authorization",
+  "x-gera-upstream-authorization",
+  "x-gera-upstream-url",
 ]);
 
-const MCP_DROP_PREFIXES = ["cf-", "sec-", "x-forwarded-"];
+const MCP_DROP_PREFIXES = ["cf-", "sec-", "x-forwarded-", "x-rork-", "x-gera-"];
 
 /**
  * Forwards MCP Streamable HTTP POSTs — and plain GETs (GitHub Actions job
@@ -1807,11 +1820,15 @@ const MCP_DROP_PREFIXES = ["cf-", "sec-", "x-forwarded-"];
  * targets on public hosts are allowed, and nothing beyond host/path/status is
  * ever logged.
  */
-async function relayMcp(request: Request, url: URL): Promise<Response> {
+async function relayMcp(request: Request, url: URL, env: Env): Promise<Response> {
   if (request.method !== "POST" && request.method !== "GET") {
     return corsJson({ error: "method_not_allowed" }, 405);
   }
-  const target = url.searchParams.get("url") ?? "";
+  const accessProblem = await relayAccessProblem(request, env);
+  if (accessProblem) {
+    return accessProblem;
+  }
+  const target = request.headers.get("X-Gera-Upstream-Url") ?? url.searchParams.get("url") ?? "";
   let parsed: URL;
   try {
     parsed = new URL(target);
@@ -1834,6 +1851,7 @@ async function relayMcp(request: Request, url: URL): Promise<Response> {
   }
 
   const headers: Record<string, string> = {};
+  const upstreamAuthorization = request.headers.get("X-Gera-Upstream-Authorization");
   request.headers.forEach((value, name) => {
     const lower = name.toLowerCase();
     if (MCP_DROP_HEADERS.has(lower) || MCP_DROP_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
@@ -1841,6 +1859,9 @@ async function relayMcp(request: Request, url: URL): Promise<Response> {
     }
     headers[lower] = value;
   });
+  if (upstreamAuthorization) {
+    headers.authorization = upstreamAuthorization;
+  }
   // MCP servers reply 406 unless Accept lists both types (probed live) —
   // normalize weak values like */* instead of forwarding them. GETs are not
   // MCP traffic; their Accept passes through untouched.
@@ -1893,7 +1914,7 @@ async function relayMcp(request: Request, url: URL): Promise<Response> {
         "user-agent": "Gera-AI-Relay/1.0",
       };
     }
-    if (upstream.status === 303 || ((upstream.status === 301 || upstream.status === 302) && method === "POST")) {
+    if (upstream.status === 303 && method === "POST") {
       method = "GET";
       forwardBody = undefined;
       delete forwardHeaders["content-type"];
@@ -1905,7 +1926,7 @@ async function relayMcp(request: Request, url: URL): Promise<Response> {
     return corsJson({ error: "too_many_redirects" }, 502);
   }
 
-  console.log("mcp relay", parsed.hostname, parsed.pathname, upstream.status);
+  console.log("mcp relay", parsed.hostname, upstream.status);
   const responseHeaders: Record<string, string> = {
     ...CORS_HEADERS,
     "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
@@ -1913,6 +1934,14 @@ async function relayMcp(request: Request, url: URL): Promise<Response> {
   const sessionId = upstream.headers.get("Mcp-Session-Id");
   if (sessionId) {
     responseHeaders["Mcp-Session-Id"] = sessionId;
+  }
+  const protocolVersion = upstream.headers.get("MCP-Protocol-Version");
+  if (protocolVersion) {
+    responseHeaders["MCP-Protocol-Version"] = protocolVersion;
+  }
+  const challenge = upstream.headers.get("WWW-Authenticate");
+  if (challenge) {
+    responseHeaders["WWW-Authenticate"] = challenge;
   }
   // Stream the body through so long-running SSE tool calls arrive as sent.
   return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
@@ -2013,13 +2042,13 @@ export default {
       return relayKnowledge(request, url, env);
     }
     if (url.pathname === "/oauth-proxy") {
-      return relayOAuth(request, url);
+      return relayOAuth(request, url, env);
     }
     if (url.pathname === "/mcp-proxy") {
-      return relayMcp(request, url);
+      return relayMcp(request, url, env);
     }
     if (url.pathname.startsWith("/intercom/")) {
-      return relayIntercom(request, url);
+      return relayIntercom(request, url, env);
     }
     if (url.pathname === "/slack/oauth/callback") {
       return relaySlackOAuthCallback(request, url, env);

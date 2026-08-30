@@ -123,13 +123,17 @@ describe("githubToolAllowed", () => {
 
 describe("accessForAgentSurface", () => {
   it("keeps authenticated project runs intact but downgrades inbound Slack GitHub writes", () => {
-    const full = access({ github: "write", slack: true });
+    const full = access({ github: "write", slack: true, mcp: true });
     expect(accessForAgentSurface(full, "project")).toBe(full);
     const slack = accessForAgentSurface(full, "slack");
     expect(slack.github).toBe("read");
-    expect(planAgentTools(slack, flags(true, false, true)).native.map((tool) => tool.fnName)).not.toContain(
-      "github_put_file",
-    );
+    expect(slack.intercom).toBe(false);
+    expect(slack.slack).toBe(false);
+    expect(slack.mcp).toBe(false);
+    const names = planAgentTools(slack, flags(true, true, true)).native.map((tool) => tool.fnName);
+    expect(names).not.toContain("github_put_file");
+    expect(names.some((name) => name.startsWith("intercom_"))).toBe(false);
+    expect(names.some((name) => name.startsWith("slack_"))).toBe(false);
   });
 });
 

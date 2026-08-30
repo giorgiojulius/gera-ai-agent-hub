@@ -24,6 +24,7 @@ describe("GitHub cloud run hand-off", () => {
           catalogId: "github",
           name: "GitHub",
           enabled: true,
+          status: "connected",
           token: "Bearer gho_browser_token",
           disabledTools: [],
         },

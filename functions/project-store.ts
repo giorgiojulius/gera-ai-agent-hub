@@ -1410,6 +1410,7 @@ export class ProjectStore extends DurableObject {
     }
     this.ctx.storage.sql.exec("DELETE FROM members WHERE email = ?", email);
     this.ctx.storage.sql.exec("DELETE FROM reads WHERE email = ?", email);
+    this.revokeMcpSelectionsOwnedBy(email);
     return json({ ok: true, email });
   }
 
@@ -1430,7 +1431,30 @@ export class ProjectStore extends DurableObject {
       return json({ error: "cannot_change_owner" }, 400);
     }
     this.ctx.storage.sql.exec("UPDATE members SET role = ? WHERE email = ?", role, email);
+    if (role !== "admin") {
+      this.revokeMcpSelectionsOwnedBy(email);
+    }
     return json({ ok: true, email, role });
+  }
+
+  /** Unlinks account-scoped MCP delegation when its admin loses project authority. */
+  private revokeMcpSelectionsOwnedBy(email: string): void {
+    const rows = this.ctx.storage.sql
+      .exec<{ id: string; secrets: string }>("SELECT id, secrets FROM agents")
+      .toArray();
+    for (const row of rows) {
+      const secrets = parseSecrets(row.secrets);
+      if (secrets.mcpSelection?.owner !== email) {
+        continue;
+      }
+      delete secrets.mcpSelection;
+      this.ctx.storage.sql.exec(
+        "UPDATE agents SET secrets = ?, updated_at = ? WHERE id = ?",
+        JSON.stringify(secrets),
+        Date.now(),
+        row.id,
+      );
+    }
   }
 
   private handleAgentUpsert(me: MemberRow, body: unknown): Response {
@@ -3453,7 +3477,12 @@ export class ProjectStore extends DurableObject {
       surface,
     );
     const secrets = parseSecrets(agent.secrets);
-    const selection = access.mcp ? secrets.mcpSelection : undefined;
+    const requestedSelection = access.mcp ? secrets.mcpSelection : undefined;
+    const selectionOwner = requestedSelection ? this.loadMember(requestedSelection.owner) : undefined;
+    const selection =
+      requestedSelection && selectionOwner && canManageProject(this.memberRole(selectionOwner))
+        ? requestedSelection
+        : undefined;
     const selectionRefs = selection?.servers ?? [];
     const plan = planAgentTools(access, secretFlags(secrets), selectionRefs.length);
     const tools: EngineToolDef[] = [
@@ -3499,7 +3528,10 @@ export class ProjectStore extends DurableObject {
       });
     }
 
-    let mcpNote = "";
+    let mcpNote =
+      requestedSelection && !selection
+        ? `\nExternal MCP servers: unavailable — the account that linked them is no longer a project admin. Re-link them in the agent settings.`
+        : "";
     if (selection && selectionRefs.length > 0) {
       const noteLines: string[] = [];
       const resolved = await this.resolveOwnerMcp(selection);

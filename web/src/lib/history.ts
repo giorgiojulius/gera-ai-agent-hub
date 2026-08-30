@@ -4,7 +4,7 @@ import { newId } from "@/lib/env";
 import { clampImageCount } from "@/lib/image-count";
 import { MAX_DOCS_PER_AGENT, MAX_FILE_CHARS } from "@/lib/knowledge";
 import { defaultJuliusSettings, JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES } from "@/lib/julius";
-import { keepUserMcpServers } from "@/lib/mcp-catalog";
+import { findCatalogEntry, keepUserMcpServers } from "@/lib/mcp-catalog";
 import { normalizeSkills } from "@/lib/skills";
 import { DEFAULT_CHAT_MODEL, isCreateMode, MODE_MODEL_IDS, modeOfModelId, sanitizeModeModel } from "@/lib/models";
 import type {
@@ -653,16 +653,29 @@ function normalizeAgent(agent: Partial<AgentProfile>): AgentProfile {
 
 const MCP_AUTH_MODES = new Set(["auto", "none", "bearer", "headers", "oauth"]);
 
+const LEGACY_CATALOG_URLS: Record<string, string[]> = {
+  firecrawl: ["https://mcp.firecrawl.dev/mcp"],
+  zapier: ["https://mcp.zapier.com"],
+  octagon: ["https://mcp.octagonagents.com/mcp"],
+  datadog: ["https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"],
+};
+
 function normalizeServer(server: McpServerConfig): McpServerConfig {
+  const catalogId = typeof server.catalogId === "string" ? server.catalogId : undefined;
+  const entry = findCatalogEntry(catalogId ?? server.id);
+  const rawUrl = typeof server.url === "string" ? server.url.trim() : "";
+  const legacyUrls = entry ? LEGACY_CATALOG_URLS[entry.id] ?? [] : [];
+  const url = entry && (!rawUrl || legacyUrls.includes(rawUrl.replace(/\/$/, ""))) ? entry.url : rawUrl;
   return {
     ...server,
+    url,
     authMode:
       typeof server.authMode === "string" && MCP_AUTH_MODES.has(server.authMode)
         ? server.authMode
         : undefined,
     headersJson: typeof server.headersJson === "string" ? server.headersJson : "",
     token: typeof server.token === "string" ? server.token : "",
-    catalogId: typeof server.catalogId === "string" ? server.catalogId : undefined,
+    catalogId,
     // "Connect once and forget": a verified server stays connected across
     // reloads — auth material persists too (tokens in this config, sign-ins
     // in localStorage) and every call re-handshakes lazily. Boot re-verifies

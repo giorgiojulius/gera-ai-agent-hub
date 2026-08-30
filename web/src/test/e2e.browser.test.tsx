@@ -243,6 +243,45 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
     if (url.includes("/access/status")) {
       return jsonResponse({ email: "e2e@gera.app", status: "invited", role: "member", requestedAt: null });
     }
+    if (url.includes("/mcp-proxy")) {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("Authorization")).toMatch(/^Bearer /);
+      expect(headers.get("X-Gera-Upstream-Url")).toBe("https://mcp.deepwiki.com/mcp");
+      const raw = typeof init?.body === "string" ? init.body : "{}";
+      const body = JSON.parse(raw) as { id?: number; method?: string };
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "initialize") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              serverInfo: { name: "DeepWiki", version: "e2e" },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json", "Mcp-Session-Id": "e2e-mcp" } },
+        );
+      }
+      if (body.method === "tools/list") {
+        return jsonResponse({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            tools: [
+              {
+                name: "ask_question",
+                description: "Ask about a public repository",
+                inputSchema: { type: "object", properties: { question: { type: "string" } } },
+              },
+            ],
+          },
+        });
+      }
+      throw new Error(`Unstubbed MCP method: ${body.method ?? "missing"}`);
+    }
     if (url.includes("/runs/start")) {
       const raw = typeof init?.body === "string" ? init.body : "";
       let body: StubRunBody = {};

@@ -1,4 +1,13 @@
-import { TID, effortOptionTid, modelOptionTid, runModeOptionTid, studioPageTid, studioTabTid } from "../src/lib/testids";
+import {
+  TID,
+  effortOptionTid,
+  mcpCatalogConnectTid,
+  mcpServerCardTid,
+  modelOptionTid,
+  runModeOptionTid,
+  studioPageTid,
+  studioTabTid,
+} from "../src/lib/testids";
 
 import type { E2eScenario } from "./types";
 
@@ -159,6 +168,16 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "see", target: studioPageTid("mcp") },
       { do: "tap", target: studioTabTid("settings") },
       { do: "see", target: studioPageTid("settings") },
+    ],
+  },
+  {
+    id: "connect-open-mcp",
+    title: "An open MCP catalog server handshakes and lists its tools",
+    steps: [
+      { do: "goto", path: "/mcp" },
+      { do: "see", target: studioPageTid("mcp"), timeoutMs: 20_000 },
+      { do: "tap", target: mcpCatalogConnectTid("deepwiki") },
+      { do: "seeText", target: mcpServerCardTid("deepwiki"), text: "1 tools", timeoutMs: 20_000 },
     ],
   },
   {

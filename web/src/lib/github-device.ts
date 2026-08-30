@@ -7,7 +7,11 @@
 // signs in with a one-time code. All requests go through the Gera relay
 // because github.com's OAuth endpoints send no CORS headers; the relay
 // forwards them verbatim and never stores tokens.
-import { storeExternalOAuthToken } from "@/lib/mcp-oauth";
+import { relayFetch } from "@/lib/backend";
+import {
+  currentOAuthOperationGeneration,
+  storeExternalOAuthToken,
+} from "@/lib/mcp-oauth";
 
 const DEVICE_CODE_URL = "https://github.com/login/device/code";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -27,18 +31,6 @@ export class GitHubAuthError extends Error {
  */
 const SCOPES = "repo read:org read:user user:email gist notifications workflow read:project";
 
-const FUNCTIONS_URL = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url === "string" && url.trim().length > 0) {
-    return url.trim().replace(/\/$/, "");
-  }
-  return "https://gera-ai-agent-hub-backend.rork.app";
-})();
-
-function relayUrl(target: string): string {
-  return `${FUNCTIONS_URL}/oauth-proxy?url=${encodeURIComponent(target)}`;
-}
-
 /** The workspace's GitHub OAuth app client ID, or null when not configured. */
 export function githubDeviceClientId(): string | null {
   const id = import.meta.env.EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID;
@@ -51,6 +43,8 @@ export type GitHubDeviceSession = {
   verificationUri: string;
   intervalMs: number;
   expiresAt: number;
+  /** Account-generation snapshot; a logout makes this device flow inert. */
+  operationGeneration?: number;
 };
 
 /** Identity + granted scopes behind a GitHub token — the honest "who am I". */
@@ -136,7 +130,7 @@ export async function fetchGitHubViewer(authorization: string): Promise<GitHubVi
 async function postForm(url: string, params: Record<string, string>): Promise<Record<string, unknown>> {
   let response: Response;
   try {
-    response = await fetch(relayUrl(url), {
+    response = await relayFetch("/oauth-proxy", url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(params).toString(),
@@ -198,6 +192,7 @@ export async function startGitHubDeviceFlow(): Promise<GitHubDeviceSession> {
         : "https://github.com/login/device",
     intervalMs: Math.max(interval, 5) * 1000,
     expiresAt: Date.now() + expiresIn * 1000,
+    operationGeneration: currentOAuthOperationGeneration(),
   };
 }
 
@@ -230,14 +225,15 @@ export async function pollGitHubDeviceToken(
     });
     if (typeof data.access_token === "string" && data.access_token) {
       const expiresIn = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in);
-      storeExternalOAuthToken("github", {
+      const stored = storeExternalOAuthToken("github", {
         accessToken: data.access_token,
         refreshToken: typeof data.refresh_token === "string" ? data.refresh_token : undefined,
         expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : undefined,
         tokenEndpoint: TOKEN_URL,
         clientId,
-      });
-      return true;
+        mcpUrl: "https://api.github.com",
+      }, session.operationGeneration ?? currentOAuthOperationGeneration());
+      return stored;
     }
     const code = typeof data.error === "string" ? data.error : "";
     if (code === "authorization_pending") {

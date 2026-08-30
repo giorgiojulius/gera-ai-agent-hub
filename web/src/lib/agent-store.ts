@@ -1814,7 +1814,8 @@ export function mcpCredentialProblem(server: McpServerConfig): string | null {
   const hasKey = Boolean(server.token?.trim());
   const hasHeaders = Boolean(server.headersJson?.trim());
   const hasOAuth =
-    hasOAuthToken(server.id) || (catalogId !== server.id && hasOAuthToken(catalogId));
+    hasOAuthToken(server.id, server.url) ||
+    (catalogId !== server.id && hasOAuthToken(catalogId, server.url));
 
   if (entry?.native === "github") {
     return hasKey || hasOAuth ? null : "GitHub sign-in is missing — sign in again or paste a PAT.";

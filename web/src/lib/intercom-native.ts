@@ -1,3 +1,4 @@
+import { relayFetch } from "@/lib/backend";
 import type { McpToolInfo } from "@/lib/types";
 
 /**
@@ -12,14 +13,6 @@ import type { McpToolInfo } from "@/lib/types";
  */
 
 type IntercomRegion = "us" | "eu";
-
-const FUNCTIONS_URL = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url !== "string" || url.length === 0) {
-    return "https://gera-ai-agent-hub-backend.rork.app";
-  }
-  return url.replace(/\/$/, "");
-})();
 
 /** Raised for Intercom error responses; `code` is Intercom's machine error. */
 class IntercomApiError extends Error {
@@ -95,15 +88,19 @@ async function relay(
 ): Promise<Record<string, unknown>> {
   let response: Response;
   try {
-    response = await fetch(`${FUNCTIONS_URL}/intercom${path}`, {
+    response = await relayFetch(
+      `/intercom${path}`,
+      region === "eu" ? "https://api.eu.intercom.io" : "https://api.intercom.io",
+      {
       method,
       headers: {
         Authorization: `Bearer ${token}`,
         "X-Intercom-Region": region,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      },
+    );
   } catch {
     throw new Error("Could not reach the Intercom relay. Check your connection.");
   }

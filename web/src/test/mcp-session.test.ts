@@ -22,9 +22,9 @@ function storedServer(overrides: Partial<McpServerConfig>): McpServerConfig {
 }
 
 describe("session-lost detection", () => {
-  it("treats 404 with an established session as idle expiry", () => {
+  it("replays only the spec-defined HTTP 404 session-expiry signal", () => {
     expect(isSessionLostSignal(404, "", true)).toBe(true);
-    expect(isSessionLostSignal(400, "Mcp-Session-Id invalid or expired", true)).toBe(true);
+    expect(isSessionLostSignal(400, "Mcp-Session-Id invalid or expired", true)).toBe(false);
   });
 
   it("never fires before a session id was issued — a 404 then means wrong URL", () => {

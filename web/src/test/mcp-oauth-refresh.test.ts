@@ -12,6 +12,7 @@ import {
   forceRefreshOAuthHeader,
   hasOAuthToken,
   isClientRegistrationUsable,
+  invalidateOAuthOperations,
   oauthAuthHeader,
 } from "@/lib/mcp-oauth";
 
@@ -91,6 +92,50 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     expect(header).toBe("Bearer U");
     expect(storedToken("race")?.accessToken).toBe("U");
     expect(storedToken("race")?.refreshToken).toBe("RU");
+  });
+
+  it("cannot repopulate an old account after logout invalidates an in-flight refresh", async () => {
+    seedToken("logout-race", "A", "RA");
+    let finish: ((response: StubResponse) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async (): Promise<StubResponse> =>
+          new Promise<StubResponse>((resolve) => {
+            finish = resolve;
+          }),
+      ),
+    );
+
+    const pending = forceRefreshOAuthHeader("logout-race");
+    await Promise.resolve();
+    invalidateOAuthOperations();
+    store.delete(TOKENS_KEY);
+    finish?.({
+      ok: true,
+      status: 200,
+      json: async () => ({ access_token: "OLD-ACCOUNT", refresh_token: "OLD-REFRESH", expires_in: 3600 }),
+    });
+
+    await expect(pending).resolves.toBeNull();
+    expect(storedToken("logout-race")).toBeUndefined();
+  });
+
+  it("does not overwrite a fresh sign-in when an older successful refresh lands late", async () => {
+    seedToken("success-race", "A", "RA");
+    stubFetch(() => {
+      seedToken("success-race", "FRESH", "RFRESH");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ access_token: "STALE-B", refresh_token: "STALE-RB", expires_in: 3600 }),
+      };
+    });
+
+    const header = await forceRefreshOAuthHeader("success-race");
+    expect(header).toBe("Bearer FRESH");
+    expect(storedToken("success-race")?.accessToken).toBe("FRESH");
+    expect(storedToken("success-race")?.refreshToken).toBe("RFRESH");
   });
 
   it("drops the sign-in only when the failed pair is still the stored one", async () => {

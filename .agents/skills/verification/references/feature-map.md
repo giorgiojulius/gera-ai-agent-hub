@@ -9,7 +9,7 @@ Research/Julius + repo access probe, truthful MCP health + durable OAuth
 grant sync/refresh + server GitHub User-Agent and authenticated raw-file reads,
 Julius Verifier GitHub hand-off, MCP structured/resource content reads, honesty
 rule in default system prompts, skills-as-guidance research fix + empty-question
-guard, Intercom attachments)
+guard, Intercom attachments, full 98-entry MCP live audit + relay/OAuth/cloud hardening)
 Drift check: `git log --oneline 6bf0c9c..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -410,9 +410,9 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   `too_many_mcp_servers`; omit = keep, [] unlinks, every non-empty save
   re-links to the saving admin — refs saved by another admin render as
   removable "saved link" rows plus an amber "linked through <owner>'s
-  account" note). Every run — channel mention, screen assistant,
-  inbound Slack bot — resolves the refs through the owner's account
-  shard (internal worker-only `POST /mcp/resolve` on ChatStore: profile
+  account" note). Authenticated runs — channel mention and screen assistant —
+  resolve the refs through the owner's account shard (internal worker-only
+  `POST /mcp/resolve` on ChatStore: profile
   blob + rotation overlays via `cloudMcpServersForAutomation`, expiring
   sign-ins refreshed there with rotations persisted — the exact cloud
   automations pipeline; `normalizeCloudMcpServer` revives the wire),
@@ -427,8 +427,13 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   call). Progress notifications preceding a Streamable HTTP result are skipped
   until the matching request id arrives, rather than becoming an empty file.
   Keys/sign-ins never copy into the project; members see name chips only.
-  Cards/profiles show "MCP · <name>" chips; amber "MCP · no servers" when the
-  switch is on with nothing linked.
+  Removing an admin or demoting them to member revokes every agent MCP link
+  delegated through that account, and every run rechecks that the link owner is
+  still owner/admin. Inbound Slack deliberately gets NO generic MCP tools:
+  arbitrary remote tool names cannot be classified reliably as read vs write;
+  native GitHub remains separately available read-only. Cards/profiles show
+  "MCP · <name>" chips; amber "MCP · no servers" when the switch is on with
+  nothing linked.
 - **Inbound Slack bot (mentionable agents)**: the Slack access row also
   takes the Slack app's Signing secret + shows a per-agent Request URL
   (`slackEventsUrl` → `/slack/events/:projectId/:agentId`) with copy
@@ -756,6 +761,44 @@ and only return green after handshake + tools/list. GitHub 401 is an auth
 failure; 403/rate-limit is not mislabeled as "sign in again". Unit suites: `mcp-oauth-refresh.test.ts`,
 `mcp-rotation.test.ts`, `mcp-session.test.ts`.
 
+Full catalog + transport audit (2026-08-30): all 98 catalog rows were probed
+read-only. Of 94 generic connectable endpoints, 26 completed initialize +
+tools/list without a credential (some still gate calls) and 68 returned the
+expected auth challenge; GitHub/Slack/Intercom native roots are reachable; the
+one blocked Intercom MCP remains listed with its provider-policy reason. All 52
+catalog Sign-in endpoints advertise usable OAuth metadata + dynamic client
+registration; Box is now an honest Developer Token entry because its metadata
+has no DCR. Current provider contracts are pinned for Firecrawl (`/v2/mcp` +
+Bearer, never key-in-URL), Exa (`x-api-key`), SearchAPI (`X-MCP-Token`), open
+Chainstack, Zapier (`/api/v1/connect` + connection token), Octagon's new host,
+and Datadog `/v1/mcp`; persisted legacy URLs migrate to the canonical rows.
+
+Relay/auth safety (2026-08-30): browser MCP, OAuth, and native Intercom relays
+require a platform-verified invited Gera identity — they are no longer public
+CORS proxies. Gera's JWT occupies `Authorization`; provider Authorization is
+carried in a dedicated internal header and restored only after the account gate,
+so provider 401 never triggers a duplicate tool retry. Target URLs ride a header
+rather than the relay query; paths/tokens are not logged. Browser relay AND
+cloud runs reject local/private/reserved IPs, embedded URL credentials and
+unsafe redirect targets; cross-origin POST redirects are refused. OAuth metadata
+must provide absolute HTTPS endpoints, matching issuer metadata and S256 when
+advertised; callback `iss` is checked when present, and every new grant is bound
+to the MCP URL that requested it. URL/key/header edits invalidate the cached
+session; a removed OAuth token cannot ride a stale in-memory header.
+
+Protocol/runtime parity (2026-08-30): browser and cloud resolve No auth / Bearer /
+custom headers / OAuth / auto identically, including provider-specific token
+headers. Only enabled, verified-connected, non-blocked cards arm in cloud runs;
+malformed headers fail closed. Initialize's negotiated protocol version is used
+on later requests; tools/list follows cursors (20 pages / 500 tools), long-lived
+SSE is cancelled as soon as the matching response arrives, and request bodies,
+response bodies and flattened results are bounded. Mixed text +
+`structuredContent` both survive; MCP `isError` becomes a real red tool failure.
+Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message that
+says "session expired" cannot duplicate a write. Function names are stable,
+valid and hash-disambiguated when normalization/truncation could collide.
+Regressions: `mcp-security.test.ts` plus the OAuth/session/file-content suites.
+
 ## Settings (`/settings`)
 
 Redesigned: icon-tiled section cards plus an anchor rail on the left
@@ -819,8 +862,9 @@ beacon sink (no Gera identity — the shard checks the project's write-only
 tracking key; feeds the desk's "Recent page views")
 · `/hooks/<id>` webhook
 triggers · `/surf` selfsurf · `/knowledge/*` · `/oauth-proxy` · `/mcp-proxy`
-(manual redirects: same-origin keeps auth; cross-origin GET strips caller
-credentials; cross-origin POST is refused) · `/intercom/*` · `/cron/automations` (HMAC via CRON_SECRET).
+(invited identity required; manual redirects: same-origin keeps upstream auth,
+cross-origin GET strips caller credentials, cross-origin POST is refused) ·
+`/intercom/*` (same invited relay gate) · `/cron/automations` (HMAC via CRON_SECRET).
 
 ## E2E coverage
 
@@ -839,11 +883,13 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | skills-rail-panel | Skills rail button opens the per-mode packs panel |
 | projects-page-opens | Projects page renders + create action behind the gate |
 | studio-pages-navigate | Tabs automations → hub → mcp → settings |
+| connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
-Admin tabs, MCP connect flows, Share dialog, Settings toggles, media modes,
+Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
+Share dialog, Settings toggles, media modes,
 Julius/Deep Research runs, incognito, thread menu (pin/rename/delete),
 Project workspace internals (posting, threads, agent editor, members,
 screens tab, screen desk / Intercom widgets) — only the list page render
@@ -860,7 +906,9 @@ false-positives, the access→tool contract, and Slack-origin write downgrade:
 read-only GitHub arms zero write tools; missing tokens arm nothing and are
 reported), plus `mcp-rotation`, `mcp-file-content`, `github-security` (all 30
 browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
-account isolation), `agent-steering`, `github-native`. Only the Durable
+account isolation), `mcp-security` (catalog, auth-mode, OAuth/egress/session/
+protocol and native Slack/Intercom parity), `agent-steering`, `github-native`.
+Only the Durable
 Object glue in `chat-store.ts` / `project-store.ts` stays untested — its
 typecheck happens at the functions deploy (`runChecks functions`), not in
 web tsc.

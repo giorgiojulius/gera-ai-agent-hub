@@ -129,8 +129,10 @@ describe("all 30 GitHub tool dispatchers", () => {
         vi.stubGlobal(
           "fetch",
           vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-            const target = String(input);
-            const url = new URL(target);
+            const requestUrl = String(input);
+            const headers = new Headers(init?.headers);
+            const target = headers.get("X-Gera-Upstream-Url") ?? requestUrl;
+            const url = new URL(requestUrl);
             const method = init?.method ?? "GET";
             requests.push({ target: decodeURIComponent(target), method });
             const path = url.pathname;

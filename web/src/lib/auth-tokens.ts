@@ -9,10 +9,13 @@ export const AUTH_URL: string = import.meta.env.EXPO_PUBLIC_RORK_AUTH_URL ?? "";
 export const APP_KEY: string = import.meta.env.EXPO_PUBLIC_RORK_APP_KEY ?? "";
 
 export function getAccessToken(): string | null {
-  return localStorage.getItem(ACCESS_TOKEN_KEY);
+  return typeof localStorage === "undefined" ? null : localStorage.getItem(ACCESS_TOKEN_KEY);
 }
 
 export function clearTokens(): void {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
   localStorage.removeItem(ACCESS_TOKEN_KEY);
   localStorage.removeItem(REFRESH_TOKEN_KEY);
   localStorage.removeItem(CODE_VERIFIER_KEY);
@@ -23,6 +26,9 @@ export function clearTokens(): void {
  * Returns the new token, or null when refresh is impossible/rejected.
  */
 export async function refreshAccessToken(): Promise<string | null> {
+  if (typeof localStorage === "undefined") {
+    return null;
+  }
   const refresh = localStorage.getItem(REFRESH_TOKEN_KEY);
   if (!refresh || !AUTH_URL || !APP_KEY) {
     return null;

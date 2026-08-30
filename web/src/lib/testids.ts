@@ -121,6 +121,16 @@ export function runModeOptionTid(mode: string): string {
   return `run-mode-option-${mode}`;
 }
 
+/** Connect action for one catalog MCP entry. */
+export function mcpCatalogConnectTid(serverId: string): string {
+  return `mcp-catalog-connect-${serverId}`;
+}
+
+/** Connected/configured MCP card in "Your tools". */
+export function mcpServerCardTid(serverId: string): string {
+  return `mcp-server-${serverId}`;
+}
+
 /** Content root of one workspace page (automations, hub, mcp, settings…). */
 export function studioPageTid(page: string): string {
   return `page-${page}`;

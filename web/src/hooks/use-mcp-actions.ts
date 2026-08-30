@@ -14,6 +14,7 @@ import {
   type AgentState,
 } from "@/lib/agent-store";
 import { catalogEntryToServer, findCatalogEntry } from "@/lib/mcp-catalog";
+import { clearMcpServerSession } from "@/lib/mcp";
 import {
   OAUTH_TOKENS_CHANGED_EVENT,
   clearOAuthToken,
@@ -116,11 +117,24 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
   }, [healthTick, oauthRevision, servers, setSettings]);
 
   const updateMcp = useCallback((id: string, patch: Partial<McpServerConfig>) => {
+    const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);
+    const urlChanged = typeof patch.url === "string" && patch.url.trim() !== current?.url.trim();
+    const connectionChanged =
+      urlChanged ||
+      patch.authMode !== undefined ||
+      patch.token !== undefined ||
+      patch.headersJson !== undefined;
+    if (urlChanged) {
+      clearOAuthToken(id);
+    }
+    if (connectionChanged) {
+      clearMcpServerSession(id);
+    }
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((item) => (item.id === id ? { ...item, ...patch } : item)),
     }));
-  }, [setSettings]);
+  }, [setSettings, stateRef]);
 
   const addMcp = useCallback(() => {
     setSettings((prev) => addBlankMcpServer(prev));
@@ -140,7 +154,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
     );
     const server = existing ?? catalogEntryToServer(entry);
     const hasToken = Boolean(server.token?.trim());
-    if (entry.auth === "none" || entry.tokenOptional || hasToken || hasOAuthToken(server.id)) {
+    if (entry.auth === "none" || entry.tokenOptional || hasToken || hasOAuthToken(server.id, server.url)) {
       void reconnectMcp(server, setSettings);
       return;
     }
@@ -188,6 +202,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
   }, [setSettings]);
 
   const removeMcp = useCallback((id: string) => {
+    clearMcpServerSession(id);
     clearOAuthToken(id);
     setSettings((prev) => ({ ...prev, mcpServers: prev.mcpServers.filter((item) => item.id !== id) }));
   }, [setSettings]);
@@ -201,7 +216,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
     const needsOAuth =
       (entry?.auth === "oauth" || server.authMode === "oauth") &&
       !server.token?.trim() &&
-      !hasOAuthToken(server.id);
+      !hasOAuthToken(server.id, server.url);
     if (needsOAuth) {
       const popup = openOAuthPopup();
       void oauthConnectMcp(server, popup, setSettings);

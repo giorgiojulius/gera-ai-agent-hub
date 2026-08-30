@@ -30,6 +30,7 @@ import {
 } from "@/lib/mcp-catalog";
 import { githubDeviceClientId, githubOrgAccessUrl } from "@/lib/github-device";
 import { hasOAuthToken } from "@/lib/mcp-oauth";
+import { mcpCatalogConnectTid, mcpServerCardTid } from "@/lib/testids";
 import type { McpAuthMode, McpServerConfig } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -483,12 +484,12 @@ function catalogStatusLabel(server: McpServerConfig, entry: McpCatalogEntry): st
     return "Failed — see Your tools";
   }
   if (entry.auth === "token" && !(server.token ?? "").trim()) {
-    if (entry.deviceFlow && hasOAuthToken(server.id)) {
+    if (entry.deviceFlow && hasOAuthToken(server.id, server.url)) {
       return "Signed in — press Connect";
     }
     return entry.deviceFlow ? "Sign-in or key needed" : "Key needed";
   }
-  if (entry.auth === "oauth" && !hasOAuthToken(server.id)) {
+  if (entry.auth === "oauth" && !hasOAuthToken(server.id, server.url)) {
     return "Sign-in needed";
   }
   return "Added — not verified";
@@ -578,6 +579,7 @@ function CatalogRow({
           size="sm"
           variant="outline"
           className="h-8 shrink-0 gap-1 rounded-full border-border"
+          data-testid={mcpCatalogConnectTid(entry.id)}
           onClick={onDeviceSignIn ?? onConnect}
         >
           {entry.auth === "oauth" || onDeviceSignIn ? (
@@ -614,7 +616,7 @@ function ConnectedCard({
   const entry = findCatalogEntry(server.catalogId ?? server.id);
   const authMode: McpAuthMode = server.authMode ?? "auto";
   const isOAuth = entry?.auth === "oauth" || (!entry && authMode === "oauth");
-  const signedIn = (isOAuth || Boolean(entry?.deviceFlow)) && hasOAuthToken(server.id);
+  const signedIn = (isOAuth || Boolean(entry?.deviceFlow)) && hasOAuthToken(server.id, server.url);
   const showSignIn =
     (isOAuth || Boolean(onDeviceSignIn)) && !signedIn && !(server.token ?? "").trim();
   const needsKey = entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";
@@ -634,7 +636,7 @@ function ConnectedCard({
               : "Not connected — not verified");
 
   return (
-    <div className="rounded-2xl border border-border/70 bg-card p-3">
+    <div data-testid={mcpServerCardTid(server.id)} className="rounded-2xl border border-border/70 bg-card p-3">
       <div className="flex items-center gap-2">
         <McpAvatar
           seed={server.id}

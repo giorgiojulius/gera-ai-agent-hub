@@ -193,7 +193,7 @@ export function cloudMcpReadiness(server: McpServerConfig): CloudMcpReadiness {
   const catalogKey = server.catalogId ?? server.id;
   const hasKey = (server.token ?? "").trim().length > 0;
   const hasHeaders = server.headersJson.trim().length > 0;
-  const signedIn = hasOAuthToken(server.id);
+  const signedIn = hasOAuthToken(server.id, server.url);
   if (entry?.native) {
     if (catalogKey === "github") {
       return hasKey || signedIn ? "ready" : "needs-auth";

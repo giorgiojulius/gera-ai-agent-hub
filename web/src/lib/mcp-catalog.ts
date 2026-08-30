@@ -24,7 +24,9 @@ export type McpCatalogEntry = {
   tokenPlaceholder?: string;
   /** Server works without a key; adding one unlocks more tools/quota. */
   tokenOptional?: boolean;
-  /** Send the API key as this query parameter instead of an Authorization header. */
+  /** Send the API key as this named header instead of Authorization. */
+  tokenHeader?: string;
+  /** Legacy query-key placement; avoid for new entries because URLs are commonly logged. */
   tokenQueryParam?: string;
   /** Replace the whole URL with this template ({token} placeholder) when a key is set. */
   tokenUrlTemplate?: string;
@@ -168,7 +170,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     url: "https://gmailmcp.googleapis.com/mcp/v1",
     category: "comms",
     auth: "token",
-    omitMcpHeaders: true,
     hint: "Official Gmail MCP: search threads, read mail, draft, label",
     icon: "gmail.com",
     tokenPlaceholder: "Google OAuth access token (ya29.…)",
@@ -229,10 +230,10 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   { id: "cometchat-docs", name: "CometChat Docs", url: "https://mcp.cometchat.com/mcp", category: "docs", auth: "none", icon: "cometchat.com", hint: "CometChat docs and implementation bundles" },
   { id: "soracom-docs", name: "Soracom Docs", url: "https://knowledge-mcp.soracom.com", category: "docs", auth: "none", icon: "soracom.io", hint: "SORACOM IoT platform docs and API reference" },
 
-  { id: "exa", name: "Exa", url: "https://mcp.exa.ai/mcp", category: "search", auth: "token", tokenOptional: true, tokenQueryParam: "exaApiKey", icon: "exa.ai", hint: "Neural web search and crawling", tokenPlaceholder: "Exa API key (optional)" },
-  { id: "firecrawl", name: "Firecrawl", url: "https://mcp.firecrawl.dev/mcp", category: "search", auth: "token", tokenOptional: true, tokenUrlTemplate: "https://mcp.firecrawl.dev/{token}/v2/mcp", icon: "firecrawl.dev", hint: "Scrape and crawl any website", tokenPlaceholder: "fc-… key (optional)" },
+  { id: "exa", name: "Exa", url: "https://mcp.exa.ai/mcp", category: "search", auth: "token", tokenOptional: true, tokenHeader: "x-api-key", icon: "exa.ai", hint: "Neural web search and crawling", tokenPlaceholder: "Exa API key (optional)" },
+  { id: "firecrawl", name: "Firecrawl", url: "https://mcp.firecrawl.dev/v2/mcp", category: "search", auth: "token", tokenOptional: true, icon: "firecrawl.dev", hint: "Scrape and crawl any website", tokenPlaceholder: "fc-… key (optional)", docsUrl: "https://docs.firecrawl.dev/mcp-server" },
   { id: "parallel-task", name: "Parallel Task", url: "https://task-mcp.parallel.ai/mcp", category: "search", auth: "token", icon: "parallel.ai", hint: "Long-running research tasks", tokenPlaceholder: "Parallel API key" },
-  { id: "searchapi", name: "SearchAPI", url: "https://www.searchapi.io/mcp", category: "search", auth: "token", icon: "searchapi.io", hint: "Google SERP and web results", tokenPlaceholder: "SearchAPI key" },
+  { id: "searchapi", name: "SearchAPI", url: "https://www.searchapi.io/mcp", category: "search", auth: "token", tokenHeader: "X-MCP-Token", icon: "searchapi.io", hint: "Google SERP and web results", tokenPlaceholder: "SearchAPI MCP token", docsUrl: "https://www.searchapi.io/integrations/mcp" },
   { id: "simplescraper", name: "SimpleScraper", url: "https://mcp.simplescraper.io/mcp", category: "search", auth: "token", icon: "simplescraper.io", hint: "Structured web scraping", tokenPlaceholder: "Bearer token" },
   { id: "ean-search", name: "EAN-Search", url: "https://www.ean-search.org/mcp", category: "search", auth: "token", icon: "ean-search.org", hint: "Product barcode lookups", tokenPlaceholder: "API token" },
   { id: "nyc-subway", name: "NYC Subway", url: "https://subwayinfo.nyc/mcp", category: "search", auth: "none", icon: "subwayinfo.nyc", hint: "Live NYC subway status" },
@@ -268,7 +269,7 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   { id: "neon", name: "Neon", url: "https://mcp.neon.tech/mcp", category: "data", auth: "oauth", icon: "neon.tech", hint: "Serverless Postgres: projects, branches, run SQL" },
   { id: "unstructured", name: "Unstructured", url: "https://mcp.transform.unstructured.io", category: "data", auth: "oauth", icon: "unstructured.io", hint: "Parse documents into structured data (ETL workflows)" },
   { id: "quicknode", name: "QuickNode", url: "https://mcp.quicknode.com/mcp", category: "data", auth: "token", icon: "quicknode.com", hint: "Blockchain RPC across major chains", tokenPlaceholder: "QuickNode API key" },
-  { id: "chainstack", name: "Chainstack", url: "https://mcp.chainstack.com/mcp", category: "data", auth: "token", icon: "chainstack.com", hint: "Blockchain infra: nodes, projects, faucets — connects openly but every tool call needs the key", tokenPlaceholder: "Chainstack platform API key", docsUrl: "https://console.chainstack.com/user/settings/api-keys" },
+  { id: "chainstack", name: "Chainstack", url: "https://mcp.chainstack.com/mcp", category: "data", auth: "token", tokenOptional: true, icon: "chainstack.com", hint: "Blockchain infra: public tools work openly; account tools need a key", tokenPlaceholder: "Chainstack platform API key (optional)", docsUrl: "https://docs.chainstack.com/docs/chainstack-mcp-server" },
 
   { id: "linear", name: "Linear", url: "https://mcp.linear.app/mcp", category: "work", auth: "oauth", icon: "linear.app", hint: "Issues, projects, comments" },
   { id: "notion", name: "Notion", url: "https://mcp.notion.com/mcp", category: "work", auth: "oauth", icon: "notion.so", hint: "Pages and databases" },
@@ -276,7 +277,7 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   { id: "atlassian", name: "Atlassian", url: "https://mcp.atlassian.com/v1/mcp", category: "work", auth: "oauth", icon: "atlassian.com", hint: "Jira and Confluence" },
   { id: "attio", name: "Attio", url: "https://mcp.attio.com/mcp", category: "work", auth: "oauth", icon: "attio.com", hint: "CRM records and lists" },
   { id: "clickup", name: "ClickUp", url: "https://mcp.clickup.com/mcp", category: "work", auth: "oauth", icon: "clickup.com", hint: "Tasks, docs, spaces, and goals" },
-  { id: "box", name: "Box", url: "https://mcp.box.com", category: "work", auth: "oauth", icon: "box.com", hint: "Files and folders" },
+  { id: "box", name: "Box", url: "https://mcp.box.com", category: "work", auth: "token", icon: "box.com", hint: "Files and folders — Box does not expose dynamic client registration", tokenPlaceholder: "Box Developer Token", docsUrl: "https://developer.box.com/guides/authentication/tokens/developer-tokens/" },
   { id: "fireflies", name: "Fireflies", url: "https://api.fireflies.ai/mcp", category: "work", auth: "token", icon: "fireflies.ai", hint: "Meeting transcripts and notes", tokenPlaceholder: "Fireflies API key" },
   { id: "egnyte", name: "Egnyte", url: "https://mcp-server.egnyte.com/mcp", category: "work", auth: "oauth", icon: "egnyte.com", hint: "Content collaboration" },
   { id: "todoist", name: "Todoist", url: "https://ai.todoist.net/mcp", category: "work", auth: "oauth", icon: "todoist.com", hint: "Tasks, projects, and filters" },
@@ -287,14 +288,13 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   {
     id: "zapier",
     name: "Zapier",
-    url: "https://mcp.zapier.com",
+    url: "https://mcp.zapier.com/api/v1/connect",
     category: "work",
-    auth: "none",
+    auth: "token",
     icon: "zapier.com",
-    hint: "8,000+ apps through your personal Zapier MCP URL",
-    blocked:
-      "Zapier issues each account a personal server URL instead of one shared endpoint — copy yours from zapier.com/mcp and paste it into Custom MCP above (auth: Detect automatically).",
-    docsUrl: "https://zapier.com/mcp",
+    hint: "9,000+ apps through a Zapier MCP connection token",
+    tokenPlaceholder: "Zapier MCP connection token",
+    docsUrl: "https://docs.zapier.com/mcp/get-started/authentication",
   },
 
   { id: "figma", name: "Figma", url: "https://mcp.figma.com/mcp", category: "design", auth: "oauth", icon: "figma.com", hint: "Design files and components" },
@@ -312,14 +312,14 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   { id: "square", name: "Square", url: "https://mcp.squareup.com/mcp", category: "commerce", auth: "oauth", icon: "squareup.com", hint: "Payments, catalog, customers" },
   { id: "paypal", name: "PayPal", url: "https://mcp.paypal.com/mcp", category: "commerce", auth: "oauth", icon: "paypal.com", hint: "Payments and invoices" },
   { id: "dodo", name: "Dodo Payments", url: "https://mcp.dodopayments.com/mcp", category: "commerce", auth: "oauth", icon: "dodopayments.com", hint: "Payments platform" },
-  { id: "octagon", name: "Octagon", url: "https://mcp.octagonagents.com/mcp", category: "commerce", auth: "token", icon: "octagonagents.com", hint: "Financial and market research", tokenPlaceholder: "Octagon API key" },
+  { id: "octagon", name: "Octagon", url: "https://mcp.octagonai.co/mcp", category: "commerce", auth: "token", tokenUrlTemplate: "https://mcp.octagonai.co/{token}/mcp", icon: "octagonai.co", hint: "Financial and market research", tokenPlaceholder: "Octagon API key or public key", docsUrl: "https://www.octagonai.co/docs/guide/mcp-server" },
   { id: "manifold", name: "Manifold", url: "https://api.manifold.markets/v0/mcp", category: "commerce", auth: "none", icon: "manifold.markets", hint: "Prediction market data" },
   { id: "stripe", name: "Stripe", url: "https://mcp.stripe.com", category: "commerce", auth: "oauth", icon: "stripe.com", hint: "Payments, customers, invoices, subscriptions" },
   { id: "atom", name: "Atom.com", url: "https://mcp.atom.com/mcp", category: "commerce", auth: "token", tokenOptional: true, icon: "atom.com", hint: "Domain name search, brainstorm, appraisal — connects openly, most tools need an API key", tokenPlaceholder: "Atom.com API key (optional)" },
   { id: "easyship", name: "Easyship", url: "https://mcp.easyship.com/mcp", category: "commerce", auth: "oauth", icon: "easyship.com", hint: "Shipping rates, labels, and tracking" },
   { id: "longbridge", name: "Longbridge", url: "https://mcp.longbridge.com", category: "commerce", auth: "oauth", icon: "longbridge.com", hint: "Markets: quotes, portfolio, and orders" },
 
-  { id: "datadog", name: "Datadog", url: "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp", category: "observability", auth: "token", icon: "datadoghq.com", hint: "Metrics, logs, traces", tokenPlaceholder: "Datadog API key" },
+  { id: "datadog", name: "Datadog", url: "https://mcp.datadoghq.com/v1/mcp", category: "observability", auth: "token", icon: "datadoghq.com", hint: "Metrics, logs, traces", tokenPlaceholder: "Datadog PAT or SAT", docsUrl: "https://docs.datadoghq.com/mcp_server/setup/" },
   { id: "cf-observability", name: "Cloudflare Observability", url: "https://observability.mcp.cloudflare.com/mcp", category: "observability", auth: "oauth", icon: "cloudflare.com", hint: "Workers logs and analytics" },
   { id: "cf-radar", name: "Cloudflare Radar", url: "https://radar.mcp.cloudflare.com/mcp", category: "observability", auth: "oauth", icon: "cloudflare.com", hint: "Internet traffic insights" },
   { id: "amplitude", name: "Amplitude", url: "https://mcp.amplitude.com/mcp", category: "observability", auth: "oauth", icon: "amplitude.com", hint: "Product analytics: events, charts, cohorts" },

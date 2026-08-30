@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import { clearLocalAccountState } from "@/lib/history";
 import { clearMcpSessionCache } from "@/lib/mcp";
+import { invalidateOAuthOperations } from "@/lib/mcp-oauth";
 import {
   ACCESS_TOKEN_KEY,
   APP_KEY,
@@ -105,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signOut = useCallback(() => {
     // GitHub/MCP credentials, private repo names, chats, and profile clocks
     // are account-scoped. Nothing from this identity may survive into the next.
+    invalidateOAuthOperations();
     clearMcpSessionCache();
     clearLocalAccountState();
     localStorage.removeItem(ACCOUNT_OWNER_KEY);
@@ -193,6 +195,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const previousOwner = localStorage.getItem(ACCOUNT_OWNER_KEY);
     clearMcpSessionCache();
     if (previousOwner && nextUser && previousOwner !== nextUser.id) {
+      invalidateOAuthOperations();
       clearLocalAccountState();
     }
     if (nextUser) {

@@ -479,12 +479,20 @@ export function githubToolAllowed(level: GithubAccessLevel, toolName: string): b
 
 /**
  * Slack channel membership is not project membership. Inbound mentions may
- * inspect GitHub, but native repository writes stay inside authenticated Gera.
+ * inspect GitHub, but native repository writes and generic MCP (whose tools
+ * have no trustworthy read/write classification) stay inside authenticated Gera.
  */
 export function accessForAgentSurface(access: AgentAccess, surface: "project" | "slack"): AgentAccess {
-  return surface === "slack" && access.github === "write"
-    ? { ...access, github: "read" }
-    : access;
+  if (surface !== "slack") {
+    return access;
+  }
+  return {
+    ...access,
+    github: access.github === "write" ? "read" : access.github,
+    intercom: false,
+    slack: false,
+    mcp: false,
+  };
 }
 
 export type PlannedNativeTool = {

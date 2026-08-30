@@ -1,3 +1,4 @@
+import { relayFetch } from "@/lib/backend";
 import { GitHubAuthError, fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
 import { oauthAuthHeader } from "@/lib/mcp-oauth";
 import type { McpServerConfig, McpToolInfo } from "@/lib/types";
@@ -96,15 +97,6 @@ const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, "g");
 function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, "");
 }
-
-/** Gera backend base URL — the CORS relay for endpoints browsers cannot reach directly. */
-const FUNCTIONS_URL: string = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url === "string" && url.trim().length > 0) {
-    return url.trim().replace(/\/+$/, "");
-  }
-  return "https://gera-ai-agent-hub-backend.rork.app";
-})();
 
 /**
  * Resolves the Authorization header for the native GitHub connector:
@@ -1311,7 +1303,7 @@ async function fetchJobLogText(auth: string, owner: string, repo: string, jobId:
   };
   let response: Response;
   try {
-    response = await fetch(`${FUNCTIONS_URL}/mcp-proxy?url=${encodeURIComponent(target)}`, { headers });
+    response = await relayFetch("/mcp-proxy", target, { headers });
   } catch {
     throw new Error("Could not reach GitHub logs through the relay.");
   }

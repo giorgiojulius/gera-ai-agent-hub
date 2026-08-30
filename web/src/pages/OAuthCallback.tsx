@@ -17,6 +17,7 @@ export default function OAuthCallback() {
       state: params.get("state") ?? "",
       code: params.get("code") ?? "",
       error: params.get("error_description") ?? params.get("error") ?? "",
+      iss: params.get("iss") ?? "",
     };
     try {
       window.localStorage.setItem(OAUTH_RESULT_KEY, JSON.stringify(payload));

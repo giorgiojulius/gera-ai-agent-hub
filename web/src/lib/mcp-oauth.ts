@@ -6,6 +6,8 @@
  * OAuth endpoints directly.
  */
 
+import { relayFetch } from "@/lib/backend";
+
 export const OAUTH_RESULT_KEY = "gera.mcp.oauth.result.v1";
 export const OAUTH_TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
 export const OAUTH_TOKENS_CHANGED_EVENT = "gera:mcp-oauth-changed";
@@ -19,6 +21,8 @@ type StoredToken = {
   tokenEndpoint: string;
   clientId: string;
   resource?: string;
+  /** Canonical MCP endpoint this grant was issued for; prevents URL-swap credential leaks. */
+  mcpUrl?: string;
 };
 
 type AuthServerMeta = {
@@ -26,6 +30,8 @@ type AuthServerMeta = {
   tokenEndpoint: string;
   registrationEndpoint?: string;
   scopesSupported?: string[];
+  issuer?: string;
+  codeChallengeMethodsSupported?: string[];
 };
 
 type StoredClient = {
@@ -40,6 +46,7 @@ type CallbackPayload = {
   state?: string;
   code?: string;
   error?: string;
+  iss?: string;
 };
 
 class OAuthTokenError extends Error {
@@ -70,26 +77,105 @@ const EXPIRY_SKEW_MS = 60_000;
 const CLOSED_POPUP_GRACE_MS = 10 * 60_000;
 
 const refreshInFlight = new Map<string, Promise<string | null>>();
+let oauthOperationGeneration = 0;
 
-const FUNCTIONS_URL = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url === "string" && url.trim().length > 0) {
-    return url.trim().replace(/\/$/, "");
+/** Invalidates popup/refresh work that began under a previous Gera account. */
+export function invalidateOAuthOperations(): void {
+  oauthOperationGeneration += 1;
+  refreshInFlight.clear();
+}
+
+/** Snapshot used by external device flows so logout makes their late result inert. */
+export function currentOAuthOperationGeneration(): number {
+  return oauthOperationGeneration;
+}
+
+/** OAuth discovery, registration, exchange, and refresh all use the authenticated Gera relay. */
+function oauthRelayFetch(target: string, init?: RequestInit): Promise<Response> {
+  return relayFetch("/oauth-proxy", target, init);
+}
+
+function isUnsafeOAuthHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const blockedSuffixes = [
+    ".localhost",
+    ".local",
+    ".internal",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".test",
+    ".invalid",
+    ".nip.io",
+    ".sslip.io",
+    ".xip.io",
+    ".localtest.me",
+    ".lvh.me",
+    ".vcap.me",
+    ".traefik.me",
+    ".local.gd",
+  ];
+  if (
+    !host ||
+    host === "localhost" ||
+    host === "metadata.google.internal" ||
+    blockedSuffixes.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix)) ||
+    (!host.includes(".") && !host.includes(":"))
+  ) {
+    return true;
   }
-  return "https://gera-ai-agent-hub-backend.rork.app";
-})();
+  if (/^127\.|^10\.|^192\.168\.|^169\.254\.|^0\./.test(host)) {
+    return true;
+  }
+  if (/^172\.(?:1[6-9]|2\d|3[01])\./.test(host)) {
+    return true;
+  }
+  return (
+    host === "::" ||
+    host === "::1" ||
+    /^(?:fc|fd|fe[89ab]|ff)/i.test(host) ||
+    /^(?:::ffff:|::|64:ff9b(?::1)?::)(?:7f00:1|a00:|ac1[0-9a-f]:|a9fe:|c0a8:)/i.test(host)
+  );
+}
 
-/**
- * Every OAuth request — discovery, registration, token exchange, refresh —
- * goes through the Gera relay, the same backend that already carries all MCP
- * tool traffic. Many providers CORS-block their OAuth endpoints; direct
- * browser attempts only left red CORS noise in the console before falling
- * back, so the direct path is gone entirely. The relay forwards each request
- * verbatim, adds CORS on the way back, and never stores anything beyond the
- * exchange.
- */
-function oauthProxyUrl(target: string): string {
-  return `${FUNCTIONS_URL}/oauth-proxy?url=${encodeURIComponent(target)}`;
+/** Rejects executable, insecure, credential-bearing, and local OAuth metadata endpoints. */
+export function safeOAuthEndpoint(value: string, label: string = "OAuth endpoint"): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${label} is not a valid URL.`);
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    isUnsafeOAuthHostname(parsed.hostname)
+  ) {
+    throw new Error(`${label} must be a public absolute HTTPS URL without embedded credentials.`);
+  }
+  return parsed.toString();
+}
+
+function canonicalMcpUrl(value: string): string {
+  const parsed = new URL(safeOAuthEndpoint(value, "MCP endpoint"));
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+function sameEndpoint(left: string, right: string): boolean {
+  return left.replace(/\/$/, "") === right.replace(/\/$/, "");
+}
+
+function tokenMatchesMcpUrl(token: StoredToken, mcpUrl?: string): boolean {
+  if (!mcpUrl || !token.mcpUrl) {
+    return true;
+  }
+  try {
+    return sameEndpoint(token.mcpUrl, canonicalMcpUrl(mcpUrl));
+  } catch {
+    return false;
+  }
 }
 
 function loadJson<T>(key: string): T | null {
@@ -147,13 +233,14 @@ function parseStoredToken(value: unknown): StoredToken | null {
     tokenEndpoint: raw.tokenEndpoint,
     clientId: raw.clientId,
     resource: typeof raw.resource === "string" && raw.resource ? raw.resource : undefined,
+    mcpUrl: typeof raw.mcpUrl === "string" && raw.mcpUrl ? raw.mcpUrl : undefined,
   };
 }
 
 /** A grant is usable when its access token is live or its refresh token can renew it. */
-export function hasOAuthToken(serverId: string): boolean {
+export function hasOAuthToken(serverId: string, mcpUrl?: string): boolean {
   const token = loadTokens()[serverId];
-  if (!token?.accessToken) {
+  if (!token?.accessToken || !tokenMatchesMcpUrl(token, mcpUrl)) {
     return false;
   }
   return token.expiresAt === undefined || Date.now() < token.expiresAt || Boolean(token.refreshToken);
@@ -170,7 +257,7 @@ export function oauthTokenFingerprint(serverId: string): string {
   if (!token?.accessToken) {
     return "missing";
   }
-  const material = `${token.accessToken}\u0000${token.refreshToken ?? ""}\u0000${token.expiresAt ?? 0}`;
+  const material = `${token.accessToken}\u0000${token.refreshToken ?? ""}\u0000${token.expiresAt ?? 0}\u0000${token.mcpUrl ?? ""}`;
   let hash = 2_166_136_261;
   for (let index = 0; index < material.length; index += 1) {
     hash ^= material.charCodeAt(index);
@@ -278,6 +365,7 @@ export function parseServerOAuthRotations(raw: unknown): ServerOAuthRotation[] {
         tokenEndpoint: token.tokenEndpoint,
         clientId: token.clientId,
         resource: typeof token.resource === "string" && token.resource ? token.resource : undefined,
+        mcpUrl: typeof token.mcpUrl === "string" && token.mcpUrl ? token.mcpUrl : undefined,
       },
     });
   }
@@ -362,17 +450,23 @@ export function storeExternalOAuthToken(
     expiresAt?: number;
     tokenEndpoint: string;
     clientId: string;
+    mcpUrl?: string;
   },
-): void {
+  expectedGeneration: number = oauthOperationGeneration,
+): boolean {
+  if (expectedGeneration !== oauthOperationGeneration) {
+    return false;
+  }
   const tokens = loadTokens();
   tokens[serverId] = token;
   saveTokens(tokens);
+  return true;
 }
 
 /** Returns an Authorization header value for a signed-in server, refreshing when close to expiry. */
-export async function oauthAuthHeader(serverId: string): Promise<string | null> {
+export async function oauthAuthHeader(serverId: string, mcpUrl?: string): Promise<string | null> {
   const stored = loadTokens()[serverId];
-  if (!stored?.accessToken) {
+  if (!stored?.accessToken || !tokenMatchesMcpUrl(stored, mcpUrl)) {
     return null;
   }
   const now = Date.now();
@@ -417,6 +511,7 @@ function refreshServerToken(serverId: string): Promise<string | null> {
   if (inFlight) {
     return inFlight;
   }
+  const generation = oauthOperationGeneration;
   const task = (async (): Promise<string | null> => {
     const stored = loadTokens()[serverId];
     if (!stored?.refreshToken) {
@@ -424,11 +519,26 @@ function refreshServerToken(serverId: string): Promise<string | null> {
     }
     try {
       const refreshed = await refreshAccessToken(stored);
+      if (generation !== oauthOperationGeneration) {
+        return null;
+      }
       const tokens = loadTokens();
+      const latest = tokens[serverId];
+      // A user or sibling tab may have completed a fresh sign-in while this
+      // refresh was in flight. Never let the old grant overwrite that winner.
+      if (
+        latest?.accessToken &&
+        (latest.accessToken !== stored.accessToken || latest.refreshToken !== stored.refreshToken)
+      ) {
+        return latest.accessToken;
+      }
       tokens[serverId] = refreshed;
       saveTokens(tokens);
       return refreshed.accessToken;
     } catch (error) {
+      if (generation !== oauthOperationGeneration) {
+        return null;
+      }
       if (error instanceof OAuthTokenError && FATAL_REFRESH_CODES.has(error.code)) {
         // Rotation makes refresh tokens single-use: when another tab redeemed
         // this pair first, its success is our invalid_grant. Never destroy
@@ -462,7 +572,9 @@ function refreshServerToken(serverId: string): Promise<string | null> {
   })();
   refreshInFlight.set(serverId, task);
   void task.finally(() => {
-    refreshInFlight.delete(serverId);
+    if (refreshInFlight.get(serverId) === task) {
+      refreshInFlight.delete(serverId);
+    }
   });
   return task;
 }
@@ -483,10 +595,18 @@ export async function runOAuthSignIn(
   if (!popup) {
     throw new Error("Popup was blocked. Allow popups for this site and press Sign in again.");
   }
+  const generation = oauthOperationGeneration;
+  const ensureCurrentAccount = (): void => {
+    if (generation !== oauthOperationGeneration) {
+      throw new Error("The Gera account changed while this sign-in was open. Start it again.");
+    }
+  };
   let registrationKey: string | null = null;
   try {
     const redirectUri = `${window.location.origin}/oauth/callback`;
-    const { meta, resource, scopes } = await discover(server.url);
+    const mcpUrl = canonicalMcpUrl(server.url);
+    const { meta, resource, scopes } = await discover(mcpUrl);
+    ensureCurrentAccount();
     registrationKey = meta.registrationEndpoint ?? "";
     const clientId = await ensureClient(meta.registrationEndpoint, redirectUri);
     const verifier = randomString();
@@ -516,7 +636,8 @@ export async function runOAuthSignIn(
 
     popup.location.replace(authorizeUrl.toString());
 
-    const code = await waitForCallback(state, popup);
+    const code = await waitForCallback(state, popup, meta.issuer);
+    ensureCurrentAccount();
     const token = await exchangeCode({
       tokenEndpoint: meta.tokenEndpoint,
       clientId,
@@ -524,8 +645,10 @@ export async function runOAuthSignIn(
       verifier,
       redirectUri,
       resource,
+      mcpUrl,
     });
 
+    ensureCurrentAccount();
     const tokens = loadTokens();
     tokens[server.id] = token;
     saveTokens(tokens);
@@ -552,7 +675,7 @@ export async function runOAuthSignIn(
 
 async function fetchJson(url: string): Promise<Record<string, unknown> | null> {
   try {
-    const response = await fetch(oauthProxyUrl(url), { headers: { Accept: "application/json" } });
+    const response = await oauthRelayFetch(url, { headers: { Accept: "application/json" } });
     if (!response.ok) {
       return null;
     }
@@ -565,7 +688,7 @@ async function fetchJson(url: string): Promise<Record<string, unknown> | null> {
 async function discover(
   mcpUrl: string,
 ): Promise<{ meta: AuthServerMeta; resource?: string; scopes?: string[] }> {
-  const target = new URL(mcpUrl);
+  const target = new URL(safeOAuthEndpoint(mcpUrl, "MCP endpoint"));
   const path = target.pathname.replace(/\/$/, "");
 
   let authServers: string[] = [];
@@ -580,8 +703,14 @@ async function discover(
     const prm = await fetchJson(candidate);
     const servers = prm?.authorization_servers;
     if (Array.isArray(servers) && servers.length > 0) {
-      authServers = servers.map(String);
-      resource = typeof prm?.resource === "string" ? prm.resource : undefined;
+      authServers = servers.map((server) => safeOAuthEndpoint(String(server), "OAuth issuer"));
+      if (typeof prm?.resource === "string") {
+        const advertisedResource = new URL(safeOAuthEndpoint(prm.resource, "OAuth resource"));
+        if (advertisedResource.origin !== target.origin) {
+          throw new Error("OAuth resource metadata points at a different origin than the MCP server.");
+        }
+        resource = advertisedResource.toString();
+      }
       if (Array.isArray(prm?.scopes_supported)) {
         scopes = (prm.scopes_supported as unknown[]).map(String);
       }
@@ -591,9 +720,10 @@ async function discover(
   if (authServers.length === 0) {
     authServers = [target.origin];
   }
+  resource ??= target.toString();
 
   for (const authServer of authServers) {
-    const asUrl = new URL(authServer);
+    const asUrl = new URL(safeOAuthEndpoint(authServer, "OAuth issuer"));
     const asPath = asUrl.pathname.replace(/\/$/, "");
     const metaCandidates = [
       asPath ? `${asUrl.origin}/.well-known/oauth-authorization-server${asPath}` : "",
@@ -607,15 +737,29 @@ async function discover(
         typeof meta?.authorization_endpoint === "string" ? meta.authorization_endpoint : null;
       const tokenEndpoint = typeof meta?.token_endpoint === "string" ? meta.token_endpoint : null;
       if (authorizationEndpoint && tokenEndpoint) {
+        const issuer = typeof meta?.issuer === "string" ? safeOAuthEndpoint(meta.issuer, "OAuth issuer") : undefined;
+        if (issuer && !sameEndpoint(issuer, asUrl.toString())) {
+          throw new Error("OAuth metadata issuer does not match the discovered authorization server.");
+        }
+        const methods = Array.isArray(meta?.code_challenge_methods_supported)
+          ? (meta.code_challenge_methods_supported as unknown[]).map(String)
+          : undefined;
+        if (methods && !methods.includes("S256")) {
+          throw new Error("This OAuth server does not advertise secure S256 PKCE.");
+        }
         return {
           meta: {
-            authorizationEndpoint,
-            tokenEndpoint,
+            authorizationEndpoint: safeOAuthEndpoint(authorizationEndpoint, "OAuth authorization endpoint"),
+            tokenEndpoint: safeOAuthEndpoint(tokenEndpoint, "OAuth token endpoint"),
             registrationEndpoint:
-              typeof meta?.registration_endpoint === "string" ? meta.registration_endpoint : undefined,
+              typeof meta?.registration_endpoint === "string"
+                ? safeOAuthEndpoint(meta.registration_endpoint, "OAuth registration endpoint")
+                : undefined,
             scopesSupported: Array.isArray(meta?.scopes_supported)
               ? (meta.scopes_supported as unknown[]).map(String)
               : undefined,
+            issuer: issuer ?? asUrl.toString(),
+            codeChallengeMethodsSupported: methods,
           },
           resource,
           scopes,
@@ -704,7 +848,7 @@ async function ensureClient(registrationEndpoint: string | undefined, redirectUr
   };
   let response: Response;
   try {
-    response = await fetch(oauthProxyUrl(registrationEndpoint), registerInit);
+    response = await oauthRelayFetch(registrationEndpoint, registerInit);
   } catch {
     throw new Error("Could not reach the Gera relay. Check your connection and try again.");
   }
@@ -746,7 +890,7 @@ async function ensureClient(registrationEndpoint: string | undefined, redirectUr
   return clientId;
 }
 
-function waitForCallback(state: string, popup: Window): Promise<string> {
+function waitForCallback(state: string, popup: Window, expectedIssuer?: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     let settled = false;
     let closeGraceTimer: number | null = null;
@@ -777,7 +921,9 @@ function waitForCallback(state: string, popup: Window): Promise<string> {
       if (!payload || payload.state !== state) {
         return;
       }
-      if (payload.code) {
+      if (payload.iss && expectedIssuer && !sameEndpoint(payload.iss, expectedIssuer)) {
+        fail("OAuth callback issuer did not match the server you authorized.");
+      } else if (payload.code) {
         finish(payload.code);
       } else {
         fail(payload.error || "Sign-in was denied.");
@@ -836,7 +982,7 @@ async function requestToken(
   try {
     // Exactly one request per exchange, always through the relay — a single-use
     // authorization code is never burned by a second attempt on another path.
-    response = await fetch(oauthProxyUrl(tokenEndpoint), {
+    response = await oauthRelayFetch(tokenEndpoint, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
@@ -878,6 +1024,7 @@ async function exchangeCode(params: {
   verifier: string;
   redirectUri: string;
   resource?: string;
+  mcpUrl: string;
 }): Promise<StoredToken> {
   const body = new URLSearchParams({
     grant_type: "authorization_code",
@@ -895,6 +1042,7 @@ async function exchangeCode(params: {
     tokenEndpoint: params.tokenEndpoint,
     clientId: params.clientId,
     resource: params.resource,
+    mcpUrl: params.mcpUrl,
   };
 }
 
@@ -918,6 +1066,7 @@ async function refreshAccessToken(stored: StoredToken): Promise<StoredToken> {
     tokenEndpoint: stored.tokenEndpoint,
     clientId: stored.clientId,
     resource: stored.resource,
+    mcpUrl: stored.mcpUrl,
   };
 }
 

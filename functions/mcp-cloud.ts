@@ -1,3 +1,5 @@
+import { fetchPublicHttps, safePublicHttpsUrl } from "./network-safety";
+
 // Cloud-side MCP for scheduled automation runs: decides which of the
 // profile's connected servers can fire without the browser, and speaks the
 // MCP Streamable HTTP protocol (initialize → tools/list → tools/call)
@@ -17,6 +19,8 @@ export type CloudOAuthToken = {
   tokenEndpoint: string;
   clientId: string;
   resource?: string;
+  /** Canonical MCP endpoint this browser grant was issued for. */
+  mcpUrl?: string;
 };
 
 /** A grant rotated server-side; the account shard persists it for later runs. */
@@ -54,6 +58,7 @@ export type CloudMcpSession = {
   url: string;
   headers: Record<string, string>;
   omitMcpHeaders: boolean;
+  protocolVersion?: string;
   sessionId?: string;
   nextId: number;
 };
@@ -91,13 +96,19 @@ const OPEN_IDS = new Set([
   "firecrawl",
   "telnyx",
   "atom",
+  "chainstack",
 ]);
 /** Catalog token-placement quirks (mirrors the web client's buildAuth). */
-const TOKEN_QUERY_PARAM: Record<string, string> = { exa: "exaApiKey" };
-const TOKEN_URL_TEMPLATE: Record<string, string> = {
-  firecrawl: "https://mcp.firecrawl.dev/{token}/v2/mcp",
+const TOKEN_HEADER: Record<string, string> = {
+  exa: "x-api-key",
+  searchapi: "X-MCP-Token",
 };
-const OMIT_HEADER_IDS = new Set(["gmail"]);
+const TOKEN_QUERY_PARAM: Record<string, string> = {};
+const TOKEN_URL_TEMPLATE: Record<string, string> = {
+  octagon: "https://mcp.octagonai.co/{token}/mcp",
+};
+const OMIT_HEADER_IDS = new Set<string>();
+const BLOCKED_IDS = new Set(["intercom-mcp"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -172,12 +183,72 @@ export function cloudMcpServersForAutomation(
   return out;
 }
 
+function parseCloudHeaders(value: unknown): Record<string, string> | null {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return null;
+    }
+    const headers: Record<string, string> = {};
+    for (const [key, item] of Object.entries(parsed)) {
+      if (typeof item === "string") {
+        headers[key] = item;
+      }
+    }
+    return headers;
+  } catch {
+    return null;
+  }
+}
+
+function oauthMatchesServer(oauth: CloudOAuthToken | undefined, url: string): oauth is CloudOAuthToken {
+  if (!oauth) {
+    return false;
+  }
+  if (!oauth.mcpUrl) {
+    return true; // backwards-compatible once; all new grants are endpoint-bound
+  }
+  const expected = safePublicHttpsUrl(oauth.mcpUrl);
+  const current = safePublicHttpsUrl(url);
+  return Boolean(expected && current && expected.toString().replace(/\/$/, "") === current.toString().replace(/\/$/, ""));
+}
+
+function applyCatalogToken(
+  catalogKey: string,
+  token: string,
+  url: string,
+  headers: Record<string, string>,
+): string {
+  const template = TOKEN_URL_TEMPLATE[catalogKey];
+  const header = TOKEN_HEADER[catalogKey];
+  const queryParam = TOKEN_QUERY_PARAM[catalogKey];
+  if (template) {
+    return template.replace("{token}", encodeURIComponent(token));
+  }
+  if (header) {
+    headers[header] = token;
+  } else if (queryParam) {
+    const parsed = new URL(url);
+    parsed.searchParams.set(queryParam, token);
+    return parsed.toString();
+  } else {
+    headers.Authorization = token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}`;
+  }
+  return url;
+}
+
 function eligibleCloudServer(
   raw: unknown,
   allowIds: string[] | null,
   oauthTokens: Record<string, CloudOAuthToken>,
 ): CloudMcpServer | null {
-  if (!isRecord(raw) || raw.enabled === false) {
+  // Cloud runs honor the same verified-green contract as the browser. Idle,
+  // connecting, errored, disabled, and provider-blocked rows never arm.
+  if (!isRecord(raw) || raw.enabled === false || raw.status !== "connected") {
     return null;
   }
   const id = typeof raw.id === "string" ? raw.id : "";
@@ -186,6 +257,9 @@ function eligibleCloudServer(
   }
   const catalogId = typeof raw.catalogId === "string" && raw.catalogId ? raw.catalogId : "";
   const catalogKey = catalogId || id;
+  if (BLOCKED_IDS.has(catalogKey)) {
+    return null;
+  }
   if (allowIds !== null && !allowIds.includes(id) && !(catalogId && allowIds.includes(catalogId))) {
     return null;
   }
@@ -195,9 +269,6 @@ function eligibleCloudServer(
     : [];
   const oauth = oauthTokens[id];
 
-  // Native GitHub/Slack/Intercom: REST connectors, not MCP endpoints. A
-  // pasted token wins (mirrors the browser); GitHub also accepts the synced
-  // device-flow sign-in. No credential — honestly not eligible.
   if (NATIVE_IDS.has(catalogKey)) {
     const pasted = typeof raw.token === "string" ? raw.token.trim() : "";
     const viaOAuth = catalogKey === "github" && !pasted ? oauth : undefined;
@@ -218,70 +289,48 @@ function eligibleCloudServer(
   }
 
   let url = (typeof raw.url === "string" ? raw.url : "").trim();
-  if (!/^https:\/\//i.test(url)) {
+  if (!safePublicHttpsUrl(url)) {
     return null;
   }
-
-  const headers: Record<string, string> = {};
-  const headersJson = typeof raw.headersJson === "string" ? raw.headersJson.trim() : "";
-  if (headersJson && raw.authMode !== "bearer") {
-    try {
-      const parsed = JSON.parse(headersJson) as unknown;
-      if (isRecord(parsed)) {
-        for (const [key, value] of Object.entries(parsed)) {
-          if (typeof value === "string") {
-            headers[key] = value;
-          }
-        }
-      }
-    } catch {
-      // malformed custom headers — ignore them, a pasted key may still work
-    }
-  }
-
-  // Explicit "sign in" mode: only the synced browser grant authenticates.
-  if (raw.authMode === "oauth") {
-    if (!oauth) {
-      return null;
-    }
-    return {
-      id,
-      name,
-      kind: "mcp",
-      url,
-      headers,
-      omitMcpHeaders: OMIT_HEADER_IDS.has(catalogKey),
-      disabledTools,
-      oauth,
-    };
-  }
-
-  const token = raw.authMode === "headers" ? "" : (typeof raw.token === "string" ? raw.token : "").trim();
-  if (token) {
-    const template = TOKEN_URL_TEMPLATE[catalogKey];
-    const queryParam = TOKEN_QUERY_PARAM[catalogKey];
-    if (template) {
-      url = template.replace("{token}", encodeURIComponent(token));
-    } else if (queryParam) {
-      url = `${url}${url.includes("?") ? "&" : "?"}${queryParam}=${encodeURIComponent(token)}`;
-    } else if (!headers.Authorization) {
-      headers.Authorization = token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}`;
-    }
-  }
-
+  const mode =
+    raw.authMode === "none" || raw.authMode === "bearer" || raw.authMode === "headers" || raw.authMode === "oauth"
+      ? raw.authMode
+      : "auto";
+  const token = typeof raw.token === "string" ? raw.token.trim() : "";
+  let headers: Record<string, string> = {};
   let grant: CloudOAuthToken | undefined;
-  if (!token && Object.keys(headers).length === 0) {
-    if (oauth) {
-      // Signed-in server — the synced grant authenticates this run.
+
+  if (mode === "headers" || mode === "auto") {
+    const parsedHeaders = parseCloudHeaders(raw.headersJson);
+    if (!parsedHeaders) {
+      return null;
+    }
+    headers = parsedHeaders;
+  }
+  if (mode === "bearer") {
+    if (!token) {
+      return null;
+    }
+    url = applyCatalogToken(catalogKey, token, url, headers);
+  } else if (mode === "oauth") {
+    if (!oauthMatchesServer(oauth, url)) {
+      return null;
+    }
+    grant = oauth;
+  } else if (mode === "auto") {
+    if (token) {
+      url = applyCatalogToken(catalogKey, token, url, headers);
+    } else if (!headers.Authorization && oauthMatchesServer(oauth, url)) {
       grant = oauth;
-    } else if (catalogId ? !OPEN_IDS.has(catalogKey) : raw.authMode === "bearer") {
-      // Keyless: open catalog servers work; key-required ones would just 401
-      // on every scheduled fire. Custom endpoints get the benefit of the
-      // doubt unless they are explicitly set to bearer auth.
+    } else if (Object.keys(headers).length === 0 && (catalogId ? !OPEN_IDS.has(catalogKey) : false)) {
       return null;
     }
   }
+  // mode "none" intentionally ignores every stale key/header/grant.
 
+  if (!safePublicHttpsUrl(url)) {
+    return null;
+  }
   return {
     id,
     name,
@@ -308,6 +357,7 @@ export function cloudOAuthToken(value: unknown): CloudOAuthToken | null {
     tokenEndpoint: typeof value.tokenEndpoint === "string" ? value.tokenEndpoint : "",
     clientId: typeof value.clientId === "string" ? value.clientId : "",
     resource: typeof value.resource === "string" && value.resource ? value.resource : undefined,
+    mcpUrl: typeof value.mcpUrl === "string" && value.mcpUrl ? value.mcpUrl : undefined,
   };
 }
 
@@ -338,7 +388,7 @@ export function normalizeCloudMcpServer(raw: unknown): CloudMcpServer | null {
   }
   const id = typeof raw.id === "string" ? raw.id : "";
   const url = typeof raw.url === "string" ? raw.url.trim() : "";
-  if (!id || !/^https:\/\//i.test(url)) {
+  if (!id || !safePublicHttpsUrl(url)) {
     return null;
   }
   const headers: Record<string, string> = {};
@@ -458,52 +508,73 @@ export function chainRotationBases(
 /** Refresh this long before the recorded expiry — clock skew + run latency. */
 const OAUTH_EXPIRY_SKEW_MS = 60_000;
 
-/**
- * Redeems the grant's refresh token now (single attempt). Rotated tokens are
- * reported through `refreshed` so the account shard can persist them — with
- * refresh-token rotation the old pair dies at the provider, so losing the
- * new one would strand every later run AND the browser's synced copy.
- * Failures keep the old token: a real auth problem then surfaces as an
- * honest connect error.
- */
+const cloudRefreshInFlight = new Map<string, Promise<CloudOAuthToken | null>>();
+
+function refreshFlightKey(grant: CloudOAuthToken): string {
+  // Exact, process-local key: never logged or persisted. Resource and MCP URL
+  // are part of the OAuth grant boundary and must never share a token exchange.
+  return JSON.stringify([
+    grant.tokenEndpoint,
+    grant.clientId,
+    grant.refreshToken ?? "",
+    grant.accessToken,
+    grant.resource ?? "",
+    grant.mcpUrl ?? "",
+  ]);
+}
+
+/** Redeems one rotating grant; concurrent cloud runs share the same exchange. */
 async function redeemCloudRefreshToken(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
 ): Promise<boolean> {
   const grant = server.oauth;
-  if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId) {
+  if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId || !safePublicHttpsUrl(grant.tokenEndpoint)) {
     return false;
   }
-  const params = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: grant.refreshToken,
-    client_id: grant.clientId,
-  });
-  if (grant.resource) {
-    params.set("resource", grant.resource);
+  const key = refreshFlightKey(grant);
+  let task = cloudRefreshInFlight.get(key);
+  if (!task) {
+    task = (async (): Promise<CloudOAuthToken | null> => {
+      const params = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: grant.refreshToken ?? "",
+        client_id: grant.clientId,
+      });
+      if (grant.resource) {
+        params.set("resource", grant.resource);
+      }
+      const response = await fetchPublicHttps(grant.tokenEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: params.toString(),
+        signal: AbortSignal.timeout(12_000),
+      });
+      const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!response.ok || !data || typeof data.access_token !== "string" || !data.access_token) {
+        return null;
+      }
+      return {
+        accessToken: data.access_token,
+        refreshToken:
+          typeof data.refresh_token === "string" && data.refresh_token ? data.refresh_token : grant.refreshToken,
+        expiresAt:
+          typeof data.expires_in === "number" && Number.isFinite(data.expires_in)
+            ? Date.now() + data.expires_in * 1_000
+            : undefined,
+        tokenEndpoint: grant.tokenEndpoint,
+        clientId: grant.clientId,
+        resource: grant.resource,
+        mcpUrl: grant.mcpUrl,
+      };
+    })();
+    cloudRefreshInFlight.set(key, task);
+    void task.finally(() => cloudRefreshInFlight.delete(key));
   }
-  const response = await fetch(grant.tokenEndpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-    body: params.toString(),
-    signal: AbortSignal.timeout(12_000),
-  });
-  const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!response.ok || !data || typeof data.access_token !== "string" || !data.access_token) {
+  const next = await task;
+  if (!next) {
     return false;
   }
-  const next: CloudOAuthToken = {
-    accessToken: data.access_token,
-    refreshToken:
-      typeof data.refresh_token === "string" && data.refresh_token ? data.refresh_token : grant.refreshToken,
-    expiresAt:
-      typeof data.expires_in === "number" && Number.isFinite(data.expires_in)
-        ? Date.now() + data.expires_in * 1_000
-        : undefined,
-    tokenEndpoint: grant.tokenEndpoint,
-    clientId: grant.clientId,
-    resource: grant.resource,
-  };
   refreshed.push({ serverId: server.id, baseAccessToken: grant.accessToken, token: next });
   server.oauth = next;
   return true;
@@ -549,7 +620,7 @@ function protocolHeaders(session: CloudMcpSession): Record<string, string> {
     return {};
   }
   return {
-    "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    "MCP-Protocol-Version": session.protocolVersion ?? MCP_PROTOCOL_VERSION,
     ...(session.sessionId ? { "Mcp-Session-Id": session.sessionId } : {}),
   };
 }
@@ -597,6 +668,65 @@ export function parseCloudMcpRpcResponse(text: string, expectedId: number): Json
   throw new Error(`no JSON-RPC response for request ${expectedId}`);
 }
 
+const MAX_MCP_RESPONSE_CHARS = 2_000_000;
+
+async function readLimitedResponseText(response: Response): Promise<string> {
+  if (!response.body) {
+    const text = await response.text();
+    if (text.length > MAX_MCP_RESPONSE_CHARS) {
+      throw new Error("MCP response was too large");
+    }
+    return text;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        text += decoder.decode();
+        return text;
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      if (text.length > MAX_MCP_RESPONSE_CHARS) {
+        throw new Error("MCP response was too large");
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+}
+
+async function readCloudRpcResponse(response: Response, expectedId: number): Promise<JsonRpcResponse> {
+  if (!response.body) {
+    return parseCloudMcpRpcResponse(await readLimitedResponseText(response), expectedId);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        text += decoder.decode();
+        return parseCloudMcpRpcResponse(text, expectedId);
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      if (text.length > MAX_MCP_RESPONSE_CHARS) {
+        throw new Error("MCP response was too large");
+      }
+      try {
+        return parseCloudMcpRpcResponse(text, expectedId);
+      } catch {
+        // Long-lived SSE: keep reading only until this request's event lands.
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+}
+
 async function rpc(
   session: CloudMcpSession,
   method: string,
@@ -605,7 +735,7 @@ async function rpc(
 ): Promise<unknown> {
   session.nextId += 1;
   const requestId = session.nextId;
-  const response = await fetch(session.url, {
+  const response = await fetchPublicHttps(session.url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -620,8 +750,8 @@ async function rpc(
   if (sessionHeader) {
     session.sessionId = sessionHeader;
   }
-  const text = await response.text();
   if (!response.ok) {
+    await readLimitedResponseText(response);
     if (response.status === 401 || response.status === 403) {
       throw new Error(
         `auth rejected (${response.status}) — the synced sign-in or key was refused; open Gera and reconnect this server so a fresh credential syncs`,
@@ -631,8 +761,11 @@ async function rpc(
   }
   let parsed: JsonRpcResponse;
   try {
-    parsed = parseCloudMcpRpcResponse(text, requestId);
-  } catch {
+    parsed = await readCloudRpcResponse(response, requestId);
+  } catch (error) {
+    if (error instanceof Error && /too large/i.test(error.message)) {
+      throw error;
+    }
     throw new Error("unexpected response shape");
   }
   if (parsed.error) {
@@ -653,20 +786,24 @@ export async function connectCloudMcp(
     url: server.url,
     headers,
     omitMcpHeaders: server.omitMcpHeaders,
+    protocolVersion: MCP_PROTOCOL_VERSION,
     nextId: 0,
   };
-  await rpc(
+  const initialized = (await rpc(
     session,
     "initialize",
     {
       protocolVersion: MCP_PROTOCOL_VERSION,
-      capabilities: { tools: {} },
+      capabilities: {},
       clientInfo: { name: "Gera AI cloud runs", version: "1.0.0" },
     },
     CONNECT_TIMEOUT_MS,
-  );
+  )) as { protocolVersion?: unknown } | null;
+  if (typeof initialized?.protocolVersion === "string" && /^\d{4}-\d{2}-\d{2}$/.test(initialized.protocolVersion)) {
+    session.protocolVersion = initialized.protocolVersion;
+  }
   try {
-    await fetch(session.url, {
+    await fetchPublicHttps(session.url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -680,11 +817,21 @@ export async function connectCloudMcp(
   } catch {
     // the initialized notification is best-effort
   }
-  const listed = (await rpc(session, "tools/list", {}, CONNECT_TIMEOUT_MS)) as {
-    tools?: Array<Record<string, unknown>>;
-  } | null;
+  const rawTools: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 20 && rawTools.length < 500; page += 1) {
+    const listed = (await rpc(session, "tools/list", cursor ? { cursor } : {}, CONNECT_TIMEOUT_MS)) as {
+      tools?: Array<Record<string, unknown>>;
+      nextCursor?: unknown;
+    } | null;
+    rawTools.push(...(listed?.tools ?? []).slice(0, 500 - rawTools.length));
+    cursor = typeof listed?.nextCursor === "string" && listed.nextCursor ? listed.nextCursor : undefined;
+    if (!cursor) {
+      break;
+    }
+  }
   const tools: CloudMcpTool[] = [];
-  for (const raw of listed?.tools ?? []) {
+  for (const raw of rawTools) {
     const name = typeof raw.name === "string" ? raw.name : "";
     if (!name || server.disabledTools.includes(name)) {
       continue;
@@ -757,8 +904,8 @@ export function stringifyCloudMcpResult(result: unknown): string {
   const pieces = Array.isArray(result.content)
     ? result.content.map(stringifyContentPart).filter((part) => part.length > 0)
     : [];
-  if (pieces.length === 0 && result.structuredContent !== undefined) {
-    pieces.push(jsonText(result.structuredContent));
+  if (result.structuredContent !== undefined) {
+    pieces.push(`[Structured content]\n${jsonText(result.structuredContent)}`);
   }
   const text = pieces.join("\n");
   return result.isError === true ? `Tool reported an error${text ? `:\n${text}` : "."}` : text;
@@ -794,13 +941,19 @@ function stringifyResourceReadResult(result: unknown): string {
  * session, so file-oriented servers deliver actual contents rather than only
  * a project tree or opaque URI.
  */
+const MAX_MCP_RENDER_CHARS = 300_000;
+
 export async function callCloudMcpTool(
   session: CloudMcpSession,
   name: string,
   args: unknown,
 ): Promise<string> {
   const result = await rpc(session, "tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
-  const pieces = [stringifyCloudMcpResult(result)];
+  const rendered = stringifyCloudMcpResult(result);
+  if (isRecord(result) && result.isError === true) {
+    throw new Error(rendered || "MCP tool reported an error.");
+  }
+  const pieces = [rendered];
   for (const uri of resourceLinks(result)) {
     try {
       const resource = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
@@ -812,11 +965,33 @@ export async function callCloudMcpTool(
       pieces.push(`[Could not read resource ${uri}: ${error instanceof Error ? error.message : "unknown error"}]`);
     }
   }
-  return pieces.filter((piece) => piece.length > 0).join("\n\n");
+  const output = pieces.filter((piece) => piece.length > 0).join("\n\n");
+  return output.length > MAX_MCP_RENDER_CHARS
+    ? `${output.slice(0, MAX_MCP_RENDER_CHARS)}\n… [MCP result truncated]`
+    : output;
 }
 
-/** Mirrors the web client's namespacing: mcp_<serverId sans dashes>_<safe tool>. */
+/** Collision-resistant mirror of the browser's MCP function namespace. */
 export function cloudMcpFunctionName(serverId: string, toolName: string): string {
-  const safe = toolName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "tool";
-  return `mcp_${serverId.replace(/-/g, "")}_${safe}`.slice(0, 64);
+  const safe = (value: string, fallback: string): string =>
+    value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || fallback;
+  const serverPart = safe(serverId, "server");
+  const toolPart = safe(toolName, "tool");
+  const base = `mcp_${serverPart}_${toolPart}`;
+  const normalizedChanged =
+    serverPart !== serverId.toLowerCase() ||
+    toolPart !== toolName.toLowerCase() ||
+    serverId !== serverId.toLowerCase() ||
+    toolName !== toolName.toLowerCase();
+  if (!normalizedChanged && base.length <= 64) {
+    return base;
+  }
+  const material = `${serverId}\u0000${toolName}`;
+  let hash = 2_166_136_261;
+  for (let index = 0; index < material.length; index += 1) {
+    hash ^= material.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  const suffix = (hash >>> 0).toString(36).slice(0, 7);
+  return `${base.slice(0, 63 - suffix.length)}_${suffix}`;
 }

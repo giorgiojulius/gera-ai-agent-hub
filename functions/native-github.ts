@@ -152,6 +152,31 @@ export function decodeGitHubContent(base64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
+function isProbablyBinaryText(text: string): boolean {
+  const sample = text.slice(0, 4_096);
+  if (sample.includes("\u0000")) {
+    return true;
+  }
+  let suspicious = 0;
+  for (const char of sample) {
+    const code = char.charCodeAt(0);
+    if ((code < 32 && code !== 9 && code !== 10 && code !== 13) || char === "\uFFFD") {
+      suspicious += 1;
+    }
+  }
+  return sample.length > 0 && suspicious > Math.max(4, sample.length * 0.02);
+}
+
+function formatGitHubFileText(record: Record<string, unknown>, text: string, streamTruncated = false): string {
+  const path = str(record.path) || "file";
+  const size = num(record.size);
+  if (isProbablyBinaryText(text)) {
+    return `${path} is a binary file (${size} B) — cannot display as text.`;
+  }
+  const truncated = streamTruncated || text.length > MAX_FILE_CHARS;
+  return `${path} (${size} B${truncated ? `, showing first ${MAX_FILE_CHARS} chars` : ""}):\n${text.slice(0, MAX_FILE_CHARS)}`;
+}
+
 /** Encodes UTF-8 text as base64 for the contents API (writes). */
 export function encodeGitHubContent(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -390,6 +415,69 @@ async function ghFetch(
   throw githubApiError(response, message);
 }
 
+async function readResponseTextPrefix(
+  response: Response,
+  maxChars: number,
+): Promise<{ text: string; truncated: boolean }> {
+  if (!response.body) {
+    const text = await response.text();
+    return { text: text.slice(0, maxChars), truncated: text.length > maxChars };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let finished = false;
+  while (text.length <= maxChars) {
+    const chunk = await reader.read();
+    if (chunk.done) {
+      finished = true;
+      text += decoder.decode();
+      break;
+    }
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  if (!finished) {
+    await reader.cancel().catch(() => undefined);
+    text += decoder.decode();
+  }
+  return { text: text.slice(0, maxChars), truncated: !finished || text.length > maxChars };
+}
+
+/** Reads a Contents endpoint as raw bytes, preserving auth for private repositories. */
+async function ghFetchRawText(
+  auth: string,
+  path: string,
+  query: Record<string, string | number | undefined> = {},
+): Promise<{ text: string; truncated: boolean }> {
+  const url = new URL(`${GITHUB_API}${path}`);
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  let response: Response;
+  try {
+    response = await fetch(url.toString(), {
+      headers: {
+        ...githubRequestHeaders(auth),
+        Accept: "application/vnd.github.raw+json",
+      },
+    });
+  } catch {
+    throw new Error("Could not reach GitHub. Check the connection and try again.");
+  }
+  if (!response.ok) {
+    const message = await githubErrorMessage(response);
+    if (response.status === 404) {
+      throw new Error(
+        "Not found — or this token cannot read the file. Check the exact path, branch, and repository Contents permission.",
+      );
+    }
+    throw githubApiError(response, message);
+  }
+  return readResponseTextPrefix(response, MAX_FILE_CHARS + 1);
+}
+
 /** Org logins visible to this token — an org missing here means it has not approved the OAuth app. */
 async function listOrgLogins(auth: string): Promise<string[]> {
   const orgs = asRecordArray(await ghFetch(auth, "/user/orgs", { query: { per_page: 100 } }));
@@ -485,11 +573,9 @@ async function getContents(auth: string, input: Record<string, unknown>): Promis
   const repo = need(input, "repo");
   const rawPath = str(input.path).replace(/^\/+/, "");
   const encodedPath = rawPath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  const data = await ghFetch(
-    auth,
-    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents${encodedPath ? `/${encodedPath}` : ""}`,
-    { query: { ref: str(input.ref) || undefined } },
-  );
+  const endpoint = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents${encodedPath ? `/${encodedPath}` : ""}`;
+  const ref = str(input.ref) || undefined;
+  const data = await ghFetch(auth, endpoint, { query: { ref } });
   if (Array.isArray(data)) {
     const entries = asRecordArray(data);
     const lines = entries.map((entry) => {
@@ -500,18 +586,21 @@ async function getContents(auth: string, input: Record<string, unknown>): Promis
     return `${owner}/${repo}/${rawPath || ""} — ${entries.length} entries:\n${lines.join("\n")}`;
   }
   const record = (data ?? {}) as Record<string, unknown>;
-  if (str(record.type) === "file" && str(record.encoding) === "base64" && str(record.content)) {
+  if (str(record.type) === "file" && str(record.encoding) === "base64" && typeof record.content === "string") {
     let text: string;
     try {
-      text = decodeGitHubContent(str(record.content));
+      text = decodeGitHubContent(record.content);
     } catch {
       return `${str(record.path)} is a binary file (${num(record.size)} B) — cannot display as text.`;
     }
-    const truncated = text.length > MAX_FILE_CHARS;
-    return `${str(record.path)} (${num(record.size)} B${truncated ? `, showing first ${MAX_FILE_CHARS} chars` : ""}):\n${text.slice(0, MAX_FILE_CHARS)}`;
+    return formatGitHubFileText(record, text);
   }
   if (str(record.type) === "file") {
-    return `${str(record.path)} (${num(record.size)} B) is too large or binary — GitHub did not inline its content. Download: ${str(record.download_url)}`;
+    // GitHub intentionally returns encoding:"none" and no inline body for
+    // files above 1 MB. Re-read the exact endpoint with its raw media type;
+    // unlike download_url this keeps private-repo authentication intact.
+    const raw = await ghFetchRawText(auth, endpoint, { ref });
+    return formatGitHubFileText(record, raw.text, raw.truncated);
   }
   return `Unexpected content type "${str(record.type)}" at ${rawPath || "/"}.`;
 }
@@ -542,12 +631,13 @@ async function getFileTree(auth: string, input: Record<string, unknown>): Promis
 async function getReadme(auth: string, input: Record<string, unknown>): Promise<string> {
   const owner = need(input, "owner");
   const repo = need(input, "repo");
-  const data = (await ghFetch(auth, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/readme`)) as Record<string, unknown>;
-  if (str(data.encoding) === "base64" && str(data.content)) {
-    const text = decodeGitHubContent(str(data.content));
-    return `${str(data.path)}:\n${text.slice(0, MAX_FILE_CHARS)}${text.length > MAX_FILE_CHARS ? "\n…(truncated)" : ""}`;
+  const endpoint = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/readme`;
+  const data = (await ghFetch(auth, endpoint)) as Record<string, unknown>;
+  if (str(data.encoding) === "base64" && typeof data.content === "string") {
+    return formatGitHubFileText(data, decodeGitHubContent(data.content));
   }
-  return "README exists but could not be inlined.";
+  const raw = await ghFetchRawText(auth, endpoint);
+  return formatGitHubFileText(data, raw.text, raw.truncated);
 }
 
 async function listCommits(auth: string, input: Record<string, unknown>): Promise<string> {
@@ -1233,7 +1323,7 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
   {
     name: "get_contents",
     description:
-      "Read a file's text content or list a directory in a repository. Omit path for the repo root. Files are UTF-8 decoded and truncated at 12k chars.",
+      "Read a file's actual text content or list a directory in a repository. Pass an exact path returned by get_file_tree; use path:'' only for the repo root. Private and 1–100 MB text files are read through GitHub's authenticated raw fallback, then truncated at 12k chars.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1242,7 +1332,7 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
         path: { type: "string", description: "File or directory path (empty = root)" },
         ref: { type: "string", description: "Branch, tag, or commit SHA (default: default branch)" },
       },
-      required: ["owner", "repo"],
+      required: ["owner", "repo", "path"],
     },
   },
   {

@@ -192,19 +192,51 @@ function mcpProtocolHeaders(session: McpSession): Record<string, string> {
   };
 }
 
-function parseSseJson(body: string): JsonRpcResponse {
-  const lines = body.split(/\r?\n/);
-  for (const line of lines) {
-    if (!line.startsWith("data:")) {
-      continue;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function jsonRpcMessages(payload: string): JsonRpcResponse[] {
+  const parsed = JSON.parse(payload) as unknown;
+  const values = Array.isArray(parsed) ? parsed : [parsed];
+  return values.filter(isRecord).map((value) => value as JsonRpcResponse);
+}
+
+/**
+ * Streamable HTTP may emit progress/log notifications before the response.
+ * Read every SSE event and select the response for this request id instead of
+ * accidentally treating the first notification as an empty tool result.
+ */
+export function parseMcpRpcResponse(body: string, expectedId: number): JsonRpcResponse {
+  const trimmed = body.trim();
+  let messages: JsonRpcResponse[] = [];
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    messages = jsonRpcMessages(trimmed);
+  } else {
+    for (const event of body.split(/\r?\n\r?\n/)) {
+      const payload = event
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n")
+        .trim();
+      if (!payload || payload === "[DONE]") {
+        continue;
+      }
+      messages.push(...jsonRpcMessages(payload));
     }
-    const payload = line.slice(5).trim();
-    if (!payload || payload === "[DONE]") {
-      continue;
-    }
-    return JSON.parse(payload) as JsonRpcResponse;
   }
-  return JSON.parse(body) as JsonRpcResponse;
+  const responses = messages.filter((message) => "result" in message || "error" in message);
+  const exact = responses.find((message) => String(message.id) === String(expectedId));
+  if (exact) {
+    return exact;
+  }
+  // Keep compatibility with a few non-conforming stateless servers that omit
+  // an id, but never accept a mismatched id from another request.
+  if (responses.length === 1 && responses[0].id === undefined) {
+    return responses[0];
+  }
+  throw new Error(`no JSON-RPC response for request ${expectedId}`);
 }
 
 async function rpc(session: McpSession, method: string, params?: unknown): Promise<unknown> {
@@ -286,7 +318,7 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
 
     let parsed: JsonRpcResponse;
     try {
-      parsed = text.trim().startsWith("{") ? (JSON.parse(text) as JsonRpcResponse) : parseSseJson(text);
+      parsed = parseMcpRpcResponse(text, request.id);
     } catch {
       throw new Error("MCP server sent an unexpected response.");
     }
@@ -431,7 +463,7 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
 
   try {
     const result = await rpc(session, "tools/call", { name, arguments: args ?? {} });
-    return stringifyMcpResult(result);
+    return renderMcpResultWithResources(session, result);
   } catch (error) {
     if (!(error instanceof McpSessionLostError)) {
       throw error;
@@ -445,7 +477,7 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
       throw new Error("MCP server is not connected.");
     }
     const result = await rpc(fresh, "tools/call", { name, arguments: args ?? {} });
-    return stringifyMcpResult(result);
+    return renderMcpResultWithResources(fresh, result);
   }
 }
 
@@ -544,26 +576,109 @@ function safeName(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "server";
 }
 
-function stringifyMcpResult(result: unknown): string {
+const MAX_RESOURCE_LINK_READS = 4;
+
+function jsonText(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function resourceHeading(resource: Record<string, unknown>): string {
+  const uri = typeof resource.uri === "string" ? resource.uri : "resource";
+  const mime = typeof resource.mimeType === "string" && resource.mimeType ? ` · ${resource.mimeType}` : "";
+  return `[Resource ${uri}${mime}]`;
+}
+
+function stringifyResource(resource: Record<string, unknown>): string {
+  const heading = resourceHeading(resource);
+  if (typeof resource.text === "string") {
+    return `${heading}\n${resource.text}`;
+  }
+  if (typeof resource.blob === "string") {
+    return `${heading}\n[Binary data omitted · ${resource.blob.length} base64 chars]`;
+  }
+  return heading;
+}
+
+function stringifyContentPart(part: unknown): string {
+  if (!isRecord(part)) {
+    return jsonText(part);
+  }
+  if (typeof part.text === "string") {
+    return part.text;
+  }
+  if (part.type === "resource" && isRecord(part.resource)) {
+    return stringifyResource(part.resource);
+  }
+  if (part.type === "resource_link" && typeof part.uri === "string") {
+    const label = typeof part.name === "string" && part.name ? `${part.name} · ` : "";
+    return `[Resource link ${label}${part.uri}]`;
+  }
+  if ((part.type === "image" || part.type === "audio") && typeof part.data === "string") {
+    const mime = typeof part.mimeType === "string" && part.mimeType ? ` · ${part.mimeType}` : "";
+    return `[${part.type} content omitted${mime} · ${part.data.length} base64 chars]`;
+  }
+  return jsonText(part);
+}
+
+/** Flattens text, embedded resources, and structured MCP results for the model. */
+export function stringifyMcpResult(result: unknown): string {
   if (typeof result === "string") {
     return result;
   }
-  if (result && typeof result === "object" && "content" in (result as Record<string, unknown>)) {
-    const content = (result as { content?: unknown }).content;
-    if (Array.isArray(content)) {
-      return content
-        .map((part) => {
-          if (part && typeof part === "object" && "text" in part) {
-            return String((part as { text: unknown }).text);
-          }
-          return JSON.stringify(part);
-        })
-        .join("\n");
+  if (!isRecord(result)) {
+    return jsonText(result);
+  }
+  const pieces = Array.isArray(result.content)
+    ? result.content.map(stringifyContentPart).filter((part) => part.length > 0)
+    : [];
+  if (pieces.length === 0 && result.structuredContent !== undefined) {
+    pieces.push(jsonText(result.structuredContent));
+  }
+  const text = pieces.join("\n");
+  return result.isError === true ? `Tool reported an error${text ? `:\n${text}` : "."}` : text;
+}
+
+function resourceLinks(result: unknown): string[] {
+  if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) {
+    return [];
+  }
+  const links: string[] = [];
+  for (const part of result.content) {
+    if (isRecord(part) && part.type === "resource_link" && typeof part.uri === "string" && part.uri) {
+      if (!links.includes(part.uri)) {
+        links.push(part.uri);
+      }
     }
   }
-  try {
-    return JSON.stringify(result, null, 2);
-  } catch {
-    return String(result);
+  return links.slice(0, MAX_RESOURCE_LINK_READS);
+}
+
+function stringifyResourceReadResult(result: unknown): string {
+  if (!isRecord(result) || !Array.isArray(result.contents)) {
+    return jsonText(result);
   }
+  return result.contents
+    .map((content) => (isRecord(content) ? stringifyResource(content) : jsonText(content)))
+    .filter((content) => content.length > 0)
+    .join("\n");
+}
+
+async function renderMcpResultWithResources(session: McpSession, result: unknown): Promise<string> {
+  const pieces = [stringifyMcpResult(result)];
+  for (const uri of resourceLinks(result)) {
+    try {
+      const resource = await rpc(session, "resources/read", { uri });
+      const text = stringifyResourceReadResult(resource);
+      if (text) {
+        pieces.push(text);
+      }
+    } catch (error) {
+      pieces.push(`[Could not read resource ${uri}: ${error instanceof Error ? error.message : "unknown error"}]`);
+    }
+  }
+  return pieces.filter((piece) => piece.length > 0).join("\n\n");
 }

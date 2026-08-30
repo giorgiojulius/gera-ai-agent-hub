@@ -513,23 +513,47 @@ function protocolHeaders(session: CloudMcpSession): Record<string, string> {
   };
 }
 
-/** Streamable HTTP bodies arrive as plain JSON or SSE frames — accept both. */
-function parseRpcBody(text: string): JsonRpcResponse {
+function jsonRpcMessages(payload: string): JsonRpcResponse[] {
+  const parsed = JSON.parse(payload) as unknown;
+  const values = Array.isArray(parsed) ? parsed : [parsed];
+  return values.filter(isRecord).map((value) => value as JsonRpcResponse);
+}
+
+/**
+ * Streamable HTTP may emit progress/log notifications before the response.
+ * Read every SSE event and select the response for this request id instead of
+ * accidentally treating the first notification as an empty tool result.
+ */
+export function parseCloudMcpRpcResponse(text: string, expectedId: number): JsonRpcResponse {
   const trimmed = text.trim();
-  if (trimmed.startsWith("{")) {
-    return JSON.parse(trimmed) as JsonRpcResponse;
-  }
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith("data:")) {
-      continue;
+  let messages: JsonRpcResponse[] = [];
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    messages = jsonRpcMessages(trimmed);
+  } else {
+    for (const event of text.split(/\r?\n\r?\n/)) {
+      const payload = event
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n")
+        .trim();
+      if (!payload || payload === "[DONE]") {
+        continue;
+      }
+      messages.push(...jsonRpcMessages(payload));
     }
-    const payload = line.slice(5).trim();
-    if (!payload || payload === "[DONE]") {
-      continue;
-    }
-    return JSON.parse(payload) as JsonRpcResponse;
   }
-  return JSON.parse(trimmed) as JsonRpcResponse;
+  const responses = messages.filter((message) => "result" in message || "error" in message);
+  const exact = responses.find((message) => String(message.id) === String(expectedId));
+  if (exact) {
+    return exact;
+  }
+  // Keep compatibility with a few non-conforming stateless servers that omit
+  // an id, but never accept a mismatched id from another request.
+  if (responses.length === 1 && responses[0].id === undefined) {
+    return responses[0];
+  }
+  throw new Error(`no JSON-RPC response for request ${expectedId}`);
 }
 
 async function rpc(
@@ -539,6 +563,7 @@ async function rpc(
   timeoutMs: number,
 ): Promise<unknown> {
   session.nextId += 1;
+  const requestId = session.nextId;
   const response = await fetch(session.url, {
     method: "POST",
     headers: {
@@ -547,7 +572,7 @@ async function rpc(
       ...protocolHeaders(session),
       ...session.headers,
     },
-    body: JSON.stringify({ jsonrpc: "2.0", id: session.nextId, method, params: params ?? {} }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params: params ?? {} }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   const sessionHeader = response.headers.get("mcp-session-id");
@@ -565,7 +590,7 @@ async function rpc(
   }
   let parsed: JsonRpcResponse;
   try {
-    parsed = parseRpcBody(text);
+    parsed = parseCloudMcpRpcResponse(text, requestId);
   } catch {
     throw new Error("unexpected response shape");
   }
@@ -632,40 +657,121 @@ export async function connectCloudMcp(
   return { session, tools };
 }
 
-/** Runs one tool and flattens the MCP content blocks into plain text. */
+const MAX_RESOURCE_LINK_READS = 4;
+
+function jsonText(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function resourceHeading(resource: Record<string, unknown>): string {
+  const uri = typeof resource.uri === "string" ? resource.uri : "resource";
+  const mime = typeof resource.mimeType === "string" && resource.mimeType ? ` · ${resource.mimeType}` : "";
+  return `[Resource ${uri}${mime}]`;
+}
+
+function stringifyResource(resource: Record<string, unknown>): string {
+  const heading = resourceHeading(resource);
+  if (typeof resource.text === "string") {
+    return `${heading}\n${resource.text}`;
+  }
+  if (typeof resource.blob === "string") {
+    return `${heading}\n[Binary data omitted · ${resource.blob.length} base64 chars]`;
+  }
+  return heading;
+}
+
+function stringifyContentPart(part: unknown): string {
+  if (!isRecord(part)) {
+    return jsonText(part);
+  }
+  if (typeof part.text === "string") {
+    return part.text;
+  }
+  if (part.type === "resource" && isRecord(part.resource)) {
+    return stringifyResource(part.resource);
+  }
+  if (part.type === "resource_link" && typeof part.uri === "string") {
+    const label = typeof part.name === "string" && part.name ? `${part.name} · ` : "";
+    return `[Resource link ${label}${part.uri}]`;
+  }
+  if ((part.type === "image" || part.type === "audio") && typeof part.data === "string") {
+    const mime = typeof part.mimeType === "string" && part.mimeType ? ` · ${part.mimeType}` : "";
+    return `[${part.type} content omitted${mime} · ${part.data.length} base64 chars]`;
+  }
+  return jsonText(part);
+}
+
+/** Flattens text, embedded resources, and structured MCP results for the model. */
+export function stringifyCloudMcpResult(result: unknown): string {
+  if (typeof result === "string") {
+    return result;
+  }
+  if (!isRecord(result)) {
+    return jsonText(result);
+  }
+  const pieces = Array.isArray(result.content)
+    ? result.content.map(stringifyContentPart).filter((part) => part.length > 0)
+    : [];
+  if (pieces.length === 0 && result.structuredContent !== undefined) {
+    pieces.push(jsonText(result.structuredContent));
+  }
+  const text = pieces.join("\n");
+  return result.isError === true ? `Tool reported an error${text ? `:\n${text}` : "."}` : text;
+}
+
+function resourceLinks(result: unknown): string[] {
+  if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) {
+    return [];
+  }
+  const links: string[] = [];
+  for (const part of result.content) {
+    if (isRecord(part) && part.type === "resource_link" && typeof part.uri === "string" && part.uri) {
+      if (!links.includes(part.uri)) {
+        links.push(part.uri);
+      }
+    }
+  }
+  return links.slice(0, MAX_RESOURCE_LINK_READS);
+}
+
+function stringifyResourceReadResult(result: unknown): string {
+  if (!isRecord(result) || !Array.isArray(result.contents)) {
+    return jsonText(result);
+  }
+  return result.contents
+    .map((content) => (isRecord(content) ? stringifyResource(content) : jsonText(content)))
+    .filter((content) => content.length > 0)
+    .join("\n");
+}
+
+/**
+ * Runs one tool and resolves resource links through the same authenticated MCP
+ * session, so file-oriented servers deliver actual contents rather than only
+ * a project tree or opaque URI.
+ */
 export async function callCloudMcpTool(
   session: CloudMcpSession,
   name: string,
   args: unknown,
 ): Promise<string> {
   const result = await rpc(session, "tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
-  return stringifyCallResult(result);
-}
-
-function stringifyCallResult(result: unknown): string {
-  if (typeof result === "string") {
-    return result;
+  const pieces = [stringifyCloudMcpResult(result)];
+  for (const uri of resourceLinks(result)) {
+    try {
+      const resource = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
+      const text = stringifyResourceReadResult(resource);
+      if (text) {
+        pieces.push(text);
+      }
+    } catch (error) {
+      pieces.push(`[Could not read resource ${uri}: ${error instanceof Error ? error.message : "unknown error"}]`);
+    }
   }
-  if (isRecord(result) && Array.isArray(result.content)) {
-    const text = result.content
-      .map((part) => {
-        if (isRecord(part) && typeof part.text === "string") {
-          return part.text;
-        }
-        try {
-          return JSON.stringify(part);
-        } catch {
-          return String(part);
-        }
-      })
-      .join("\n");
-    return result.isError === true ? `Tool reported an error:\n${text}` : text;
-  }
-  try {
-    return JSON.stringify(result, null, 2);
-  } catch {
-    return String(result);
-  }
+  return pieces.filter((piece) => piece.length > 0).join("\n\n");
 }
 
 /** Mirrors the web client's namespacing: mcp_<serverId sans dashes>_<safe tool>. */

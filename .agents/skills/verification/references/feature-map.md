@@ -1,14 +1,16 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `fb17507` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `bc5cb7f` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
 credential hand-off + server contents preflight + structured pin across
 Research/Julius + repo access probe, truthful MCP health + durable OAuth
-grant sync/refresh + server GitHub User-Agent fix + Julius Verifier GitHub hand-off, honesty rule in default system prompts,
-skills-as-guidance research fix + empty-question guard, Intercom attachments)
-Drift check: `git log --oneline fb17507..HEAD`, then compare against
+grant sync/refresh + server GitHub User-Agent and authenticated raw-file reads,
+Julius Verifier GitHub hand-off, MCP structured/resource content reads, honesty
+rule in default system prompts, skills-as-guidance research fix + empty-question
+guard, Intercom attachments)
+Drift check: `git log --oneline bc5cb7f..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -177,8 +179,14 @@ Worker calls — including `/user` — with 403 while the same credential passed
 the browser, producing the false "token dead" diagnosis. Live control probe:
 no User-Agent → 403, identified request → 200. Error classification matches the
 browser: only 401 asks for a new credential; 403/429 keeps it and reports the
-actual rate-limit/SSO/org-policy cause. Regression: `github-run-flow.test.ts`.
-New chats start without a pin; signed out stays an honest unavailable state.
+actual rate-limit/SSO/org-policy cause. `get_contents` now requires an exact
+path (empty string means root) and returns the real file body, not just the tree:
+inline base64 still takes the fast path, while GitHub's normal `encoding:none`
+response for 1–100 MB files is retried through the authenticated raw media type
+with the same branch/ref; empty files remain valid and binary payloads stay
+honestly labelled. Regressions: `github-run-flow.test.ts`,
+`mcp-file-content.test.ts`. New chats start without a pin; signed out stays an
+honest unavailable state.
 
 Repo access probe (2026-08-30, `composer-repo-diagnose`): listing repos
 and reading one are separate GitHub authorization contours — GitHub
@@ -387,9 +395,15 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   after "auth rejected"), exposes tools as `mcp_<serverId>_<tool>`
   (90-route cap) and reports per-server status honestly: connected · N
   tools, FAILED with reason, or "not among <owner>'s connected servers
-  anymore". Keys/sign-ins never copy into the project; members see name
-  chips only. Cards/profiles show "MCP · <name>" chips; amber "MCP · no
-  servers" when the switch is on with nothing linked.
+  anymore". Tool results retain actual file bodies across every project-agent
+  surface: text and embedded resources are flattened for the model,
+  `structuredContent` is used when no text block exists, and `resource_link`
+  entries are fetched through authenticated `resources/read` (up to four per
+  call). Progress notifications preceding a Streamable HTTP result are skipped
+  until the matching request id arrives, rather than becoming an empty file.
+  Keys/sign-ins never copy into the project; members see name chips only.
+  Cards/profiles show "MCP · <name>" chips; amber "MCP · no servers" when the
+  switch is on with nothing linked.
 - **Inbound Slack bot (mentionable agents)**: the Slack access row also
   takes the Slack app's Signing secret + shows a per-agent Request URL
   (`slackEventsUrl` → `/slack/events/:projectId/:agentId`) with copy
@@ -699,6 +713,15 @@ sibling/server rotation first, and only a genuinely dead or expired
 non-refreshable grant drops to Sign in. Expired DCR registrations
 (client_secret_expires_at) re-register instead of failing from cache.
 
+File-result truth (2026-08-30): generic MCP calls preserve plain text,
+embedded text resources and `structuredContent`; opaque image/audio/blob base64
+is replaced by a short descriptor instead of crowding file text out of context.
+A returned `resource_link` is resolved with `resources/read` on the same signed
+session (up to four links). Streamable HTTP parsing scans notifications and
+selects the final JSON-RPC response by request id, so progress events no longer
+turn a file read into an empty result. The browser and Worker implementations
+share regression fixtures in `mcp-file-content.test.ts`.
+
 Status truth (2026-08-30): every persisted green card is live-checked once
 per browser session, again when synced settings/auth arrive, every 10 minutes
 in a long-open tab, and when the tab returns (the old mount-only pass often ran
@@ -808,7 +831,7 @@ finalize, sweep isolation), `automation-schedule.test.ts` (the
 `project-shared.test.ts` (handles/translit, @mention parsing incl. email
 false-positives, and the access→tool contract: read-only GitHub arms zero
 write tools; missing tokens arm nothing and are reported), plus
-`mcp-rotation`, `agent-steering`, `github-native`. Only the Durable
+`mcp-rotation`, `mcp-file-content`, `agent-steering`, `github-native`. Only the Durable
 Object glue in `chat-store.ts` / `project-store.ts` stays untested — its
 typecheck happens at the functions deploy (`runChecks functions`), not in
 web tsc.

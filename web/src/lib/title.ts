@@ -1,12 +1,12 @@
-import { FAST_MODEL } from "@/lib/models";
+import { TITLE_MODEL } from "@/lib/models";
 import { chatGatewayOptions } from "@/lib/tools";
 import { toolkitFetch } from "@/lib/toolkit";
 import { reportUsage } from "@/lib/usage";
 
 /**
- * Thread auto-titling: the cheapest catalog model condenses the first prompt
- * into a short human title ("Рецепт борща", "Trip budget planner"). Any
- * failure returns null and the caller keeps the raw-prompt fallback title.
+ * Thread auto-titling: Luna condenses the first prompt into a short human
+ * title ("Рецепт борща", "Trip budget planner"). Any failure returns null
+ * and the caller keeps the raw-prompt fallback title.
  */
 const TITLE_PROMPT = `You name chat threads. The user message below is the FIRST message of a conversation. Reply with ONLY the thread title.
 Rules:
@@ -74,7 +74,7 @@ export function cleanGeneratedTitle(raw: string): string | null {
 }
 
 /**
- * Asks the fast model for a pretty thread title. Fire-and-forget friendly:
+ * Asks Luna for a pretty thread title. Fire-and-forget friendly:
  * never throws, ~8s budget, usage is reported into the session cost meter.
  */
 export async function generateChatTitle(prompt: string): Promise<string | null> {
@@ -86,7 +86,7 @@ export async function generateChatTitle(prompt: string): Promise<string | null> 
       retry: false,
       signal: controller.signal,
       body: JSON.stringify({
-        model: FAST_MODEL,
+        model: TITLE_MODEL,
         stream: false,
         temperature: 0.4,
         max_tokens: 64,
@@ -104,7 +104,7 @@ export async function generateChatTitle(prompt: string): Promise<string | null> 
       choices?: Array<{ message?: { content?: string | null } }>;
       usage?: Record<string, unknown>;
     };
-    reportUsage(FAST_MODEL, data.usage, "service");
+    reportUsage(TITLE_MODEL, data.usage, "service");
     return cleanGeneratedTitle(data.choices?.[0]?.message?.content ?? "");
   } catch {
     return null;

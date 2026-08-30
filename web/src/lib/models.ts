@@ -12,10 +12,15 @@ export const DEFAULT_CHAT_MODEL = "spacexai/grok-4.6:xhigh";
 export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.7-flash"] as const;
 /**
  * Cheapest catalog model for internal helper calls (tool router, research
- * planner, thread titles). Gateway list rates as of 2026-08: qwen3.7-flash
+ * planner). Gateway list rates as of 2026-08: qwen3.7-flash
  * $0.03/$0.13 per 1M vs gemini-3.7-flash $0.75/$3.75 — ~25x cheaper input.
  */
 export const FAST_MODEL = "alibaba/qwen3.7-flash";
+/**
+ * Thread auto-titles run on Luna instead of the fast model — qwen titles
+ * read clunky; at ≤64 output tokens per thread the upgrade costs pennies.
+ */
+export const TITLE_MODEL = "openai/gpt-5.6-luna";
 export const DEFAULT_IMAGE_MODEL = "openai/gpt-image-2";
 export const IMAGE_FALLBACKS = ["bytedance/seedream-5.0-lite", "spacexai/grok-imagine-image-2.0"] as const;
 export const DEFAULT_VIDEO_MODEL = "bytedance/seedance-2.5";

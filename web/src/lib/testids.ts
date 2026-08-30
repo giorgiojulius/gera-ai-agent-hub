@@ -43,6 +43,10 @@ export const TID = {
   composerRepo: "composer-repo",
   /** Body of the repo-pin popover (search + repo list). */
   composerRepoPanel: "composer-repo-panel",
+  /** "Can't see a private repo?" trigger inside the repo-pin popover. */
+  composerRepoDiagnose: "composer-repo-diagnose",
+  /** Verdict card of the repo access check. */
+  composerRepoVerdict: "composer-repo-verdict",
   /** Model picker trigger in the composer rail. */
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */

@@ -54,6 +54,7 @@ import { RESEARCH_PROFILES } from "@/lib/deep-research";
 import { errorFromUnknown } from "@/lib/errors";
 import { KNOWLEDGE_FILE_ACCEPT } from "@/lib/file-extract";
 import { listRepoOptions, resolveGitHubAuth, type RepoOption } from "@/lib/github-native";
+import { RepoAccessCheck } from "./RepoAccessCheck";
 import { JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES, juliusLetter } from "@/lib/julius";
 import { serverIconUrl } from "@/lib/mcp-catalog";
 import { cloudRunPhase, cloudRunsVersion, subscribeCloudRuns } from "@/lib/server-run";
@@ -1372,6 +1373,7 @@ function GitHubRepoPin() {
               )}
             </div>
           )}
+          <RepoAccessCheck server={server} seed={query} />
           <p className="px-0.5 text-[10px] leading-snug text-muted-foreground">
             The pin rides this thread only — new chats start clean. Deep research still reads repos you name in
             the prompt.

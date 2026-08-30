@@ -4,8 +4,9 @@ Last synced: 2026-08-30 · commit `9a3abb1` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
-credential hand-off, honesty rule in default system prompts, skills-as-
-guidance research fix + empty-question guard)
+credential hand-off + repo access probe in the picker, honesty rule in
+default system prompts, skills-as-guidance research fix + empty-question
+guard)
 Drift check: `git log --oneline 9a3abb1..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -160,6 +161,27 @@ sign-in store and the profile-blob `mcpOAuth` sync is best-effort, so
 without the hand-off the cloud run silently dropped GitHub tools (the
 repo picker worked, the reply said it could not see the repo). Signed
 out → the pin block honestly says contents cannot be read.
+
+Repo access probe (2026-08-30, `composer-repo-diagnose`): listing repos
+and reading one are separate GitHub authorization contours — GitHub
+answers 404 (never 403) for private repos a credential cannot see, so a
+missing repo looks nonexistent. The picker popover's "Can't see a
+private repo?" expands an input (owner/repo or github.com URL, seeded
+from the search query) + Check: the browser probes BOTH contours with
+the SAME credential the picker and runs use (`/repos/{o}/{r}` metadata,
+then `/contents` — only if metadata answers), plus whoami scopes and
+visible orgs. The pure mapper (`diagnoseRepoAccess` in
+`github-diagnose.ts`, unit-tested matrix) yields verdicts: ok · empty
+repo (size 0 contents-404 is honest) · fine-grained-token contents gap
+(metadata 200 / contents 404 → link to token settings) · missing "repo"
+scope · own-repo missing from FG-PAT selection · org visible but repo
+hidden · org NOT visible → OAuth-app approval verdict with "Review org
+access" link (`githubOrgAccessUrl`) · SAML SSO challenge (X-GitHub-SSO
+header → authorize URL) · 401 dead token · 403 rate-limit/IP-allow-list
+(quotes GitHub's message). Verdict card (`composer-repo-verdict`) shows
+title, plain-language fix, honest probe trace ("Checked as @login —
+repo HTTP 404"), external action link, and "Sign in on the MCP page…"
+for scope/401 verdicts. Credential never leaves the browser.
 
 - Attachments: paste/pick files (images, pdf, docx, xlsx), remove, drag to
   reorder (↑/↓ works too).

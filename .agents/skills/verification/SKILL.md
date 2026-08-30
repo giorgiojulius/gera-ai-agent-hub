@@ -36,7 +36,10 @@ A turn that changed code ends only after steps 1–3 are green.
 ## Sandbox repair (browser tests)
 
 The sandbox gets recreated; Playwright then fails with "Executable doesn't
-exist" or a segfault with `libnss3.so => not found`. Fix in order:
+exist", "error while loading shared libraries: libnspr4.so / libnss3.so",
+or a segfault. Run BOTH commands — `sudo -n` works in the sandbox. Never
+substitute LD_LIBRARY_PATH / dpkg-deb hacks: they don't survive the next
+run. Re-run the suite cleanly (no env vars) to confirm the repair:
 
 ```bash
 cd web && bunx playwright install chromium-headless-shell

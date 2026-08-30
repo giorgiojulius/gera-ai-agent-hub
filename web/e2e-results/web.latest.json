@@ -2,8 +2,8 @@
   "schema": 1,
   "platform": "web",
   "app": "gera-web",
-  "startedAt": "2026-08-30T06:35:37.913Z",
-  "durationMs": 2085,
+  "startedAt": "2026-08-30T06:45:48.159Z",
+  "durationMs": 2430,
   "passed": 11,
   "failed": 0,
   "results": [
@@ -11,31 +11,31 @@
       "scenarioId": "boot-to-launchpad",
       "title": "Boot lands on the launchpad behind the invite gate",
       "ok": true,
-      "ms": 115,
+      "ms": 128,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 38
+          "ms": 41
         },
         {
           "index": 1,
           "label": "see launchpad",
           "ok": true,
-          "ms": 76
+          "ms": 86
         },
         {
           "index": 2,
           "label": "see composer-input",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 3,
           "label": "see sidebar-new-chat",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     },
@@ -43,31 +43,31 @@
       "scenarioId": "send-chat-message",
       "title": "Sending a message renders the user turn and a streamed reply",
       "ok": true,
-      "ms": 267,
+      "ms": 332,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 38
+          "ms": 40
         },
         {
           "index": 1,
           "label": "see composer-input",
           "ok": true,
-          "ms": 2
+          "ms": 3
         },
         {
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 69
+          "ms": 88
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 156
+          "ms": 199
         },
         {
           "index": 4,
@@ -99,13 +99,13 @@
       "scenarioId": "new-chat-keeps-history",
       "title": "New chat returns to the launchpad and keeps the thread listed",
       "ok": true,
-      "ms": 295,
+      "ms": 320,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 39
+          "ms": 36
         },
         {
           "index": 1,
@@ -117,13 +117,13 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 50
+          "ms": 59
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 130
+          "ms": 141
         },
         {
           "index": 4,
@@ -135,7 +135,7 @@
           "index": 5,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 72
+          "ms": 80
         },
         {
           "index": 6,
@@ -155,13 +155,13 @@
       "scenarioId": "switch-chat-model",
       "title": "The picker's Model submenu switches the active chat model",
       "ok": true,
-      "ms": 161,
+      "ms": 191,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 12
+          "ms": 13
         },
         {
           "index": 1,
@@ -173,19 +173,19 @@
           "index": 2,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 49
+          "ms": 69
         },
         {
           "index": 3,
           "label": "tap model-picker-model-row",
           "ok": true,
-          "ms": 47
+          "ms": 55
         },
         {
           "index": 4,
           "label": "tap model-option-anthropic/claude-opus-5",
           "ok": true,
-          "ms": 50
+          "ms": 51
         },
         {
           "index": 5,
@@ -199,13 +199,13 @@
       "scenarioId": "switch-chat-effort",
       "title": "The picker's Effort submenu pins the thinking budget",
       "ok": true,
-      "ms": 163,
+      "ms": 204,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 12
+          "ms": 13
         },
         {
           "index": 1,
@@ -217,19 +217,19 @@
           "index": 2,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 51
+          "ms": 66
         },
         {
           "index": 3,
           "label": "tap model-picker-effort-row",
           "ok": true,
-          "ms": 48
+          "ms": 66
         },
         {
           "index": 4,
           "label": "tap effort-option-medium",
           "ok": true,
-          "ms": 50
+          "ms": 57
         },
         {
           "index": 5,
@@ -243,13 +243,13 @@
       "scenarioId": "switch-run-mode",
       "title": "The run-mode selector engages Deep research from one menu",
       "ok": true,
-      "ms": 186,
+      "ms": 253,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 28
+          "ms": 32
         },
         {
           "index": 1,
@@ -261,19 +261,19 @@
           "index": 2,
           "label": "tap composer-mode-trigger",
           "ok": true,
-          "ms": 72
+          "ms": 110
         },
         {
           "index": 3,
           "label": "tap run-mode-option-research",
           "ok": true,
-          "ms": 83
+          "ms": 109
         },
         {
           "index": 4,
           "label": "see \"Deep research\" in composer-mode-trigger",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -281,13 +281,13 @@
       "scenarioId": "run-mode-settings-panel",
       "title": "The engaged run mode's gear opens its settings panel",
       "ok": true,
-      "ms": 230,
+      "ms": 267,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 29
+          "ms": 35
         },
         {
           "index": 1,
@@ -299,19 +299,19 @@
           "index": 2,
           "label": "tap composer-mode-trigger",
           "ok": true,
-          "ms": 57
+          "ms": 78
         },
         {
           "index": 3,
           "label": "tap run-mode-option-research",
           "ok": true,
-          "ms": 94
+          "ms": 85
         },
         {
           "index": 4,
           "label": "tap composer-mode-config",
           "ok": true,
-          "ms": 47
+          "ms": 66
         },
         {
           "index": 5,
@@ -323,7 +323,7 @@
           "index": 6,
           "label": "see \"Balanced\" in composer-mode-config-panel",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -331,13 +331,13 @@
       "scenarioId": "skills-rail-panel",
       "title": "The rail Skills button opens the per-mode packs panel",
       "ok": true,
-      "ms": 81,
+      "ms": 104,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 27
+          "ms": 34
         },
         {
           "index": 1,
@@ -349,13 +349,13 @@
           "index": 2,
           "label": "tap composer-skills",
           "ok": true,
-          "ms": 52
+          "ms": 67
         },
         {
           "index": 3,
           "label": "see composer-skills-panel",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 4,
@@ -369,25 +369,25 @@
       "scenarioId": "projects-page-opens",
       "title": "Projects page renders with the create action behind the gate",
       "ok": true,
-      "ms": 11,
+      "ms": 14,
       "steps": [
         {
           "index": 0,
           "label": "goto /projects",
           "ok": true,
-          "ms": 9
+          "ms": 12
         },
         {
           "index": 1,
           "label": "see page-projects",
           "ok": true,
-          "ms": 1
+          "ms": 2
         },
         {
           "index": 2,
           "label": "see project-create",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -395,13 +395,13 @@
       "scenarioId": "studio-pages-navigate",
       "title": "Workspace tabs hop between Automations, Hub, MCP and Settings",
       "ok": true,
-      "ms": 372,
+      "ms": 396,
       "steps": [
         {
           "index": 0,
           "label": "goto /automations",
           "ok": true,
-          "ms": 13
+          "ms": 16
         },
         {
           "index": 1,
@@ -431,19 +431,19 @@
           "index": 5,
           "label": "see page-mcp",
           "ok": true,
-          "ms": 112
+          "ms": 111
         },
         {
           "index": 6,
           "label": "tap nav-tab-settings",
           "ok": true,
-          "ms": 37
+          "ms": 41
         },
         {
           "index": 7,
           "label": "see page-settings",
           "ok": true,
-          "ms": 51
+          "ms": 69
         }
       ]
     },
@@ -451,13 +451,13 @@
       "scenarioId": "objects-have-addresses",
       "title": "Editors and studio objects open straight from their URLs",
       "ok": true,
-      "ms": 172,
+      "ms": 180,
       "steps": [
         {
           "index": 0,
           "label": "goto /automations/new",
           "ok": true,
-          "ms": 19
+          "ms": 26
         },
         {
           "index": 1,
@@ -469,31 +469,31 @@
           "index": 2,
           "label": "goto /skills/new",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 3,
           "label": "see skill-editor",
           "ok": true,
-          "ms": 51
+          "ms": 50
         },
         {
           "index": 4,
           "label": "goto /profiles/new",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 5,
           "label": "see profile-editor",
           "ok": true,
-          "ms": 51
+          "ms": 50
         },
         {
           "index": 6,
           "label": "goto /hub?tab=memory",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 7,

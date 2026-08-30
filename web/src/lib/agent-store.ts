@@ -621,6 +621,20 @@ export async function sendPrompt(params: {
   if (!prompt && attachments.length === 0) {
     return;
   }
+  // Deep research runs on the question text alone — attachments never enter
+  // the pipeline, and workspace context (skills, knowledge) must not become
+  // the subject. An attachments-only send in research mode would start a run
+  // with an empty question that ends up "researching the skills"; refuse
+  // honestly before seeding the thread.
+  const wantsResearchRun = overrides ? overrides.deepResearch === true : params.state.deepResearch;
+  if (!prompt && mode === "chat" && wantsResearchRun) {
+    if (!background) {
+      toast.error("Deep research needs a question", {
+        description: "Type what to research — attachments alone can't drive a research run.",
+      });
+    }
+    return;
+  }
 
   const overrideAgent = overrides?.agentId
     ? settings.agents.find((item) => item.id === overrides.agentId)

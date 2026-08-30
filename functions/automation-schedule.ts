@@ -225,5 +225,5 @@ export function cloudSkillsBlock(
   if (parts.length === 0) {
     return "";
   }
-  return `SKILLS — reusable instruction packs the user enabled. Apply each skill whose "When to apply" matches the task at hand; skip the ones that clearly do not. A direct user request always wins over a skill.\n\n${parts.join("\n\n")}`;
+  return `SKILLS — reusable instruction packs the user enabled. Apply each skill whose "When to apply" matches the task at hand; skip the ones that clearly do not. A direct user request always wins over a skill. Skills are never the task itself: do not research, summarize, or answer about a skill unless the user explicitly asks about their skills.\n\n${parts.join("\n\n")}`;
 }

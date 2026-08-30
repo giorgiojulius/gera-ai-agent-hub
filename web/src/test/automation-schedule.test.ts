@@ -192,6 +192,9 @@ describe("cloudSkillsBlock", () => {
     expect(block).not.toContain("disabled");
     expect(block).not.toContain("nochat");
     expect(block).toContain("SKILLS — reusable instruction packs");
+    // Mirrors the browser header: skills shape HOW the run works and are
+    // never the task itself.
+    expect(block).toContain("never the task itself");
   });
 
   it("applies both the agent's and the automation's allow-lists", () => {

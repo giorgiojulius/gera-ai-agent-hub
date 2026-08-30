@@ -4,7 +4,8 @@ Last synced: 2026-08-30 · commit `9a3abb1` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
-credential hand-off, honesty rule in default system prompts)
+credential hand-off, honesty rule in default system prompts, skills-as-
+guidance research fix + empty-question guard)
 Drift check: `git log --oneline 9a3abb1..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -228,6 +229,15 @@ settings (deeper = longer + more credits). Produces a cited report; with
 Julius on, every candidate researches independently and the council
 distills one final report.
 
+Research runs on the question text alone (2026-08-30): an attachments-only
+send in research mode is blocked with an honest toast, and both engines
+(`functions/research-runner.ts` + browser twin `deep-research.ts`) reject a
+blank prompt before any network call — previously the report ended up
+riffing on the skill packs, the only content left in context. Workspace
+context (profile + skills + knowledge) rides into the report writer via
+`synthesisSystem` framed as guidance that "is NOT the research subject",
+replacing the old "User instructions (always follow these)" label.
+
 ## Julius
 
 Composer toggle: parallel candidate answers compete, or the council
@@ -264,7 +274,10 @@ a PR to green, maintain a feature map); clicking a template card opens a
 full-text preview dialog (complete instructions, folder, surfaces, Add
 inside); the card's quick **Add** and the **Add all** button stay — hitting
 the 24 limit adds what fits and shows an honest toast. Skills are also editable
-from chat (the agent can propose edits via skill-ops).
+from chat (the agent can propose edits via skill-ops). The prompt-block
+headers (browser `buildSkillsBlock` + cloud `cloudSkillsBlock`) mark skills
+as guidance that is "never the task itself" — models must not research or
+summarize them unless the user explicitly asks (2026-08-30).
 
 ## Projects (`/projects`)
 

@@ -253,7 +253,7 @@ export function renameSkillFolder(skills: Skill[], from: string, to: string): Sk
 }
 
 const SKILLS_HEADER =
-  'SKILLS — reusable instruction packs the user enabled for this run. Apply each skill whose "When to apply" matches the task at hand; skip the ones that clearly do not. Skills shape HOW you work — a direct user request always wins over a skill.';
+  'SKILLS — reusable instruction packs the user enabled for this run. Apply each skill whose "When to apply" matches the task at hand; skip the ones that clearly do not. Skills shape HOW you work — a direct user request always wins over a skill. Skills are never the task itself: do not research, summarize, or answer about a skill unless the user explicitly asks about their skills.';
 
 /**
  * One honest line about a skill's bound connectors, for runs that take MCP

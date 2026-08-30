@@ -160,6 +160,22 @@ Structure:
 - End with a "Sources" section ${citeNumeric ? `listing every CITED source as "- [n] [Title](url)" in number order (only sources you actually cited)` : "listing the cited links"}, then 1-2 suggested follow-up questions.
 - Length must match the evidence — a rich dossier deserves a long report; never pad a thin one.`;
 
+/**
+ * Mounts the workspace context (profile instructions, skill packs, saved
+ * knowledge) under the synthesis prompt with an honest frame: it shapes HOW
+ * the report is researched and written — it is never WHAT to research. The
+ * old "User instructions (always follow these)" label made models treat
+ * skill packs as the subject and write reports about them when the question
+ * was thin. Kept in sync with the browser twin in web/src/lib/deep-research.ts.
+ */
+export function synthesisSystem(base: string, workspaceGuidance?: string): string {
+  const guidance = workspaceGuidance?.trim();
+  if (!guidance) {
+    return base;
+  }
+  return `${base}\n\nWorkspace guidance — the user's saved profile instructions, skill packs, and knowledge. It shapes HOW you research and write (tone, language, rigor, format). It is NOT the research subject: never research, summarize, or cite the guidance itself, and when it conflicts with the user's question, the question wins.\n\n${guidance}`;
+}
+
 export type RegistrySource = {
   index: number;
   url: string;
@@ -615,6 +631,15 @@ export async function runServerDeepResearch(
   };
 
   try {
+    // Research runs on the question text alone — attachments and workspace
+    // context (skills, knowledge) never become the subject. An empty prompt
+    // would leave the planner nothing and the report would riff on the skill
+    // packs instead; refuse honestly before spending a single credit.
+    if (params.prompt.trim().length === 0) {
+      throw new Error(
+        "Deep research needs a question — this run started with an empty message, so there is nothing to research.",
+      );
+    }
     const planStep = addStep("plan", "Planning research");
     const today = new Date().toISOString().slice(0, 10);
     const planJson = await withRetries(
@@ -916,9 +941,10 @@ export async function runServerDeepResearch(
     ensureAlive();
     const writeStep = addStep("synthesize", "Writing report", `${state.sources.length} sources`);
     const dossier = buildDossier(registry, profile.dossierCharBudget);
-    const base = synthesisPrompt((params.citations ?? "numeric") === "numeric");
-    const custom = params.systemPrompt?.trim();
-    const system = custom ? `${base}\n\nUser instructions (always follow these):\n${custom}` : base;
+    const system = synthesisSystem(
+      synthesisPrompt((params.citations ?? "numeric") === "numeric"),
+      params.systemPrompt,
+    );
     const messages: EngineMessage[] = [
       { role: "system", content: system },
       ...historyMessages(params.history),

@@ -145,6 +145,9 @@ describe("buildSkillsBlock", () => {
     expect(block).toContain("When to apply: Comparing options.");
     expect(block).toContain("Use markdown tables.");
     expect(block).toContain("a direct user request always wins over a skill");
+    // Skills steer HOW the agent works — they must never become the task
+    // itself (the old header let thin research prompts "research the skills").
+    expect(block).toContain("never the task itself");
   });
 
   it("omits skills past the budget with an honest note instead of silent truncation", () => {

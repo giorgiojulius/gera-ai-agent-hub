@@ -8,6 +8,7 @@ import {
   REFLECT_LIST_BUDGET,
   RESEARCH_PROFILES,
   runDeepResearch,
+  synthesisSystem,
   type RegistrySource,
 } from "@/lib/deep-research";
 import { toolkitFetch } from "@/lib/toolkit";
@@ -250,9 +251,37 @@ function scriptToolkit(options?: { contents?: Array<{ url: string; title?: strin
   });
 }
 
+describe("synthesisSystem (browser twin)", () => {
+  it("returns the base prompt untouched when there is no workspace guidance", () => {
+    expect(synthesisSystem("BASE")).toBe("BASE");
+    expect(synthesisSystem("BASE", "   ")).toBe("BASE");
+  });
+
+  it("frames guidance as how-to-work context, never the research subject", () => {
+    const system = synthesisSystem("BASE", "SKILLS — packs\nAlways answer in Russian.");
+    expect(system).toContain("Always answer in Russian.");
+    expect(system).toContain("NOT the research subject");
+    expect(system).not.toContain("User instructions (always follow these)");
+  });
+});
+
 describe("runDeepResearch", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+  });
+
+  it("refuses an empty question before any network call", async () => {
+    await expect(
+      runDeepResearch({
+        prompt: "  ",
+        history: [],
+        modelId: "test/model",
+        onUpdate: () => {},
+        onText: () => {},
+      }),
+    ).rejects.toThrow(/needs a question/i);
+    expect(toolkitFetchMock).not.toHaveBeenCalled();
+    expect(streamCompletionMock).not.toHaveBeenCalled();
   });
 
   it("searches, reads the picked page, and writes a cited report with the chosen model", async () => {

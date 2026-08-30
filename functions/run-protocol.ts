@@ -152,7 +152,12 @@ export type StartRunConfig = {
   steeringWrapNote?: string;
   /** Resume: continue an existing assistant message instead of appending. */
   resume?: { messageId: string; partial: string };
-  research?: { depth: ResearchDepth; citations?: "numeric" | "links"; githubAuth?: string };
+  research?: {
+    depth: ResearchDepth;
+    citations?: "numeric" | "links";
+    githubAuth?: string;
+    githubDisabledTools?: string[];
+  };
   julius?: { settings: JuliusWireSettings; research?: boolean };
   /** Incognito threads: the run never writes into server chat history. */
   ephemeral?: boolean;

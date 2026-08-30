@@ -477,6 +477,16 @@ export function githubToolAllowed(level: GithubAccessLevel, toolName: string): b
   return GITHUB_READ_TOOL_NAMES.has(toolName);
 }
 
+/**
+ * Slack channel membership is not project membership. Inbound mentions may
+ * inspect GitHub, but native repository writes stay inside authenticated Gera.
+ */
+export function accessForAgentSurface(access: AgentAccess, surface: "project" | "slack"): AgentAccess {
+  return surface === "slack" && access.github === "write"
+    ? { ...access, github: "read" }
+    : access;
+}
+
 export type PlannedNativeTool = {
   kind: "github" | "intercom" | "slack";
   /** Function name exposed to the model, e.g. "github_get_repo". */

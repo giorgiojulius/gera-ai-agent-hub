@@ -49,9 +49,10 @@ describe("injectGitHubRunAuth", () => {
     expect(out).toBe(input); // nothing changed — same array back
   });
 
-  it("returns the list untouched without a credential and never mutates sources", () => {
+  it("drops GitHub without a browser credential and never mutates sources", () => {
     const input = [base];
-    expect(injectGitHubRunAuth(input, undefined)).toBe(input);
+    expect(injectGitHubRunAuth(input, undefined)).toEqual([]);
+    expect(input).toEqual([base]);
     const out = injectGitHubRunAuth(input, "Bearer gho_x");
     expect(out).not.toBe(input);
     expect(base.token).toBeUndefined(); // settings state stays pristine
@@ -73,7 +74,7 @@ describe("githubRunRepoRefs", () => {
 
   it("does not turn malformed pins or file paths into repositories", () => {
     expect(githubRunRepoRefs("check this", "not-a-repo")).toEqual([]);
-    expect(githubRunRepoRefs("check this", "src/app.ts")).toEqual([]);
+    expect(githubRunRepoRefs("check this", "src/app.ts/more")).toEqual([]);
   });
 });
 

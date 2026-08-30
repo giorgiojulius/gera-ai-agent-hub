@@ -1,7 +1,7 @@
 import { toast } from "sonner";
 
 import { serializeConversation } from "@/lib/chat-sync";
-import { injectGitHubRunAuth, pinnedRepoPromptBlock, resolveGitHubAuth } from "@/lib/github-native";
+import { githubRepoRefs, injectGitHubRunAuth, pinnedRepoPromptBlock, resolveGitHubAuth } from "@/lib/github-native";
 import {
   ackServerRun,
   attachServerRun,
@@ -1027,7 +1027,14 @@ export async function sendPrompt(params: {
             wantJulius && githubServer ? injectGitHubRunAuth([githubServer], githubAuth) : [],
           githubRepo: pinnedRepo || undefined,
           ...(wantResearch
-            ? { research: { depth: settings.researchDepth, citations: "numeric", githubAuth } }
+            ? {
+                research: {
+                  depth: settings.researchDepth,
+                  citations: "numeric",
+                  githubAuth,
+                  githubDisabledTools: githubServer?.disabledTools,
+                },
+              }
             : {}),
           ...(wantJulius
             ? { julius: { settings: settings.julius, research: wantResearch || undefined } }
@@ -1114,9 +1121,9 @@ export async function sendPrompt(params: {
           // scoped.mcpServers, so excluded servers never resurrect here.
           const pinnedIds = [
             ...skillPinnedServerIds(runSkills),
-            // The thread's pinned repo depends on the GitHub connector — it
-            // arms regardless of the router's guess, exactly like skill pins.
-            ...(pinnedRepo && githubServer ? [githubServer.id] : []),
+            // A thread pin OR an explicit owner/repo is deterministic intent,
+            // so GitHub arms regardless of the heuristic router's guess.
+            ...((pinnedRepo || githubRepoRefs(prompt, 1).length > 0) && githubServer ? [githubServer.id] : []),
           ];
           armedServers = scoped.mcpServers.filter(
             (server) => plan.mcpServerIds.includes(server.id) || pinnedIds.includes(server.id),

@@ -652,6 +652,7 @@ export class RunManager {
           systemPrompt: config.systemPrompt,
           depth: config.research?.depth ?? "balanced",
           githubAuth: config.research?.githubAuth,
+          githubDisabledTools: config.research?.githubDisabledTools,
           githubRepo: config.githubRepo,
           citations: config.research?.citations ?? "numeric",
           isCancelled,
@@ -733,6 +734,7 @@ export class RunManager {
                   systemPrompt: config.systemPrompt,
                   depth: config.research?.depth ?? "balanced",
                   githubAuth: config.research?.githubAuth,
+                  githubDisabledTools: config.research?.githubDisabledTools,
                   githubRepo: config.githubRepo,
                   // Candidates compete as SPECIFIC models — the report write
                   // fails honestly instead of being ghost-written by a backup.
@@ -810,7 +812,7 @@ export class RunManager {
     const pinnedRef = githubRunRepoRefs("", config.githubRepo)[0];
     if (pinnedRef) {
       const route = [...mcp.routes.values()].find(
-        (item) => item.type === "native" && item.kind === "github",
+        (item) => item.type === "native" && item.kind === "github" && item.toolName === "get_contents",
       );
       const target = `${pinnedRef.owner}/${pinnedRef.repo}`;
       if (!route || route.type !== "native") {

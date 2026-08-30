@@ -40,11 +40,14 @@ function githubApiError(response: Response, message: string): Error {
     return new Error('GitHub rejected the credential (401) — press "Sign in with GitHub" again, or paste a fresh PAT.');
   }
   if (response.status === 403 || response.status === 429) {
-    if (response.status === 429 || response.headers.get("x-ratelimit-remaining") === "0") {
+    const retryAfter = response.headers.get("retry-after");
+    if (response.status === 429 || response.headers.get("x-ratelimit-remaining") === "0" || retryAfter) {
       const reset = Number.parseInt(response.headers.get("x-ratelimit-reset") ?? "", 10);
-      const at = Number.isFinite(reset)
-        ? ` (resets ${new Date(reset * 1000).toISOString().slice(11, 16)} UTC)`
-        : "";
+      const at = retryAfter
+        ? ` (retry after ${retryAfter} seconds)`
+        : Number.isFinite(reset)
+          ? ` (resets ${new Date(reset * 1000).toISOString().slice(11, 16)} UTC)`
+          : "";
       return new Error(`GitHub rate limit reached${at}. Retry after the reset; the credential was kept.`);
     }
     const detail = message ? `: ${message}` : ".";
@@ -123,12 +126,46 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
   return Math.min(max, Math.max(min, Math.trunc(parsed)));
 }
 
+const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const GITHUB_REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
+
+class GitHubNotFoundError extends Error {}
+
 function need(input: Record<string, unknown>, key: string): string {
   const value = str(input[key]).trim();
   if (!value) {
     throw new Error(`Provide "${key}".`);
   }
+  if (key === "owner" && !GITHUB_OWNER_RE.test(value)) {
+    throw new Error('Provide a valid GitHub "owner" login.');
+  }
+  if (key === "repo" && (!GITHUB_REPO_RE.test(value) || value === "." || value === "..")) {
+    throw new Error('Provide a valid GitHub "repo" name.');
+  }
   return value;
+}
+
+function requiredString(input: Record<string, unknown>, key: string): string {
+  if (typeof input[key] !== "string") {
+    throw new Error(`Provide "${key}" as a string.`);
+  }
+  return input[key];
+}
+
+/** Keeps a Contents path inside the selected repository; root is explicit only. */
+function normalizeContentsPath(raw: string, allowRoot: boolean): string {
+  const value = raw.replace(/^\/+/, "");
+  if (!value) {
+    if (allowRoot) {
+      return "";
+    }
+    throw new Error('Provide a non-empty file "path".');
+  }
+  const segments = value.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\u0000"))) {
+    throw new Error('GitHub file paths cannot contain empty, ".", or ".." segments.');
+  }
+  return segments.join("/");
 }
 
 function day(iso: unknown): string {
@@ -170,11 +207,12 @@ function isProbablyBinaryText(text: string): boolean {
 function formatGitHubFileText(record: Record<string, unknown>, text: string, streamTruncated = false): string {
   const path = str(record.path) || "file";
   const size = num(record.size);
+  const sha = str(record.sha);
   if (isProbablyBinaryText(text)) {
-    return `${path} is a binary file (${size} B) — cannot display as text.`;
+    return `${path} is a binary file (${size} B${sha ? `, sha ${sha}` : ""}) — cannot display as text.`;
   }
   const truncated = streamTruncated || text.length > MAX_FILE_CHARS;
-  return `${path} (${size} B${truncated ? `, showing first ${MAX_FILE_CHARS} chars` : ""}):\n${text.slice(0, MAX_FILE_CHARS)}`;
+  return `${path} (${size} B${sha ? `, sha ${sha}` : ""}${truncated ? `, showing first ${MAX_FILE_CHARS} chars` : ""}):\n${text.slice(0, MAX_FILE_CHARS)}`;
 }
 
 /** Encodes UTF-8 text as base64 for the contents API (writes). */
@@ -235,13 +273,13 @@ const FILE_LIKE_RE = /\.(?:tsx?|jsx?|mjs|cjs|json|md|css|scss|html|svg|png|jpe?g
 export function githubRepoRefs(text: string, limit = 3): Array<{ owner: string; repo: string }> {
   const out: Array<{ owner: string; repo: string }> = [];
   const seen = new Set<string>();
-  const push = (rawOwner: string, rawRepo: string) => {
+  const push = (rawOwner: string, rawRepo: string, allowFileLike: boolean) => {
     const owner = rawOwner.trim();
     const repo = rawRepo.trim().replace(/\.+$/, "").replace(/\.git$/i, "");
     if (!owner || !repo || out.length >= limit) {
       return;
     }
-    if (NON_REPO_OWNERS.has(owner.toLowerCase()) || FILE_LIKE_RE.test(repo)) {
+    if (NON_REPO_OWNERS.has(owner.toLowerCase()) || (!allowFileLike && FILE_LIKE_RE.test(repo))) {
       return;
     }
     if (!/[a-z]/i.test(owner + repo)) {
@@ -254,10 +292,10 @@ export function githubRepoRefs(text: string, limit = 3): Array<{ owner: string; 
     }
   };
   for (const match of text.matchAll(/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)/gi)) {
-    push(match[1], match[2]);
+    push(match[1], match[2], true);
   }
   for (const match of text.matchAll(/(?<![\w./@-])([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?)\/([A-Za-z0-9._-]{1,100})(?![\w/-])/g)) {
-    push(match[1], match[2]);
+    push(match[1], match[2], false);
   }
   return out;
 }
@@ -276,7 +314,9 @@ export function githubRunRepoRefs(
   if (explicit.length > 0) {
     return explicit;
   }
-  return pinnedRepo?.trim() ? githubRepoRefs(pinnedRepo.trim(), 1) : [];
+  const pin = pinnedRepo?.trim() ?? "";
+  const match = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})?)\/([A-Za-z0-9._-]{1,100})$/.exec(pin);
+  return match ? [{ owner: match[1], repo: match[2] }] : [];
 }
 
 /** Structured repo metadata for callers that need more than a display string (deep research). */
@@ -343,7 +383,7 @@ export function parseRepoPick(pick: string, repos: Map<string, GitHubRepoMeta>):
     const meta = prefix ? repos.get(prefix) : only;
     // A known repo prefix (or a lone sha-like ref) means a commit pick;
     // "src/@types/x.d.ts" has no repo prefix and falls through to files.
-    if (meta && ref && !ref.includes("/") && !ref.includes(":") && (repos.has(prefix) || /^[0-9a-f]{7,40}$/i.test(ref))) {
+    if (meta && ref && !ref.includes(":") && (repos.has(prefix) || /^[0-9a-f]{7,40}$/i.test(ref))) {
       return { meta, kind: "commit", ref };
     }
   }
@@ -408,7 +448,7 @@ async function ghFetch(
   }
 
   if (response.status === 404) {
-    throw new Error(
+    throw new GitHubNotFoundError(
       "Not found — or this token cannot see it. Private repos owned by an organization stay hidden until the org approves this OAuth app (see \"review org access\" on the GitHub card).",
     );
   }
@@ -571,9 +611,8 @@ async function getRepo(auth: string, input: Record<string, unknown>): Promise<st
 async function getContents(auth: string, input: Record<string, unknown>): Promise<string> {
   const owner = need(input, "owner");
   const repo = need(input, "repo");
-  const rawPath = str(input.path).replace(/^\/+/, "");
-  const encodedPath = rawPath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  const endpoint = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents${encodedPath ? `/${encodedPath}` : ""}`;
+  const rawPath = normalizeContentsPath(requiredString(input, "path"), true);
+  const endpoint = contentsEndpoint(owner, repo, rawPath, true);
   const ref = str(input.ref) || undefined;
   const data = await ghFetch(auth, endpoint, { query: { ref } });
   if (Array.isArray(data)) {
@@ -820,19 +859,23 @@ async function createBranch(auth: string, input: Record<string, unknown>): Promi
   return `Created branch "${branch}" in ${owner}/${repo} from ${from}@${sha.slice(0, 7)}. Commit with put_file, then open a PR with create_pull.`;
 }
 
-/** Contents endpoint for one path (segments encoded, leading slashes dropped). */
-function contentsEndpoint(owner: string, repo: string, rawPath: string): string {
-  const encodedPath = rawPath.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}`;
+/** Contents endpoint for one validated path; an empty root must be explicitly allowed. */
+function contentsEndpoint(owner: string, repo: string, rawPath: string, allowRoot = false): string {
+  const path = normalizeContentsPath(rawPath, allowRoot);
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents${encodedPath ? `/${encodedPath}` : ""}`;
 }
 
-/** Current blob sha of a file on a branch; null when it does not exist there. */
+/** Current blob sha of a file on a branch; null only when GitHub says it is absent. */
 async function fileShaOnBranch(auth: string, endpoint: string, branch: string): Promise<string | null> {
   let data: unknown;
   try {
     data = await ghFetch(auth, endpoint, { query: { ref: branch } });
-  } catch {
-    return null; // missing file — a missing BRANCH still fails honestly at the write itself
+  } catch (error) {
+    if (error instanceof GitHubNotFoundError) {
+      return null;
+    }
+    throw error;
   }
   if (Array.isArray(data)) {
     throw new Error("That path is a directory — pass a file path.");
@@ -845,9 +888,9 @@ async function putFile(auth: string, input: Record<string, unknown>): Promise<st
   const owner = need(input, "owner");
   const repo = need(input, "repo");
   const branch = need(input, "branch");
-  const path = need(input, "path").replace(/^\/+/, "");
+  const path = normalizeContentsPath(need(input, "path"), false);
   const message = need(input, "message");
-  const content = str(input.content);
+  const content = requiredString(input, "content");
   if (content.length > MAX_WRITE_CHARS) {
     throw new Error(
       `Content is ${content.length} chars — the per-write cap is ${MAX_WRITE_CHARS}. Split the file or the change.`,
@@ -856,6 +899,16 @@ async function putFile(auth: string, input: Record<string, unknown>): Promise<st
   await assertWritableBranch(auth, owner, repo, branch);
   const endpoint = contentsEndpoint(owner, repo, path);
   const existingSha = await fileShaOnBranch(auth, endpoint, branch);
+  const expectedSha = str(input.expected_sha).trim();
+  if (existingSha && !expectedSha) {
+    throw new Error(`File ${path} already exists on ${branch}. Read it first and pass its sha as "expected_sha" to prevent overwriting a newer edit.`);
+  }
+  if (existingSha && expectedSha !== existingSha) {
+    throw new Error(`File ${path} changed since it was read (expected ${expectedSha}, current ${existingSha}). Read it again before writing.`);
+  }
+  if (!existingSha && expectedSha) {
+    throw new Error(`File ${path} does not exist on ${branch}, but "expected_sha" was provided. Re-check the path before writing.`);
+  }
   const data = (await ghFetch(auth, endpoint, {
     method: "PUT",
     body: {
@@ -874,13 +927,17 @@ async function deleteFile(auth: string, input: Record<string, unknown>): Promise
   const owner = need(input, "owner");
   const repo = need(input, "repo");
   const branch = need(input, "branch");
-  const path = need(input, "path").replace(/^\/+/, "");
+  const path = normalizeContentsPath(need(input, "path"), false);
   const message = need(input, "message");
   await assertWritableBranch(auth, owner, repo, branch);
   const endpoint = contentsEndpoint(owner, repo, path);
   const sha = await fileShaOnBranch(auth, endpoint, branch);
   if (!sha) {
     throw new Error(`${path} does not exist on ${branch} — nothing to delete.`);
+  }
+  const expectedSha = need(input, "expected_sha");
+  if (expectedSha !== sha) {
+    throw new Error(`File ${path} changed since it was read (expected ${expectedSha}, current ${sha}). Read it again before deleting.`);
   }
   const data = (await ghFetch(auth, endpoint, {
     method: "DELETE",
@@ -950,6 +1007,32 @@ const MAX_PATCH_CHARS = 2_500;
 
 /** Tail kept from a CI job log — failures live at the end. */
 const LOG_TAIL_CHARS = 9_000;
+
+type JobLogTail = { text: string; totalChars: number; truncated: boolean };
+
+/** Streams a potentially huge log while retaining only its failure-heavy tail. */
+async function readResponseTextTail(response: Response, maxChars: number): Promise<JobLogTail> {
+  if (!response.body) {
+    const text = stripAnsi(await response.text());
+    return { text: text.slice(-maxChars), totalChars: text.length, truncated: text.length > maxChars };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let tail = "";
+  let totalChars = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) {
+      tail += decoder.decode();
+      break;
+    }
+    const text = decoder.decode(chunk.value, { stream: true });
+    totalChars += text.length;
+    tail = `${tail}${text}`.slice(-(maxChars + 128));
+  }
+  const clean = stripAnsi(tail).slice(-maxChars);
+  return { text: clean, totalChars: Math.max(totalChars, clean.length), truncated: totalChars > maxChars };
+}
 
 /** Renders a GitHub "files" array (commit / PR / compare) as readable unified diffs within a budget. */
 export function formatDiffFiles(files: Array<Record<string, unknown>>, budget = MAX_FILE_CHARS): string {
@@ -1027,11 +1110,18 @@ async function getPullFiles(auth: string, input: Record<string, unknown>): Promi
   if (number === 0) {
     throw new Error('Provide "number".');
   }
-  const files = asRecordArray(
-    await ghFetch(auth, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/files`, {
-      query: { per_page: 100 },
-    }),
-  );
+  const files: Array<Record<string, unknown>> = [];
+  for (let page = 1; page <= 30; page += 1) {
+    const batch = asRecordArray(
+      await ghFetch(auth, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/files`, {
+        query: { per_page: 100, page },
+      }),
+    );
+    files.push(...batch);
+    if (batch.length < 100) {
+      break;
+    }
+  }
   return `PR #${number} in ${owner}/${repo} — ${files.length} changed files:\n\n${formatDiffFiles(files)}`;
 }
 
@@ -1096,17 +1186,31 @@ async function listRunJobs(auth: string, input: Record<string, unknown>): Promis
 }
 
 /**
- * Job logs sit behind a 302 to blob storage; the Worker follows redirects
- * freely (no CORS constraints server-side), so a direct fetch is enough.
+ * GitHub job logs redirect to a signed blob URL. Follow that hop manually and
+ * deliberately drop Authorization so a repository credential never reaches
+ * blob storage; the streamed reader retains only the bounded log tail.
  */
-async function fetchJobLogText(auth: string, owner: string, repo: string, jobId: number): Promise<string> {
+async function fetchJobLogText(auth: string, owner: string, repo: string, jobId: number): Promise<JobLogTail> {
   const target = `${GITHUB_API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/jobs/${jobId}/logs`;
-  const headers = githubRequestHeaders(auth);
   let response: Response;
   try {
-    response = await fetch(target, { headers });
-  } catch {
-    throw new Error("Could not reach GitHub logs.");
+    response = await fetch(target, { headers: githubRequestHeaders(auth), redirect: "manual" });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error("GitHub log redirect had no destination.");
+      }
+      const download = new URL(location, target);
+      if (download.protocol !== "https:" || download.username || download.password) {
+        throw new Error("GitHub returned an unsafe log download URL.");
+      }
+      response = await fetch(download.toString(), {
+        headers: { Accept: "text/plain" },
+        redirect: "follow",
+      });
+    }
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : "Could not reach GitHub logs.");
   }
   if (response.status === 404) {
     throw new Error("No logs — they expire after 90 days, or the job_id is wrong (take it from list_run_jobs).");
@@ -1114,7 +1218,7 @@ async function fetchJobLogText(auth: string, owner: string, repo: string, jobId:
   if (!response.ok) {
     throw githubApiError(response, await githubErrorMessage(response));
   }
-  return stripAnsi(await response.text());
+  return readResponseTextTail(response, LOG_TAIL_CHARS);
 }
 
 async function getJobLogs(auth: string, input: Record<string, unknown>): Promise<string> {
@@ -1124,12 +1228,12 @@ async function getJobLogs(auth: string, input: Record<string, unknown>): Promise
   if (jobId === 0) {
     throw new Error('Provide "job_id" (from list_run_jobs).');
   }
-  const text = (await fetchJobLogText(auth, owner, repo, jobId)).trim();
+  const log = await fetchJobLogText(auth, owner, repo, jobId);
+  const text = log.text.trim();
   if (!text) {
     return `Job ${jobId} produced an empty log.`;
   }
-  const tail = text.length > LOG_TAIL_CHARS ? text.slice(-LOG_TAIL_CHARS) : text;
-  return `Log of job ${jobId}${text.length > LOG_TAIL_CHARS ? ` (last ${LOG_TAIL_CHARS} of ${text.length} chars — failures live at the end)` : ""}:\n${tail}`;
+  return `Log of job ${jobId}${log.truncated ? ` (last ${LOG_TAIL_CHARS} of ${log.totalChars} chars — failures live at the end)` : ""}:\n${text}`;
 }
 
 async function listRunArtifacts(auth: string, input: Record<string, unknown>): Promise<string> {
@@ -1257,7 +1361,7 @@ export async function fetchRepoCiSnapshot(auth: string, owner: string, repo: str
     text = `${header}\n${jobs.map(formatJobLine).join("\n")}`;
     if (failedJob) {
       try {
-        const log = (await fetchJobLogText(auth, owner, repo, num(failedJob.id))).trim();
+        const log = (await fetchJobLogText(auth, owner, repo, num(failedJob.id))).text.trim();
         if (log) {
           text += `\n\nLog tail of failed job "${str(failedJob.name)}":\n${log.slice(-6_000)}`;
         }
@@ -1444,7 +1548,7 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
   },
   {
     name: "get_pull_files",
-    description: "Get a pull request's full diff: every changed file with its patch.",
+    description: "Get a pull request's full diff: every changed file with its patch (up to GitHub's 3,000-file API limit).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1623,7 +1727,7 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
   {
     name: "put_file",
     description:
-      "Create or update ONE file on a working branch as a commit. Pass the COMPLETE new file content — never a diff, never placeholders. The default branch is write-protected: commit to a create_branch branch and ship the change as a PR (create_pull).",
+      "Create or update ONE file on a working branch as a commit. Pass the COMPLETE new file content — never a diff, never placeholders. To update an existing file, read it first and pass its sha as expected_sha; stale writes are refused. The default branch is write-protected: commit to a create_branch branch and ship the change as a PR (create_pull).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1631,7 +1735,8 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
         repo: { type: "string", description: "Repo name" },
         branch: { type: "string", description: "Working branch to commit to (never the default branch)" },
         path: { type: "string", description: "File path, e.g. src/app.ts" },
-        content: { type: "string", description: "The complete new file content (UTF-8 text)" },
+        content: { type: "string", description: "The complete new file content (UTF-8 text; an explicit empty string is allowed)" },
+        expected_sha: { type: "string", description: "Required when updating an existing file: sha returned by get_contents" },
         message: { type: "string", description: "Commit message" },
       },
       required: ["owner", "repo", "branch", "path", "content", "message"],
@@ -1639,7 +1744,7 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
   },
   {
     name: "delete_file",
-    description: "Delete one file on a working branch as a commit. The default branch is write-protected.",
+    description: "Delete one file on a working branch as a commit. Read it first and pass its sha as expected_sha; stale deletes are refused. The default branch is write-protected.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1647,9 +1752,10 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
         repo: { type: "string", description: "Repo name" },
         branch: { type: "string", description: "Working branch (never the default branch)" },
         path: { type: "string", description: "File path to delete" },
+        expected_sha: { type: "string", description: "sha returned by get_contents for the version being deleted" },
         message: { type: "string", description: "Commit message" },
       },
-      required: ["owner", "repo", "branch", "path", "message"],
+      required: ["owner", "repo", "branch", "path", "expected_sha", "message"],
     },
   },
   {

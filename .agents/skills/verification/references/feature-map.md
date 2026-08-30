@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `bc5cb7f` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `6bf0c9c` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
@@ -10,7 +10,7 @@ grant sync/refresh + server GitHub User-Agent and authenticated raw-file reads,
 Julius Verifier GitHub hand-off, MCP structured/resource content reads, honesty
 rule in default system prompts, skills-as-guidance research fix + empty-question
 guard, Intercom attachments)
-Drift check: `git log --oneline bc5cb7f..HEAD`, then compare against
+Drift check: `git log --oneline 6bf0c9c..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -169,6 +169,12 @@ contents are read before the model answers and the real root listing is added
 to context. A missing/expired credential, profile exclusion, org 404, or
 fine-grained PAT without Contents permission becomes an explicit failed
 `mcp_github_get_contents` record — never a model pretending it read code.
+Explicit owner/repo text now force-arms GitHub just like a thread pin. Disabled
+native tools remain disabled in deterministic pin preflight and Deep Research;
+profile and automation connector allow-lists intersect in cloud runs exactly as
+in the browser. Julius candidates and Verifier are read-only at BOTH definition
+and route-execution layers, so parallel candidates cannot multiply GitHub writes
+and a hidden write name cannot bypass the filter.
 Credential hand-off (2026-08-30): the browser resolves the credential at run
 start (PAT or device-flow sign-in) and injects it only into the authenticated
 run request (`injectGitHubRunAuth`); it is neither logged nor persisted in the
@@ -178,14 +184,23 @@ mandatory User-Agent + API version. The missing header made GitHub reject all
 Worker calls — including `/user` — with 403 while the same credential passed in
 the browser, producing the false "token dead" diagnosis. Live control probe:
 no User-Agent → 403, identified request → 200. Error classification matches the
-browser: only 401 asks for a new credential; 403/429 keeps it and reports the
-actual rate-limit/SSO/org-policy cause. `get_contents` now requires an exact
+browser: only 401 asks for a new credential; 403/429 (including Retry-After
+secondary limits) keeps it and reports the actual rate-limit/SSO/org-policy
+cause. Native browser and Worker tables are contract-tested as the same 30 tools;
+every dispatcher has a method/endpoint fixture. New GitHub connections start
+read-only: seven mutations remain disabled until deliberately enabled. `get_contents` now requires an exact
 path (empty string means root) and returns the real file body, not just the tree:
 inline base64 still takes the fast path, while GitHub's normal `encoding:none`
 response for 1–100 MB files is retried through the authenticated raw media type
 with the same branch/ref; empty files remain valid and binary payloads stay
-honestly labelled. Regressions: `github-run-flow.test.ts`,
-`mcp-file-content.test.ts`. New chats start without a pin; signed out stays an
+honestly labelled. Owner/repo values and every Contents path are validated before
+fetch; empty or dot-segments cannot escape the selected repo. File reads show
+GitHub's blob sha; updates and deletes require the sha that was actually read and
+refuse stale versions, while an explicit empty new file remains valid. PR file
+diffs page to GitHub's 3,000-file ceiling. Actions logs stream only a bounded
+tail; their signed cross-host redirect is followed without Authorization.
+Regressions: `github-run-flow.test.ts`, `mcp-file-content.test.ts`,
+`github-security.test.ts`. New chats start without a pin; signed out stays an
 honest unavailable state.
 
 Repo access probe (2026-08-30, `composer-repo-diagnose`): listing repos
@@ -207,9 +222,19 @@ header → authorize URL) · 401 dead token · 403 rate-limit/IP-allow-list
 (quotes GitHub's message). Verdict card (`composer-repo-verdict`) shows
 title, plain-language fix, honest probe trace ("Checked as @login —
 repo HTTP 404"), external action link, and "Sign in on the MCP page…"
-for scope/401 verdicts. These diagnostic probes stay entirely in the browser;
-actual cloud agent runs transmit the credential to Gera's authenticated worker
-for that run so the server can call GitHub, but do not log or persist it.
+for scope/401 verdicts. SSO and GitHub refusal text are collected from the
+contents response too, not only metadata. These diagnostic probes stay entirely
+in the browser; actual cloud agent runs transmit the credential to Gera's
+authenticated worker for that run so the server can call GitHub, but do not log
+or persist it. Repo picker cache entries are keyed by a non-secret credential
+fingerprint, so an account/PAT swap cannot show the previous account's private
+repo names. Explicit Gera sign-out/account exchange clears account-scoped local
+data and in-memory MCP sessions before the next identity mounts; a missing local
+GitHub credential also removes the connector from the run instead of resurrecting
+a stale synced grant. Project-agent GitHub tokens are normalized and a newly
+entered token must verify before save. Slack-originated project-agent runs are
+always native GitHub read-only, even when the same agent has write access inside
+authenticated Gera.
 
 - Attachments: paste/pick files (images, pdf, docx, xlsx), remove, drag to
   reorder (↑/↓ works too).
@@ -794,7 +819,8 @@ beacon sink (no Gera identity — the shard checks the project's write-only
 tracking key; feeds the desk's "Recent page views")
 · `/hooks/<id>` webhook
 triggers · `/surf` selfsurf · `/knowledge/*` · `/oauth-proxy` · `/mcp-proxy`
-· `/intercom/*` · `/cron/automations` (HMAC via CRON_SECRET).
+(manual redirects: same-origin keeps auth; cross-origin GET strips caller
+credentials; cross-origin POST is refused) · `/intercom/*` · `/cron/automations` (HMAC via CRON_SECRET).
 
 ## E2E coverage
 
@@ -805,6 +831,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | boot-to-launchpad | Gate bypass, launchpad, composer, sidebar render |
 | send-chat-message | Send → user turn + streamed reply + `/c/` address |
 | new-chat-keeps-history | New chat resets view, thread stays listed |
+| github-pin-and-send | Connected GitHub → private repo list → pin → `/runs/start` carries exact repo + credential |
 | switch-chat-model | Picker root → Model submenu → selection sticks |
 | switch-chat-effort | Picker root → Effort submenu → budget pins |
 | switch-run-mode | Model-style mode picker engages Deep research, trigger reflects it |
@@ -829,9 +856,11 @@ modules directly: `cron-auth.test.ts` (HMAC contract), `run-protocol.test.ts`
 finalize, sweep isolation), `automation-schedule.test.ts` (the
 `automationDue ⟺ nextDueAt` alarm invariant across cadences/timezones),
 `project-shared.test.ts` (handles/translit, @mention parsing incl. email
-false-positives, and the access→tool contract: read-only GitHub arms zero
-write tools; missing tokens arm nothing and are reported), plus
-`mcp-rotation`, `mcp-file-content`, `agent-steering`, `github-native`. Only the Durable
+false-positives, the access→tool contract, and Slack-origin write downgrade:
+read-only GitHub arms zero write tools; missing tokens arm nothing and are
+reported), plus `mcp-rotation`, `mcp-file-content`, `github-security` (all 30
+browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
+account isolation), `agent-steering`, `github-native`. Only the Durable
 Object glue in `chat-store.ts` / `project-store.ts` stays untested — its
 typecheck happens at the functions deploy (`runChecks functions`), not in
 web tsc.

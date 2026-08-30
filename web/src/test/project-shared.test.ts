@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { normalizeCloudMcpServer } from "../../../functions/mcp-cloud";
 import {
+  accessForAgentSurface,
   describeAgentAccess,
   ensureUniqueHandle,
   githubToolAllowed,
@@ -117,6 +118,18 @@ describe("githubToolAllowed", () => {
     expect(githubToolAllowed("write", "put_file")).toBe(true);
     expect(githubToolAllowed("write", "get_repo")).toBe(true);
     expect(githubToolAllowed("off", "get_repo")).toBe(false);
+  });
+});
+
+describe("accessForAgentSurface", () => {
+  it("keeps authenticated project runs intact but downgrades inbound Slack GitHub writes", () => {
+    const full = access({ github: "write", slack: true });
+    expect(accessForAgentSurface(full, "project")).toBe(full);
+    const slack = accessForAgentSurface(full, "slack");
+    expect(slack.github).toBe("read");
+    expect(planAgentTools(slack, flags(true, false, true)).native.map((tool) => tool.fnName)).not.toContain(
+      "github_put_file",
+    );
   });
 });
 

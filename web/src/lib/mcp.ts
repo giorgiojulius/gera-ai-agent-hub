@@ -29,6 +29,7 @@ type JsonRpcResponse = {
 
 type McpSession = {
   configId: string;
+  generation: number;
   url: string;
   headers: Record<string, string>;
   usedOAuth: boolean;
@@ -39,6 +40,13 @@ type McpSession = {
 };
 
 const sessions = new Map<string, McpSession>();
+let sessionGeneration = 0;
+
+/** Drops every in-memory session/header copy when the signed-in Gera account leaves. */
+export function clearMcpSessionCache(): void {
+  sessionGeneration += 1;
+  sessions.clear();
+}
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -384,9 +392,11 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
       throw error;
     }
   }
+  const generation = sessionGeneration;
   const auth = await buildAuth(config);
   const session: McpSession = {
     configId: config.id,
+    generation,
     url: auth.url,
     headers: auth.headers,
     usedOAuth: auth.usedOAuth,
@@ -425,6 +435,9 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
         : { type: "object", properties: {} },
   })).filter((tool) => tool.name.length > 0);
 
+  if (generation !== sessionGeneration) {
+    throw new Error("The signed-in account changed while MCP was connecting.");
+  }
   sessions.set(config.id, session);
   const info = initResult?.serverInfo;
   const serverName = typeof info?.name === "string" && info.name.trim() ? info.name.trim() : "";
@@ -453,6 +466,10 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
     return callGitHubNativeTool(auth, name, args);
   }
   let session = sessions.get(config.id);
+  if (session && session.generation !== sessionGeneration) {
+    sessions.delete(config.id);
+    session = undefined;
+  }
   if (!session) {
     await connectMcpServer(config);
     session = sessions.get(config.id);
@@ -540,18 +557,18 @@ export function findServerForTool(servers: McpServerConfig[], functionName: stri
   }
   const rest = functionName.slice(4);
   for (const server of servers) {
-    if (!server.enabled) {
+    if (!server.enabled || server.status !== "connected") {
       continue;
     }
     const prefix = `${compactId(server.id)}_`;
-    if (!rest.startsWith(prefix) && !rest.startsWith(compactId(server.id))) {
+    if (!rest.startsWith(prefix)) {
       continue;
     }
-    const toolPart = rest.startsWith(prefix) ? rest.slice(prefix.length) : "";
-    const tool = (nativeToolTable(server) ?? server.tools).find((item) => {
-      const safe = safeName(item.name);
-      return safe === toolPart || safe.startsWith(toolPart) || toolPart.startsWith(safe) || item.name === toolPart;
-    });
+    const tool = (nativeToolTable(server) ?? server.tools).find(
+      (item) =>
+        !server.disabledTools.includes(item.name) &&
+        mcpFunctionName(server.id, item.name) === functionName,
+    );
     if (tool) {
       return { server, toolName: tool.name };
     }

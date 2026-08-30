@@ -332,6 +332,16 @@ export function findCatalogEntry(id: string): McpCatalogEntry | undefined {
   return CATALOG_BY_ID.get(id);
 }
 
+const GITHUB_WRITE_TOOLS = [
+  "create_issue",
+  "add_issue_comment",
+  "create_branch",
+  "put_file",
+  "delete_file",
+  "create_pull",
+  "update_pull",
+] as const;
+
 export function catalogEntryToServer(entry: McpCatalogEntry): McpServerConfig {
   return {
     id: entry.id,
@@ -343,7 +353,9 @@ export function catalogEntryToServer(entry: McpCatalogEntry): McpServerConfig {
     enabled: true,
     status: "idle",
     tools: [],
-    disabledTools: [],
+    // New GitHub connections begin read-only. The user can deliberately enable
+    // individual mutation tools on the card; unattended writes are never opt-out.
+    disabledTools: entry.id === "github" ? [...GITHUB_WRITE_TOOLS] : [],
   };
 }
 

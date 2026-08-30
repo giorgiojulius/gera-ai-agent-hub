@@ -101,6 +101,8 @@ export type EngineToolRecord = {
 
 export type EngineToolOutcome = {
   text: string;
+  /** The tool returned an honest failure payload that still needs to reach the model. */
+  isError?: boolean;
   images?: string[];
   videos?: string[];
   audios?: string[];
@@ -968,7 +970,7 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
           if (outcome.result.audios) {
             audios.push(...outcome.result.audios);
           }
-          record.status = "done";
+          record.status = outcome.result.isError === true ? "error" : "done";
         } else {
           record.status = "error";
           record.result = outcome.error instanceof Error ? outcome.error.message : "Tool failed.";

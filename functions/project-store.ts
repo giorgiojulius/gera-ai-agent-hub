@@ -121,6 +121,7 @@ import {
   SCREEN_CHAT_KEEP,
   SCREEN_NAME_LIMIT,
   THREAD_CONTEXT_MESSAGES,
+  accessForAgentSurface,
   canManageProject,
   describeAgentAccess,
   ensureUniqueHandle,
@@ -1499,6 +1500,9 @@ export class ProjectStore extends DurableObject {
       }
     };
     applySecret("githubToken", incoming.githubToken);
+    if (secrets.githubToken) {
+      secrets.githubToken = secrets.githubToken.replace(/^Bearer\s+/i, "");
+    }
     applySecret("intercomToken", incoming.intercomToken);
     applySecret("slackToken", incoming.slackToken);
     applySecret("slackSigningSecret", incoming.slackSigningSecret);
@@ -3437,14 +3441,17 @@ export class ProjectStore extends DurableObject {
    * run. External MCP servers connect live (in parallel) — `mcpNote` reports
    * per-server status honestly for the system prompt ("" when none).
    */
-  private async buildAgentToolset(agent: AgentRow): Promise<{
+  private async buildAgentToolset(agent: AgentRow, surface: "project" | "slack" = "project"): Promise<{
     tools: EngineToolDef[];
     routes: Map<string, McpRoute>;
     plan: AgentToolPlan;
     access: AgentAccess;
     mcpNote: string;
   }> {
-    const access = normalizeAccess(JSON.parse(agent.access || "{}") as unknown);
+    const access = accessForAgentSurface(
+      normalizeAccess(JSON.parse(agent.access || "{}") as unknown),
+      surface,
+    );
     const secrets = parseSecrets(agent.secrets);
     const selection = access.mcp ? secrets.mcpSelection : undefined;
     const selectionRefs = selection?.servers ?? [];
@@ -3473,7 +3480,12 @@ export class ProjectStore extends DurableObject {
       routes.set(planned.fnName, {
         type: "native",
         kind: planned.kind,
-        auth: planned.kind === "github" ? `Bearer ${token}` : token,
+        auth:
+          planned.kind === "github"
+            ? token.toLowerCase().startsWith("bearer ")
+              ? token
+              : `Bearer ${token}`
+            : token,
         toolName: planned.toolName,
         serverName: planned.kind,
       });
@@ -4037,7 +4049,7 @@ export class ProjectStore extends DurableObject {
       );
       return;
     }
-    const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent);
+    const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent, "slack");
 
     // Bot identity — used to strip self-mentions; failures are non-fatal.
     let botUserId = "";

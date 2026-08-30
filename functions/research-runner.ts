@@ -490,6 +490,8 @@ export type ResearchRunParams = {
   depth?: ResearchDepth;
   /** Ready GitHub Authorization value (client resolves the sign-in/PAT). */
   githubAuth?: string;
+  /** Native tools disabled on the selected GitHub connector. */
+  githubDisabledTools?: string[];
   /** Thread pin used when the current question does not name another repo. */
   githubRepo?: string;
   citations?: "numeric" | "links";
@@ -568,6 +570,8 @@ export async function runServerDeepResearch(
   const repos = new Map<string, GitHubRepoMeta>();
   const readRepoPicks = new Set<string>();
   const githubAuth: string | null = params.githubAuth?.trim() ? params.githubAuth.trim() : null;
+  const githubDisabled = new Set(params.githubDisabledTools ?? []);
+  const canGitHub = (toolName: string): boolean => !githubDisabled.has(toolName);
   const upsertRepoSource = (url: string, title: string, text: string) => {
     if (!registry.has(url)) {
       registerHit({ url, title, highlights: [] });
@@ -672,14 +676,16 @@ export async function runServerDeepResearch(
     // The pin is structured run data — system-prompt prose alone never reached
     // this deterministic GitHub preload, which made pinned private repos vanish.
     const repoRefs = githubRunRepoRefs(params.prompt, params.githubRepo);
-    if (repoRefs.length > 0 && !githubAuth) {
+    if (repoRefs.length > 0 && (!githubAuth || !canGitHub("get_repo"))) {
       finishStep(
         addStep("read", repoRefs.map((ref) => `${ref.owner}/${ref.repo}`).join(", "), "GitHub"),
         "error",
-        "GitHub connector is disabled — enable it in Connections so research can read the repo",
+        !githubAuth
+          ? "GitHub connector is disabled — enable it in Connections so research can read the repo"
+          : "GitHub get_repo is disabled for this connector — repository preload was not allowed",
       );
     }
-    if (githubAuth) {
+    if (githubAuth && canGitHub("get_repo")) {
       for (const ref of repoRefs) {
         ensureAlive();
         const step = addStep("read", `${ref.owner}/${ref.repo}`, "GitHub · overview, tree, commits, CI");
@@ -693,31 +699,38 @@ export async function runServerDeepResearch(
           ]
             .filter(Boolean)
             .join("\n");
-          let tree = "File tree unavailable.";
-          try {
-            tree = await callGitHubNativeTool(githubAuth, "get_file_tree", { owner, repo, ref: meta.defaultBranch });
-          } catch {
-            // keep the placeholder — overview and commits are still worth having
+          let tree = canGitHub("get_file_tree") ? "File tree unavailable." : "File tree tool disabled.";
+          if (canGitHub("get_file_tree")) {
+            try {
+              tree = await callGitHubNativeTool(githubAuth, "get_file_tree", { owner, repo, ref: meta.defaultBranch });
+            } catch {
+              // keep the placeholder — overview and commits are still worth having
+            }
           }
           upsertRepoSource(
             meta.htmlUrl,
             `${meta.fullName} — repository overview & file tree`,
             `${overview}\n\n${tree}`.slice(0, profile.pageChars * 2),
           );
-          try {
-            const readme = await callGitHubNativeTool(githubAuth, "get_readme", { owner, repo });
-            upsertRepoSource(`${meta.htmlUrl}#readme`, `${meta.fullName} — README`, readme.slice(0, profile.pageChars));
-          } catch {
-            // no README — skip the source
+          if (canGitHub("get_readme")) {
+            try {
+              const readme = await callGitHubNativeTool(githubAuth, "get_readme", { owner, repo });
+              upsertRepoSource(`${meta.htmlUrl}#readme`, `${meta.fullName} — README`, readme.slice(0, profile.pageChars));
+            } catch {
+              // no README — skip the source
+            }
           }
-          try {
-            const commits = await callGitHubNativeTool(githubAuth, "list_commits", { owner, repo, limit: 30 });
-            upsertRepoSource(`${meta.htmlUrl}/commits/${meta.defaultBranch}`, `${meta.fullName} — recent commits`, commits);
-          } catch {
-            // commits are optional
+          if (canGitHub("list_commits")) {
+            try {
+              const commits = await callGitHubNativeTool(githubAuth, "list_commits", { owner, repo, limit: 30 });
+              upsertRepoSource(`${meta.htmlUrl}/commits/${meta.defaultBranch}`, `${meta.fullName} — recent commits`, commits);
+            } catch {
+              // commits are optional
+            }
           }
-          try {
-            const ci = await fetchRepoCiSnapshot(githubAuth, owner, repo);
+          if (["list_workflow_runs", "list_run_jobs", "get_job_logs"].every(canGitHub)) {
+            try {
+              const ci = await fetchRepoCiSnapshot(githubAuth, owner, repo);
             if (ci) {
               upsertRepoSource(
                 `${meta.htmlUrl}/actions`,
@@ -727,9 +740,10 @@ export async function runServerDeepResearch(
               if (ci.failure) {
                 upsertRepoSource(ci.failure.url, ci.failure.title, ci.failure.text.slice(0, profile.pageChars));
               }
+              }
+            } catch {
+              // Actions disabled or inaccessible — CI context is optional
             }
-          } catch {
-            // Actions disabled or inaccessible — CI context is optional
           }
           finishStep(step, "done", `GitHub · @${meta.defaultBranch}`);
         } catch (error) {
@@ -893,6 +907,12 @@ export async function runServerDeepResearch(
                 ? `commit ${target.ref.slice(0, 10)}`
                 : `PR #${target.number} diff`;
           const step = addStep("read", label.slice(0, 90), `GitHub · ${target.meta.fullName}`);
+          const toolName =
+            target.kind === "file" ? "get_contents" : target.kind === "commit" ? "get_commit" : "get_pull_files";
+          if (!canGitHub(toolName)) {
+            finishStep(step, "error", `${toolName} is disabled for this connector`);
+            continue;
+          }
           try {
             const [owner, repo] = target.meta.fullName.split("/");
             let url: string;

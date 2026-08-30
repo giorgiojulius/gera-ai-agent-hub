@@ -164,11 +164,20 @@ const OAUTH_DISCOVERY_PREFIXES = [
 const OAUTH_BODY_LIMIT = 16_384;
 
 function isForbiddenHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
+  const host = hostname.toLowerCase().replace(/\.$/, "");
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
     return true;
   }
-  if (host === "0.0.0.0" || host === "::1" || host === "[::1]") {
+  if (host === "0.0.0.0" || host === "::" || host === "[::]" || host === "::1" || host === "[::1]") {
+    return true;
+  }
+  const ipv6 = host.replace(/^\[|\]$/g, "");
+  if (
+    /^(?:fc|fd)/i.test(ipv6) ||
+    /^fe[89ab]/i.test(ipv6) ||
+    /^::ffff:(?:7f[0-9a-f]{2}|a[0-9a-f]{2}|ac1[0-9a-f]|a9fe|c0a8):/i.test(ipv6) ||
+    /^::ffff:(?:127\.|10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.)/i.test(ipv6)
+  ) {
     return true;
   }
   if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) {
@@ -209,7 +218,7 @@ async function relayOAuth(request: Request, url: URL): Promise<Response> {
     if (!OAUTH_DISCOVERY_PREFIXES.some((prefix) => parsed.pathname.startsWith(prefix))) {
       return corsJson({ error: "path_not_allowed" }, 403);
     }
-    init = { method: "GET", headers: { Accept: "application/json" }, redirect: "follow" };
+    init = { method: "GET", headers: { Accept: "application/json" }, redirect: "manual" };
   } else if (request.method === "POST") {
     const contentType = request.headers.get("Content-Type") ?? "";
     const allowedType =
@@ -225,22 +234,53 @@ async function relayOAuth(request: Request, url: URL): Promise<Response> {
       method: "POST",
       headers: { "Content-Type": contentType, Accept: "application/json" },
       body,
-      redirect: "follow",
+      redirect: "manual",
     };
   } else {
     return corsJson({ error: "method_not_allowed" }, 405);
   }
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(parsed.toString(), init);
-  } catch (error) {
-    console.error(
-      "oauth relay unreachable",
-      parsed.hostname,
-      error instanceof Error ? error.message : "fetch failed",
-    );
-    return corsJson({ error: "upstream_unreachable" }, 502);
+  let upstream: Response | null = null;
+  let current = parsed;
+  let currentInit = init;
+  for (let hop = 0; hop <= 5; hop += 1) {
+    try {
+      upstream = await fetch(current.toString(), currentInit);
+    } catch (error) {
+      console.error(
+        "oauth relay unreachable",
+        current.hostname,
+        error instanceof Error ? error.message : "fetch failed",
+      );
+      return corsJson({ error: "upstream_unreachable" }, 502);
+    }
+    if (upstream.status < 300 || upstream.status >= 400) {
+      break;
+    }
+    const location = upstream.headers.get("location");
+    if (!location) {
+      return corsJson({ error: "redirect_without_location" }, 502);
+    }
+    let next: URL;
+    try {
+      next = new URL(location, current);
+    } catch {
+      return corsJson({ error: "invalid_redirect" }, 502);
+    }
+    if (next.protocol !== "https:" || next.username || next.password || isForbiddenHost(next.hostname)) {
+      return corsJson({ error: "redirect_not_allowed" }, 502);
+    }
+    if (currentInit.method === "POST" && next.origin !== current.origin) {
+      return corsJson({ error: "cross_origin_redirect_refused" }, 502);
+    }
+    if (upstream.status === 303) {
+      currentInit = { method: "GET", headers: { Accept: "application/json" }, redirect: "manual" };
+    }
+    current = next;
+    upstream = null;
+  }
+  if (!upstream) {
+    return corsJson({ error: "too_many_redirects" }, 502);
   }
 
   const text = await upstream.text();
@@ -1761,11 +1801,11 @@ const MCP_DROP_PREFIXES = ["cf-", "sec-", "x-forwarded-"];
 /**
  * Forwards MCP Streamable HTTP POSTs — and plain GETs (GitHub Actions job
  * logs sit behind a redirect to blob storage that sends no CORS headers, so
- * browsers cannot follow it; this relay follows it server-side) — adding
- * CORS on the way back. All caller headers pass through except hop-by-hop
- * and platform ones — Bearer tokens and custom API-key schemes both work.
- * Bodies are size-capped, only https targets on public hosts are allowed,
- * and nothing beyond host/path/status is ever logged.
+ * browsers cannot follow it). Redirects are manual: same-origin hops retain
+ * auth, while a cross-origin GET follows with every caller credential removed;
+ * cross-origin POST redirects are refused. Bodies are size-capped, only https
+ * targets on public hosts are allowed, and nothing beyond host/path/status is
+ * ever logged.
  */
 async function relayMcp(request: Request, url: URL): Promise<Response> {
   if (request.method !== "POST" && request.method !== "GET") {
@@ -1809,17 +1849,60 @@ async function relayMcp(request: Request, url: URL): Promise<Response> {
   }
   headers["user-agent"] = "Gera-AI-Relay/1.0";
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(parsed.toString(), {
-      method: request.method,
-      headers,
-      body: request.method === "POST" ? body : undefined,
-      redirect: "follow",
-    });
-  } catch (error) {
-    console.error("mcp relay unreachable", parsed.hostname, error instanceof Error ? error.message : "fetch failed");
-    return corsJson({ error: "upstream_unreachable" }, 502);
+  let upstream: Response | null = null;
+  let current = parsed;
+  let method: "GET" | "POST" = request.method === "POST" ? "POST" : "GET";
+  let forwardBody: string | undefined = method === "POST" ? body : undefined;
+  let forwardHeaders = { ...headers };
+  for (let hop = 0; hop <= 5; hop += 1) {
+    try {
+      upstream = await fetch(current.toString(), {
+        method,
+        headers: forwardHeaders,
+        body: forwardBody,
+        redirect: "manual",
+      });
+    } catch (error) {
+      console.error("mcp relay unreachable", current.hostname, error instanceof Error ? error.message : "fetch failed");
+      return corsJson({ error: "upstream_unreachable" }, 502);
+    }
+    if (upstream.status < 300 || upstream.status >= 400) {
+      break;
+    }
+    const location = upstream.headers.get("location");
+    if (!location) {
+      return corsJson({ error: "redirect_without_location" }, 502);
+    }
+    let next: URL;
+    try {
+      next = new URL(location, current);
+    } catch {
+      return corsJson({ error: "invalid_redirect" }, 502);
+    }
+    if (next.protocol !== "https:" || next.username || next.password || isForbiddenHost(next.hostname)) {
+      return corsJson({ error: "redirect_not_allowed" }, 502);
+    }
+    if (next.origin !== current.origin) {
+      if (method === "POST") {
+        return corsJson({ error: "cross_origin_redirect_refused" }, 502);
+      }
+      // GitHub's signed Actions blob needs no API credential. Dropping every
+      // caller-controlled header is safer than guessing which custom name is a key.
+      forwardHeaders = {
+        accept: forwardHeaders.accept ?? "*/*",
+        "user-agent": "Gera-AI-Relay/1.0",
+      };
+    }
+    if (upstream.status === 303 || ((upstream.status === 301 || upstream.status === 302) && method === "POST")) {
+      method = "GET";
+      forwardBody = undefined;
+      delete forwardHeaders["content-type"];
+    }
+    current = next;
+    upstream = null;
+  }
+  if (!upstream) {
+    return corsJson({ error: "too_many_redirects" }, 502);
   }
 
   console.log("mcp relay", parsed.hostname, parsed.pathname, upstream.status);

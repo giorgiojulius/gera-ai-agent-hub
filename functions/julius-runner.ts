@@ -366,6 +366,19 @@ function verifierMcpToolDefs(tools: EngineToolDef[]): EngineToolDef[] {
   );
 }
 
+/** Runtime routes must never exceed the names actually advertised to a phase. */
+export function mcpRoutesForToolDefs(
+  tools: EngineToolDef[],
+  routes: Map<string, McpRoute> | undefined,
+): Map<string, McpRoute> | null {
+  if (!routes) {
+    return null;
+  }
+  const allowedNames = new Set(tools.map((tool) => tool.function.name));
+  const allowed = new Map([...routes].filter(([name]) => allowedNames.has(name)));
+  return allowed.size > 0 ? allowed : null;
+}
+
 /** Server-side Julius panel — candidates, council, chairman, synthesis. */
 export async function runServerJulius(params: ServerJuliusParams): Promise<ServerJuliusResult> {
   const research = params.research;
@@ -393,7 +406,9 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
 
   const webToolDefs: EngineToolDef[] = [
     ...builtinToolDefs(webOnlyBuiltins(params.builtins, false)),
-    ...(params.mcpToolDefs ?? []),
+    // Candidates run in parallel, so repository mutations here could fire N
+    // times before a winner exists. Julius is analysis-only at every phase.
+    ...verifierMcpToolDefs(params.mcpToolDefs ?? []),
   ];
   const verifierToolDefs: EngineToolDef[] = [
     ...builtinToolDefs(webOnlyBuiltins(params.builtins, true)),
@@ -411,11 +426,14 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
     onToolCalls: (calls: JuliusCandidateState["toolCalls"]) => void;
   }) => {
     const ledger = createSourceLedger();
+    const allowedRoutes = mcpRoutesForToolDefs(input.tools, params.mcpRoutes);
     const ctx: ServerToolContext = {
       authKey: params.authKey,
       ledger,
       surf: createServerSurfSession(),
-      mcpRoutes: params.mcpRoutes ?? null,
+      // Definitions and execution routes share one allow-list. A hallucinated
+      // hidden write name therefore cannot bypass Julius's read-only surface.
+      mcpRoutes: allowedRoutes,
     };
     return runEngineTurn({
       authKey: params.authKey,

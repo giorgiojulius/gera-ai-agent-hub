@@ -124,7 +124,17 @@ function sseResponse(modelId: string): Response {
 // Agent runs now execute on the backend — the stub emulates the run node:
 // /runs/start registers the run, /runs/stream streams snapshot → text → done.
 type StubRun = { runId: string; conversationId: string; assistantMessageId: string };
+type StubRunBody = {
+  runId?: string;
+  conversationId?: string;
+  assistantMessageId?: string;
+  config?: {
+    githubRepo?: string;
+    mcpServers?: Array<{ id?: string; catalogId?: string; token?: string }>;
+  };
+};
 let lastStubRun: StubRun | null = null;
+let lastStubRunBody: StubRunBody | null = null;
 /** Set by /runs/start when the prompt carries STUB_HANG_PROMPT — the stream then never terminates. */
 let hangStubRun = false;
 
@@ -207,18 +217,41 @@ function hangingRunStreamResponse(signal?: AbortSignal | null): Response {
 function handleStubbed(url: string, init?: RequestInit): Response | null {
   const toolkit = getToolkitUrl();
 
+  if (url.startsWith("https://api.github.com")) {
+    const path = new URL(url).pathname;
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer ghp_e2e_fixture");
+    if (path === "/user") {
+      return jsonResponse({ login: "e2e-octocat", name: "E2E GitHub" });
+    }
+    if (path === "/user/orgs") {
+      return jsonResponse([{ login: "acme" }]);
+    }
+    if (path === "/user/repos") {
+      return jsonResponse([
+        {
+          full_name: "acme/private-app",
+          private: true,
+          description: "Private fixture repository",
+          pushed_at: "2026-08-30T10:00:00Z",
+        },
+      ]);
+    }
+    throw new Error(`Unstubbed GitHub request: ${url}`);
+  }
+
   if (url.startsWith(FUNCTIONS_URL)) {
     if (url.includes("/access/status")) {
       return jsonResponse({ email: "e2e@gera.app", status: "invited", role: "member", requestedAt: null });
     }
     if (url.includes("/runs/start")) {
       const raw = typeof init?.body === "string" ? init.body : "";
-      let body: { runId?: string; conversationId?: string; assistantMessageId?: string } = {};
+      let body: StubRunBody = {};
       try {
-        body = JSON.parse(raw) as typeof body;
+        body = JSON.parse(raw) as StubRunBody;
       } catch {
         body = {};
       }
+      lastStubRunBody = body;
       lastStubRun = {
         runId: body.runId ?? "e2e-run",
         conversationId: body.conversationId ?? "e2e-thread",
@@ -343,6 +376,8 @@ const results: E2eScenarioResult[] = [];
 beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
+  lastStubRun = null;
+  lastStubRunBody = null;
   localStorage.setItem(ACCESS_TOKEN_KEY, fakeAccessToken());
   installNetworkStub();
 });
@@ -354,10 +389,48 @@ afterAll(async () => {
 
 for (const scenario of E2E_SCENARIOS) {
   test(`e2e · ${scenario.title}`, { timeout: 90_000 }, async () => {
+    if (scenario.id === "github-pin-and-send") {
+      localStorage.setItem(
+        "gera.settings.v1",
+        JSON.stringify({
+          mcpServers: [
+            {
+              id: "github",
+              catalogId: "github",
+              name: "GitHub",
+              url: "",
+              headersJson: "",
+              token: "ghp_e2e_fixture",
+              enabled: true,
+              status: "connected",
+              tools: [],
+              disabledTools: [
+                "create_issue",
+                "add_issue_comment",
+                "create_branch",
+                "put_file",
+                "delete_file",
+                "create_pull",
+                "update_pull",
+              ],
+              identity: "@e2e-octocat · repo access OK",
+              verifiedAt: Date.now(),
+            },
+          ],
+        }),
+      );
+    }
     const result = await runScenario(webDriver(), scenario);
     results.push(result);
     if (!result.ok) {
       expect.fail(`[${result.scenarioId}] ${result.error ?? "scenario did not finish"}`);
+    }
+    if (scenario.id === "github-pin-and-send") {
+      expect(lastStubRunBody?.config?.githubRepo).toBe("acme/private-app");
+      const github = lastStubRunBody?.config?.mcpServers?.find(
+        (server) => (server.catalogId ?? server.id) === "github",
+      );
+      expect(github?.token).toBe("ghp_e2e_fixture");
     }
   });
 }

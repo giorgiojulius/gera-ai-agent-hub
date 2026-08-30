@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useMemo, type ReactNode } from "react";
 import { BrowserRouter, Navigate, Routes, Route, useNavigate } from "react-router-dom";
 
 import { AccessGate } from "@/components/gera/AccessGate";
@@ -7,7 +7,7 @@ import { registerNavigate } from "@/lib/nav";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AgentProvider } from "@/hooks/use-agent";
-import { AuthProvider } from "@/hooks/use-auth";
+import { AuthProvider, useAuth } from "@/hooks/use-auth";
 
 import AdminPage from "./pages/Admin";
 import AuthCallback from "./pages/AuthCallback";
@@ -25,8 +25,6 @@ import SettingsPage from "./pages/Settings";
 import SkillsPage from "./pages/Skills";
 import SharedChat from "./pages/SharedChat";
 
-const queryClient = new QueryClient();
-
 /** Hands react-router's navigate to non-router code (toast actions, notifications). */
 const NavBridge = () => {
   const navigate = useNavigate();
@@ -34,11 +32,22 @@ const NavBridge = () => {
   return null;
 };
 
+/** Remounts state and creates a fresh query cache when authentication identity changes. */
+const AccountProviders = ({ children }: { children: ReactNode }) => {
+  const { user, isLoading } = useAuth();
+  const identity = isLoading ? "loading" : user?.id ?? "signed-out";
+  const queryClient = useMemo(() => new QueryClient(), [identity]);
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AgentProvider key={identity}>{children}</AgentProvider>
+    </QueryClientProvider>
+  );
+};
+
 const App = () => (
-  <QueryClientProvider client={queryClient}>
-    <TooltipProvider>
-      <AuthProvider>
-        <AgentProvider>
+  <TooltipProvider>
+    <AuthProvider>
+      <AccountProviders>
           <Toaster />
           <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
             <NavBridge />
@@ -194,10 +203,9 @@ const App = () => (
               <Route path="*" element={<NotFound />} />
             </Routes>
           </BrowserRouter>
-        </AgentProvider>
-      </AuthProvider>
-    </TooltipProvider>
-  </QueryClientProvider>
+      </AccountProviders>
+    </AuthProvider>
+  </TooltipProvider>
 );
 
 export default App;

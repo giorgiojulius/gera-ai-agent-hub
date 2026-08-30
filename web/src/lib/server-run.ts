@@ -61,7 +61,12 @@ export type ServerRunConfig = {
   grounding?: { block: string; sources: ResearchSource[] };
   steeringWrapNote?: string;
   resume?: { messageId: string; partial: string };
-  research?: { depth: ResearchDepth; citations?: "numeric" | "links"; githubAuth?: string };
+  research?: {
+    depth: ResearchDepth;
+    citations?: "numeric" | "links";
+    githubAuth?: string;
+    githubDisabledTools?: string[];
+  };
   julius?: { settings: JuliusSettings; research?: boolean };
   ephemeral?: boolean;
 };

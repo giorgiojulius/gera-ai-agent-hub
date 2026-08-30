@@ -247,6 +247,32 @@ const SAVE_DEBOUNCE_MS = 800;
 let pendingSave: Conversation[] | null = null;
 let saveTimer: number | null = null;
 
+/**
+ * Clears every account-scoped browser value on explicit sign-out/account swap.
+ * Pending debounced history must be discarded first or it could resurrect the
+ * previous account's chats after the storage wipe.
+ */
+export function clearLocalAccountState(): void {
+  pendingSave = null;
+  if (saveTimer !== null) {
+    window.clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (!canUseStorage()) {
+    return;
+  }
+  const keys: string[] = [];
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (key?.startsWith("gera.")) {
+      keys.push(key);
+    }
+  }
+  for (const key of keys) {
+    window.localStorage.removeItem(key);
+  }
+}
+
 export function saveConversations(conversations: Conversation[]): void {
   if (!canUseStorage()) {
     return;

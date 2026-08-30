@@ -740,6 +740,7 @@ export async function executeServerTool(
     } catch (error) {
       return {
         text: `MCP tool failed (${route.serverName}): ${error instanceof Error ? error.message : "unknown error"}`,
+        isError: true,
       };
     }
   }

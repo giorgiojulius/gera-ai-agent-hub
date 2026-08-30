@@ -258,8 +258,13 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         saveConversations(conversations);
         return { ...prev, conversations, activeId: conversation.id };
       }
+      if ((current.githubRepo ?? "") === trimmed) {
+        return prev;
+      }
       const conversations = prev.conversations.map((item) =>
-        item.id === current.id ? { ...item, githubRepo: trimmed || undefined } : item,
+        item.id === current.id
+          ? { ...item, githubRepo: trimmed || undefined, updatedAt: Date.now() }
+          : item,
       );
       saveConversations(conversations);
       return { ...prev, conversations };

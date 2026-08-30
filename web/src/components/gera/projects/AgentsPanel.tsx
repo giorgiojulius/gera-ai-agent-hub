@@ -270,6 +270,17 @@ function draftFrom(agent: ProjectAgent | null): Draft {
   };
 }
 
+function normalizeGithubToken(value: string): string {
+  return value.trim().replace(/^Bearer\s+/i, "");
+}
+
+function githubTokenPatch(draft: TokenDraft): string | null {
+  if (draft.clear) {
+    return null;
+  }
+  return normalizeGithubToken(draft.value);
+}
+
 function tokenPatch(draft: TokenDraft): string | null {
   if (draft.clear) {
     return null;
@@ -330,15 +341,20 @@ export function AgentsPanel({
 
   /** Asks api.github.com who the token belongs to — runs in the browser, token never leaves it. */
   const verifyGithub = (token: string) => {
-    setGithubCheck({ state: "checking", token });
+    const normalized = normalizeGithubToken(token);
+    if (!normalized) {
+      setGithubCheck({ state: "bad", token: "", error: "Paste a GitHub token first." });
+      return;
+    }
+    setGithubCheck({ state: "checking", token: normalized });
     void (async () => {
       try {
-        const viewer = await fetchGitHubViewer(`Bearer ${token}`);
-        setGithubCheck({ state: "ok", token, viewer });
+        const viewer = await fetchGitHubViewer(`Bearer ${normalized}`);
+        setGithubCheck({ state: "ok", token: normalized, viewer });
       } catch (error) {
         setGithubCheck({
           state: "bad",
-          token,
+          token: normalized,
           error: error instanceof Error ? error.message : "Could not verify the token.",
         });
       }
@@ -346,9 +362,10 @@ export function AgentsPanel({
   };
 
   const adoptGithubToken = (token: string) => {
-    setDraft((prev) => (prev ? { ...prev, githubToken: { value: token, clear: false } } : prev));
+    const normalized = normalizeGithubToken(token);
+    setDraft((prev) => (prev ? { ...prev, githubToken: { value: normalized, clear: false } } : prev));
     setGithubPasteOpen(false);
-    verifyGithub(token);
+    verifyGithub(normalized);
   };
 
   /** Device-flow finished — pull the fresh token from the browser's sign-in store. */
@@ -523,6 +540,20 @@ export function AgentsPanel({
       toast.error("Give the agent a name");
       return;
     }
+    const githubToken = normalizeGithubToken(draft.githubToken.value);
+    const willHaveGithub = !draft.githubToken.clear && (Boolean(githubToken) || draft.stored.github);
+    if (draft.github !== "off" && !willHaveGithub) {
+      toast.error("Connect a GitHub credential before enabling GitHub access");
+      return;
+    }
+    if (
+      draft.github !== "off" &&
+      githubToken &&
+      !(githubCheck.state === "ok" && githubCheck.token === githubToken)
+    ) {
+      toast.error("Verify this GitHub credential before saving the agent");
+      return;
+    }
     setSaving(true);
     try {
       const payload: AgentUpsertPayload = {
@@ -540,7 +571,7 @@ export function AgentsPanel({
           mcp: draft.mcp,
         },
         secrets: {
-          githubToken: tokenPatch(draft.githubToken),
+          githubToken: githubTokenPatch(draft.githubToken),
           intercomToken: tokenPatch(draft.intercomToken),
           slackToken: tokenPatch(draft.slackToken),
           slackSigningSecret: tokenPatch(draft.slackSigningSecret),

@@ -43,6 +43,8 @@ export const TID = {
   composerRepo: "composer-repo",
   /** Body of the repo-pin popover (search + repo list). */
   composerRepoPanel: "composer-repo-panel",
+  /** One repository choice inside the GitHub pin popover (repeats). */
+  composerRepoOption: "composer-repo-option",
   /** "Can't see a private repo?" trigger inside the repo-pin popover. */
   composerRepoDiagnose: "composer-repo-diagnose",
   /** Verdict card of the repo access check. */

@@ -104,6 +104,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Intersects a profile's connector scope with an automation's scope against
+ * the actual server ids/catalog ids stored in the account profile.
+ */
+export function intersectMcpAllowIds(
+  rawServers: unknown,
+  profileValue: unknown,
+  automationValue: unknown,
+): string[] | null {
+  const normalize = (value: unknown): string[] | null => {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+      : [];
+  };
+  const profileIds = normalize(profileValue);
+  const automationIds = normalize(automationValue);
+  if (profileIds === null && automationIds === null) {
+    return null;
+  }
+  if (!Array.isArray(rawServers)) {
+    return [];
+  }
+  const allowedBy = (ids: string[] | null, candidates: string[]): boolean =>
+    ids === null || candidates.some((candidate) => ids.includes(candidate));
+  return rawServers.flatMap((raw): string[] => {
+    if (!isRecord(raw)) {
+      return [];
+    }
+    const id = typeof raw.id === "string" ? raw.id : "";
+    const catalogId = typeof raw.catalogId === "string" ? raw.catalogId : "";
+    if (!id) {
+      return [];
+    }
+    const candidates = [id, catalogId].filter(Boolean);
+    return allowedBy(profileIds, candidates) && allowedBy(automationIds, candidates) ? [id] : [];
+  });
+}
+
+/**
  * Filters the profile's MCP servers down to the ones this automation may use
  * (null allow-list = all) AND that can authenticate server-side. Auth is
  * resolved here: pasted keys follow the catalog's token placement, custom

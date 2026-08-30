@@ -194,7 +194,7 @@ function isChatMessage(item: unknown): item is ChatMessage {
 }
 
 /** Distrust the wire: rebuild the conversation from validated pieces only. */
-function parseRemoteChat(item: RemoteChat): Conversation | null {
+export function parseRemoteChat(item: RemoteChat): Conversation | null {
   try {
     const raw = JSON.parse(item.payload) as Partial<Conversation> | null;
     if (!raw || typeof raw !== "object" || raw.id !== item.id) {
@@ -214,6 +214,10 @@ function parseRemoteChat(item: RemoteChat): Conversation | null {
       agentId: typeof raw.agentId === "string" && raw.agentId ? raw.agentId : undefined,
       automationId:
         typeof raw.automationId === "string" && raw.automationId ? raw.automationId : undefined,
+      githubRepo:
+        typeof raw.githubRepo === "string" && /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(raw.githubRepo)
+          ? raw.githubRepo
+          : undefined,
       pinned: raw.pinned === true ? true : undefined,
       messages,
       createdAt: typeof raw.createdAt === "number" ? raw.createdAt : item.updatedAt,

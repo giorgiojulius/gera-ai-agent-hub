@@ -112,6 +112,7 @@ import {
   cloudOAuthTokens,
   ensureFreshCloudOAuth,
   forceRefreshCloudOAuth,
+  intersectMcpAllowIds,
   normalizeOAuthOverride,
   overlayOAuthRotations,
   type CloudOAuthToken,
@@ -1130,10 +1131,13 @@ export class ChatStore extends DurableObject {
       memories,
       knowledge,
       prior,
-      // Cursor-style per-automation MCP: only servers the automation allows
-      // reach the run — keys, headers, open access, synced sign-ins, and the
-      // native GitHub/Slack/Intercom connectors all authenticate server-side.
-      mcpServers: cloudMcpServersForAutomation(settings.mcpServers, auto.mcpServerIds, oauthTokens),
+      // Profile and automation allow-lists intersect exactly like browser
+      // runs; a cloud schedule can never resurrect GitHub excluded by its profile.
+      mcpServers: cloudMcpServersForAutomation(
+        settings.mcpServers,
+        intersectMcpAllowIds(settings.mcpServers, agent?.mcpServerIds, auto.mcpServerIds),
+        oauthTokens,
+      ),
     };
   }
 
@@ -1194,6 +1198,7 @@ export class ChatStore extends DurableObject {
       modelId: string;
       agentId?: string;
       automationId?: string;
+      githubRepo?: string;
       messages: unknown[];
       createdAt: number;
       updatedAt: number;
@@ -1209,6 +1214,10 @@ export class ChatStore extends DurableObject {
             modelId: asStr(parsed.modelId) || input.modelId,
             agentId: typeof parsed.agentId === "string" && parsed.agentId ? parsed.agentId : undefined,
             automationId,
+            githubRepo:
+              typeof parsed.githubRepo === "string" && /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(parsed.githubRepo)
+                ? parsed.githubRepo
+                : undefined,
             messages: parsed.messages,
             createdAt: asNum(parsed.createdAt, existing.updated_at),
             updatedAt: now,

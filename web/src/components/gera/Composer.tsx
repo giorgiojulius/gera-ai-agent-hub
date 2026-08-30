@@ -54,7 +54,12 @@ import { agentHue, agentMonogram } from "@/lib/agents";
 import { RESEARCH_PROFILES } from "@/lib/deep-research";
 import { errorFromUnknown } from "@/lib/errors";
 import { KNOWLEDGE_FILE_ACCEPT } from "@/lib/file-extract";
-import { listRepoOptions, resolveGitHubAuth, type RepoOption } from "@/lib/github-native";
+import {
+  githubAuthorizationFingerprint,
+  listRepoOptions,
+  resolveGitHubAuth,
+  type RepoOption,
+} from "@/lib/github-native";
 import { RepoAccessCheck } from "./RepoAccessCheck";
 import { JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES, juliusLetter } from "@/lib/julius";
 import { serverIconUrl } from "@/lib/mcp-catalog";
@@ -1173,8 +1178,8 @@ function SkillsRailButton() {
   );
 }
 
-/** Repo listing cache for the composer's pin picker — refetched at most every 5 minutes. */
-let repoPickCache: { serverId: string; at: number; repos: RepoOption[] } | null = null;
+/** Repo listing cache, isolated by connector and non-secret credential fingerprint. */
+let repoPickCache: { serverId: string; credential: string; at: number; repos: RepoOption[] } | null = null;
 
 /**
  * GitHub repo pin — rendered only while the GitHub connector is on. Pins one
@@ -1236,21 +1241,23 @@ function GitHubRepoPin() {
   }
 
   const load = async (force?: boolean) => {
-    if (
-      !force &&
-      repoPickCache &&
-      repoPickCache.serverId === server.id &&
-      Date.now() - repoPickCache.at < 300_000
-    ) {
-      setRepos(repoPickCache.repos);
-      return;
-    }
     setLoading(true);
     setError("");
     try {
       const auth = await resolveGitHubAuth(server);
+      const credential = githubAuthorizationFingerprint(auth);
+      if (
+        !force &&
+        repoPickCache &&
+        repoPickCache.serverId === server.id &&
+        repoPickCache.credential === credential &&
+        Date.now() - repoPickCache.at < 300_000
+      ) {
+        setRepos(repoPickCache.repos);
+        return;
+      }
       const list = await listRepoOptions(auth);
-      repoPickCache = { serverId: server.id, at: Date.now(), repos: list };
+      repoPickCache = { serverId: server.id, credential, at: Date.now(), repos: list };
       setRepos(list);
     } catch (err) {
       setRepos(null);
@@ -1385,6 +1392,7 @@ function GitHubRepoPin() {
                   <button
                     key={repo.fullName}
                     type="button"
+                    data-testid={TID.composerRepoOption}
                     onClick={() => {
                       setChatRepo(repo.fullName);
                       setOpen(false);

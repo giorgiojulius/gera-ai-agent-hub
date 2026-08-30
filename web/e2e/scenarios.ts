@@ -65,6 +65,21 @@ export const E2E_SCENARIOS: E2eScenario[] = [
     ],
   },
   {
+    id: "github-pin-and-send",
+    title: "GitHub repo picker pins a private repo and carries it into a run",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerRepo, timeoutMs: 20_000 },
+      { do: "tap", target: TID.composerRepo },
+      { do: "see", target: TID.composerRepoPanel },
+      { do: "tap", target: TID.composerRepoOption },
+      { do: "seeText", target: TID.composerRepo, text: "private-app" },
+      { do: "fill", target: TID.composerInput, text: "Inspect the pinned repository" },
+      { do: "tap", target: TID.composerSend },
+      { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
+    ],
+  },
+  {
     id: "switch-chat-model",
     title: "The picker's Model submenu switches the active chat model",
     steps: [

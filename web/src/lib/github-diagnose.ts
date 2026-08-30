@@ -67,7 +67,7 @@ export async function probeRepoAccess(auth: string, target: RepoTarget): Promise
   const owner = encodeURIComponent(target.owner);
   const repo = encodeURIComponent(target.repo);
   const meta = await gh(auth, `/repos/${owner}/${repo}`);
-  const sso = meta.headers.get("x-github-sso");
+  let sso = meta.headers.get("x-github-sso");
   let size: number | null = null;
   let message: string | null = null;
   if (meta.ok) {
@@ -81,8 +81,16 @@ export async function probeRepoAccess(auth: string, target: RepoTarget): Promise
   if (meta.ok) {
     const contents = await gh(auth, `/repos/${owner}/${repo}/contents?per_page=1`);
     contentsStatus = contents.status;
-    // Drain quietly so the connection is reusable; the status is the signal.
-    await contents.text().catch(() => "");
+    sso = sso ?? contents.headers.get("x-github-sso");
+    const text = await contents.text().catch(() => "");
+    if (!contents.ok && !message) {
+      try {
+        const body = JSON.parse(text) as { message?: unknown };
+        message = typeof body.message === "string" ? body.message : null;
+      } catch {
+        // Non-JSON refusal — status still drives the verdict.
+      }
+    }
   }
   return { metadataStatus: meta.status, contentsStatus, size, sso, message };
 }

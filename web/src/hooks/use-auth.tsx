@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
+import { clearLocalAccountState } from "@/lib/history";
+import { clearMcpSessionCache } from "@/lib/mcp";
 import {
   ACCESS_TOKEN_KEY,
   APP_KEY,
@@ -9,6 +11,8 @@ import {
   clearTokens,
   refreshAccessToken,
 } from "@/lib/auth-tokens";
+
+const ACCOUNT_OWNER_KEY = "rork:gera_account_owner";
 
 export type AuthUser = {
   id: string;
@@ -99,6 +103,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const clearError = useCallback(() => setError(null), []);
 
   const signOut = useCallback(() => {
+    // GitHub/MCP credentials, private repo names, chats, and profile clocks
+    // are account-scoped. Nothing from this identity may survive into the next.
+    clearMcpSessionCache();
+    clearLocalAccountState();
+    localStorage.removeItem(ACCOUNT_OWNER_KEY);
     clearTokens();
     setUser(null);
   }, []);
@@ -111,7 +120,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (accessToken) {
           const decoded = userFromToken(accessToken);
           if (decoded) {
-            if (!cancelled) setUser(decoded);
+            if (!cancelled) {
+              localStorage.setItem(ACCOUNT_OWNER_KEY, decoded.id);
+              setUser(decoded);
+            }
             return;
           }
         }
@@ -119,7 +131,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const refreshed = await refreshAccessToken();
           if (!cancelled) {
             if (refreshed) {
-              setUser(userFromToken(refreshed));
+              const decoded = userFromToken(refreshed);
+              if (decoded) {
+                localStorage.setItem(ACCOUNT_OWNER_KEY, decoded.id);
+              }
+              setUser(decoded);
             } else {
               clearTokens();
               setUser(null);
@@ -170,9 +186,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refresh_token: string;
       user: AuthUser;
     };
+    // A different identity starts from a clean browser copy, then pulls only
+    // its cloud state. Re-authenticating the same account keeps unsynced local
+    // drafts/queue instead of destroying them.
+    const nextUser = data.user ?? userFromToken(data.access_token);
+    const previousOwner = localStorage.getItem(ACCOUNT_OWNER_KEY);
+    clearMcpSessionCache();
+    if (previousOwner && nextUser && previousOwner !== nextUser.id) {
+      clearLocalAccountState();
+    }
+    if (nextUser) {
+      localStorage.setItem(ACCOUNT_OWNER_KEY, nextUser.id);
+    }
     localStorage.setItem(ACCESS_TOKEN_KEY, data.access_token);
     localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
-    setUser(data.user ?? userFromToken(data.access_token));
+    setUser(nextUser);
   }, []);
 
   const signIn = useCallback(

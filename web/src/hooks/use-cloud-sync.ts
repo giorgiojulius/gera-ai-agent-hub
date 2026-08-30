@@ -57,6 +57,7 @@ export function useCloudSync(args: CloudSyncArgs): {
   const applyingProfileRef = useRef<boolean>(false);
   const firstProfileRenderRef = useRef<boolean>(true);
   const syncTimerRef = useRef<number | null>(null);
+  const disposedRef = useRef<boolean>(false);
   const syncBusyRef = useRef<boolean>(false);
   const syncAgainRef = useRef<boolean>(false);
   const lastSyncAtRef = useRef<number>(0);
@@ -76,8 +77,9 @@ export function useCloudSync(args: CloudSyncArgs): {
   }, []);
 
   const performSync = useCallback(async () => {
-    if (!userRef.current) {
-      return; // Signed out — local-only until the next sign-in.
+    const syncUserId = userRef.current?.id;
+    if (!syncUserId || disposedRef.current) {
+      return; // Signed out/unmounted — local-only until the next sign-in.
     }
     if (syncBusyRef.current) {
       syncAgainRef.current = true;
@@ -98,6 +100,9 @@ export function useCloudSync(args: CloudSyncArgs): {
           dirty: meta.updatedAt > meta.ackedAt,
         },
       });
+      if (disposedRef.current || userRef.current?.id !== syncUserId) {
+        return; // A late response from the previous account must change nothing.
+      }
       lastSyncAtRef.current = Date.now();
       if (typeof result.profileAckedAt === "number") {
         meta.ackedAt = Math.max(meta.ackedAt, result.profileAckedAt);
@@ -201,7 +206,7 @@ export function useCloudSync(args: CloudSyncArgs): {
       console.warn("gera sync failed:", error instanceof Error ? error.message : error);
     } finally {
       syncBusyRef.current = false;
-      if (syncAgainRef.current) {
+      if (!disposedRef.current && syncAgainRef.current) {
         syncAgainRef.current = false;
         scheduleSync(1_000);
       }
@@ -315,7 +320,9 @@ export function useCloudSync(args: CloudSyncArgs): {
   }, [scheduleSync]);
 
   useEffect(() => {
+    disposedRef.current = false;
     return () => {
+      disposedRef.current = true;
       if (syncTimerRef.current !== null) {
         window.clearTimeout(syncTimerRef.current);
       }

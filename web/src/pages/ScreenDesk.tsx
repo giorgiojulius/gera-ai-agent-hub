@@ -58,6 +58,7 @@ import {
   fetchScreenMentionAdmins,
   fetchScreenSuggestions,
   fetchScreenThread,
+  formatAttachmentBytes,
   formatSpendCompact,
   linkDeskTeammate,
   postProjectMessage,
@@ -788,9 +789,50 @@ function ThreadPane({
               ) : null}
               <span>{formatTime(part.createdAt)}</span>
             </p>
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed">
-              {part.body}
-            </p>
+            {part.body ? (
+              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed">
+                {part.body}
+              </p>
+            ) : null}
+            {(part.attachments ?? []).length > 0 ? (
+              <div className="mt-2 flex flex-col items-start gap-2">
+                {(part.attachments ?? []).map((file, index) =>
+                  file.contentType.startsWith("image/") ? (
+                    <a
+                      key={`${part.id}-att-${index}`}
+                      href={file.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="block max-w-full"
+                      title={file.name}
+                    >
+                      <img
+                        src={file.url}
+                        alt={file.name}
+                        loading="lazy"
+                        className="max-h-56 w-auto max-w-full rounded-lg border border-foreground/10"
+                      />
+                    </a>
+                  ) : (
+                    <a
+                      key={`${part.id}-att-${index}`}
+                      href={file.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex max-w-full items-center gap-1.5 rounded-lg border border-foreground/10 bg-background/70 px-2.5 py-1.5 text-xs font-medium text-foreground/80 transition-colors hover:bg-background"
+                    >
+                      <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <span className="truncate">{file.name}</span>
+                      {formatAttachmentBytes(file.size) ? (
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {formatAttachmentBytes(file.size)}
+                        </span>
+                      ) : null}
+                    </a>
+                  ),
+                )}
+              </div>
+            ) : null}
           </div>
         ))}
         {parts.length === 0 ? (

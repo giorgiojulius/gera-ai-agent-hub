@@ -215,6 +215,74 @@ function snippet(text: string, max = 140): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+type AttachmentInfo = { name: string; contentType: string; size: number };
+
+/** Parses the `attachments` array Intercom puts on sources and parts (twin of the worker's). */
+function readAttachments(record: Record<string, unknown>): AttachmentInfo[] {
+  const out: AttachmentInfo[] = [];
+  for (const raw of asRecordArray(record.attachments)) {
+    const url = str(raw.url).trim();
+    if (!/^https?:\/\//i.test(url)) {
+      continue;
+    }
+    out.push({
+      name: str(raw.name).trim() || "attachment",
+      contentType: str(raw.content_type).trim().toLowerCase(),
+      size:
+        typeof raw.filesize === "number" && Number.isFinite(raw.filesize) && raw.filesize > 0
+          ? Math.trunc(raw.filesize)
+          : 0,
+    });
+    if (out.length >= 10) {
+      break;
+    }
+  }
+  return out;
+}
+
+function formatAttachmentSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "";
+  }
+  if (bytes < 1024) {
+    return `${Math.trunc(bytes)} B`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb >= 10 ? Math.round(kb) : Math.round(kb * 10) / 10} KB`;
+  }
+  const mb = kb / 1024;
+  return `${mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
+}
+
+/** "[attached: a.png (image/png, 1.2 MB)]" — names/types only, never expiring URLs. */
+function attachmentLabel(attachments: AttachmentInfo[]): string {
+  if (attachments.length === 0) {
+    return "";
+  }
+  const items = attachments.map((attachment) => {
+    const meta = [attachment.contentType, formatAttachmentSize(attachment.size)]
+      .filter((piece) => piece.length > 0)
+      .join(", ");
+    return meta ? `${attachment.name} (${meta})` : attachment.name;
+  });
+  return `[attached: ${items.join("; ")}]`;
+}
+
+function joinTextAndAttachments(text: string, attachments: AttachmentInfo[]): string {
+  return [text, attachmentLabel(attachments)].filter((piece) => piece.length > 0).join(" ");
+}
+
+function attachmentPreviewText(attachments: AttachmentInfo[]): string {
+  const first = attachments[0];
+  if (!first) {
+    return "";
+  }
+  return attachments.length > 1
+    ? `Attachments: ${first.name} +${attachments.length - 1}`
+    : `Attachment: ${first.name}`;
+}
+
 function describeConversation(item: Record<string, unknown>): string {
   const source = asRecord(item.source);
   const author = asRecord(source.author);
@@ -223,7 +291,7 @@ function describeConversation(item: Record<string, unknown>): string {
   const who = str(author.name) || str(author.email) || str(author.type) || "unknown";
   const when = formatUnix(item.updated_at) || formatUnix(item.created_at);
   const state = str(item.state) || "open";
-  const headline = subject || body || "(no text)";
+  const headline = subject || body || attachmentPreviewText(readAttachments(source)) || "(no text)";
   return `#${str(item.id)} [${state}] ${when} — from ${who}: ${headline}`;
 }
 
@@ -250,20 +318,24 @@ async function readConversation(token: string, input: Record<string, unknown>): 
   const source = asRecord(data.source);
   const sourceAuthor = asRecord(source.author);
   const lines: string[] = [];
-  const opener = stripHtml(str(source.body));
+  const opener = joinTextAndAttachments(stripHtml(str(source.body)), readAttachments(source));
   if (opener) {
     const who = str(sourceAuthor.name) || str(sourceAuthor.email) || str(sourceAuthor.type) || "user";
     lines.push(`[${formatUnix(data.created_at)}] ${who}: ${opener}`);
   }
   const partsRecord = asRecord(data.conversation_parts);
-  const parts = asRecordArray(partsRecord.conversation_parts).filter((part) => stripHtml(str(part.body)).length > 0);
+  const parts = asRecordArray(partsRecord.conversation_parts).filter(
+    (part) => stripHtml(str(part.body)).length > 0 || readAttachments(part).length > 0,
+  );
   const visible = parts.slice(-40);
   for (const part of visible) {
     const author = asRecord(part.author);
     const who = str(author.name) || str(author.email) || str(author.type) || "user";
     const kind = str(part.part_type);
     const note = kind === "note" ? " (internal note)" : "";
-    lines.push(`[${formatUnix(part.created_at)}] ${who}${note}: ${stripHtml(str(part.body))}`);
+    lines.push(
+      `[${formatUnix(part.created_at)}] ${who}${note}: ${joinTextAndAttachments(stripHtml(str(part.body)), readAttachments(part))}`,
+    );
   }
   if (lines.length === 0) {
     return `Conversation #${id} has no readable messages.`;

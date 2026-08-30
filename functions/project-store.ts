@@ -59,6 +59,7 @@ import {
 } from "./mcp-cloud";
 import { chatShardId } from "./shard-migration";
 import {
+  attachmentLabel,
   callIntercomNativeTool,
   fetchIntercomConversationDetails,
   fetchIntercomInboxData,
@@ -2466,16 +2467,22 @@ export class ProjectStore extends DurableObject {
         )
         .toArray();
       const transcript = thread.parts.slice(-24).map((part) => {
+        // Attachment-only turns arrive with body "" — the "[attached: …]" label
+        // keeps the drafts aware a screenshot/file exists without inventing it.
+        const withFiles = (text: string, cap: number): string =>
+          [capText(text, cap), attachmentLabel(part.attachments)]
+            .filter((piece) => piece.length > 0)
+            .join(" ");
         if (part.note) {
-          return `Internal note by ${part.author}: ${capText(part.body, 500)}`;
+          return `Internal note by ${part.author}: ${withFiles(part.body, 500)}`;
         }
         if (part.role === "teammate") {
-          return `${part.author} (teammate): ${capText(part.body, 500)}`;
+          return `${part.author} (teammate): ${withFiles(part.body, 500)}`;
         }
         if (part.role === "bot") {
-          return `Bot: ${capText(part.body, 400)}`;
+          return `Bot: ${withFiles(part.body, 400)}`;
         }
-        return `Customer (${part.author}): ${capText(part.body, 500)}`;
+        return `Customer (${part.author}): ${withFiles(part.body, 500)}`;
       });
       // Slack awareness: the team's own discussions about this case ride into
       // the prompt so drafts can wait for (or use) the internal outcome.

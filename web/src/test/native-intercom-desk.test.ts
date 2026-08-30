@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  attachmentLabel,
   buildIntercomNoteBody,
   deriveCompanyRows,
   deriveContactProfile,
@@ -13,9 +14,11 @@ import {
   deriveEventRows,
   deriveInboxRow,
   deriveReplyPairs,
+  deriveThreadParts,
   extractSpendValue,
   moneyValue,
   rankInboxRows,
+  readAttachments,
   scalarAttrs,
 } from "../../../functions/native-intercom";
 
@@ -451,6 +454,175 @@ describe("deriveConversationTranscript", () => {
       conversation_parts: { conversation_parts: [] },
     };
     expect(deriveConversationTranscript(outbound)).toBe("Maria (teammate, opener): Hey, checking in!");
+  });
+});
+
+// Attachments: Intercom delivers pasted screenshots/files as `attachments`
+// arrays on sources and parts — often with NO text body. Dropping bodyless
+// parts silently hid whole customer turns from the desk, previews, and the
+// model-facing transcripts.
+const upload = (name: string, contentType: string, filesize = 0): Record<string, unknown> => ({
+  type: "upload",
+  name,
+  url: `https://downloads.intercomcdn.com/i/o/${name}?expires=1&signature=s`,
+  content_type: contentType,
+  filesize,
+});
+
+describe("readAttachments", () => {
+  it("parses name/type/size and keeps only http(s) links", () => {
+    const parsed = readAttachments({
+      attachments: [
+        upload("screen.png", "image/png", 1_300_000),
+        { type: "upload", name: "evil", url: "javascript:alert(1)", content_type: "" },
+        { type: "upload", name: "", url: "https://downloads.intercomcdn.com/x", content_type: "text/plain" },
+      ],
+    });
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]).toMatchObject({ name: "screen.png", contentType: "image/png", size: 1_300_000 });
+    expect(parsed[1]?.name).toBe("attachment");
+  });
+
+  it("returns empty for payloads without attachments", () => {
+    expect(readAttachments({})).toEqual([]);
+  });
+});
+
+describe("attachmentLabel", () => {
+  it("names files with type and size — never the expiring URL", () => {
+    const label = attachmentLabel(
+      readAttachments({ attachments: [upload("a.png", "image/png", 1_300_000), upload("b.log", "")] }),
+    );
+    expect(label).toBe("[attached: a.png (image/png, 1.2 MB); b.log]");
+    expect(label).not.toContain("https://");
+    expect(attachmentLabel([])).toBe("");
+  });
+});
+
+describe("deriveThreadParts", () => {
+  it("keeps attachment-only customer messages that were previously dropped", () => {
+    const parts = deriveThreadParts({
+      id: "55",
+      created_at: 1_700_000_000,
+      source: { body: "<p>hi</p>", author: { type: "user", name: "Anna" } },
+      conversation_parts: {
+        conversation_parts: [
+          {
+            id: "p1",
+            part_type: "comment",
+            body: "",
+            created_at: 1_700_000_060,
+            author: { type: "user", name: "Anna" },
+            attachments: [upload("crash.png", "image/png", 52_000)],
+          },
+        ],
+      },
+    });
+    expect(parts).toHaveLength(2);
+    expect(parts[1]).toMatchObject({ id: "p1", role: "customer", body: "" });
+    expect(parts[1]?.attachments[0]).toMatchObject({ name: "crash.png", contentType: "image/png" });
+    expect(parts[1]?.attachments[0]?.url).toContain("https://downloads.intercomcdn.com");
+  });
+
+  it("keeps an attachment-only opener", () => {
+    const parts = deriveThreadParts(
+      {
+        id: "",
+        created_at: 1_700_000_000,
+        source: {
+          body: "",
+          author: { type: "user", name: "Anna" },
+          attachments: [upload("invoice.pdf", "application/pdf")],
+        },
+        conversation_parts: { conversation_parts: [] },
+      },
+      "56",
+    );
+    expect(parts).toHaveLength(1);
+    expect(parts[0]?.id).toBe("src-56");
+    expect(parts[0]?.attachments[0]?.name).toBe("invoice.pdf");
+  });
+});
+
+describe("attachment-only turns in previews and grading inputs", () => {
+  it("deriveInboxRow previews the attachment instead of hiding the turn", () => {
+    const row = deriveInboxRow({
+      ...botStartedConversation,
+      conversation_parts: {
+        conversation_parts: [
+          {
+            id: "p9",
+            part_type: "comment",
+            body: "",
+            created_at: 1_700_000_100,
+            author: { type: "user", name: "根津孝誠", email: "kome@example.com" },
+            attachments: [upload("bug.png", "image/png", 10_000), upload("log.txt", "text/plain")],
+          },
+        ],
+      },
+    });
+    expect(row.snippet).toBe("Attachments: bug.png +1");
+    expect(row.customerName).toBe("根津孝誠");
+  });
+
+  it("deriveReplyPairs pairs the reply to a screenshot-only turn with its wait time", () => {
+    const pairs = deriveReplyPairs({
+      id: "78",
+      created_at: 1_700_000_000,
+      source: { body: "<p>see this</p>", author: { type: "user", name: "Anna" } },
+      conversation_parts: {
+        conversation_parts: [
+          {
+            id: "s1",
+            part_type: "comment",
+            body: "",
+            created_at: 1_700_000_060,
+            author: { type: "user", name: "Anna" },
+            attachments: [upload("error.png", "image/png", 1_300_000)],
+          },
+          {
+            id: "s2",
+            part_type: "comment",
+            body: "<p>Thanks, looking!</p>",
+            created_at: 1_700_000_120,
+            author: { type: "admin", id: 9, name: "Maria" },
+          },
+        ],
+      },
+    });
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]).toMatchObject({
+      id: "s2",
+      customerText: "[attached: error.png (image/png, 1.2 MB)]",
+      responseMs: 60_000,
+    });
+  });
+
+  it("deriveConversationTranscript mentions attachments inline for the grader", () => {
+    const transcript = deriveConversationTranscript({
+      id: "79",
+      created_at: 1_700_000_000,
+      source: {
+        body: "",
+        author: { type: "user", name: "Anna" },
+        attachments: [upload("err.png", "image/png")],
+      },
+      conversation_parts: {
+        conversation_parts: [
+          {
+            id: "t1",
+            part_type: "comment",
+            body: "<p>fix attached</p>",
+            created_at: 1_700_000_060,
+            author: { type: "admin", id: 9, name: "Maria" },
+            attachments: [upload("patch.txt", "text/plain")],
+          },
+        ],
+      },
+    });
+    const lines = transcript.split("\n");
+    expect(lines[0]).toBe("Customer (Anna): [attached: err.png (image/png)]");
+    expect(lines[1]).toBe("[t1] Maria (teammate): fix attached [attached: patch.txt (text/plain)]");
   });
 });
 

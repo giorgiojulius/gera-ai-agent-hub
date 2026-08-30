@@ -140,6 +140,31 @@ export function formatSpendCompact(spend: number): string {
   return `${Math.round(spend)}`;
 }
 
+export type IntercomAttachment = {
+  name: string;
+  /** Signed Intercom CDN link — public but expiring; refreshed with each thread poll. */
+  url: string;
+  contentType: string;
+  /** Bytes; 0 = unknown. */
+  size: number;
+};
+
+/** "1.2 MB" / "340 KB" for the attachment chip; "" when the size is unknown. */
+export function formatAttachmentBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "";
+  }
+  if (bytes < 1024) {
+    return `${Math.trunc(bytes)} B`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb >= 10 ? Math.round(kb) : Math.round(kb * 10) / 10} KB`;
+  }
+  const mb = kb / 1024;
+  return `${mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
+}
+
 export type IntercomPart = {
   id: string;
   author: string;
@@ -147,6 +172,8 @@ export type IntercomPart = {
   note: boolean;
   body: string;
   createdAt: number;
+  /** Optional — older worker payloads did not carry it. */
+  attachments?: IntercomAttachment[];
 };
 
 export type IntercomThread = {

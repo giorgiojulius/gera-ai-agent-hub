@@ -264,6 +264,94 @@ function snippet(text: string, max = 140): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+export type IntercomAttachmentData = {
+  name: string;
+  /** Signed Intercom CDN link — public but expiring; refreshed on every refetch. */
+  url: string;
+  contentType: string;
+  /** Bytes; 0 = unknown. */
+  size: number;
+};
+
+/**
+ * Parses the `attachments` array Intercom puts on conversation sources and
+ * parts. A pasted screenshot with no text is a real customer turn — dropping
+ * bodyless parts silently hid those messages from the desk and the model.
+ */
+export function readAttachments(record: Record<string, unknown>): IntercomAttachmentData[] {
+  const out: IntercomAttachmentData[] = [];
+  for (const raw of asRecordArray(record.attachments)) {
+    const url = str(raw.url).trim();
+    if (!/^https?:\/\//i.test(url)) {
+      continue;
+    }
+    out.push({
+      name: str(raw.name).trim() || "attachment",
+      url,
+      contentType: str(raw.content_type).trim().toLowerCase(),
+      size:
+        typeof raw.filesize === "number" && Number.isFinite(raw.filesize) && raw.filesize > 0
+          ? Math.trunc(raw.filesize)
+          : 0,
+    });
+    if (out.length >= 10) {
+      break;
+    }
+  }
+  return out;
+}
+
+/** "1.2 MB" / "340 KB"; "" when the size is unknown. */
+export function formatAttachmentSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "";
+  }
+  if (bytes < 1024) {
+    return `${Math.trunc(bytes)} B`;
+  }
+  const kb = bytes / 1024;
+  if (kb < 1024) {
+    return `${kb >= 10 ? Math.round(kb) : Math.round(kb * 10) / 10} KB`;
+  }
+  const mb = kb / 1024;
+  return `${mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
+}
+
+/**
+ * "[attached: screenshot.png (image/png, 1.2 MB); crash.log]" — how LLM-facing
+ * transcripts mention files. Names, types and sizes only — never the expiring
+ * CDN URLs: the model must know the file exists (and say it cannot open it)
+ * instead of hallucinating its content.
+ */
+export function attachmentLabel(attachments: IntercomAttachmentData[]): string {
+  if (attachments.length === 0) {
+    return "";
+  }
+  const items = attachments.map((attachment) => {
+    const meta = [attachment.contentType, formatAttachmentSize(attachment.size)]
+      .filter((piece) => piece.length > 0)
+      .join(", ");
+    return meta ? `${attachment.name} (${meta})` : attachment.name;
+  });
+  return `[attached: ${items.join("; ")}]`;
+}
+
+/** "text [attached: …]" — body and attachment mention joined; "" when both empty. */
+export function joinTextAndAttachments(text: string, attachments: IntercomAttachmentData[]): string {
+  return [text, attachmentLabel(attachments)].filter((piece) => piece.length > 0).join(" ");
+}
+
+/** Short list-row preview: "Attachment: screenshot.png" / "Attachments: a.png +2". */
+export function attachmentPreviewText(attachments: IntercomAttachmentData[]): string {
+  const first = attachments[0];
+  if (!first) {
+    return "";
+  }
+  return attachments.length > 1
+    ? `Attachments: ${first.name} +${attachments.length - 1}`
+    : `Attachment: ${first.name}`;
+}
+
 function describeConversation(item: Record<string, unknown>): string {
   const source = asRecord(item.source);
   const author = asRecord(source.author);
@@ -272,7 +360,7 @@ function describeConversation(item: Record<string, unknown>): string {
   const who = str(author.name) || str(author.email) || str(author.type) || "unknown";
   const when = formatUnix(item.updated_at) || formatUnix(item.created_at);
   const state = str(item.state) || "open";
-  const headline = subject || body || "(no text)";
+  const headline = subject || body || attachmentPreviewText(readAttachments(source)) || "(no text)";
   return `#${str(item.id)} [${state}] ${when} — from ${who}: ${headline}`;
 }
 
@@ -299,20 +387,24 @@ async function readConversation(token: string, input: Record<string, unknown>): 
   const source = asRecord(data.source);
   const sourceAuthor = asRecord(source.author);
   const lines: string[] = [];
-  const opener = stripHtml(str(source.body));
+  const opener = joinTextAndAttachments(stripHtml(str(source.body)), readAttachments(source));
   if (opener) {
     const who = str(sourceAuthor.name) || str(sourceAuthor.email) || str(sourceAuthor.type) || "user";
     lines.push(`[${formatUnix(data.created_at)}] ${who}: ${opener}`);
   }
   const partsRecord = asRecord(data.conversation_parts);
-  const parts = asRecordArray(partsRecord.conversation_parts).filter((part) => stripHtml(str(part.body)).length > 0);
+  const parts = asRecordArray(partsRecord.conversation_parts).filter(
+    (part) => stripHtml(str(part.body)).length > 0 || readAttachments(part).length > 0,
+  );
   const visible = parts.slice(-40);
   for (const part of visible) {
     const author = asRecord(part.author);
     const who = str(author.name) || str(author.email) || str(author.type) || "user";
     const kind = str(part.part_type);
     const note = kind === "note" ? " (internal note)" : "";
-    lines.push(`[${formatUnix(part.created_at)}] ${who}${note}: ${stripHtml(str(part.body))}`);
+    lines.push(
+      `[${formatUnix(part.created_at)}] ${who}${note}: ${joinTextAndAttachments(stripHtml(str(part.body)), readAttachments(part))}`,
+    );
   }
   if (lines.length === 0) {
     return `Conversation #${id} has no readable messages.`;
@@ -555,6 +647,7 @@ export type IntercomPartData = {
   note: boolean;
   body: string;
   createdAt: number;
+  attachments: IntercomAttachmentData[];
 };
 
 export type IntercomThreadData = {
@@ -644,7 +737,7 @@ export function deriveInboxRow(detail: Record<string, unknown>): InboxRowCore {
   const source = asRecord(detail.source);
   const sourceAuthor = asRecord(source.author);
   const parts = asRecordArray(asRecord(detail.conversation_parts).conversation_parts).filter(
-    (part) => stripHtml(str(part.body)).length > 0,
+    (part) => stripHtml(str(part.body)).length > 0 || readAttachments(part).length > 0,
   );
   let customerName = "";
   let customerEmail = "";
@@ -675,7 +768,9 @@ export function deriveInboxRow(detail: Record<string, unknown>): InboxRowCore {
   } else if (previewAuthorType === "bot") {
     prefix = `${previewName || "Bot"}: `;
   }
-  const text = snippet(str(lastPart ? lastPart.body : source.body), 130);
+  const text =
+    snippet(str(lastPart ? lastPart.body : source.body), 130) ||
+    attachmentPreviewText(readAttachments(lastPart ?? source));
   const subject = stripHtml(str(source.subject));
   return {
     id: idStr(detail.id),
@@ -799,6 +894,48 @@ export async function fetchIntercomInboxData(
   );
 }
 
+/**
+ * Pure: typed thread parts (opener + conversation parts) from one conversation
+ * payload. Attachment-only messages stay in — with body "" and the files listed.
+ */
+export function deriveThreadParts(detail: Record<string, unknown>, fallbackId = ""): IntercomPartData[] {
+  const source = asRecord(detail.source);
+  const author = asRecord(source.author);
+  const parts: IntercomPartData[] = [];
+  const opener = stripHtml(str(source.body));
+  const openerAttachments = readAttachments(source);
+  if (opener || openerAttachments.length > 0) {
+    parts.push({
+      id: `src-${idStr(detail.id) || fallbackId}`,
+      author: str(author.name) || str(author.email) || "Customer",
+      role: partRole(str(author.type)),
+      note: false,
+      body: opener,
+      createdAt: toMs(detail.created_at),
+      attachments: openerAttachments,
+    });
+  }
+  const partsRecord = asRecord(detail.conversation_parts);
+  for (const part of asRecordArray(partsRecord.conversation_parts)) {
+    const body = stripHtml(str(part.body));
+    const attachments = readAttachments(part);
+    if (!body && attachments.length === 0) {
+      continue;
+    }
+    const partAuthor = asRecord(part.author);
+    parts.push({
+      id: idStr(part.id) || `p-${parts.length}`,
+      author: str(partAuthor.name) || str(partAuthor.email) || str(partAuthor.type) || "user",
+      role: partRole(str(partAuthor.type)),
+      note: str(part.part_type) === "note",
+      body,
+      createdAt: toMs(part.created_at),
+      attachments,
+    });
+  }
+  return parts;
+}
+
 /** One conversation's transcript as typed parts for a thread pane. */
 export async function fetchIntercomThreadData(
   token: string,
@@ -812,34 +949,7 @@ export async function fetchIntercomThreadData(
   const data = await relay(token, region, "GET", `/conversations/${encodeURIComponent(id)}?display_as=plaintext`);
   const source = asRecord(data.source);
   const author = asRecord(source.author);
-  const parts: IntercomPartData[] = [];
-  const opener = stripHtml(str(source.body));
-  if (opener) {
-    parts.push({
-      id: `src-${str(data.id) || id}`,
-      author: str(author.name) || str(author.email) || "Customer",
-      role: partRole(str(author.type)),
-      note: false,
-      body: opener,
-      createdAt: toMs(data.created_at),
-    });
-  }
-  const partsRecord = asRecord(data.conversation_parts);
-  for (const part of asRecordArray(partsRecord.conversation_parts)) {
-    const body = stripHtml(str(part.body));
-    if (!body) {
-      continue;
-    }
-    const partAuthor = asRecord(part.author);
-    parts.push({
-      id: str(part.id) || `p-${parts.length}`,
-      author: str(partAuthor.name) || str(partAuthor.email) || str(partAuthor.type) || "user",
-      role: partRole(str(partAuthor.type)),
-      note: str(part.part_type) === "note",
-      body,
-      createdAt: toMs(part.created_at),
-    });
-  }
+  const parts = deriveThreadParts(data, id);
   return {
     id: str(data.id) || id,
     state: str(data.state) || "open",
@@ -923,7 +1033,7 @@ export function deriveReplyPairs(detail: Record<string, unknown>): IntercomReply
   const sourceType = str(sourceAuthor.type);
   let lastCustomerText = "";
   let lastCustomerAt = 0;
-  const opener = stripHtml(str(source.body));
+  const opener = joinTextAndAttachments(stripHtml(str(source.body)), readAttachments(source));
   if (opener && sourceType !== "admin" && sourceType !== "bot") {
     lastCustomerText = opener;
     lastCustomerAt = toMs(detail.created_at);
@@ -931,19 +1041,22 @@ export function deriveReplyPairs(detail: Record<string, unknown>): IntercomReply
   const partsRecord = asRecord(detail.conversation_parts);
   for (const part of asRecordArray(partsRecord.conversation_parts)) {
     const body = stripHtml(str(part.body));
-    if (!body) {
+    const attachments = readAttachments(part);
+    if (!body && attachments.length === 0) {
       continue;
     }
     const author = asRecord(part.author);
     const authorType = str(author.type);
     const at = toMs(part.created_at);
     if (authorType === "user" || authorType === "lead" || authorType === "contact") {
-      lastCustomerText = body;
+      // A screenshot with no words is still a customer turn — the reply that
+      // answers it must inherit the wait time and see the attachment mention.
+      lastCustomerText = joinTextAndAttachments(body, attachments);
       lastCustomerAt = at;
       continue;
     }
-    if (authorType !== "admin" || str(part.part_type) !== "comment") {
-      continue; // Bots, notes, assignments and state changes are not graded replies.
+    if (authorType !== "admin" || str(part.part_type) !== "comment" || !body) {
+      continue; // Bots, notes, assignments and attachment-only comments are not graded replies.
     }
     const partId = idStr(part.id);
     if (!partId) {
@@ -980,7 +1093,7 @@ export function deriveConversationTranscript(detail: Record<string, unknown>): s
   };
   const source = asRecord(detail.source);
   const sourceAuthor = asRecord(source.author);
-  const opener = stripHtml(str(source.body));
+  const opener = joinTextAndAttachments(stripHtml(str(source.body)), readAttachments(source));
   if (opener) {
     const openerName = str(sourceAuthor.name);
     const openerType = str(sourceAuthor.type);
@@ -994,7 +1107,9 @@ export function deriveConversationTranscript(detail: Record<string, unknown>): s
   }
   const partsRecord = asRecord(detail.conversation_parts);
   for (const part of asRecordArray(partsRecord.conversation_parts)) {
-    const body = stripHtml(str(part.body));
+    // Attachment-only turns ride in as "[attached: …]" — the grader must know
+    // the customer sent a screenshot even when they typed nothing.
+    const body = joinTextAndAttachments(stripHtml(str(part.body)), readAttachments(part));
     if (!body) {
       continue;
     }

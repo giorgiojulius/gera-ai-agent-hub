@@ -6,7 +6,7 @@ composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
 credential hand-off + repo access probe in the picker, honesty rule in
 default system prompts, skills-as-guidance research fix + empty-question
-guard)
+guard, Intercom attachments in desk threads/previews/transcripts)
 Drift check: `git log --oneline 9a3abb1..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -472,7 +472,20 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   `native-intercom.ts` reads per-conversation detail payloads (cached by
   updated_at across polls; teammate/bot previews prefixed "Name: ", notes
   "Name (note): "), and greeting-only threads resolve the human via ONE
-  contacts/search IN round-trip (30-min cache). A right **Details panel**
+  contacts/search IN round-trip (30-min cache). Attachments (2026-08-30):
+  Intercom ships pasted screenshots/files as `attachments` arrays on the
+  source and on parts — often with NO text body; `readAttachments` in
+  `native-intercom.ts` parses them (http links only, name/type/size),
+  attachment-only turns STAY in the thread (`deriveThreadParts`, body ""),
+  bubbles render images inline (click opens the signed CDN link — links
+  refresh with the 8s thread poll, so expiry never bites) and other files
+  as paperclip chips with size (`formatAttachmentBytes` in lib/projects),
+  inbox previews say "Attachment: name" instead of hiding the turn, and
+  EVERY model-facing transcript (read_conversation in both twins, desk
+  suggestion prompt, reply-pair harvesting + grading transcripts, list
+  previews) mentions "[attached: name (type, size)]" — names/types only,
+  never the expiring URLs, so drafts and grades know a screenshot exists
+  instead of hallucinating its content. A right **Details panel**
   (`screen-desk-details`, polls 30s via POST `/intercom/details`) mirrors
   Intercom's sidebar, top to bottom: contact card (avatar initial,
   name/email, last-seen presence dot), Assignee + Team Inbox (names via

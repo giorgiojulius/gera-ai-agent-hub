@@ -90,7 +90,7 @@ export const E2E_SCENARIOS: E2eScenario[] = [
   },
   {
     id: "switch-run-mode",
-    title: "The run-mode selector engages Deep research from one menu",
+    title: "The model-style run-mode picker engages Deep research",
     steps: [
       { do: "goto", path: "/" },
       { do: "see", target: TID.composerInput, timeoutMs: 20_000 },

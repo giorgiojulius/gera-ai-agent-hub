@@ -3,6 +3,7 @@ import {
   AudioLines,
   Check,
   ChevronDown,
+  ChevronsUpDown,
   Clapperboard,
   Cloud,
   Compass,
@@ -1454,13 +1455,14 @@ function ModeGlyph({ mode, className }: { mode: RunModeId; className?: string })
 }
 
 /**
- * One selector for how a chat answer is produced — Standard, Deep research,
- * Julius, or both combined. Replaces the two separate toggle pills so the
- * rail stays compact on phones; the gear beside it opens the active mode's
- * settings (tabbed when both engines ride together).
+ * Model-picker-style selector for how a chat answer is produced — Standard,
+ * Deep research, Julius, or both combined. The compact trigger and checked
+ * catalog mirror the AI model picker; the adjacent gear opens the active
+ * mode's settings (tabbed when both engines ride together).
  */
 function RunModeSelector() {
   const { state, toggleDeepResearch, toggleJulius } = useAgent();
+  const [open, setOpen] = useState<boolean>(false);
   const settings = state.settings;
   const active =
     RUN_MODES.find((mode) => mode.research === state.deepResearch && mode.julius === state.julius) ??
@@ -1474,6 +1476,7 @@ function RunModeSelector() {
     if (state.julius !== mode.julius) {
       toggleJulius();
     }
+    setOpen(false);
   };
 
   const depthTitle =
@@ -1493,54 +1496,70 @@ function RunModeSelector() {
 
   return (
     <>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
           <button
             type="button"
             data-testid={TID.composerModeTrigger}
             aria-label={`Run mode: ${active.label}`}
-            title="How the answer is produced — standard, deep research, Julius panel, or both"
+            title="Choose how the answer is produced"
             className={cn(
-              "flex items-center gap-1.5 rounded-full border py-1.5 pl-2.5 pr-2 text-[11px] font-medium transition-colors",
+              "flex h-8 min-w-0 items-center gap-1 rounded-lg px-2 text-xs font-medium transition-colors hover:bg-foreground/5 data-[state=open]:bg-foreground/5",
               engaged
-                ? "border-ember/60 bg-ember/10 text-ember"
-                : "border-border/70 text-muted-foreground hover:text-foreground",
+                ? "bg-ember/10 text-ember hover:bg-ember/15 data-[state=open]:bg-ember/15"
+                : "text-muted-foreground hover:text-foreground data-[state=open]:text-foreground",
             )}
           >
-            <ModeGlyph mode={active.id} className="h-3.5 w-3.5" />
-            <span className="sm:hidden">{active.short}</span>
-            <span className="hidden sm:inline">{active.label}</span>
-            <ChevronDown className="h-3 w-3 opacity-60" />
+            <ModeGlyph mode={active.id} className="h-3.5 w-3.5 shrink-0" />
+            <span className="max-w-[7rem] truncate sm:hidden">{active.short}</span>
+            <span className="hidden max-w-[10rem] truncate sm:inline">{active.label}</span>
+            <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-50" />
           </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
+        </PopoverTrigger>
+        <PopoverContent
           align="start"
           side="top"
-          sideOffset={8}
-          className="w-[19rem] rounded-2xl border-border/80 bg-popover p-1.5 shadow-[0_24px_60px_-24px_rgba(35,20,28,0.45)]"
+          sideOffset={10}
+          collisionPadding={12}
+          className="flex max-h-[min(70vh,var(--radix-popover-content-available-height))] w-[min(92vw,20rem)] flex-col overflow-hidden rounded-2xl border-border bg-popover p-0 shadow-2xl"
         >
-          <DropdownMenuLabel className="px-2 pb-0.5 pt-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Run mode
-          </DropdownMenuLabel>
-          {RUN_MODES.map((mode) => (
-            <DropdownMenuItem
-              key={mode.id}
-              data-testid={runModeOptionTid(mode.id)}
-              onSelect={() => apply(mode)}
-              className="items-start gap-2.5 rounded-xl px-2 py-2"
-            >
-              <span className="mt-0.5 flex w-9 shrink-0 items-center justify-center text-muted-foreground">
-                <ModeGlyph mode={mode.id} className="h-4 w-4" />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-[13px] font-medium">{mode.label}</span>
-                <span className="block text-[11px] leading-snug text-muted-foreground">{mode.hint}</span>
-              </span>
-              {active.id === mode.id ? <Check className="mt-0.5 h-4 w-4 shrink-0 text-ember" /> : null}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
+          <div className="min-h-0 overflow-y-auto p-2">
+            <p className="px-2 py-1.5 text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+              Answer mode
+            </p>
+            {RUN_MODES.map((mode) => {
+              const selected = active.id === mode.id;
+              return (
+                <button
+                  key={mode.id}
+                  type="button"
+                  data-testid={runModeOptionTid(mode.id)}
+                  onClick={() => apply(mode)}
+                  aria-pressed={selected}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left transition-colors hover:bg-foreground/5",
+                    selected && "bg-ember/10",
+                  )}
+                >
+                  <Check className={cn("h-3.5 w-3.5 shrink-0", selected ? "text-ember" : "opacity-0")} />
+                  <span
+                    className={cn(
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+                      selected ? "bg-ember/10 text-ember" : "bg-foreground/5 text-muted-foreground",
+                    )}
+                  >
+                    <ModeGlyph mode={mode.id} className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm">{mode.label}</span>
+                    <span className="block text-[11px] leading-snug text-muted-foreground">{mode.hint}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </PopoverContent>
+      </Popover>
       {engaged ? (
         <Popover>
           <PopoverTrigger asChild>

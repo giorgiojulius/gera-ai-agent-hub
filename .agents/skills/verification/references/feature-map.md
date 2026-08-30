@@ -107,10 +107,11 @@ Bottom rail (left→right): attach, Studio popover ("Studio — tools, MCP
 servers, behavior": builtin tools, MCP servers, auto routing, memory,
 settings link), run-mode selector + config gear, Skills button, GitHub
 repo pin (only while the GitHub connector is on), model picker, send. The
-run-mode selector (`composer-mode-trigger`) is ONE labeled pill opening a
-4-option menu — Standard / Deep research / Julius / Research × Julius
-(`run-mode-option-<id>`) — it replaced the two separate toggle pills; on
-narrow screens it shows a short label (Research / Julius / R×J). A single
+run-mode selector (`composer-mode-trigger`) mirrors the AI model picker: the
+same compact, borderless trigger with up/down chevrons opens a checked catalog
+of Standard / Deep research / Julius / Research × Julius
+(`run-mode-option-<id>`), with an icon and explanation on every row. On narrow
+screens it shows a short label (Research / Julius / R×J). A single
 config gear (`composer-mode-config`) appears beside it only while
 research/Julius is engaged and opens the mode's settings panel
 (`composer-mode-config-panel`) — Research | Julius tabs when both ride.
@@ -783,7 +784,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | new-chat-keeps-history | New chat resets view, thread stays listed |
 | switch-chat-model | Picker root → Model submenu → selection sticks |
 | switch-chat-effort | Picker root → Effort submenu → budget pins |
-| switch-run-mode | Mode menu engages Deep research, trigger reflects it |
+| switch-run-mode | Model-style mode picker engages Deep research, trigger reflects it |
 | run-mode-settings-panel | Gear opens the research settings panel (depth control) |
 | skills-rail-panel | Skills rail button opens the per-mode packs panel |
 | projects-page-opens | Projects page renders + create action behind the gate |

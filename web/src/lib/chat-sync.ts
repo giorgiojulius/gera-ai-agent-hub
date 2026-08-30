@@ -133,13 +133,13 @@ export function serializeProfile(settings: AgentSettings, life: LifeState): stri
 }
 
 /** Splits a synced profile blob; each half is validated by its own normalizer. */
-export function parseProfilePayload(payload: string): { settings: unknown; life: unknown } | null {
+export function parseProfilePayload(payload: string): { settings: unknown; life: unknown; mcpOAuth: unknown } | null {
   try {
-    const parsed = JSON.parse(payload) as { settings?: unknown; life?: unknown } | null;
+    const parsed = JSON.parse(payload) as { settings?: unknown; life?: unknown; mcpOAuth?: unknown } | null;
     if (!parsed || typeof parsed !== "object") {
       return null;
     }
-    return { settings: parsed.settings, life: parsed.life };
+    return { settings: parsed.settings, life: parsed.life, mcpOAuth: parsed.mcpOAuth };
   } catch {
     return null;
   }

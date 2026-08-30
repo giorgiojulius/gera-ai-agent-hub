@@ -12,6 +12,14 @@ import { storeExternalOAuthToken } from "@/lib/mcp-oauth";
 const DEVICE_CODE_URL = "https://github.com/login/device/code";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
 
+/** A credential is absent or definitively rejected; only a fresh sign-in/key can repair it. */
+export class GitHubAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubAuthError";
+  }
+}
+
 /**
  * Subset of the GitHub MCP server's published scopes_supported — enough for
  * repos, issues, PRs, Actions, gists, notifications and projects. Excludes
@@ -108,7 +116,10 @@ export async function fetchGitHubViewer(authorization: string): Promise<GitHubVi
     },
   });
   if (!response.ok) {
-    throw new Error(`GitHub rejected the token (${response.status}) — sign in again.`);
+    if (response.status === 401) {
+      throw new GitHubAuthError("GitHub rejected this credential — sign in again or paste a fresh PAT.");
+    }
+    throw new Error(`GitHub could not verify the credential right now (HTTP ${response.status}) — retry shortly.`);
   }
   const data = (await response.json()) as { login?: unknown; name?: unknown };
   const login = typeof data.login === "string" ? data.login : "";

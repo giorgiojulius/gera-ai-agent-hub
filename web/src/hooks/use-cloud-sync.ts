@@ -21,6 +21,11 @@ import {
 } from "@/lib/chat-sync";
 import { normalizeStoredSettings, saveActiveId, saveConversations } from "@/lib/history";
 import { normalizeLife } from "@/lib/life";
+import {
+  OAUTH_TOKENS_CHANGED_EVENT,
+  OAUTH_TOKENS_KEY,
+  adoptProfileOAuthTokens,
+} from "@/lib/mcp-oauth";
 
 type CloudSyncArgs = {
   state: AgentState;
@@ -102,6 +107,10 @@ export function useCloudSync(args: CloudSyncArgs): {
       if (appliedProfile) {
         const parsed = parseProfilePayload(appliedProfile.payload);
         if (parsed) {
+          // Settings and their OAuth grants are one account profile. Applying
+          // only the green `connected` flag while discarding `mcpOAuth` left
+          // this browser unable to authenticate and caused repeated re-login.
+          adoptProfileOAuthTokens(parsed.mcpOAuth);
           const nextSettings = normalizeStoredSettings(parsed.settings);
           const nextLife = normalizeLife(parsed.life);
           applyingProfileRef.current = true;
@@ -256,6 +265,31 @@ export function useCloudSync(args: CloudSyncArgs): {
       scheduleSync(4_000);
     }
   }, [state.settings, state.life, scheduleSync]);
+
+  // OAuth lives outside React state, so sign-in, refresh, and sign-out need
+  // their own profile-clock signal. Without it a browser could rotate a token
+  // locally while the cloud kept the revoked old pair and asked for re-login.
+  useEffect(() => {
+    const markOAuthChanged = () => {
+      const meta = profileMetaRef.current;
+      meta.updatedAt = Math.max(Date.now(), meta.updatedAt + 1);
+      saveProfileMeta(meta);
+      if (userRef.current) {
+        scheduleSync(600);
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === OAUTH_TOKENS_KEY) {
+        markOAuthChanged();
+      }
+    };
+    window.addEventListener(OAUTH_TOKENS_CHANGED_EVENT, markOAuthChanged);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(OAUTH_TOKENS_CHANGED_EVENT, markOAuthChanged);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [scheduleSync]);
 
   // Returning to the tab pulls what other devices did meanwhile.
   useEffect(() => {

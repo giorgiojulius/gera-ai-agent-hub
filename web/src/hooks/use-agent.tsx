@@ -167,7 +167,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     removeMcp,
     connectMcp,
     toggleMcpTool,
-  } = useMcpActions({ stateRef, setSettings });
+  } = useMcpActions({ stateRef, servers: state.settings.mcpServers, setSettings });
 
   const updateLife = useCallback((updater: (prev: LifeState) => LifeState) => {
     setState((prev) => ({ ...prev, life: updater(prev.life) }));

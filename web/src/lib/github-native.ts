@@ -1,4 +1,4 @@
-import { fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
+import { GitHubAuthError, fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
 import { oauthAuthHeader } from "@/lib/mcp-oauth";
 import type { McpServerConfig, McpToolInfo } from "@/lib/types";
 
@@ -76,7 +76,9 @@ const FUNCTIONS_URL: string = (() => {
  * a pasted PAT wins, then the stored device-flow sign-in. Throws a
  * user-actionable error when neither exists.
  */
-export async function resolveGitHubAuth(config: Pick<McpServerConfig, "id" | "token">): Promise<string> {
+export async function resolveGitHubAuth(
+  config: Pick<McpServerConfig, "id" | "catalogId" | "token">,
+): Promise<string> {
   const pasted = config.token?.trim();
   if (pasted) {
     return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
@@ -85,7 +87,15 @@ export async function resolveGitHubAuth(config: Pick<McpServerConfig, "id" | "to
   if (oauth) {
     return oauth;
   }
-  throw new Error('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');
+  // Device flow stores the catalog credential under the stable `github` key.
+  // Legacy/imported rows may have a generated instance id plus catalogId.
+  if (config.catalogId && config.catalogId !== config.id) {
+    const catalogOAuth = await oauthAuthHeader(config.catalogId);
+    if (catalogOAuth) {
+      return catalogOAuth;
+    }
+  }
+  throw new GitHubAuthError('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');
 }
 
 /**
@@ -428,7 +438,7 @@ async function ghFetch(
   }
 
   if (response.status === 401) {
-    throw new Error('GitHub rejected the token — press "Sign in with GitHub" again, or paste a fresh PAT.');
+    throw new GitHubAuthError('GitHub rejected the token — press "Sign in with GitHub" again, or paste a fresh PAT.');
   }
   if (response.status === 403 || response.status === 429) {
     if (response.headers.get("x-ratelimit-remaining") === "0") {
@@ -1103,7 +1113,7 @@ async function fetchJobLogText(auth: string, owner: string, repo: string, jobId:
     throw new Error("No logs — they expire after 90 days, or the job_id is wrong (take it from list_run_jobs).");
   }
   if (response.status === 401) {
-    throw new Error('GitHub rejected the token — press "Sign in with GitHub" again, or paste a fresh PAT.');
+    throw new GitHubAuthError('GitHub rejected the token — press "Sign in with GitHub" again, or paste a fresh PAT.');
   }
   if (!response.ok) {
     throw new Error(`GitHub returned ${response.status} for job logs.`);

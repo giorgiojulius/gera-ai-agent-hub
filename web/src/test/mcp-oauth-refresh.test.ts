@@ -6,9 +6,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  OAUTH_TOKENS_CHANGED_EVENT,
+  adoptProfileOAuthTokens,
   composeAuthScope,
   forceRefreshOAuthHeader,
+  hasOAuthToken,
   isClientRegistrationUsable,
+  oauthAuthHeader,
 } from "@/lib/mcp-oauth";
 
 const TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
@@ -17,15 +21,17 @@ type StubResponse = { ok: boolean; status: number; json: () => Promise<unknown> 
 
 describe("refresh survival (web/src/lib/mcp-oauth)", () => {
   let store: Map<string, string>;
+  let dispatchEvent: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     store = new Map<string, string>();
+    dispatchEvent = vi.fn();
     const storage = {
       getItem: (key: string) => store.get(key) ?? null,
       setItem: (key: string, value: string) => void store.set(key, value),
       removeItem: (key: string) => void store.delete(key),
     };
-    vi.stubGlobal("window", { localStorage: storage });
+    vi.stubGlobal("window", { localStorage: storage, dispatchEvent });
     vi.stubGlobal("localStorage", storage);
   });
 
@@ -114,7 +120,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     expect(storedToken("transient")?.refreshToken).toBe("RA");
   });
 
-  it("stores the rotated pair on a successful refresh", async () => {
+  it("stores the rotated pair on a successful refresh and wakes profile sync", async () => {
     seedToken("happy", "A", "RA");
     stubFetch(() => ({
       ok: true,
@@ -126,6 +132,45 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     expect(header).toBe("Bearer B");
     expect(storedToken("happy")?.accessToken).toBe("B");
     expect(storedToken("happy")?.refreshToken).toBe("RB");
+    expect(dispatchEvent).toHaveBeenCalledTimes(1);
+    expect((dispatchEvent.mock.calls[0]?.[0] as Event | undefined)?.type).toBe(OAUTH_TOKENS_CHANGED_EVENT);
+  });
+
+  it("adopts grants from a newer synced profile instead of keeping a green card without auth", () => {
+    seedToken("local-only", "L", "RL");
+    const adopted = adoptProfileOAuthTokens({
+      github: {
+        accessToken: "G",
+        refreshToken: "RG",
+        expiresAt: Date.now() + 3_600_000,
+        tokenEndpoint: "https://github.com/login/oauth/access_token",
+        clientId: "github-client",
+      },
+      malformed: { accessToken: "secret-without-client-metadata" },
+    });
+
+    expect(adopted).toBe(1);
+    expect(storedToken("github")?.accessToken).toBe("G");
+    expect(storedToken("github")?.refreshToken).toBe("RG");
+    expect(storedToken("local-only")?.accessToken).toBe("L");
+    expect(storedToken("malformed")).toBeUndefined();
+    expect(dispatchEvent).not.toHaveBeenCalled(); // remote apply must not echo as a local edit
+  });
+
+  it("does not advertise or send a known-expired access token with no refresh grant", async () => {
+    const map = {
+      dead: {
+        accessToken: "A",
+        expiresAt: Date.now() - 1,
+        tokenEndpoint: "https://auth.example/token",
+        clientId: "client-1",
+      },
+    };
+    store.set(TOKENS_KEY, JSON.stringify(map));
+
+    expect(hasOAuthToken("dead")).toBe(false);
+    await expect(oauthAuthHeader("dead")).resolves.toBeNull();
+    expect(storedToken("dead")).toBeUndefined();
   });
 });
 

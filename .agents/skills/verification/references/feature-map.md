@@ -1,13 +1,14 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `0d4a0d9` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `8ac9ffc` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
 credential hand-off + server contents preflight + structured pin across
-Research/Julius + repo access probe, honesty rule in default system prompts,
-skills-as-guidance research fix + empty-question guard, Intercom attachments)
-Drift check: `git log --oneline 0d4a0d9..HEAD`, then compare against
+Research/Julius + repo access probe, truthful MCP health + durable OAuth
+grant sync/refresh, honesty rule in default system prompts, skills-as-guidance
+research fix + empty-question guard, Intercom attachments)
+Drift check: `git log --oneline 8ac9ffc..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -673,12 +674,25 @@ tokens refresh 60s before expiry and once more reactively on 401; no
 client-side TTL is invented when a server omits expires_in; refresh always
 uses the stored token endpoint (no re-discovery); offline_access is
 requested whenever the AS advertises it (otherwise many providers issue no
-refresh token); a fatal refresh (invalid_grant) adopts the freshest stored
-pair first — sibling-tab or server-run rotations win over clearing — and
-only a genuinely dead grant drops to Sign in; expired DCR registrations
+refresh token). Every sign-in/refresh/sign-out now bumps the profile clock,
+so a browser-rotated pair reaches cloud runs before the old refresh token is
+reused there. A newer account profile applies BOTH its MCP settings and its
+validated `mcpOAuth` grants (the old loader discarded the grants but kept the
+green flags); local-only grants remain. A transient relay/provider refresh
+failure keeps the recoverable grant and says retry — it never deletes it or
+asks for re-login; a fatal refresh (invalid_grant) still adopts the freshest
+sibling/server rotation first, and only a genuinely dead or expired
+non-refreshable grant drops to Sign in. Expired DCR registrations
 (client_secret_expires_at) re-register instead of failing from cache.
-Unit suites: `mcp-oauth-refresh.test.ts`, `mcp-rotation.test.ts`,
-`mcp-session.test.ts`.
+
+Status truth (2026-08-30): every persisted green card is live-checked once
+per browser session, again when synced settings/auth arrive, every 10 minutes
+in a long-open tab, and when the tab returns (the old mount-only pass often ran
+too early). A `connected` card with missing OAuth/key bypasses the freshness
+window and flips straight to a specific error; checks visibly enter Connecting
+and only return green after handshake + tools/list. GitHub 401 is an auth
+failure; 403/rate-limit is not mislabeled as "sign in again". Unit suites: `mcp-oauth-refresh.test.ts`,
+`mcp-rotation.test.ts`, `mcp-session.test.ts`.
 
 ## Settings (`/settings`)
 

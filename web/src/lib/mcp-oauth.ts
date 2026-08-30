@@ -7,7 +7,8 @@
  */
 
 export const OAUTH_RESULT_KEY = "gera.mcp.oauth.result.v1";
-const TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
+export const OAUTH_TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
+export const OAUTH_TOKENS_CHANGED_EVENT = "gera:mcp-oauth-changed";
 const CLIENTS_KEY = "gera.mcp.oauth.clients.v1";
 
 type StoredToken = {
@@ -109,11 +110,105 @@ function saveJson(key: string, value: unknown): void {
 }
 
 function loadTokens(): Record<string, StoredToken> {
-  return loadJson<Record<string, StoredToken>>(TOKENS_KEY) ?? {};
+  return loadJson<Record<string, StoredToken>>(OAUTH_TOKENS_KEY) ?? {};
 }
 
+/** Persists grants and tells profile sync that auth changed without exposing any credential. */
+function saveTokens(tokens: Record<string, StoredToken>, notify: boolean = true): void {
+  saveJson(OAUTH_TOKENS_KEY, tokens);
+  if (!notify) {
+    return;
+  }
+  try {
+    window.dispatchEvent(new Event(OAUTH_TOKENS_CHANGED_EVENT));
+  } catch {
+    // Tests, SSR, and restricted documents may not expose DOM events.
+  }
+}
+
+function parseStoredToken(value: unknown): StoredToken | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Partial<StoredToken>;
+  if (
+    typeof raw.accessToken !== "string" ||
+    !raw.accessToken ||
+    typeof raw.tokenEndpoint !== "string" ||
+    typeof raw.clientId !== "string"
+  ) {
+    return null;
+  }
+  return {
+    accessToken: raw.accessToken,
+    refreshToken: typeof raw.refreshToken === "string" && raw.refreshToken ? raw.refreshToken : undefined,
+    expiresAt:
+      typeof raw.expiresAt === "number" && Number.isFinite(raw.expiresAt) ? raw.expiresAt : undefined,
+    tokenEndpoint: raw.tokenEndpoint,
+    clientId: raw.clientId,
+    resource: typeof raw.resource === "string" && raw.resource ? raw.resource : undefined,
+  };
+}
+
+/** A grant is usable when its access token is live or its refresh token can renew it. */
 export function hasOAuthToken(serverId: string): boolean {
-  return Boolean(loadTokens()[serverId]?.accessToken);
+  const token = loadTokens()[serverId];
+  if (!token?.accessToken) {
+    return false;
+  }
+  return token.expiresAt === undefined || Date.now() < token.expiresAt || Boolean(token.refreshToken);
+}
+
+/** Whether a rejected access token can be repaired without asking the user to sign in. */
+export function hasOAuthRefreshToken(serverId: string): boolean {
+  return Boolean(loadTokens()[serverId]?.refreshToken);
+}
+
+/** Non-secret revision marker used to re-check a card when its grant changes. */
+export function oauthTokenFingerprint(serverId: string): string {
+  const token = loadTokens()[serverId];
+  if (!token?.accessToken) {
+    return "missing";
+  }
+  const material = `${token.accessToken}\u0000${token.refreshToken ?? ""}\u0000${token.expiresAt ?? 0}`;
+  let hash = 2_166_136_261;
+  for (let index = 0; index < material.length; index += 1) {
+    hash ^= material.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * Adopts the grants carried by a newer synced profile. The profile payload
+ * already crossed the authenticated account boundary; older code applied its
+ * green MCP settings but discarded this half, producing a connected card with
+ * no credential. Remote entries win for the same server, while local-only
+ * grants survive until their own profile update syncs.
+ */
+export function adoptProfileOAuthTokens(raw: unknown): number {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return 0;
+  }
+  const tokens = loadTokens();
+  let adopted = 0;
+  for (const [serverId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!serverId) {
+      continue;
+    }
+    const token = parseStoredToken(value);
+    if (!token || JSON.stringify(tokens[serverId]) === JSON.stringify(token)) {
+      continue;
+    }
+    tokens[serverId] = token;
+    adopted += 1;
+  }
+  if (adopted > 0) {
+    // This is a remote profile application, not a new local mutation: do not
+    // bump the profile clock and immediately echo it back.
+    saveTokens(tokens, false);
+  }
+  return adopted;
 }
 
 /**
@@ -129,7 +224,7 @@ export function clearOAuthToken(serverId: string): void {
   const tokens = loadTokens();
   if (tokens[serverId]) {
     delete tokens[serverId];
-    saveJson(TOKENS_KEY, tokens);
+    saveTokens(tokens);
   }
 }
 
@@ -215,7 +310,7 @@ export function applyServerOAuthRotations(rotations: ServerOAuthRotation[]): num
     adopted += 1;
   }
   if (adopted > 0) {
-    saveJson(TOKENS_KEY, tokens);
+    saveTokens(tokens, false);
   }
   return adopted;
 }
@@ -248,7 +343,7 @@ async function adoptRotationFromServer(
     }
     const tokens = loadTokens();
     tokens[serverId] = match.token;
-    saveJson(TOKENS_KEY, tokens);
+    saveTokens(tokens);
     return match.token.accessToken;
   } catch {
     return null;
@@ -271,7 +366,7 @@ export function storeExternalOAuthToken(
 ): void {
   const tokens = loadTokens();
   tokens[serverId] = token;
-  saveJson(TOKENS_KEY, tokens);
+  saveTokens(tokens);
 }
 
 /** Returns an Authorization header value for a signed-in server, refreshing when close to expiry. */
@@ -280,16 +375,24 @@ export async function oauthAuthHeader(serverId: string): Promise<string | null> 
   if (!stored?.accessToken) {
     return null;
   }
-  const expiringSoon = stored.expiresAt !== undefined && Date.now() > stored.expiresAt - EXPIRY_SKEW_MS;
+  const now = Date.now();
+  const expiringSoon = stored.expiresAt !== undefined && now > stored.expiresAt - EXPIRY_SKEW_MS;
   if (expiringSoon && stored.refreshToken) {
     const refreshed = await refreshServerToken(serverId);
     if (refreshed) {
       return `Bearer ${refreshed}`;
     }
     // Refresh failed: the token may have been cleared (dead grant) or the
-    // failure was transient — re-read and fall back to whatever is left.
+    // failure was transient — re-read and fall back only while access is
+    // genuinely unexpired. Sending a known-expired token just creates another
+    // 401 and used to turn temporary refresh outages into forced re-logins.
     const after = loadTokens()[serverId];
-    return after?.accessToken ? `Bearer ${after.accessToken}` : null;
+    const stillLive = after?.expiresAt === undefined || now < after.expiresAt;
+    return after?.accessToken && stillLive ? `Bearer ${after.accessToken}` : null;
+  }
+  if (stored.expiresAt !== undefined && now >= stored.expiresAt) {
+    clearOAuthToken(serverId);
+    return null;
   }
   return `Bearer ${stored.accessToken}`;
 }
@@ -323,7 +426,7 @@ function refreshServerToken(serverId: string): Promise<string | null> {
       const refreshed = await refreshAccessToken(stored);
       const tokens = loadTokens();
       tokens[serverId] = refreshed;
-      saveJson(TOKENS_KEY, tokens);
+      saveTokens(tokens);
       return refreshed.accessToken;
     } catch (error) {
       if (error instanceof OAuthTokenError && FATAL_REFRESH_CODES.has(error.code)) {
@@ -425,7 +528,7 @@ export async function runOAuthSignIn(
 
     const tokens = loadTokens();
     tokens[server.id] = token;
-    saveJson(TOKENS_KEY, tokens);
+    saveTokens(tokens);
   } catch (error) {
     // A registration the provider expired or revoked would fail every future
     // sign-in straight from cache — forget it so the next attempt re-registers.

@@ -44,7 +44,7 @@ import { buildSkillsBlock, filterSkillsByIds, skillPinnedServerIds, skillsForSur
 import { applySkillOps, buildSkillsEditorContext, extractSkillOps } from "@/lib/skill-ops";
 import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerableRun, watchSteering } from "@/lib/steering";
 import { McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
-import { runOAuthSignIn } from "@/lib/mcp-oauth";
+import { hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
 import {
   IMAGE_EDIT_MODEL,
   modelIdForMode,
@@ -1798,27 +1798,88 @@ export async function reconnectMcp(
   }
 }
 
-/** Re-verify a booted "connected" server no more often than this. */
+/** Re-verify a persisted green status after this age, and always once auth disappears. */
 const MCP_REVERIFY_AFTER_MS = 10 * 60_000;
 
+/** Returns the exact local credential gap that makes a green card impossible. */
+export function mcpCredentialProblem(server: McpServerConfig): string | null {
+  const entry = findCatalogEntry(server.catalogId ?? server.id);
+  const catalogId = server.catalogId ?? server.id;
+  const hasKey = Boolean(server.token?.trim());
+  const hasHeaders = Boolean(server.headersJson?.trim());
+  const hasOAuth =
+    hasOAuthToken(server.id) || (catalogId !== server.id && hasOAuthToken(catalogId));
+
+  if (entry?.native === "github") {
+    return hasKey || hasOAuth ? null : "GitHub sign-in is missing — sign in again or paste a PAT.";
+  }
+  if (entry?.native === "slack" || entry?.native === "intercom") {
+    return hasKey ? null : `${entry.name} needs a fresh API token.`;
+  }
+  if (server.authMode === "oauth" || entry?.auth === "oauth") {
+    return hasOAuth ? null : "Sign-in is missing or expired — authorize this server again.";
+  }
+  if (server.authMode === "bearer") {
+    return hasKey ? null : "Bearer token is missing.";
+  }
+  if (entry?.auth === "token" && entry.tokenOptional !== true) {
+    return hasKey || hasHeaders ? null : `${entry.name} needs an API key.`;
+  }
+  return null;
+}
+
 /**
- * Boot-time background re-verification — "connect once and forget". Servers
- * verified recently are trusted as-is; the rest re-handshake quietly: fresh
- * tools on success, an honest error state (with a toast) when the sign-in or
- * key truly died, and no change at all on transient failures — those heal
- * lazily because tool calls reconnect on demand.
+ * Re-validates persisted connection state after boot and after a synced profile
+ * arrives. Missing auth bypasses the freshness window, so a remote green flag
+ * can never mask an absent local grant. Stale cards visibly enter Checking and
+ * end in either a fresh verified green state or an honest error state.
  */
 export function revalidateMcpServers(
   servers: McpServerConfig[],
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void,
+  forceIds: ReadonlySet<string> = new Set<string>(),
 ): void {
+  const candidates: McpServerConfig[] = [];
+  const problems = new Map<string, string>();
   for (const server of servers) {
     if (!server.enabled || server.status !== "connected") {
       continue;
     }
-    if (server.verifiedAt && Date.now() - server.verifiedAt < MCP_REVERIFY_AFTER_MS) {
+    const problem = mcpCredentialProblem(server);
+    if (problem) {
+      problems.set(server.id, problem);
       continue;
     }
+    if (
+      forceIds.has(server.id) ||
+      !server.verifiedAt ||
+      Date.now() - server.verifiedAt >= MCP_REVERIFY_AFTER_MS
+    ) {
+      candidates.push(server);
+    }
+  }
+  if (problems.size > 0 || candidates.length > 0) {
+    const checkingIds = new Set(candidates.map((server) => server.id));
+    setSettings((prev) => ({
+      ...prev,
+      mcpServers: prev.mcpServers.map((server) => {
+        const problem = problems.get(server.id);
+        if (problem) {
+          return {
+            ...server,
+            status: "error" as const,
+            error: problem,
+            identity: undefined,
+            verifiedAt: undefined,
+          };
+        }
+        return checkingIds.has(server.id)
+          ? { ...server, status: "connecting" as const, error: undefined }
+          : server;
+      }),
+    }));
+  }
+  for (const server of candidates) {
     void revalidateQuietly(server, setSettings);
   }
 }
@@ -1845,11 +1906,6 @@ async function revalidateQuietly(
       ),
     }));
   } catch (error) {
-    if (!(error instanceof McpAuthError)) {
-      // Transient (network blip, server down): keep the stored state — the
-      // next tool call reconnects on demand and the next boot re-verifies.
-      return;
-    }
     const message = errorFromUnknown(error);
     setSettings((prev) => ({
       ...prev,
@@ -1859,7 +1915,9 @@ async function revalidateQuietly(
           : item,
       ),
     }));
-    toast.error(`${server.name} disconnected`, { description: message });
+    if (error instanceof McpAuthError) {
+      toast.error(`${server.name} disconnected`, { description: message });
+    }
   }
 }
 

@@ -2,7 +2,7 @@
 // revalidation pass plus every card/catalog action (add, connect, OAuth
 // sign-in, token toggle, removal). All state flows through the provider's
 // setSettings, so behavior and persistence are unchanged.
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   addBlankMcpServer,
@@ -14,22 +14,106 @@ import {
   type AgentState,
 } from "@/lib/agent-store";
 import { catalogEntryToServer, findCatalogEntry } from "@/lib/mcp-catalog";
-import { clearOAuthToken, hasOAuthToken, openOAuthPopup } from "@/lib/mcp-oauth";
+import {
+  OAUTH_TOKENS_CHANGED_EVENT,
+  clearOAuthToken,
+  hasOAuthToken,
+  oauthTokenFingerprint,
+  openOAuthPopup,
+} from "@/lib/mcp-oauth";
 import type { AgentSettings, McpServerConfig } from "@/lib/types";
 
 type McpActionsArgs = {
   stateRef: { current: AgentState };
+  servers: McpServerConfig[];
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void;
 };
 
-export function useMcpActions({ stateRef, setSettings }: McpActionsArgs) {
-  // "Connect once and forget": MCP servers verified earlier stay connected
-  // across reloads; one boot pass quietly re-verifies them in the background.
-  // Dead sign-ins flip to an honest error; network blips change nothing and
-  // heal lazily on the next tool call.
+function shortFingerprint(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/** Auth/config revision only — tools, identity, and verifiedAt must not loop validation. */
+function validationFingerprint(server: McpServerConfig): string {
+  const catalogId = server.catalogId ?? server.id;
+  const oauth = [oauthTokenFingerprint(server.id)];
+  if (catalogId !== server.id) {
+    oauth.push(oauthTokenFingerprint(catalogId));
+  }
+  return [
+    server.url,
+    server.authMode ?? "auto",
+    catalogId,
+    shortFingerprint(server.token ?? ""),
+    shortFingerprint(server.headersJson ?? ""),
+    ...oauth,
+  ].join("|");
+}
+
+export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs) {
+  const [oauthRevision, setOAuthRevision] = useState<number>(0);
+  const [healthTick, setHealthTick] = useState<number>(0);
+  const validatedRef = useRef<Map<string, string>>(new Map<string, string>());
+
+  // OAuth tokens live outside React state. Wake the status validator whenever
+  // sign-in/refresh/sign-out changes them in this document.
   useEffect(() => {
-    revalidateMcpServers(stateRef.current.settings.mcpServers, setSettings);
-  }, [setSettings, stateRef]);
+    const onOAuthChanged = () => setOAuthRevision((value) => value + 1);
+    window.addEventListener(OAUTH_TOKENS_CHANGED_EVENT, onOAuthChanged);
+    return () => window.removeEventListener(OAUTH_TOKENS_CHANGED_EVENT, onOAuthChanged);
+  }, []);
+
+  // Long-open tabs need the same honesty as a reload. Wake the ten-minute
+  // freshness check once a minute and immediately when a hidden tab returns.
+  useEffect(() => {
+    const wake = () => setHealthTick((value) => value + 1);
+    const onVisible = () => {
+      if (!document.hidden) {
+        wake();
+      }
+    };
+    const timer = window.setInterval(wake, 60_000);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  // Re-run when cloud profile settings arrive too — the old mount-only pass
+  // often ran before sync loaded its green cards, so they were never checked.
+  // Each persisted green card is force-checked once per browser session (and
+  // again whenever its auth/config fingerprint changes); a successful update
+  // changes tools/verifiedAt only, so it cannot create a verification loop.
+  useEffect(() => {
+    const forceIds = new Set<string>();
+    const liveIds = new Set(servers.map((server) => server.id));
+    for (const id of validatedRef.current.keys()) {
+      if (!liveIds.has(id)) {
+        validatedRef.current.delete(id);
+      }
+    }
+    for (const server of servers) {
+      if (server.status === "error" || server.status === "idle") {
+        validatedRef.current.delete(server.id);
+        continue;
+      }
+      if (!server.enabled || server.status !== "connected") {
+        continue;
+      }
+      const fingerprint = validationFingerprint(server);
+      if (validatedRef.current.get(server.id) !== fingerprint) {
+        validatedRef.current.set(server.id, fingerprint);
+        forceIds.add(server.id);
+      }
+    }
+    revalidateMcpServers(servers, setSettings, forceIds);
+  }, [healthTick, oauthRevision, servers, setSettings]);
 
   const updateMcp = useCallback((id: string, patch: Partial<McpServerConfig>) => {
     setSettings((prev) => ({

@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { mcpCredentialProblem, revalidateMcpServers } from "@/lib/agent-store";
+import { parseProfilePayload } from "@/lib/chat-sync";
 import { normalizeStoredSettings } from "@/lib/history";
 import { isSessionLostRpcMessage, isSessionLostSignal } from "@/lib/mcp";
-import type { McpServerConfig } from "@/lib/types";
+import { adoptProfileOAuthTokens } from "@/lib/mcp-oauth";
+import type { AgentSettings, McpServerConfig } from "@/lib/types";
 
 function storedServer(overrides: Partial<McpServerConfig>): McpServerConfig {
   return {
@@ -49,6 +52,18 @@ describe("session-lost detection", () => {
 });
 
 describe("MCP connection persistence — connect once and forget", () => {
+  it("keeps the OAuth half of a synced profile available to the caller", () => {
+    const oauth = {
+      github: {
+        accessToken: "credential",
+        tokenEndpoint: "https://github.com/login/oauth/access_token",
+        clientId: "client",
+      },
+    };
+    const parsed = parseProfilePayload(JSON.stringify({ settings: {}, life: {}, mcpOAuth: oauth }));
+    expect(parsed?.mcpOAuth).toEqual(oauth);
+  });
+
   it("keeps verified servers connected across reloads, with proof intact", () => {
     const settings = normalizeStoredSettings({
       mcpServers: [
@@ -93,5 +108,65 @@ describe("MCP connection persistence — connect once and forget", () => {
     expect(settings.mcpServers[0]?.status).toBe("connected");
     expect(settings.mcpServers[0]?.identity).toBeUndefined();
     expect(settings.mcpServers[0]?.verifiedAt).toBeUndefined();
+  });
+});
+
+describe("honest MCP auth status", () => {
+  let store: Map<string, string>;
+
+  beforeEach(() => {
+    store = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+    };
+    vi.stubGlobal("window", { localStorage: storage, dispatchEvent: vi.fn() });
+    vi.stubGlobal("localStorage", storage);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("rejects a fresh-looking green GitHub card when its credential is absent", () => {
+    const github = storedServer({
+      id: "github",
+      catalogId: "github",
+      name: "GitHub",
+      status: "connected",
+      verifiedAt: Date.now(),
+      tools: [{ name: "get_contents" }],
+    });
+    expect(mcpCredentialProblem(github)).toContain("sign-in is missing");
+
+    let settings: AgentSettings = normalizeStoredSettings({ mcpServers: [github] });
+    revalidateMcpServers(settings.mcpServers, (updater) => {
+      settings = updater(settings);
+    });
+    expect(settings.mcpServers[0]?.status).toBe("error");
+    expect(settings.mcpServers[0]?.verifiedAt).toBeUndefined();
+    expect(settings.mcpServers[0]?.error).toContain("sign in again");
+  });
+
+  it("accepts the same card once the synced OAuth grant has been adopted", () => {
+    const adopted = adoptProfileOAuthTokens({
+      github: {
+        accessToken: "credential",
+        tokenEndpoint: "https://github.com/login/oauth/access_token",
+        clientId: "client",
+      },
+    });
+    const github = storedServer({
+      id: "github-instance",
+      catalogId: "github",
+      name: "GitHub",
+      status: "connected",
+      verifiedAt: Date.now(),
+      tools: [{ name: "get_contents" }],
+    });
+
+    expect(adopted).toBe(1);
+    expect(mcpCredentialProblem(github)).toBeNull();
   });
 });

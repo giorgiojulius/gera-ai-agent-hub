@@ -1,8 +1,15 @@
 import { newId } from "@/lib/env";
+import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
 import { INTERCOM_NATIVE_TOOLS, callIntercomNativeTool, verifyIntercomToken } from "@/lib/intercom-native";
 import { findCatalogEntry } from "@/lib/mcp-catalog";
-import { clearOAuthToken, forceRefreshOAuthHeader, oauthAuthHeader } from "@/lib/mcp-oauth";
+import {
+  clearOAuthToken,
+  forceRefreshOAuthHeader,
+  hasOAuthRefreshToken,
+  hasOAuthToken,
+  oauthAuthHeader,
+} from "@/lib/mcp-oauth";
 import { SLACK_NATIVE_TOOLS, callSlackNativeTool, verifySlackToken } from "@/lib/slack-native";
 import type { McpAuthMode, McpServerConfig, McpToolInfo, OpenAiTool } from "@/lib/types";
 
@@ -134,8 +141,12 @@ async function buildAuth(
     return { url, headers: {}, usedOAuth: false, omitMcpHeaders };
   }
   if (mode === "oauth") {
+    const hadRefreshableGrant = hasOAuthToken(config.id) && hasOAuthRefreshToken(config.id);
     const oauth = await oauthAuthHeader(config.id);
     if (!oauth) {
+      if (hadRefreshableGrant && hasOAuthToken(config.id)) {
+        throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
+      }
       throw new McpAuthError("Sign-in required — press Sign in to authorize in the browser.");
     }
     return { url, headers: { Authorization: oauth }, usedOAuth: true, omitMcpHeaders };
@@ -158,10 +169,14 @@ async function buildAuth(
     return { url, headers, usedOAuth: false, omitMcpHeaders };
   }
   if (!headers.Authorization) {
+    const hadRefreshableGrant = hasOAuthToken(config.id) && hasOAuthRefreshToken(config.id);
     const oauth = await oauthAuthHeader(config.id);
     if (oauth) {
       headers.Authorization = oauth;
       return { url, headers, usedOAuth: true, omitMcpHeaders };
+    }
+    if (hadRefreshableGrant && hasOAuthToken(config.id)) {
+      throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
     }
   }
   return { url, headers, usedOAuth: false, omitMcpHeaders };
@@ -250,8 +265,14 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
           }
         }
         if (session.usedOAuth) {
-          clearOAuthToken(session.configId);
           sessions.delete(session.configId);
+          if (hasOAuthToken(session.configId) && hasOAuthRefreshToken(session.configId)) {
+            // The provider/relay may be temporarily unavailable. The rejected
+            // access token cannot be used now, but its refresh grant may repair
+            // the next attempt; deleting it here caused needless re-logins.
+            throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
+          }
+          clearOAuthToken(session.configId);
           throw new McpAuthError("Sign-in expired. Press Sign in to authorize again.");
         }
         throw new McpAuthError("This server needs a key or sign-in before it will talk.");
@@ -317,12 +338,19 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
   if (entry?.native === "github") {
     // Native GitHub: REST API straight from the browser with the device-flow
     // token or a pasted PAT — verifies who the token belongs to on connect.
-    const auth = await resolveGitHubAuth(config);
-    const verified = await verifyGitHubNative(auth);
-    return {
-      tools: GITHUB_NATIVE_TOOLS.map((tool) => ({ ...tool })),
-      identity: verified.identity,
-    };
+    try {
+      const auth = await resolveGitHubAuth(config);
+      const verified = await verifyGitHubNative(auth);
+      return {
+        tools: GITHUB_NATIVE_TOOLS.map((tool) => ({ ...tool })),
+        identity: verified.identity,
+      };
+    } catch (error) {
+      if (error instanceof GitHubAuthError) {
+        throw new McpAuthError(error.message);
+      }
+      throw error;
+    }
   }
   const auth = await buildAuth(config);
   const session: McpSession = {

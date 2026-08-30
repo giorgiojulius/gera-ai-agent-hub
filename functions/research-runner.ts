@@ -21,7 +21,7 @@ import {
   callGitHubNativeTool,
   fetchGitHubRepoMeta,
   fetchRepoCiSnapshot,
-  githubRepoRefs,
+  githubRunRepoRefs,
   parseRepoPick,
   type GitHubRepoMeta,
 } from "./native-github";
@@ -490,6 +490,8 @@ export type ResearchRunParams = {
   depth?: ResearchDepth;
   /** Ready GitHub Authorization value (client resolves the sign-in/PAT). */
   githubAuth?: string;
+  /** Thread pin used when the current question does not name another repo. */
+  githubRepo?: string;
   citations?: "numeric" | "links";
   fallbacks?: boolean;
   isCancelled?: () => boolean;
@@ -666,8 +668,10 @@ export async function runServerDeepResearch(
       ensureAlive();
     }
 
-    // Repos named in the question, read through the user's GitHub connector.
-    const repoRefs = githubRepoRefs(params.prompt);
+    // An explicit repo in the question wins; otherwise read the thread pin.
+    // The pin is structured run data — system-prompt prose alone never reached
+    // this deterministic GitHub preload, which made pinned private repos vanish.
+    const repoRefs = githubRunRepoRefs(params.prompt, params.githubRepo);
     if (repoRefs.length > 0 && !githubAuth) {
       finishStep(
         addStep("read", repoRefs.map((ref) => `${ref.owner}/${ref.repo}`).join(", "), "GitHub"),

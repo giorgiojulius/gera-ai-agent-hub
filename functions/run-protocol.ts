@@ -146,6 +146,8 @@ export type StartRunConfig = {
   prompt: string;
   builtins: Record<BuiltinToolId, boolean>;
   mcpServers: WireMcpServer[];
+  /** Thread-pinned owner/repo; server modes treat it as the structured default. */
+  githubRepo?: string;
   grounding?: { block: string; sources: RunSource[] };
   steeringWrapNote?: string;
   /** Resume: continue an existing assistant message instead of appending. */

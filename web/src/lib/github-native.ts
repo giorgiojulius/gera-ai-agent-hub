@@ -278,6 +278,23 @@ export function githubRepoRefs(text: string, limit = 3): Array<{ owner: string; 
   return out;
 }
 
+/**
+ * Repositories a run should read: an explicit owner/repo in the current
+ * request wins; otherwise the thread pin is the default. Keeping the pin as
+ * structured run data (instead of hoping a model notices it in a system
+ * prompt) is what makes private repos work in Research and Julius too.
+ */
+export function githubRunRepoRefs(
+  text: string,
+  pinnedRepo?: string,
+): Array<{ owner: string; repo: string }> {
+  const explicit = githubRepoRefs(text);
+  if (explicit.length > 0) {
+    return explicit;
+  }
+  return pinnedRepo?.trim() ? githubRepoRefs(pinnedRepo.trim(), 1) : [];
+}
+
 /** Structured repo metadata for callers that need more than a display string (deep research). */
 export type GitHubRepoMeta = {
   fullName: string;

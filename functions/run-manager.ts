@@ -32,6 +32,7 @@ import {
 } from "./mcp-cloud";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
 import { runServerJulius } from "./julius-runner";
+import { callGitHubNativeTool, fetchGitHubRepoMeta, githubRunRepoRefs } from "./native-github";
 import {
   builtinToolDefs,
   createServerSurfSession,
@@ -651,6 +652,7 @@ export class RunManager {
           systemPrompt: config.systemPrompt,
           depth: config.research?.depth ?? "balanced",
           githubAuth: config.research?.githubAuth,
+          githubRepo: config.githubRepo,
           citations: config.research?.citations ?? "numeric",
           isCancelled,
           onUpdate: (research) => {
@@ -698,12 +700,27 @@ export class RunManager {
         return;
       }
       try {
+        // Plain Julius used to receive web tools only, so a repo visible and
+        // pinned in the composer vanished at the panel boundary. The client
+        // sends only its scoped GitHub connector here; arm that native route
+        // once and share the stateless route with every candidate.
+        let juliusMcp: McpRuntime = emptyMcpRuntime();
+        if (!juliusConfig.research && config.mcpServers.length > 0) {
+          const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
+          const servers = cloudMcpServersForAutomation(config.mcpServers, null, oauthTokens).filter(
+            (server) => server.kind === "github",
+          );
+          juliusMcp = servers.length > 0 ? await armCloudMcp(servers) : emptyMcpRuntime();
+          await this.persistRefreshedGrants(run.owner, juliusMcp, appliedChains);
+        }
         const result = await runServerJulius({
           authKey,
           history: config.history,
           prompt: config.prompt,
           settings: juliusConfig.settings,
           builtins: config.builtins,
+          mcpToolDefs: juliusMcp.toolDefs,
+          mcpRoutes: juliusMcp.routes,
           systemPrompt: config.systemPrompt,
           isCancelled,
           research: juliusConfig.research
@@ -716,6 +733,7 @@ export class RunManager {
                   systemPrompt: config.systemPrompt,
                   depth: config.research?.depth ?? "balanced",
                   githubAuth: config.research?.githubAuth,
+                  githubRepo: config.githubRepo,
                   // Candidates compete as SPECIFIC models — the report write
                   // fails honestly instead of being ghost-written by a backup.
                   fallbacks: false,
@@ -781,13 +799,67 @@ export class RunManager {
         console.error("mcp arming failed:", error instanceof Error ? error.message : "unknown");
       }
     }
-    const failureRecords: RunToolRecord[] = mcp.failures.map((failure, index) => ({
-      id: `mcpfail_${index}`,
-      name: failure.name,
-      arguments: failure.arguments,
-      status: "error",
-      result: failure.result,
-    }));
+    // A pin is an explicit promise that the agent can read this repo. Verify
+    // that promise on the SAME server route the model will use, then preload
+    // the root listing. This closes the misleading state where /user/repos in
+    // the browser showed a private repo but the cloud credential or Contents
+    // permission failed later — and it gives the model real repo context even
+    // before its first tool call.
+    let pinnedGitHubBlock = "";
+    let pinnedGitHubFailure: RunToolRecord | null = null;
+    const pinnedRef = githubRunRepoRefs("", config.githubRepo)[0];
+    if (pinnedRef) {
+      const route = [...mcp.routes.values()].find(
+        (item) => item.type === "native" && item.kind === "github",
+      );
+      const target = `${pinnedRef.owner}/${pinnedRef.repo}`;
+      if (!route || route.type !== "native") {
+        const reason = `GitHub is not armed for this run — the active profile may exclude it or the sign-in is missing.`;
+        pinnedGitHubFailure = {
+          id: "github_pin_preflight",
+          name: "mcp_github_get_contents",
+          arguments: JSON.stringify({ owner: pinnedRef.owner, repo: pinnedRef.repo, path: "" }),
+          status: "error",
+          result: reason,
+        };
+        pinnedGitHubBlock = `Pinned GitHub repository check FAILED for ${target}: ${reason} Do not claim to have read its code.`;
+      } else {
+        try {
+          const meta = await fetchGitHubRepoMeta(route.auth, pinnedRef.owner, pinnedRef.repo);
+          const root = await callGitHubNativeTool(route.auth, "get_contents", {
+            owner: pinnedRef.owner,
+            repo: pinnedRef.repo,
+            path: "",
+            ref: meta.defaultBranch,
+          });
+          pinnedGitHubBlock = [
+            `## Server-verified pinned GitHub repository`,
+            `The cloud run authenticated to GitHub and read ${meta.fullName}${meta.isPrivate ? " (private)" : ""} on branch ${meta.defaultBranch}. The root listing below is real tool output. Use the armed mcp_github_* tools to inspect relevant files before making code-level claims.`,
+            capStr(root, 12_000),
+          ].join("\n");
+        } catch (error) {
+          const reason = error instanceof Error ? capStr(error.message, 300) : "GitHub access check failed.";
+          pinnedGitHubFailure = {
+            id: "github_pin_preflight",
+            name: "mcp_github_get_contents",
+            arguments: JSON.stringify({ owner: pinnedRef.owner, repo: pinnedRef.repo, path: "" }),
+            status: "error",
+            result: reason,
+          };
+          pinnedGitHubBlock = `Pinned GitHub repository check FAILED for ${target}: ${reason} The browser may list repository metadata even when file Contents permission is missing. Do not claim to have read its code.`;
+        }
+      }
+    }
+    const failureRecords: RunToolRecord[] = [
+      ...mcp.failures.map((failure, index) => ({
+        id: `mcpfail_${index}`,
+        name: failure.name,
+        arguments: failure.arguments,
+        status: "error" as const,
+        result: failure.result,
+      })),
+      ...(pinnedGitHubFailure ? [pinnedGitHubFailure] : []),
+    ];
     if (failureRecords.length > 0) {
       run.toolCalls = [...failureRecords];
       this.emitTools(run);
@@ -802,6 +874,9 @@ export class RunManager {
     const tools = [...builtinToolDefs(config.builtins), ...mcp.toolDefs.map((def) => ({ ...def }))];
 
     const apiMessages = buildApiMessages(config.history, config.systemPrompt);
+    if (pinnedGitHubBlock) {
+      apiMessages.push({ role: "system", content: pinnedGitHubBlock });
+    }
     if (config.grounding && config.grounding.sources.length > 0) {
       apiMessages.push({ role: "system", content: config.grounding.block });
     }

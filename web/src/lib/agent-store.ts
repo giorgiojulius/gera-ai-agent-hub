@@ -1019,7 +1019,14 @@ export async function sendPrompt(params: {
           history: wireHistory,
           prompt,
           builtins: scoped.builtinTools,
-          mcpServers: [],
+          // Plain Julius candidates need the same GitHub tools as chat. In
+          // Research × Julius each candidate uses the deterministic research
+          // preload below, so no duplicate native tool pool is needed.
+          mcpServers:
+            wantJulius && !wantResearch && githubServer
+              ? injectGitHubRunAuth([githubServer], githubAuth)
+              : [],
+          githubRepo: pinnedRepo || undefined,
           ...(wantResearch
             ? { research: { depth: settings.researchDepth, citations: "numeric", githubAuth } }
             : {}),
@@ -1163,6 +1170,7 @@ export async function sendPrompt(params: {
         prompt,
         builtins: armedBuiltins,
         mcpServers: injectGitHubRunAuth(armedServers, githubAuth),
+        githubRepo: pinnedRepo || undefined,
         grounding: grounding ?? undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
         ...(isIncognito ? { ephemeral: true } : {}),
@@ -1418,6 +1426,7 @@ export async function resumePrompt(params: {
         prompt: lastUser?.content ?? "",
         builtins: scoped.builtinTools,
         mcpServers: injectGitHubRunAuth(scoped.mcpServers, resumeGithubAuth),
+        githubRepo: resumeRepo || undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
         resume: { messageId: assistantId, partial },
         ...(isIncognito ? { ephemeral: true } : {}),

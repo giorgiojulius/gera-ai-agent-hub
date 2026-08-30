@@ -8,6 +8,7 @@ import {
   formatDiffFiles,
   formatRepoLine,
   githubRepoRefs,
+  githubRunRepoRefs,
   injectGitHubRunAuth,
   parseRepoPick,
   resolveGitHubAuth,
@@ -54,6 +55,25 @@ describe("injectGitHubRunAuth", () => {
     const out = injectGitHubRunAuth(input, "Bearer gho_x");
     expect(out).not.toBe(input);
     expect(base.token).toBeUndefined(); // settings state stays pristine
+  });
+});
+
+describe("githubRunRepoRefs", () => {
+  it("uses the thread pin when the question does not repeat owner/repo", () => {
+    expect(githubRunRepoRefs("найди причину бага", "acme/private-app")).toEqual([
+      { owner: "acme", repo: "private-app" },
+    ]);
+  });
+
+  it("lets an explicitly named repo override the thread pin", () => {
+    expect(githubRunRepoRefs("compare other/repo", "acme/private-app")).toEqual([
+      { owner: "other", repo: "repo" },
+    ]);
+  });
+
+  it("does not turn malformed pins or file paths into repositories", () => {
+    expect(githubRunRepoRefs("check this", "not-a-repo")).toEqual([]);
+    expect(githubRunRepoRefs("check this", "src/app.ts")).toEqual([]);
   });
 });
 

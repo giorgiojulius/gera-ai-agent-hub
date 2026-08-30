@@ -56,6 +56,8 @@ export type ServerRunConfig = {
   prompt: string;
   builtins: Record<BuiltinToolId, boolean>;
   mcpServers: McpServerConfig[];
+  /** Thread-pinned owner/repo; server modes treat it as the structured default. */
+  githubRepo?: string;
   grounding?: { block: string; sources: ResearchSource[] };
   steeringWrapNote?: string;
   resume?: { messageId: string; partial: string };

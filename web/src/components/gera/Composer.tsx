@@ -1190,12 +1190,46 @@ function GitHubRepoPin() {
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
 
-  const server = state.settings.mcpServers.find(
+  const active = state.conversations.find((item) => item.id === state.activeId);
+  const activeAgent = active?.agentId
+    ? state.settings.agents.find((item) => item.id === active.agentId)
+    : undefined;
+  const configuredServer = state.settings.mcpServers.find(
     (item) => item.enabled && (item.catalogId ?? item.id) === "github",
   );
-  const active = state.conversations.find((item) => item.id === state.activeId);
+  const agentAllowsServer =
+    !activeAgent ||
+    activeAgent.mcpServerIds === null ||
+    Boolean(
+      configuredServer &&
+        (activeAgent.mcpServerIds.includes(configuredServer.id) ||
+          (configuredServer.catalogId
+            ? activeAgent.mcpServerIds.includes(configuredServer.catalogId)
+            : false)),
+    );
+  const server = agentAllowsServer ? configuredServer : undefined;
   const pinned = active?.githubRepo ?? "";
 
+  if (!configuredServer) {
+    return null;
+  }
+  if (!server && activeAgent) {
+    return (
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        data-testid={TID.composerRepo}
+        onClick={() => navigate(`/profiles/${activeAgent.id}`)}
+        className="relative h-9 w-9 rounded-full text-amber-700 hover:text-amber-800"
+        aria-label={`${activeAgent.name} does not have GitHub access. Edit the profile to allow it.`}
+        title={`${activeAgent.name} excludes GitHub — edit the profile's MCP access to use repository pins.`}
+      >
+        <Github className="h-4 w-4 opacity-60" />
+        <span className="absolute right-1 top-0.5 text-[10px] font-bold">!</span>
+      </Button>
+    );
+  }
   if (!server) {
     return null;
   }

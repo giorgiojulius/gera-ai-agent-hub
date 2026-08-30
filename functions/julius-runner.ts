@@ -6,6 +6,7 @@
 // every candidate runs its own multi-wave deep research first and their
 // private source numberings are folded into one shared citation space.
 
+import type { McpRoute } from "./automation-runner";
 import {
   buildApiMessages,
   fallbackServedBy,
@@ -317,6 +318,9 @@ export type ServerJuliusParams = {
   prompt: string;
   settings: JuliusWireSettings;
   builtins: Record<BuiltinToolId, boolean>;
+  /** Native GitHub tools explicitly handed to plain Julius candidates. */
+  mcpToolDefs?: EngineToolDef[];
+  mcpRoutes?: Map<string, McpRoute>;
   research?: ServerJuliusResearchRunner;
   systemPrompt?: string;
   isCancelled?: () => boolean;
@@ -367,7 +371,10 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
   const { emit, snapshot } = makeEmitter(state, params.onUpdate);
   emit(true);
 
-  const webToolDefs: EngineToolDef[] = builtinToolDefs(webOnlyBuiltins(params.builtins, false));
+  const webToolDefs: EngineToolDef[] = [
+    ...builtinToolDefs(webOnlyBuiltins(params.builtins, false)),
+    ...(params.mcpToolDefs ?? []),
+  ];
   const verifierToolDefs: EngineToolDef[] = builtinToolDefs(webOnlyBuiltins(params.builtins, true));
 
   const runEngineWith = async (input: {
@@ -385,7 +392,7 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
       authKey: params.authKey,
       ledger,
       surf: createServerSurfSession(),
-      mcpRoutes: null,
+      mcpRoutes: params.mcpRoutes ?? null,
     };
     return runEngineTurn({
       authKey: params.authKey,

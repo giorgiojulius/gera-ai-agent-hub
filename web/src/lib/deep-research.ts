@@ -5,7 +5,7 @@ import {
   callGitHubNativeTool,
   fetchGitHubRepoMeta,
   fetchRepoCiSnapshot,
-  githubRepoRefs,
+  githubRunRepoRefs,
   parseRepoPick,
   resolveGitHubAuth,
   type GitHubRepoMeta,
@@ -513,6 +513,8 @@ export async function runDeepResearch(params: {
   depth?: ResearchDepth;
   /** Enabled GitHub connector (id + optional pasted PAT); lets research read repos named in the prompt. */
   github?: Pick<McpServerConfig, "id" | "token">;
+  /** Thread pin used when the current question does not name another repo. */
+  githubRepo?: string;
   /** "numeric" (default) cites [n] pills resolved against the message's source list; "links" keeps markdown links. */
   citations?: "numeric" | "links";
   /**
@@ -694,10 +696,10 @@ export async function runDeepResearch(params: {
       ensureAlive();
     }
 
-    // Repos named in the question: read them through the user's GitHub
-    // connector — private code never shows up in web search, so this is the
-    // only honest way actual source files reach the dossier.
-    const repoRefs = githubRepoRefs(params.prompt);
+    // An explicit repo in the question wins; otherwise read the thread pin.
+    // Private code never appears in web search, so this deterministic preload
+    // is the only honest way actual source files reach the dossier.
+    const repoRefs = githubRunRepoRefs(params.prompt, params.githubRepo);
     if (repoRefs.length > 0) {
       const refsLabel = repoRefs.map((ref) => `${ref.owner}/${ref.repo}`).join(", ");
       if (!params.github) {

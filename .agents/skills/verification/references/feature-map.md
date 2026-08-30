@@ -1,13 +1,13 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `9a3abb1` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `0d4a0d9` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
-credential hand-off + repo access probe in the picker, honesty rule in
-default system prompts, skills-as-guidance research fix + empty-question
-guard, Intercom attachments in desk threads/previews/transcripts)
-Drift check: `git log --oneline 9a3abb1..HEAD`, then compare against
+credential hand-off + server contents preflight + structured pin across
+Research/Julius + repo access probe, honesty rule in default system prompts,
+skills-as-guidance research fix + empty-question guard, Intercom attachments)
+Drift check: `git log --oneline 0d4a0d9..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -139,7 +139,10 @@ Julius · n tabs. In the MCP catalog, amber "server-side" reasons clamp to
 two lines and expand on tap (no hover on phones).
 
 GitHub repo pin (`composer-repo`, GitHub glyph): rendered only while an
-enabled GitHub connector exists in settings. Its popover
+enabled GitHub connector exists in settings AND the active profile allows
+that connector. A profile that excludes GitHub gets an amber `!` GitHub
+button leading to its profile editor instead of a picker that promises
+access the profile cannot use. Its popover
 (`composer-repo-panel`) lists the account's repositories (same
 deterministic /user/repos listing as list_my_repos, newest push first,
 cached ~5 min) with search, private badges, and honest error states
@@ -147,20 +150,23 @@ cached ~5 min) with search, private badges, and honest error states
 to the ACTIVE thread (`conversation.githubRepo`, synced like any thread
 field; pinning on an empty Launchpad creates the draft): the pill shows
 the repo short name with an X to unpin. Every run kind in the thread
-(chat / research / Julius / resume) carries a "Pinned GitHub repository"
-system block — chat runs also force-arm the GitHub connector past the
-tool router (like skill pins), so mcp_github_* tools default to the
-pinned owner/repo instead of asking which repo; when the connector is
-off for a run the block honestly says contents cannot be read. New chats
-start without a pin. Credential hand-off (2026-08-30): the browser
-resolves the GitHub credential at run start (pasted PAT or the
-device-flow sign-in from localStorage) and injects it into the run's
-connector entry (`injectGitHubRunAuth` in `github-native.ts`, used by
-sendPrompt AND resumePrompt) — server runs cannot read the browser's
-sign-in store and the profile-blob `mcpOAuth` sync is best-effort, so
-without the hand-off the cloud run silently dropped GitHub tools (the
-repo picker worked, the reply said it could not see the repo). Signed
-out → the pin block honestly says contents cannot be read.
+(chat / research / Julius / resume) carries both the human-readable
+"Pinned GitHub repository" block AND structured `config.githubRepo`.
+`githubRunRepoRefs` gives an explicitly named repo precedence and otherwise
+returns the pin; this fixes Research and Research × Julius, whose deterministic
+GitHub preload used to inspect only the typed question and therefore ignored
+the pin. Plain Julius now receives the scoped native GitHub routes too.
+Chat and resume force-arm GitHub past the tool router (like skill pins), then
+the worker performs a SAME-CREDENTIAL server preflight: repo metadata + root
+contents are read before the model answers and the real root listing is added
+to context. A missing/expired credential, profile exclusion, org 404, or
+fine-grained PAT without Contents permission becomes an explicit failed
+`mcp_github_get_contents` record — never a model pretending it read code.
+Credential hand-off (2026-08-30): the browser resolves the credential at run
+start (PAT or device-flow sign-in) and injects it only into the authenticated
+run request (`injectGitHubRunAuth`); it is neither logged nor persisted in the
+run row. This immediate hand-off avoids relying on best-effort profile sync.
+New chats start without a pin; signed out stays an honest unavailable state.
 
 Repo access probe (2026-08-30, `composer-repo-diagnose`): listing repos
 and reading one are separate GitHub authorization contours — GitHub
@@ -181,7 +187,9 @@ header → authorize URL) · 401 dead token · 403 rate-limit/IP-allow-list
 (quotes GitHub's message). Verdict card (`composer-repo-verdict`) shows
 title, plain-language fix, honest probe trace ("Checked as @login —
 repo HTTP 404"), external action link, and "Sign in on the MCP page…"
-for scope/401 verdicts. Credential never leaves the browser.
+for scope/401 verdicts. These diagnostic probes stay entirely in the browser;
+actual cloud agent runs transmit the credential to Gera's authenticated worker
+for that run so the server can call GitHub, but do not log or persist it.
 
 - Attachments: paste/pick files (images, pdf, docx, xlsx), remove, drag to
   reorder (↑/↓ works too).

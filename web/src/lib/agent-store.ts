@@ -1,7 +1,7 @@
 import { toast } from "sonner";
 
 import { serializeConversation } from "@/lib/chat-sync";
-import { pinnedRepoPromptBlock, resolveGitHubAuth } from "@/lib/github-native";
+import { injectGitHubRunAuth, pinnedRepoPromptBlock, resolveGitHubAuth } from "@/lib/github-native";
 import {
   ackServerRun,
   attachServerRun,
@@ -895,10 +895,27 @@ export async function sendPrompt(params: {
     const githubServer = scoped.mcpServers.find(
       (server) => server.enabled && (server.catalogId ?? server.id) === "github",
     );
+    // The GitHub credential lives only in this browser (a device-flow sign-in
+    // sits in localStorage; the profile sync that mirrors it server-side is
+    // best-effort). Resolve it once and hand it to the server run itself —
+    // research takes it directly, chat runs carry it inside the connector
+    // entry — otherwise the cloud run silently drops GitHub tools while the
+    // composer's repo picker keeps working.
+    let githubAuth: string | undefined;
+    if (githubServer) {
+      try {
+        githubAuth = await resolveGitHubAuth(githubServer);
+      } catch {
+        githubAuth = undefined; // signed out — the repo block stays honest
+      }
+    }
     // Repo pinned from the composer: every run kind sees the pin in its system
-    // prompt; the block stays honest when the connector is off for this run.
+    // prompt; the block stays honest when the connector is off for this run
+    // or the sign-in is gone.
     const pinnedRepo = seeded.githubRepo?.trim() ?? "";
-    const repoBlock = pinnedRepo ? pinnedRepoPromptBlock(pinnedRepo, Boolean(githubServer)) : "";
+    const repoBlock = pinnedRepo
+      ? pinnedRepoPromptBlock(pinnedRepo, Boolean(githubServer && githubAuth))
+      : "";
     const hubSystemPrompt = [scoped.systemPrompt, skillsBlock, knowledge, personal, repoBlock]
       .filter((part) => part.length > 0)
       .join("\n\n");
@@ -970,14 +987,6 @@ export async function sendPrompt(params: {
     // this tab closing; the GitHub credential is resolved here because only
     // the browser holds the sign-in token store.
     if (wantResearch || wantJulius) {
-      let githubAuth: string | undefined;
-      if (wantResearch && githubServer) {
-        try {
-          githubAuth = await resolveGitHubAuth(githubServer);
-        } catch {
-          githubAuth = undefined; // research says so honestly in its trail
-        }
-      }
       const kind: ServerRunKind = wantJulius ? "julius" : "research";
       const wireHistory = wantJulius
         ? toWireMessages(turnHistory.filter((message) => message.id !== assistantId))
@@ -1139,7 +1148,7 @@ export async function sendPrompt(params: {
         history: toWireMessages(turnHistory.filter((message) => message.id !== assistantId)),
         prompt,
         builtins: armedBuiltins,
-        mcpServers: armedServers,
+        mcpServers: injectGitHubRunAuth(armedServers, githubAuth),
         grounding: grounding ?? undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
         ...(isIncognito ? { ephemeral: true } : {}),
@@ -1354,14 +1363,22 @@ export async function resumePrompt(params: {
       : "";
     // The thread's pinned repo rides continuations too — the resume passes
     // every scoped server, so the GitHub connector is armed when enabled.
+    // Same credential hand-off as sendPrompt: the sign-in token lives only in
+    // this browser, so the continuation carries it into the server run.
+    const resumeGithubServer = scoped.mcpServers.find(
+      (server) => server.enabled && (server.catalogId ?? server.id) === "github",
+    );
+    let resumeGithubAuth: string | undefined;
+    if (resumeGithubServer) {
+      try {
+        resumeGithubAuth = await resolveGitHubAuth(resumeGithubServer);
+      } catch {
+        resumeGithubAuth = undefined; // signed out — the block stays honest
+      }
+    }
     const resumeRepo = conversation.githubRepo?.trim() ?? "";
     const resumeRepoBlock = resumeRepo
-      ? pinnedRepoPromptBlock(
-          resumeRepo,
-          scoped.mcpServers.some(
-            (server) => server.enabled && (server.catalogId ?? server.id) === "github",
-          ),
-        )
+      ? pinnedRepoPromptBlock(resumeRepo, Boolean(resumeGithubServer && resumeGithubAuth))
       : "";
     const hubSystemPrompt = [scoped.systemPrompt, skillsBlock, knowledge, personal, skillsEditor, resumeRepoBlock]
       .filter((part) => part.length > 0)
@@ -1386,7 +1403,7 @@ export async function resumePrompt(params: {
         history: toWireMessages(history),
         prompt: lastUser?.content ?? "",
         builtins: scoped.builtinTools,
-        mcpServers: scoped.mcpServers,
+        mcpServers: injectGitHubRunAuth(scoped.mcpServers, resumeGithubAuth),
         steeringWrapNote: STEER_WRAP_NOTE,
         resume: { messageId: assistantId, partial },
         ...(isIncognito ? { ephemeral: true } : {}),

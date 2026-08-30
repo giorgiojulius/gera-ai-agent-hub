@@ -88,6 +88,34 @@ export async function resolveGitHubAuth(config: Pick<McpServerConfig, "id" | "to
   throw new Error('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');
 }
 
+/**
+ * Returns the run's copy of the MCP server list with the browser-held GitHub
+ * credential injected into the GitHub connector entry (as `token`). Server
+ * runs cannot read this browser's sign-in store — the device-flow token
+ * lives in localStorage only, and the profile sync that mirrors it
+ * server-side is best-effort — so without this hand-off a cloud run can
+ * silently lose GitHub tools while the composer's repo picker keeps working.
+ * A pasted PAT already rides in `token` and stays untouched; the input array
+ * and its entries are never mutated.
+ */
+export function injectGitHubRunAuth(
+  servers: McpServerConfig[],
+  auth: string | undefined,
+): McpServerConfig[] {
+  if (!auth) {
+    return servers;
+  }
+  let changed = false;
+  const next = servers.map((server) => {
+    if ((server.catalogId ?? server.id) !== "github" || server.token?.trim()) {
+      return server;
+    }
+    changed = true;
+    return { ...server, token: auth };
+  });
+  return changed ? next : servers;
+}
+
 /** Decodes GitHub's base64 file content (newline-wrapped) as UTF-8 text. */
 export function decodeGitHubContent(base64: string): string {
   const binary = atob(base64.replace(/\s/g, ""));

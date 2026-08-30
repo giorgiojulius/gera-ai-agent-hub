@@ -8,10 +8,54 @@ import {
   formatDiffFiles,
   formatRepoLine,
   githubRepoRefs,
+  injectGitHubRunAuth,
   parseRepoPick,
   resolveGitHubAuth,
   type GitHubRepoMeta,
 } from "@/lib/github-native";
+import type { McpServerConfig } from "@/lib/types";
+
+describe("injectGitHubRunAuth", () => {
+  const base: McpServerConfig = {
+    id: "github",
+    name: "GitHub",
+    url: "",
+    headersJson: "",
+    enabled: true,
+    status: "connected",
+    tools: [],
+    disabledTools: [],
+  };
+  const other: McpServerConfig = { ...base, id: "notion", name: "Notion" };
+
+  it("hands the browser credential to the GitHub entry only", () => {
+    const out = injectGitHubRunAuth([other, base], "Bearer gho_x");
+    expect(out[1].token).toBe("Bearer gho_x");
+    expect(out[0].token).toBeUndefined();
+  });
+
+  it("matches by catalogId when the entry has a custom id", () => {
+    const custom: McpServerConfig = { ...base, id: "srv_1", catalogId: "github" };
+    const out = injectGitHubRunAuth([custom], "Bearer gho_x");
+    expect(out[0].token).toBe("Bearer gho_x");
+  });
+
+  it("never overwrites a pasted PAT — that credential already rides the run", () => {
+    const pat: McpServerConfig = { ...base, token: "ghp_pasted" };
+    const input = [pat];
+    const out = injectGitHubRunAuth(input, "Bearer gho_x");
+    expect(out[0].token).toBe("ghp_pasted");
+    expect(out).toBe(input); // nothing changed — same array back
+  });
+
+  it("returns the list untouched without a credential and never mutates sources", () => {
+    const input = [base];
+    expect(injectGitHubRunAuth(input, undefined)).toBe(input);
+    const out = injectGitHubRunAuth(input, "Bearer gho_x");
+    expect(out).not.toBe(input);
+    expect(base.token).toBeUndefined(); // settings state stays pristine
+  });
+});
 
 describe("GITHUB_NATIVE_TOOLS", () => {
   it("has unique, function-safe names", () => {

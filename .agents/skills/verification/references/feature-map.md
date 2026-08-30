@@ -1,9 +1,10 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `9c67fc4` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `9e84a40` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
-stop/steering race fixes in the same sync)
+stop/steering race fixes, GitHub run credential hand-off in the same
+sync)
 Drift check: `git log --oneline d239655..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -149,7 +150,15 @@ system block — chat runs also force-arm the GitHub connector past the
 tool router (like skill pins), so mcp_github_* tools default to the
 pinned owner/repo instead of asking which repo; when the connector is
 off for a run the block honestly says contents cannot be read. New chats
-start without a pin.
+start without a pin. Credential hand-off (2026-08-30): the browser
+resolves the GitHub credential at run start (pasted PAT or the
+device-flow sign-in from localStorage) and injects it into the run's
+connector entry (`injectGitHubRunAuth` in `github-native.ts`, used by
+sendPrompt AND resumePrompt) — server runs cannot read the browser's
+sign-in store and the profile-blob `mcpOAuth` sync is best-effort, so
+without the hand-off the cloud run silently dropped GitHub tools (the
+repo picker worked, the reply said it could not see the repo). Signed
+out → the pin block honestly says contents cannot be read.
 
 - Attachments: paste/pick files (images, pdf, docx, xlsx), remove, drag to
   reorder (↑/↓ works too).

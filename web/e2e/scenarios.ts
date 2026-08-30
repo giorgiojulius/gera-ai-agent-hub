@@ -13,6 +13,13 @@ import type { E2eScenario } from "./types";
 /** Snippet of the deterministic assistant reply each platform's stub streams. */
 export const STUB_REPLY_SNIPPET = "Gera e2e reply";
 
+/**
+ * Prompt marker that makes the platform stub stream hang without a terminal
+ * event while /runs/stop answers "not_running" — the production shape behind
+ * "stop only works after a page reload".
+ */
+export const STUB_HANG_PROMPT = "Hang this run for the stop regression";
+
 /** Curated chat model every platform's picker must offer. */
 export const SWITCH_TARGET_MODEL_ID = "anthropic/claude-opus-5";
 export const SWITCH_TARGET_MODEL_NAME = "Claude Opus 5";
@@ -151,6 +158,23 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "see", target: TID.profileEditor },
       { do: "goto", path: "/hub?tab=memory" },
       { do: "see", target: studioPageTid("hub") },
+    ],
+  },
+  {
+    id: "stop-run-settles-ui",
+    title: "Stop settles the composer even when the run node lost the run",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "tap", target: TID.sidebarNewChat },
+      { do: "fill", target: TID.composerInput, text: STUB_HANG_PROMPT },
+      { do: "tap", target: TID.composerSend },
+      { do: "see", target: TID.composerStop },
+      { do: "tap", target: TID.composerStop },
+      // The dead-button regression: the stub's /runs/stop says "not_running"
+      // and the hanging stream never sends a terminal event — the composer
+      // must return to Send without a page reload.
+      { do: "see", target: TID.composerSend, timeoutMs: 10_000 },
     ],
   },
 ];

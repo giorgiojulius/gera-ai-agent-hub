@@ -26,6 +26,7 @@ import { getToolkitUrl } from "@/lib/env";
 import { buildRunReport, runScenario, type E2eDriver } from "../../e2e/runner";
 import {
   E2E_SCENARIOS,
+  STUB_HANG_PROMPT,
   STUB_REPLY_SNIPPET,
   SWITCH_TARGET_MODEL_ID,
   SWITCH_TARGET_MODEL_NAME,
@@ -124,6 +125,8 @@ function sseResponse(modelId: string): Response {
 // /runs/start registers the run, /runs/stream streams snapshot → text → done.
 type StubRun = { runId: string; conversationId: string; assistantMessageId: string };
 let lastStubRun: StubRun | null = null;
+/** Set by /runs/start when the prompt carries STUB_HANG_PROMPT — the stream then never terminates. */
+let hangStubRun = false;
 
 function runStreamResponse(): Response {
   const run = lastStubRun;
@@ -158,6 +161,48 @@ function runStreamResponse(): Response {
   return new Response(text, { status: 200, headers: { "Content-Type": "text/event-stream" } });
 }
 
+/**
+ * A run stream that emits a snapshot plus one text delta and then never
+ * terminates — the production shape behind "stop only works after a page
+ * reload": the tab must settle from the /runs/stop response alone.
+ */
+function hangingRunStreamResponse(signal?: AbortSignal | null): Response {
+  const run = lastStubRun;
+  const encoder = new TextEncoder();
+  const events: unknown[] = [
+    {
+      t: "snapshot",
+      seq: 1,
+      snapshot: {
+        runId: run?.runId ?? "e2e-run",
+        conversationId: run?.conversationId ?? "e2e-thread",
+        kind: "chat",
+        status: "running",
+        startedAt: Date.now(),
+        content: "",
+      },
+    },
+    { t: "text", seq: 2, content: REPLY_TEXT.slice(0, 14) },
+  ];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const event of events) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      }
+      // Never closed on purpose; honor the abort so the detached turn unwinds
+      // immediately, like a real fetch would.
+      signal?.addEventListener("abort", () => {
+        try {
+          controller.error(new DOMException("Stopped.", "AbortError"));
+        } catch {
+          // already errored
+        }
+      });
+    },
+  });
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
 /** Returns a stubbed response for app backends, or null to hit the real network. */
 function handleStubbed(url: string, init?: RequestInit): Response | null {
   const toolkit = getToolkitUrl();
@@ -179,13 +224,19 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
         conversationId: body.conversationId ?? "e2e-thread",
         assistantMessageId: body.assistantMessageId ?? "e2e-assistant",
       };
+      hangStubRun = raw.includes(STUB_HANG_PROMPT);
       return jsonResponse({ ok: true, runId: lastStubRun.runId, historyOnServer: true });
     }
     if (url.includes("/runs/stream")) {
-      return runStreamResponse();
+      return hangStubRun ? hangingRunStreamResponse(init?.signal) : runStreamResponse();
     }
     if (url.includes("/runs/active")) {
       return jsonResponse({ runs: [] });
+    }
+    if (url.includes("/runs/stop")) {
+      // Production regression shape: the run node lost the run — the client
+      // must settle its UI from this response alone (no terminal event comes).
+      return jsonResponse({ ok: false, reason: "not_running" });
     }
     if (url.includes("/runs/")) {
       return jsonResponse({ ok: true, accepted: true, removed: false });

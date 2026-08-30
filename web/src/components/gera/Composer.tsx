@@ -697,6 +697,7 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
                   type="button"
                   size="icon"
                   onClick={stop}
+                  data-testid={TID.composerStop}
                   className="h-10 w-10 shrink-0 rounded-full bg-foreground text-background hover:bg-foreground/90"
                   aria-label="Stop"
                 >

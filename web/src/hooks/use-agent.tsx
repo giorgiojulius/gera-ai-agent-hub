@@ -42,10 +42,15 @@ import type { AgentSettings, CreateMode, LifeState, QueuedMessage } from "@/lib/
 export { useAgent } from "@/hooks/agent-context";
 export type { AgentDraftInput } from "@/hooks/agent-context";
 
+/** A server-confirmed stop must visibly settle the UI within this window even when the terminal event is lost. */
+const STOP_SETTLE_GRACE_MS = 6_000;
+
 export function AgentProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AgentState>(() => initialAgentState());
   /** One controller per conversation — threads run in parallel and stop independently. */
   const abortMapRef = useRef<Map<string, AbortController>>(new Map());
+  /** Threads where an explicit "stop & send" awaits its dispatch on settle. */
+  const interruptPendingRef = useRef<Set<string>>(new Set());
   /** Completion signals (chime + desktop notification); a ref so every settle path can call it. */
   const notifyRef = useRef<(conversationId: string) => void>(() => {});
   /** Server runs are adopted once per session (boot or first sign-in). */
@@ -445,17 +450,71 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     setState((prev) => ({ ...prev, attachments: prev.attachments.filter((item) => item.id !== id) }));
   }, []);
 
+  /** Detaches this tab from a thread's run: abort, forget the controller, clear the flag. */
+  const detachLocalRun = useCallback((id: string) => {
+    abortMapRef.current.get(id)?.abort();
+    abortMapRef.current.delete(id);
+    setState((prev) => ({ ...prev, runningIds: prev.runningIds.filter((item) => item !== id) }));
+  }, []);
+
+  /**
+   * Stops a cloud run with a guaranteed visible result. Normally the server
+   * confirms, the engine winds down and the terminal event settles the UI
+   * within a second or two — but the Stop button must never depend on that
+   * event alone. A backend node that lost the run ("not_running" after a
+   * deploy), a dropped stream or a lost terminal event used to leave a dead
+   * Stop button until a page reload:
+   * - the server says nothing is running → this tab detaches immediately;
+   * - the stop is confirmed but no terminal event lands within the grace
+   *   window → the tab detaches honestly (the draft stays as shown; sync or
+   *   the next boot reconciles the authoritative final);
+   * - a successor turn that took over the thread meanwhile is never touched.
+   */
+  const stopCloudRun = useCallback(
+    (id: string, errorTitle: string) => {
+      const controllerAtPress = abortMapRef.current.get(id);
+      const settle = () => {
+        if (abortMapRef.current.get(id) !== controllerAtPress) {
+          return; // a newer turn owns this thread now — hands off
+        }
+        if (!stateRef.current.runningIds.includes(id)) {
+          return; // the terminal event landed — nothing to force
+        }
+        const hadInterrupt = interruptPendingRef.current.has(id);
+        interruptPendingRef.current.delete(id);
+        detachLocalRun(id);
+        if (hadInterrupt) {
+          // "Stop & send" must still dispatch its message — the aborted
+          // unwind path holds the queue by design.
+          window.setTimeout(() => drainRef.current(id), 90);
+        }
+      };
+      void stopServerRun(id)
+        .then((result) => {
+          if (result.ok === false) {
+            settle();
+            return;
+          }
+          window.setTimeout(settle, STOP_SETTLE_GRACE_MS);
+        })
+        .catch((error) => {
+          interruptPendingRef.current.delete(id);
+          toast.error(errorTitle, { description: errorFromUnknown(error) });
+        });
+    },
+    [detachLocalRun],
+  );
+
   const stop = useCallback(() => {
     const id = stateRef.current.activeId;
     if (!id) {
       return;
     }
     if (hasActiveCloudRun(id)) {
-      // The run lives on the server — stop it there. The draft stays exactly
-      // as shown and the running flag clears when the terminal event lands.
-      void stopServerRun(id).catch((error) => {
-        toast.error("Could not stop the run", { description: errorFromUnknown(error) });
-      });
+      // The run lives on the server — stop it there. The terminal event
+      // normally clears the running flag; stopCloudRun guarantees the UI
+      // settles even when that event never arrives.
+      stopCloudRun(id, "Could not stop the run");
       return;
     }
     if (stateRef.current.runningIds.includes(id)) {
@@ -466,10 +525,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       // when nothing reached the server.
       void stopServerRun(id).catch(() => undefined);
     }
-    abortMapRef.current.get(id)?.abort();
-    abortMapRef.current.delete(id);
-    setState((prev) => ({ ...prev, runningIds: prev.runningIds.filter((item) => item !== id) }));
-  }, []);
+    detachLocalRun(id);
+  }, [detachLocalRun, stopCloudRun]);
 
   const toggleDeepResearch = useCallback(() => {
     setState((prev) => ({ ...prev, deepResearch: !prev.deepResearch }));
@@ -560,9 +617,6 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       }
     }, 0);
   }, []);
-
-  /** Threads where an explicit "stop & send" awaits its dispatch on settle. */
-  const interruptPendingRef = useRef<Set<string>>(new Set());
 
   /** Clears the run's controller and, unless it was stopped, fires the next queued follow-up. */
   const finishRun = useCallback(
@@ -691,10 +745,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         // Server run: stop it there; the marker below lets the settle handler
         // dispatch this message immediately (a plain stop holds the queue).
         interruptPendingRef.current.add(conversationId);
-        void stopServerRun(conversationId).catch((error) => {
-          interruptPendingRef.current.delete(conversationId);
-          toast.error("Could not interrupt the run", { description: errorFromUnknown(error) });
-        });
+        stopCloudRun(conversationId, "Could not interrupt the run");
         setState((prev) => ({
           ...prev,
           input: "",
@@ -746,7 +797,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     if (!running) {
       window.setTimeout(() => drainRef.current(conversationId), 60);
     }
-  }, []);
+  }, [stopCloudRun]);
 
   const removeQueued = useCallback((id: string) => {
     const conversationId = stateRef.current.activeId;
@@ -827,10 +878,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       // Server run: stop it there; the marker lets the head of the queue
       // dispatch the moment the stopped run settles.
       interruptPendingRef.current.add(conversationId);
-      void stopServerRun(conversationId).catch((error) => {
-        interruptPendingRef.current.delete(conversationId);
-        toast.error("Could not interrupt the run", { description: errorFromUnknown(error) });
-      });
+      stopCloudRun(conversationId, "Could not interrupt the run");
       setState((prev) => ({
         ...prev,
         queued: {

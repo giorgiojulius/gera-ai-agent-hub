@@ -17,6 +17,8 @@ export const TID = {
   composerInput: "composer-input",
   /** Round send button in the composer's bottom rail. */
   composerSend: "composer-send",
+  /** Round stop button shown while the thread's run is live. */
+  composerStop: "composer-stop",
   /** Scrollable message thread container. */
   chatThread: "chat-thread",
   /** One user message row (repeats per turn). */

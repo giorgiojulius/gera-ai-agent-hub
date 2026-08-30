@@ -1,11 +1,11 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `9e84a40` (+ Luna suggestion model,
+Last synced: 2026-08-30 · commit `9a3abb1` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
-stop/steering race fixes, GitHub run credential hand-off in the same
-sync)
-Drift check: `git log --oneline d239655..HEAD`, then compare against
+stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
+credential hand-off, honesty rule in default system prompts)
+Drift check: `git log --oneline 9a3abb1..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -173,6 +173,15 @@ out → the pin block honestly says contents cannot be read.
   the abort signal before AND after `/runs/start` (a stop during prep never
   starts the run; during start it is killed server-side), and `stop()` fires
   a best-effort server stop when the thread runs but isn't attached yet.
+- Stop watchdog (2026-08-30, `stopCloudRun` in use-agent.tsx): the button
+  never depends on the terminal event alone. `/runs/stop` answering
+  `ok:false` ("not_running" — the node lost the run, e.g. after a worker
+  deploy) detaches the tab immediately; a confirmed stop whose terminal
+  event never lands detaches after a ~6s grace window (draft stays, sync
+  reconciles). A successor turn in the same thread is never touched
+  (controller identity check); a pending "stop & send" still dispatches its
+  message after a forced detach. Fixes "stop only works after a page
+  reload". E2E: `stop-run-settles-ui` (hanging stream + not_running stop).
 - Turn ownership (`turnOwners` in agent-store): a successor turn (interrupt,
   "stop & send", quick re-send) owns the thread's slot; the aborted
   predecessor's finally no longer closes the successor's steering inbox
@@ -697,6 +706,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | projects-page-opens | Projects page renders + create action behind the gate |
 | studio-pages-navigate | Tabs automations → hub → mcp → settings |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
+| stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
 Admin tabs, MCP connect flows, Share dialog, Settings toggles, media modes,

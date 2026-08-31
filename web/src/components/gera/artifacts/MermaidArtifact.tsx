@@ -10,9 +10,25 @@ import { CodeBlock } from "./CodeBlock";
 let initialized = false;
 let renderSeq = 0;
 
+type MermaidApi = typeof import("mermaid").default;
+
+/**
+ * Loads mermaid's single-file bundle (side effect: sets `globalThis.mermaid`).
+ * The ESM entry dynamically imports ~30 per-diagram chunks, which makes the
+ * deploy uploader flaky; the bundled build keeps it to one lazy chunk.
+ */
+async function loadMermaid(): Promise<MermaidApi> {
+  await import("mermaid/dist/mermaid.min.js");
+  const api = (globalThis as unknown as { mermaid?: MermaidApi }).mermaid;
+  if (!api) {
+    throw new Error("Mermaid failed to initialize.");
+  }
+  return api;
+}
+
 /** Lazy-loads mermaid on first diagram and renders to an SVG string. */
 async function renderMermaid(code: string): Promise<string> {
-  const mermaid = (await import("mermaid")).default;
+  const mermaid = await loadMermaid();
   if (!initialized) {
     mermaid.initialize({
       startOnLoad: false,

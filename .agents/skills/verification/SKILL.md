@@ -67,6 +67,8 @@ sudo -n apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
 - `web/src/test/calendar.browser.test.tsx` — screenshot regression test.
 - `web/src/test/autogrow.browser.test.tsx` — composer auto-grow regression
   (grows per line, clamps at the cap, shrinks back).
+- Web-only gestures the neutral DSL can't express (real `DataTransfer`
+  drag-and-drop attach) live as bespoke tests inside `e2e.browser.test.tsx`.
 
 ### Adding a scenario for a new feature
 

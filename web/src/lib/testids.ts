@@ -21,8 +21,10 @@ export const TID = {
   composerSend: "composer-send",
   /** Round stop button shown while the thread's run is live. */
   composerStop: "composer-stop",
-  /** Drag handle above the docked thread composer (desktop). */
-  composerDragHandle: "composer-drag-handle",
+  /** Drop-files overlay covering the prompt card while files are dragged over it. */
+  composerDropZone: "composer-drop-zone",
+  /** One queued attachment chip above the composer (repeats). */
+  composerAttachment: "composer-attachment",
   /** Scrollable message thread container. */
   chatThread: "chat-thread",
   /** One user message row (repeats per turn). */
@@ -91,6 +93,10 @@ export const TID = {
   screenDeskDetails: "screen-desk-details",
   /** Floating live-chat launcher for the desk's AI assistant. */
   screenDeskAssistant: "screen-desk-assistant",
+  /** The assistant's floating panel (open state) — draggable on desktop. */
+  screenDeskAssistantPanel: "screen-desk-assistant-panel",
+  /** Header of the assistant panel — the drag handle (double-click resets). */
+  screenDeskAssistantHandle: "screen-desk-assistant-handle",
   /** Gera's reply-suggestion strip above the desk composer. */
   screenDeskSuggest: "screen-desk-suggest",
   /** Header button opening the desk's team-performance panel. */

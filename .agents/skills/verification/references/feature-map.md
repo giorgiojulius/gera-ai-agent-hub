@@ -264,8 +264,14 @@ entered token must verify before save. Slack-originated project-agent runs are
 always native GitHub read-only, even when the same agent has write access inside
 authenticated Gera.
 
-- Attachments: paste/pick files (images, pdf, docx, xlsx), remove, drag to
-  reorder (↑/↓ works too).
+- Attachments: paste/pick files (images, pdf, docx, xlsx) or drag & drop them
+  onto the prompt card — an ember "Drop files to attach" overlay
+  (`composer-drop-zone`) confirms the target, with the same accept rules as
+  the paperclip (chat: images + documents; Image/Video modes: images only,
+  Video keeps one and replaces; unsupported drops get an honest toast and
+  attach nothing). Chips (`composer-attachment`) removable; drag to reorder
+  (↑/↓ works too). The composer card itself is NOT draggable — dragging is
+  reserved for files.
 - While a run is live: Send becomes **Queue message** (queued items support
   "Send now" / "Remove from queue"); **Steer** (Ctrl/⌘ Enter) injects text
   into the live run; **Stop** cancels (never plays a completion chime).
@@ -693,7 +699,11 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   members see ONLY their own linked card — grades are coaching, not a
   public scoreboard. **AI assistant** — a floating live-chat
   launcher + panel (`screen-desk-assistant`, Intercom-messenger style,
-  bottom-right), PRIVATE chat per member (3.5s poll only while open,
+  bottom-right). On desktop the open panel (`screen-desk-assistant-panel`)
+  is drag & movable by its header (`screen-desk-assistant-handle`): offset
+  clamped to the viewport (`panel-position.ts`), seat persisted in
+  localStorage, double-click resets to the corner, window resize re-clamps;
+  on mobile the sheet stays fixed. PRIVATE chat per member (3.5s poll only while open,
   pending "thinking…" row), an "Attach conv #id" chip makes the SERVER
   fetch the live transcript into the run (client-supplied context is never
   trusted); **Post to channel** — a third composer target beside
@@ -869,8 +879,8 @@ Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message t
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
-OAuth/session/file-content suites. Full verification on 2026-08-31: 731 unit
-checks, 22 browser checks, web build, Worker deploy, live preview/ping and
+OAuth/session/file-content suites. Full verification on 2026-08-31: 739 unit
+checks, 23 browser checks, web build, Worker deploy, live preview/ping and
 unauthenticated relay-gate smoke probes all passed.
 
 ## Settings (`/settings`)

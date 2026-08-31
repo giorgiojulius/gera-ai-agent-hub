@@ -20,6 +20,7 @@ import { render } from "vitest-browser-react";
 
 import App from "@/App";
 import { ACCESS_TOKEN_KEY } from "@/lib/auth-tokens";
+import { TID } from "@/lib/testids";
 import { FUNCTIONS_URL } from "@/lib/backend";
 import { getToolkitUrl } from "@/lib/env";
 
@@ -489,6 +490,30 @@ beforeEach(() => {
 afterAll(async () => {
   const report = buildRunReport({ platform: "web", app: "gera-web", startedAt, results });
   await commands.saveE2eReport(report);
+});
+
+// Web-only gesture: real DataTransfer drag-and-drop cannot be expressed in the
+// platform-neutral scenario DSL, so it lives here as a bespoke Chromium test.
+test("e2e · Dropping a file onto the composer attaches it", { timeout: 90_000 }, async () => {
+  const driver = webDriver();
+  await driver.goto("/");
+  await driver.see(TID.composerInput, 20_000);
+
+  const input = document.querySelector(`[data-testid="${TID.composerInput}"]`);
+  if (!input) {
+    throw new Error("composer input not mounted");
+  }
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(new File(["drag and attach"], "notes.txt", { type: "text/plain" }));
+
+  input.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer }));
+  await expect.element(page.getByTestId(TID.composerDropZone).first(), { timeout: 5_000 }).toBeVisible();
+
+  input.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer }));
+  await expect
+    .element(page.getByTestId(TID.composerAttachment).first(), { timeout: 10_000 })
+    .toHaveTextContent("notes.txt");
+  expect(document.querySelector(`[data-testid="${TID.composerDropZone}"]`)).toBeNull();
 });
 
 for (const scenario of E2E_SCENARIOS) {

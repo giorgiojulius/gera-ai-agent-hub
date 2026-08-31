@@ -23,6 +23,7 @@ import {
   ExternalLink,
   Globe,
   GraduationCap,
+  GripHorizontal,
   Hash,
   Inbox,
   Loader2,
@@ -37,12 +38,20 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import { MarkdownBody } from "@/components/gera/Markdown";
 import { Button } from "@/components/ui/button";
+import { useIsMobile } from "@/hooks/use-mobile";
+import {
+  ASSISTANT_PANEL_POS_KEY,
+  clampPanelOffset,
+  isDefaultPanelOffset,
+  parsePanelOffset,
+  type PanelOffset,
+} from "@/lib/panel-position";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   actOnScreenConversation,
@@ -2025,9 +2034,30 @@ function TeammateCard({
   );
 }
 
+function readAssistantPanelOffset(): PanelOffset {
+  try {
+    return parsePanelOffset(window.localStorage.getItem(ASSISTANT_PANEL_POS_KEY)) ?? { x: 0, y: 0 };
+  } catch {
+    return { x: 0, y: 0 };
+  }
+}
+
+function persistAssistantPanelOffset(offset: PanelOffset): void {
+  try {
+    if (isDefaultPanelOffset(offset)) {
+      window.localStorage.removeItem(ASSISTANT_PANEL_POS_KEY);
+    } else {
+      window.localStorage.setItem(ASSISTANT_PANEL_POS_KEY, JSON.stringify(offset));
+    }
+  } catch {
+    // The seat just won't stick — nothing to surface.
+  }
+}
+
 /**
  * Private per-member chat with the screen's agent — a floating live-chat
  * launcher + panel (Intercom-messenger style); can attach the open case.
+ * On desktop the open panel is draggable by its header (double-click resets).
  */
 function AssistantOverlay({
   projectId,
@@ -2053,6 +2083,135 @@ function AssistantOverlay({
   const [sending, setSending] = useState<boolean>(false);
   const [attach, setAttach] = useState<boolean>(true);
   const listRef = useRef<HTMLDivElement>(null);
+
+  // Drag & move (desktop): the header is the handle; the offset is clamped to
+  // the viewport, remembered across sessions, and reset by a double-click.
+  const isMobile = useIsMobile();
+  const panelRef = useRef<HTMLElement | null>(null);
+  const [panelOffset, setPanelOffset] = useState<PanelOffset>(readAssistantPanelOffset);
+  const [panelDragging, setPanelDragging] = useState<boolean>(false);
+  const panelOffsetRef = useRef<PanelOffset>(panelOffset);
+  panelOffsetRef.current = panelOffset;
+  const panelDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    base: { left: number; top: number; width: number; height: number };
+  } | null>(null);
+
+  const startPanelDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (isMobile || event.button !== 0) {
+      return;
+    }
+    // The close button stays a click, not a grab.
+    if ((event.target as HTMLElement | null)?.closest("button")) {
+      return;
+    }
+    const panel = panelRef.current;
+    if (!panel) {
+      return;
+    }
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const rect = panel.getBoundingClientRect();
+    const current = panelOffsetRef.current;
+    panelDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: current.x,
+      originY: current.y,
+      base: {
+        left: rect.left - current.x,
+        top: rect.top - current.y,
+        width: rect.width,
+        height: rect.height,
+      },
+    };
+    setPanelDragging(true);
+  };
+
+  const movePanelDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = panelDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    setPanelOffset(
+      clampPanelOffset(
+        { x: drag.originX + event.clientX - drag.startX, y: drag.originY + event.clientY - drag.startY },
+        drag.base,
+        { width: window.innerWidth, height: window.innerHeight },
+      ),
+    );
+  };
+
+  const endPanelDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = panelDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    panelDragRef.current = null;
+    setPanelDragging(false);
+    persistAssistantPanelOffset(panelOffsetRef.current);
+  };
+
+  const resetPanelDrag = () => {
+    panelDragRef.current = null;
+    setPanelDragging(false);
+    setPanelOffset({ x: 0, y: 0 });
+    persistAssistantPanelOffset({ x: 0, y: 0 });
+  };
+
+  // A parked panel must never end up off screen when the window shrinks.
+  useEffect(() => {
+    if (!open || isMobile) {
+      return;
+    }
+    const sync = () => {
+      const panel = panelRef.current;
+      if (!panel) {
+        return;
+      }
+      setPanelOffset((prev) => {
+        if (isDefaultPanelOffset(prev)) {
+          return prev;
+        }
+        const rect = panel.getBoundingClientRect();
+        const next = clampPanelOffset(
+          prev,
+          { left: rect.left - prev.x, top: rect.top - prev.y, width: rect.width, height: rect.height },
+          { width: window.innerWidth, height: window.innerHeight },
+        );
+        if (next.x === prev.x && next.y === prev.y) {
+          return prev;
+        }
+        persistAssistantPanelOffset(next);
+        return next;
+      });
+    };
+    sync();
+    window.addEventListener("resize", sync);
+    return () => window.removeEventListener("resize", sync);
+  }, [open, isMobile]);
+
+  // While dragging, keep the grabbing cursor and suppress text selection everywhere.
+  useEffect(() => {
+    if (!panelDragging) {
+      return;
+    }
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevSelect;
+    };
+  }, [panelDragging]);
+
+  const panelParked = !isMobile && !isDefaultPanelOffset(panelOffset);
 
   const chatKey = useMemo(
     () => ["screen-chat", projectId, screenId, widgetId] as const,
@@ -2110,12 +2269,30 @@ function AssistantOverlay({
       ) : null}
 
       <aside
+        ref={panelRef}
+        data-testid={TID.screenDeskAssistantPanel}
         className={cn(
           "fixed inset-x-3 bottom-3 z-50 h-[min(620px,calc(100dvh-24px))] flex-col overflow-hidden rounded-3xl border border-border/70 bg-background shadow-2xl sm:inset-x-auto sm:bottom-5 sm:right-5 sm:w-[400px]",
-          open ? "flex animate-in fade-in slide-in-from-bottom-4 zoom-in-95 duration-200" : "hidden",
+          open
+            ? cn("flex", !panelParked && "animate-in fade-in slide-in-from-bottom-4 zoom-in-95 duration-200")
+            : "hidden",
+        )}
+        style={panelParked ? { transform: `translate3d(${panelOffset.x}px, ${panelOffset.y}px, 0)` } : undefined}
+      >
+      <div
+        data-testid={TID.screenDeskAssistantHandle}
+        title={isMobile ? undefined : "Drag to move · double-click to reset"}
+        onPointerDown={startPanelDrag}
+        onPointerMove={movePanelDrag}
+        onPointerUp={endPanelDrag}
+        onPointerCancel={endPanelDrag}
+        onDoubleClick={isMobile ? undefined : resetPanelDrag}
+        className={cn(
+          "flex h-11 shrink-0 items-center gap-2 border-b border-border/60 px-3.5",
+          !isMobile && "touch-none select-none",
+          !isMobile && (panelDragging ? "cursor-grabbing" : "cursor-grab"),
         )}
       >
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/60 px-3.5">
         <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-ember/10 text-xs">
           {agent?.emoji || <Sparkles className="h-3 w-3 text-ember" />}
         </span>
@@ -2125,6 +2302,7 @@ function AssistantOverlay({
             <span className="ml-1.5 text-xs font-normal text-muted-foreground">@{agent.handle}</span>
           ) : null}
         </p>
+        <GripHorizontal className="hidden h-4 w-4 shrink-0 text-muted-foreground/40 sm:block" aria-hidden />
         <button
           type="button"
           aria-label="Close assistant"

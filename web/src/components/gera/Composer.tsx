@@ -27,8 +27,9 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useMemo, useRef, useState, useSyncExternalStore, type DragEvent as ReactDragEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
 
 import { useAutoGrow } from "@/hooks/use-autogrow";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -53,8 +54,8 @@ import { MediaImg } from "@/components/gera/VaultMedia";
 import { useAgent } from "@/hooks/use-agent";
 import { agentHue, agentMonogram } from "@/lib/agents";
 import { RESEARCH_PROFILES } from "@/lib/deep-research";
+import { composerAccept, filterDroppedFiles } from "@/lib/composer-drop";
 import { errorFromUnknown } from "@/lib/errors";
-import { KNOWLEDGE_FILE_ACCEPT } from "@/lib/file-extract";
 import {
   githubAuthorizationFingerprint,
   listRepoOptions,
@@ -208,6 +209,72 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
   };
 
   const endQueueDrag = () => setDragId(null);
+
+  // Drag-and-drop attach: dropping files anywhere on the prompt card attaches
+  // them with the same accept rules as the paperclip. Depth counting keeps the
+  // overlay steady while the pointer crosses the card's children.
+  const [dropActive, setDropActive] = useState<boolean>(false);
+  const dropDepthRef = useRef<number>(0);
+  const dropAccept = canAttach ? composerAccept(mode, videoTakesFiles) : null;
+
+  const dragHasFiles = (event: ReactDragEvent<HTMLDivElement>): boolean =>
+    [...(event.dataTransfer?.types ?? [])].includes("Files");
+
+  const onDropZoneEnter = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!dropAccept || !dragHasFiles(event)) {
+      return;
+    }
+    event.preventDefault();
+    dropDepthRef.current += 1;
+    setDropActive(true);
+  };
+
+  const onDropZoneOver = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!dropAccept || !dragHasFiles(event)) {
+      return;
+    }
+    // preventDefault marks the card as a valid drop target (otherwise the
+    // browser navigates to the file on drop).
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const onDropZoneLeave = () => {
+    if (dropDepthRef.current === 0) {
+      return;
+    }
+    dropDepthRef.current -= 1;
+    if (dropDepthRef.current <= 0) {
+      dropDepthRef.current = 0;
+      setDropActive(false);
+    }
+  };
+
+  const onDropZoneDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!dropAccept) {
+      return;
+    }
+    event.preventDefault();
+    dropDepthRef.current = 0;
+    setDropActive(false);
+    const files = [...(event.dataTransfer?.files ?? [])];
+    if (files.length === 0) {
+      return;
+    }
+    const accepted = filterDroppedFiles(files, dropAccept);
+    if (accepted.length === 0) {
+      toast.error(
+        isChat
+          ? "Those files aren't supported — images, PDF, Office and text files work"
+          : "Drop an image file",
+      );
+      return;
+    }
+    // Video animates exactly one image — a new drop replaces the old one.
+    void addAttachments(mode === "video" ? accepted.slice(0, 1) : accepted, {
+      replace: mode === "video",
+    });
+  };
 
   // Mobile placeholders drop desktop-only shortcut hints and stay short enough
   // for a one-line textarea on a narrow screen. Desktop strings are unchanged.
@@ -394,6 +461,7 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
           {state.attachments.map((file) => (
             <div
               key={file.id}
+              data-testid={TID.composerAttachment}
               className={cn(
                 "relative h-16 overflow-hidden rounded-xl border border-border bg-card",
                 file.mime.startsWith("image/") ? "w-16" : "w-28",
@@ -546,13 +614,27 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
         </div>
       ) : null}
       <div
+        onDragEnter={onDropZoneEnter}
+        onDragOver={onDropZoneOver}
+        onDragLeave={onDropZoneLeave}
+        onDrop={onDropZoneDrop}
         className={cn(
-          "rounded-3xl border border-border/70 bg-card",
+          "relative rounded-3xl border border-border/70 bg-card",
           variant === "hero"
             ? "shadow-[0_2px_4px_rgba(35,20,28,0.05),0_44px_90px_-48px_rgba(122,46,80,0.5)]"
             : "shadow-[0_1px_2px_rgba(35,20,28,0.04),0_24px_50px_-32px_rgba(35,20,28,0.35)]",
         )}
       >
+        {dropActive ? (
+          <div
+            data-testid={TID.composerDropZone}
+            aria-hidden
+            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center gap-2 rounded-3xl border-2 border-dashed border-ember bg-ember/10 text-sm font-medium text-ember"
+          >
+            <Paperclip className="h-4 w-4" />
+            {isChat ? "Drop files to attach" : mode === "image" ? "Drop an image to edit" : "Drop an image to animate"}
+          </div>
+        ) : null}
         <textarea
           ref={inputRef}
           data-testid={TID.composerInput}
@@ -573,7 +655,7 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
                 <input
                   ref={fileRef}
                   type="file"
-                  accept={isChat ? `image/*,${KNOWLEDGE_FILE_ACCEPT}` : "image/*"}
+                  accept={dropAccept ?? undefined}
                   multiple={mode !== "video"}
                   className="hidden"
                   onChange={(event) => {

@@ -8,6 +8,7 @@ import {
   REASONING_EFFORTS,
   chatBaseModels,
   effortLabel,
+  groupChatModels,
   parseModelSelection,
   sanitizeChatModel,
   withEffort,
@@ -69,6 +70,32 @@ describe("chatBaseModels", () => {
   it("falls back to gateway language models when no curated base matches", () => {
     const models = [gatewayModel("acme/new-chat-model")];
     expect(chatBaseModels(models).map((model) => model.id)).toEqual(["acme/new-chat-model"]);
+  });
+});
+
+describe("groupChatModels", () => {
+  it("keeps Grok, Sol, Fable and Luna first and puts every other model under More", () => {
+    const catalog = [
+      gatewayModel("google/gemini-3.7-flash"),
+      gatewayModel("openai/gpt-5.6-sol"),
+      gatewayModel("openai/gpt-5.6-luna"),
+      gatewayModel("anthropic/claude-opus-5"),
+      gatewayModel("anthropic/claude-fable-5"),
+      gatewayModel("spacexai/grok-4.6"),
+    ];
+
+    const groups = groupChatModels(catalog);
+
+    expect(groups.primary.map((model) => model.id)).toEqual([
+      "spacexai/grok-4.6",
+      "openai/gpt-5.6-sol",
+      "anthropic/claude-fable-5",
+      "openai/gpt-5.6-luna",
+    ]);
+    expect(groups.more.map((model) => model.id)).toEqual([
+      "google/gemini-3.7-flash",
+      "anthropic/claude-opus-5",
+    ]);
   });
 });
 

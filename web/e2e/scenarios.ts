@@ -109,12 +109,17 @@ export const E2E_SCENARIOS: E2eScenario[] = [
   },
   {
     id: "switch-chat-model",
-    title: "The picker's Model submenu switches the active chat model",
+    title: "The picker keeps four primary models up front and opens the rest under More",
     steps: [
       { do: "goto", path: "/" },
       { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
       { do: "tap", target: TID.modelPickerTrigger },
       { do: "tap", target: TID.modelPickerModelRow },
+      { do: "see", target: modelOptionTid("spacexai/grok-4.6") },
+      { do: "see", target: modelOptionTid("openai/gpt-5.6-sol") },
+      { do: "see", target: modelOptionTid("anthropic/claude-fable-5") },
+      { do: "see", target: modelOptionTid("openai/gpt-5.6-luna") },
+      { do: "tap", target: TID.modelPickerMoreRow },
       { do: "tap", target: modelOptionTid(SWITCH_TARGET_MODEL_ID) },
       { do: "seeText", target: TID.modelPickerTrigger, text: SWITCH_TARGET_MODEL_NAME },
     ],

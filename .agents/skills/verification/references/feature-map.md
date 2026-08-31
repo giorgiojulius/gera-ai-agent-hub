@@ -5,9 +5,9 @@ fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering hardening, GitHub run credential hand-off + pin/access fixes,
 truthful MCP health + OAuth/account-session/sleep/deploy-resume hardening,
-authenticated file reads, Intercom attachments, full 98-entry MCP audit, and
-the live code Changes / Preview workbench with sandboxed HTML and deployment
-previews)
+authenticated file reads, Intercom attachments, full 98-entry MCP audit, the
+four-model primary picker with More, and the live code Changes / Preview
+workbench with sandboxed HTML and deployment previews)
 Drift check: `git log --oneline e1c652a..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -301,9 +301,12 @@ Trigger `model-picker-trigger` in the composer rail (shows name + pinned
 effort + blended cost; effort label and cost hide on narrow screens — the
 picker itself always shows them). Chat mode opens a root menu:
 
-- **Model** (`model-picker-model-row`) → searchable catalog submenu, one row
-  per base model (`model-option-<id>`), cost badge + tier, effort variants
-  deduped.
+- **Model** (`model-picker-model-row`) → searchable catalog submenu. Its main
+  view contains exactly Grok 4.6, GPT-5.6 Sol, Claude Fable 5 and GPT-5.6 Luna,
+  in that order; **More** (`model-picker-more-row`) opens every other curated
+  base model. A selected secondary model is summarized on the More row, while
+  searching from the main view still scans the full catalog. Model rows use
+  `model-option-<id>`, show cost badge + tier, and dedupe effort variants.
 - **Effort** (`model-picker-effort-row`) → `effort-option-default|low|medium|high|xhigh`;
   pins `reasoning.effort` (selection id becomes `catalogId:effort`).
 - **Reset to default** (`model-picker-reset`) → Grok 4.6 xHigh.
@@ -860,7 +863,7 @@ Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message t
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
-OAuth/session/file-content suites. Full verification on 2026-08-31: 730 unit
+OAuth/session/file-content suites. Full verification on 2026-08-31: 731 unit
 checks, 20 browser checks, web build, Worker deploy, live preview/ping and
 unauthenticated relay-gate smoke probes all passed.
 
@@ -943,7 +946,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | code-changes-preview | Repository edit event → live Changes diff → runnable sandbox Preview iframe |
 | new-chat-keeps-history | New chat resets view, thread stays listed |
 | github-pin-and-send | Connected GitHub → private repo list → pin → `/runs/start` carries exact repo + credential |
-| switch-chat-model | Picker root → Model submenu → selection sticks |
+| switch-chat-model | Picker root → four main models → More → secondary selection sticks |
 | switch-chat-effort | Picker root → Effort submenu → budget pins |
 | switch-run-mode | Model-style mode picker engages Deep research, trigger reflects it |
 | run-mode-settings-panel | Gear opens the research settings panel (depth control) |

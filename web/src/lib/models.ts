@@ -9,6 +9,13 @@ import type {
 } from "@/lib/types";
 
 export const DEFAULT_CHAT_MODEL = "spacexai/grok-4.6:xhigh";
+/** Four everyday choices shown before the chat picker's full catalog. */
+export const PRIMARY_CHAT_MODEL_IDS = [
+  "spacexai/grok-4.6",
+  "openai/gpt-5.6-sol",
+  "anthropic/claude-fable-5",
+  "openai/gpt-5.6-luna",
+] as const;
 export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.7-flash"] as const;
 /**
  * Cheapest catalog model for internal helper calls (tool router, research
@@ -482,6 +489,20 @@ export function chatBaseModels(models: GatewayModel[]): GatewayModel[] {
     return result;
   }
   return models.filter((model) => model.type === "language").slice(0, 12);
+}
+
+/** Splits the chat catalog into the four primary choices and the More submenu. */
+export function groupChatModels(models: GatewayModel[]): {
+  primary: GatewayModel[];
+  more: GatewayModel[];
+} {
+  const modelsById = new Map<string, GatewayModel>(models.map((model) => [model.id, model]));
+  const primary = PRIMARY_CHAT_MODEL_IDS.map((id) => modelsById.get(id)).filter(
+    (model): model is GatewayModel => Boolean(model),
+  );
+  const primaryIds = new Set<string>(PRIMARY_CHAT_MODEL_IDS);
+  const more = models.filter((model) => !primaryIds.has(model.id));
+  return { primary, more };
 }
 
 /** Every curated model across all creation tabs, in tab order. */

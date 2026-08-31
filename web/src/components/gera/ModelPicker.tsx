@@ -14,6 +14,7 @@ import {
   formatContext,
   formatModelCost,
   formatModelCostDetail,
+  groupChatModels,
   modelCostTier,
   modelIdForMode,
   modelsForMode,
@@ -40,7 +41,7 @@ const EFFORT_HINTS: Record<ReasoningEffort, string> = {
   xhigh: "Maximum thinking budget",
 };
 
-type PickerView = "root" | "model" | "effort";
+type PickerView = "root" | "model" | "more" | "effort";
 
 /**
  * Compact model selector in the composer's bottom rail. Chat mode opens a
@@ -67,13 +68,34 @@ export function ModelPicker() {
     [models, mode, isChat],
   );
 
+  const chatGroups = useMemo(() => groupChatModels(catalog), [catalog]);
+  const normalizedQuery = query.trim().toLowerCase();
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return q ? catalog.filter((model) => matchesQuery(model, q)) : catalog;
-  }, [catalog, query]);
+    let source = catalog;
+    if (isChat) {
+      if (view === "more") {
+        source = chatGroups.more;
+      } else if (!normalizedQuery) {
+        source = chatGroups.primary;
+      }
+    }
+    return normalizedQuery ? source.filter((model) => matchesQuery(model, normalizedQuery)) : source;
+  }, [catalog, chatGroups, isChat, normalizedQuery, view]);
 
   const activeCost = activeModel ? formatModelCost(activeModel) : "";
   const triggerName = isChat ? baseModel?.name ?? selection.catalogId : activeModel?.name ?? selectedId;
+  const selectedMoreModel = isChat
+    ? chatGroups.more.find((model) => model.id === selection.catalogId)
+    : undefined;
+  const showMoreRow =
+    isChat && view === "model" && normalizedQuery.length === 0 && chatGroups.more.length > 0;
+  const catalogHeading = !isChat
+    ? `${MODE_LABEL[mode]} models · ${catalog.length} curated`
+    : normalizedQuery
+      ? `Search results · ${filtered.length}`
+      : view === "more"
+        ? `More models · ${chatGroups.more.length}`
+        : `Main models · ${chatGroups.primary.length}`;
 
   const onOpenChange = (next: boolean) => {
     setOpen(next);
@@ -121,7 +143,7 @@ export function ModelPicker() {
         collisionPadding={12}
         className={cn(
           "flex max-h-[min(70vh,var(--radix-popover-content-available-height))] flex-col overflow-hidden rounded-2xl border-border bg-popover p-0 shadow-2xl",
-          view === "model" ? "w-[min(92vw,30rem)]" : "w-[min(92vw,18rem)]",
+          view === "model" || view === "more" ? "w-[min(92vw,30rem)]" : "w-[min(92vw,18rem)]",
         )}
       >
         {view === "root" ? (
@@ -207,11 +229,17 @@ export function ModelPicker() {
           </div>
         ) : null}
 
-        {view === "model" ? (
+        {view === "model" || view === "more" ? (
           <>
             {isChat ? (
               <div className="shrink-0 px-1.5 pt-1.5">
-                <BackHeader label="Model" onBack={() => setView("root")} />
+                <BackHeader
+                  label={view === "more" ? "More models" : "Model"}
+                  onBack={() => {
+                    setQuery("");
+                    setView(view === "more" ? "model" : "root");
+                  }}
+                />
               </div>
             ) : null}
             <div className="flex shrink-0 items-center gap-2 border-b border-border/70 px-3">
@@ -225,12 +253,12 @@ export function ModelPicker() {
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-2">
               <p className="px-2 py-1.5 text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                {MODE_LABEL[mode]} models · {catalog.length} curated
+                {catalogHeading}
               </p>
               {modelsLoading && catalog.length === 0 ? (
                 <p className="px-3 py-6 text-center text-sm text-muted-foreground">Loading catalog…</p>
               ) : null}
-              {!modelsLoading && filtered.length === 0 ? (
+              {!modelsLoading && filtered.length === 0 && !showMoreRow ? (
                 <p className="px-3 py-6 text-center text-sm text-muted-foreground">No matches.</p>
               ) : null}
               {filtered.map((model) => (
@@ -241,6 +269,38 @@ export function ModelPicker() {
                   onSelect={() => pickModel(model)}
                 />
               ))}
+              {showMoreRow ? (
+                <div className="mt-1 border-t border-border/70 pt-1">
+                  <button
+                    type="button"
+                    data-testid={TID.modelPickerMoreRow}
+                    onClick={() => {
+                      setQuery("");
+                      setView("more");
+                    }}
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded-xl px-2 py-2 text-left transition-colors hover:bg-foreground/5",
+                      selectedMoreModel && "bg-ember/10",
+                    )}
+                  >
+                    <Check
+                      className={cn(
+                        "h-3.5 w-3.5 shrink-0",
+                        selectedMoreModel ? "text-ember" : "opacity-0",
+                      )}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm">More</span>
+                      <span className="block truncate text-[11px] text-muted-foreground">
+                        {selectedMoreModel
+                          ? `${selectedMoreModel.name} selected`
+                          : `${chatGroups.more.length} additional models`}
+                      </span>
+                    </span>
+                    <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  </button>
+                </div>
+              ) : null}
             </div>
           </>
         ) : null}

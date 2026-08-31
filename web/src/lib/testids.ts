@@ -63,6 +63,8 @@ export const TID = {
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */
   modelPickerModelRow: "model-picker-model-row",
+  /** "More" row after Grok, Sol, Fable and Luna — opens the rest of the chat catalog. */
+  modelPickerMoreRow: "model-picker-more-row",
   /** "Effort" row in the chat picker's root menu — opens the thinking-budget submenu. */
   modelPickerEffortRow: "model-picker-effort-row",
   /** "Reset to default" row in the chat picker's root menu. */

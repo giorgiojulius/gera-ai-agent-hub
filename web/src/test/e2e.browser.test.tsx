@@ -63,6 +63,7 @@ const GATEWAY_MODEL_STUBS: GatewayModelStub[] = [
   { id: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol", owned_by: "openai" },
   { id: "openai/gpt-5.6-terra", name: "GPT-5.6 Terra", owned_by: "openai" },
   { id: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna", owned_by: "openai" },
+  { id: "anthropic/claude-fable-5", name: "Claude Fable 5", owned_by: "anthropic" },
   { id: SWITCH_TARGET_MODEL_ID, name: SWITCH_TARGET_MODEL_NAME, owned_by: "anthropic" },
   { id: "spacexai/grok-4.6", name: "Grok 4.6", owned_by: "spacexai" },
   { id: "spacexai/grok-4.20-reasoning", name: "Grok 4.20 Reasoning", owned_by: "spacexai" },

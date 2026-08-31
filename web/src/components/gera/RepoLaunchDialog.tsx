@@ -322,7 +322,7 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
                   <div className="min-w-0 flex-1">
                     <p className="text-xs font-medium text-white/80">Safe setup, explicit review</p>
                     <p className="mt-1 text-[11px] leading-relaxed text-white/40">
-                      The PR grants only <code className="text-white/55">contents: read</code>. Builds receive no Gera/Rork keys or repository secrets; only a short-lived upload capability bound to this preview artifact.
+                      Build scripts run read-only with no OIDC permission, Gera/Rork keys, or repository secrets. Only the separate trusted publisher receives the expiring preview read capability after the build handoff.
                     </p>
                     {setup?.pullRequestUrl ? (
                       <a

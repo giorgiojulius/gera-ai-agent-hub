@@ -3,10 +3,10 @@
 // repository workflow supplies isolated build compute without receiving any
 // Gera/Rork credential.
 
-export const REPO_PREVIEW_RUNNER_VERSION = 1;
+export const REPO_PREVIEW_RUNNER_VERSION = 3;
 export const REPO_PREVIEW_WORKFLOW_PATH = ".github/workflows/gera-web-preview.yml";
 export const REPO_PREVIEW_TTL_MS = 24 * 60 * 60_000;
-export const REPO_PREVIEW_TOKEN_TTL_MS = 45 * 60_000;
+export const REPO_PREVIEW_RUNNER_TTL_MS = 45 * 60_000;
 export const REPO_PREVIEW_MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 export const REPO_PREVIEW_MAX_FILES = 1_000;
 export const REPO_PREVIEW_MAX_LOG_CHARS = 120_000;
@@ -15,6 +15,7 @@ const OWNER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const REPO_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 const SAFE_REF_PATTERN = /^[A-Za-z0-9._/-]{1,180}$/;
 const PREVIEW_ID_PATTERN = /^[a-f0-9]{24}\.[A-Za-z0-9_-]{32,64}\.[a-f0-9]{24}$/;
+const PREVIEW_ACCESS_PATTERN = /^[a-f0-9]{48}$/;
 
 export type RepoPreviewPhase =
   | "queued"
@@ -141,6 +142,17 @@ export function isRepoPreviewId(value: string): boolean {
   return PREVIEW_ID_PATTERN.test(value);
 }
 
+export function isRepoPreviewAccessToken(value: string): boolean {
+  return PREVIEW_ACCESS_PATTERN.test(value);
+}
+
+/** Capability-bearing namespace; the workflow receives the id but never this access token. */
+export function repoPreviewPublicPrefix(id: string, accessToken: string): string | null {
+  return isRepoPreviewId(id) && isRepoPreviewAccessToken(accessToken)
+    ? `/repo-preview/${id}/${accessToken}/`
+    : null;
+}
+
 async function previewIdentityHmac(secret: string, value: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -180,6 +192,44 @@ function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+/** Verifies the workflow run GitHub created before any callback identity is accepted. */
+export function repoPreviewWorkflowRunMatches(
+  value: unknown,
+  expected: {
+    repository: string;
+    defaultBranch: string;
+    workflowSha: string;
+    workflowPath: string;
+    runId: string;
+  },
+): boolean {
+  const run = record(value);
+  const repository = record(run?.repository);
+  const id = typeof run?.id === "number" && Number.isSafeInteger(run.id) ? String(run.id) : "";
+  const path = typeof run?.path === "string" ? run.path.trim().split("@", 1)[0] : "";
+  const htmlUrl = typeof run?.html_url === "string" ? run.html_url.trim() : "";
+  return id === expected.runId &&
+    typeof repository?.full_name === "string" &&
+    repository.full_name.toLowerCase() === expected.repository.toLowerCase() &&
+    typeof run?.head_sha === "string" &&
+    run.head_sha.toLowerCase() === expected.workflowSha.toLowerCase() &&
+    run.head_branch === expected.defaultBranch &&
+    path === expected.workflowPath &&
+    run.event === "workflow_dispatch" &&
+    run.run_attempt === 1 &&
+    run.name === "Gera web preview" &&
+    htmlUrl.toLowerCase().startsWith(
+      `https://github.com/${expected.repository}/actions/runs/`.toLowerCase(),
+    );
+}
+
+/** Keeps bearer-like preview ids out of route-level diagnostics. */
+export function repoPreviewSafeRouteLabel(pathname: string): string {
+  if (pathname.startsWith("/hook/")) return "/hook/[redacted]";
+  if (pathname.startsWith("/asset/")) return "/asset/[redacted]";
+  return pathname.slice(0, 300);
 }
 
 /** Framework/package-manager inference from immutable repository metadata. */
@@ -258,7 +308,7 @@ export function repoPreviewWorkflowMatches(source: string | null): boolean {
 }
 
 const PREVIEW_ARTIFACT_EXTENSIONS = new Set([
-  "html", "htm", "css", "js", "mjs", "cjs", "json", "webmanifest", "xml", "txt", "csv",
+  "html", "htm", "css", "js", "mjs", "cjs", "json", "webmanifest", "txt", "csv",
   "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "ico",
   "woff", "woff2", "ttf", "otf", "wasm",
   "mp3", "wav", "ogg", "m4a", "mp4", "webm", "mov",
@@ -344,6 +394,18 @@ export function normalizeRepoPreviewManifest(value: unknown, archiveBytes: numbe
   return { version: 1, entry, files };
 }
 
+/** Active document formats receive an origin-sandboxing CSP when served publicly. */
+export function repoPreviewContentSecurityPolicy(path: string): string | undefined {
+  const extension = path.toLowerCase().split(".").pop() ?? "";
+  if (extension === "html" || extension === "htm") {
+    return "sandbox allow-scripts allow-forms allow-popups allow-modals; default-src 'self' https: data: blob:; base-uri 'self'; object-src 'none'; frame-ancestors *; script-src 'self' 'unsafe-inline' 'unsafe-eval' https: blob:; style-src 'self' 'unsafe-inline' https:; connect-src 'self' https: wss:; img-src 'self' https: data: blob:; media-src 'self' https: data: blob:; font-src 'self' https: data:; worker-src 'self' blob:;";
+  }
+  if (extension === "svg") {
+    return "sandbox; default-src 'none'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; style-src 'unsafe-inline'; img-src data:;";
+  }
+  return undefined;
+}
+
 /** MIME is derived from the validated path, never accepted from the workflow. */
 export function repoPreviewContentType(path: string): string {
   const extension = path.toLowerCase().split(".").pop() ?? "";
@@ -356,7 +418,6 @@ export function repoPreviewContentType(path: string): string {
     cjs: "text/javascript; charset=utf-8",
     json: "application/json; charset=utf-8",
     map: "application/json; charset=utf-8",
-    xml: "application/xml; charset=utf-8",
     svg: "image/svg+xml",
     png: "image/png",
     jpg: "image/jpeg",
@@ -381,9 +442,12 @@ export function repoPreviewContentType(path: string): string {
 /** Makes root-relative build assets resolve inside one preview's path namespace. */
 export function rewriteRepoPreviewHtml(html: string, previewPrefix: string): string {
   const prefix = previewPrefix.endsWith("/") ? previewPrefix : `${previewPrefix}/`;
+  const namespacedPath = prefix.replace(/^\/+/, "");
   const rewritten = html.replace(
     /\b(src|href|poster|action)=(['"])\/(?!\/)([^'"]*)\2/gi,
-    (_full, attribute: string, quote: string, path: string) => `${attribute}=${quote}${prefix}${path}${quote}`,
+    (full, attribute: string, quote: string, path: string) => path.startsWith(namespacedPath)
+      ? full
+      : `${attribute}=${quote}${prefix}${path}${quote}`,
   );
   const base = `<base href="${prefix}">`;
   if (/<head(?:\s[^>]*)?>/i.test(rewritten)) {
@@ -397,6 +461,7 @@ export function redactRepoPreviewLog(value: string): string {
   return value
     .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
     .replace(/\b(?:gh[opsu]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,})\b/g, "[redacted-token]")
+    .replace(/\b[a-f0-9]{24}\.[A-Za-z0-9_-]{32,64}\.[a-f0-9]{24}\b/g, "[redacted-preview-id]")
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, "$1 [redacted]")
     .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/g, "$1[redacted]@")
     .replace(/([?&](?:token|key|secret|signature|auth)=)[^&\s]+/gi, "$1[redacted]")
@@ -435,29 +500,47 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
-  preview:
+  begin:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 2
+    permissions:
+      contents: none
+      id-token: write
     steps:
-      - name: Mark runner started
-        continue-on-error: true
+      - name: Authenticate exact runner
         shell: bash
         env:
           CALLBACK_URL: \${{ inputs.callback_url }}
-          PREVIEW_ID: \${{ inputs.preview_id }}
         run: |
-          OIDC_TOKEN="$(curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
-          printf '{}' | curl --fail --silent --show-error \
-            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
-            "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/started"
+          set -euo pipefail
+          PREVIEW_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["preview_id"])' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$PREVIEW_ID"
+          for ATTEMPT in {1..10}; do
+            OIDC_TOKEN="$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+            if printf '{}' | curl --fail --silent --show-error \
+              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
+              "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/started"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
 
+  build:
+    needs: begin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: none
+    outputs:
+      exit_code: \${{ steps.build.outputs.exit_code }}
+    steps:
       - name: Check out immutable source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -479,24 +562,11 @@ jobs:
         id: build
         shell: bash
         env:
-          CALLBACK_URL: \${{ inputs.callback_url }}
-          PREVIEW_ID: \${{ inputs.preview_id }}
           ROOT_DIRECTORY: \${{ inputs.root_directory }}
           REQUESTED_OUTPUT: \${{ inputs.output_directory }}
         run: |
           set +e
           LOG_FILE="$RUNNER_TEMP/gera-preview.log"
-          gera_oidc() {
-            curl --fail --silent --show-error \
-              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])'
-          }
-          notify_phase() {
-            OIDC_TOKEN="$(gera_oidc)" || return 0
-            printf '{"phase":"%s"}' "$1" | curl --silent --show-error \
-              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
-              "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/phase" >/dev/null || true
-          }
           {
             set -euo pipefail
             case "$ROOT_DIRECTORY" in
@@ -506,10 +576,9 @@ jobs:
             if [ "$ROOT_DIRECTORY" != "." ]; then PROJECT_DIR="$GITHUB_WORKSPACE/$ROOT_DIRECTORY"; fi
             if [ ! -d "$PROJECT_DIR" ]; then echo "Project root not found: $ROOT_DIRECTORY"; exit 2; fi
             cd "$PROJECT_DIR"
-            PREVIEW_BASE="/repo-preview/$PREVIEW_ID/"
+            PREVIEW_BASE="/repo-preview/__GERA_PREVIEW_BASE__/"
 
             if [ -f package.json ]; then
-              notify_phase installing
               corepack enable || true
               if [ -f bun.lock ] || [ -f bun.lockb ]; then
                 PACKAGE_MANAGER=bun
@@ -533,7 +602,6 @@ jobs:
               fi
 
               if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.build ? 0 : 1)'; then
-                notify_phase building
                 if node -e 'const p=require("./package.json"); const d={...(p.dependencies||{}),...(p.devDependencies||{})}; process.exit(d.vite ? 0 : 1)'; then
                   case "$PACKAGE_MANAGER" in
                     bun) bun run build -- --base="$PREVIEW_BASE" ;;
@@ -560,7 +628,6 @@ jobs:
               exit 3
             fi
 
-            notify_phase packaging
             export REQUESTED_OUTPUT
             OUTPUT_DIR="$(python3 - <<'PY'
           import os
@@ -599,7 +666,7 @@ jobs:
           manifest_path = Path(os.environ["RUNNER_TEMP"]) / "gera-preview-manifest.json"
           files = []
           allowed_extensions = {
-              ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".json", ".webmanifest", ".xml", ".txt", ".csv",
+              ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".json", ".webmanifest", ".txt", ".csv",
               ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
               ".woff", ".woff2", ".ttf", ".otf", ".wasm",
               ".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".webm", ".mov",
@@ -651,67 +718,165 @@ jobs:
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Upload preview to Rork
-        id: upload
-        if: steps.build.outputs.exit_code == '0'
-        shell: bash
-        env:
-          CALLBACK_URL: \${{ inputs.callback_url }}
-          PREVIEW_ID: \${{ inputs.preview_id }}
-        run: |
-          OIDC_TOKEN="$(curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
-          printf '{"phase":"uploading"}' | curl --fail --silent --show-error \
-            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
-            "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/phase"
-          curl --fail --silent --show-error -X PUT \
-            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/x-tar" \
-            --data-binary @"$RUNNER_TEMP/gera-preview.tar" \
-            "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/archive"
-          curl --fail --silent --show-error -X PUT \
-            -H "Authorization: Bearer $UPLOAD_TOKEN" -H "Content-Type: application/json" \
-            --data-binary @"$RUNNER_TEMP/gera-preview-manifest.json" \
-            "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/manifest"
-
-      - name: Upload bounded build log
+      - name: Stage bounded handoff
         if: always()
-        continue-on-error: true
         shell: bash
-        env:
-          CALLBACK_URL: \${{ inputs.callback_url }}
-          PREVIEW_ID: \${{ inputs.preview_id }}
         run: |
-          OIDC_TOKEN="$(curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
           touch "$RUNNER_TEMP/gera-preview.log"
-          tail -c 120000 "$RUNNER_TEMP/gera-preview.log" | curl --fail --silent --show-error -X PUT \
-            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: text/plain; charset=utf-8" --data-binary @- \
-            "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/logs"
+          if [ "\${{ steps.build.outputs.exit_code }}" != "0" ]; then
+            rm -f "$RUNNER_TEMP/gera-preview.tar" "$RUNNER_TEMP/gera-preview-manifest.json"
+          fi
 
-      - name: Finalize preview
+      - name: Transfer bounded handoff
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gera-preview-handoff-\${{ github.run_id }}-\${{ github.run_attempt }}
+          path: |
+            \${{ runner.temp }}/gera-preview.tar
+            \${{ runner.temp }}/gera-preview.log
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: [begin, build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: none
+      id-token: write
+    steps:
+      - name: Receive bounded handoff
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: gera-preview-handoff-\${{ github.run_id }}-\${{ github.run_attempt }}
+          path: \${{ runner.temp }}/gera-preview-handoff
+
+      - name: Publish from trusted job
         if: always()
         shell: bash
         env:
           CALLBACK_URL: \${{ inputs.callback_url }}
-          PREVIEW_ID: \${{ inputs.preview_id }}
-          BUILD_CODE: \${{ steps.build.outputs.exit_code }}
-          UPLOAD_OUTCOME: \${{ steps.upload.outcome }}
+          BUILD_CODE: \${{ needs.build.outputs.exit_code }}
+          BUILD_RESULT: \${{ needs.build.result }}
         run: |
+          set -euo pipefail
+          PREVIEW_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["preview_id"])' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$PREVIEW_ID"
           OIDC_TOKEN="$(curl --fail --silent --show-error \
             -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
-          if [ "$BUILD_CODE" = "0" ] && [ "$UPLOAD_OUTCOME" = "success" ]; then
+          PREVIEW_BASE="$(printf '{}' | curl --fail --silent --show-error \
+            -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
+            "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/configuration" \
+            | python3 -c 'import json,re,sys; value=json.load(sys.stdin).get("previewBase", ""); prefix=f"/repo-preview/{sys.argv[1]}/"; token=value[len(prefix):-1] if value.startswith(prefix) and value.endswith("/") else ""; assert re.fullmatch(r"[a-f0-9]{48}", token); print(value)' "$PREVIEW_ID")"
+          PREVIEW_ACCESS="\${PREVIEW_BASE%/}"
+          PREVIEW_ACCESS="\${PREVIEW_ACCESS##*/}"
+          echo "::add-mask::$PREVIEW_ACCESS"
+          echo "::add-mask::$PREVIEW_BASE"
+          set +e
+          HANDOFF_DIR="$RUNNER_TEMP/gera-preview-handoff"
+          LOG_FILE="$HANDOFF_DIR/gera-preview.log"
+          if [ -f "$LOG_FILE" ]; then
+            tail -c 120000 "$LOG_FILE" | curl --fail --silent --show-error -X PUT \
+              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: text/plain; charset=utf-8" --data-binary @- \
+              "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/logs" >/dev/null || true
+          fi
+
+          REWRITE_CODE=1
+          if [ "$BUILD_RESULT" = "success" ] && [ "$BUILD_CODE" = "0" ] \
+            && [ -f "$HANDOFF_DIR/gera-preview.tar" ]; then
+            export HANDOFF_DIR PREVIEW_BASE
+            python3 - <<'PY'
+          import io
+          import json
+          import os
+          import tarfile
+          from pathlib import Path
+
+          limit = 50 * 1024 * 1024
+          placeholder = b"/repo-preview/__GERA_PREVIEW_BASE__/"
+          replacement = os.environ["PREVIEW_BASE"].encode("utf-8")
+          handoff = Path(os.environ["HANDOFF_DIR"])
+          source = handoff / "gera-preview.tar"
+          target = handoff / "gera-preview-bound.tar"
+          manifest_path = handoff / "gera-preview-manifest.json"
+          text_extensions = {".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".json", ".webmanifest", ".txt", ".csv", ".svg", ".gltf"}
+          seen = set()
+          total = 0
+          with tarfile.open(source, "r:") as incoming, tarfile.open(target, "w", format=tarfile.GNU_FORMAT) as outgoing:
+              members = incoming.getmembers()
+              if not members or len(members) > 1000:
+                  raise SystemExit("Invalid handoff file count.")
+              for member in members:
+                  parts = member.name.split("/")
+                  if not member.isfile() or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts) or member.name in seen:
+                      raise SystemExit("Unsafe handoff entry.")
+                  if member.size < 0 or member.size > limit or total + member.size > limit:
+                      raise SystemExit("Oversized handoff entry.")
+                  stream = incoming.extractfile(member)
+                  if stream is None:
+                      raise SystemExit("Unreadable handoff entry.")
+                  data = stream.read(member.size + 1)
+                  if len(data) != member.size:
+                      raise SystemExit("Handoff entry size mismatch.")
+                  if Path(member.name).suffix.lower() in text_extensions:
+                      data = data.replace(placeholder, replacement)
+                  total += len(data)
+                  if total > limit:
+                      raise SystemExit("Bound preview exceeds 50 MiB.")
+                  info = tarfile.TarInfo(member.name)
+                  info.size = len(data)
+                  info.mode = 0o644
+                  info.mtime = 0
+                  outgoing.addfile(info, io.BytesIO(data))
+                  seen.add(member.name)
+          if "index.html" not in seen or target.stat().st_size > limit:
+              raise SystemExit("Bound preview is invalid or too large.")
+          with tarfile.open(target, "r:") as archive:
+              entries = [
+                  {"path": member.name, "offset": member.offset_data, "size": member.size}
+                  for member in archive.getmembers()
+                  if member.isfile()
+              ]
+          manifest_path.write_text(json.dumps({"version": 1, "entry": "index.html", "files": entries}), encoding="utf-8")
+          os.replace(target, source)
+          PY
+            REWRITE_CODE=$?
+          fi
+
+          UPLOAD_CODE=1
+          if [ "$REWRITE_CODE" = "0" ]; then
+            printf '{"phase":"uploading"}' | curl --fail --silent --show-error \
+              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
+              "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/phase" \
+            && curl --fail --silent --show-error -X PUT \
+              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/x-tar" \
+              --data-binary @"$HANDOFF_DIR/gera-preview.tar" \
+              "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/archive" \
+            && curl --fail --silent --show-error -X PUT \
+              -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" \
+              --data-binary @"$HANDOFF_DIR/gera-preview-manifest.json" \
+              "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/manifest"
+            UPLOAD_CODE=$?
+          fi
+
+          if [ "$UPLOAD_CODE" = "0" ]; then
             STATUS=success
             MESSAGE="Static preview is ready."
           else
             STATUS=failed
-            MESSAGE="Install, build, packaging, or upload failed. Open the bounded log in Gera."
+            MESSAGE="Install, build, packaging, transfer, or upload failed. Open the bounded log in Gera."
           fi
           printf '{"status":"%s","message":"%s"}' "$STATUS" "$MESSAGE" | curl --fail --silent --show-error \
             -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @- \
             "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/complete"
-          if [ "$STATUS" != "success" ]; then exit 1; fi
+          COMPLETE_CODE=$?
+          if [ "$STATUS" != "success" ] || [ "$COMPLETE_CODE" != "0" ]; then exit 1; fi
 `;
 }

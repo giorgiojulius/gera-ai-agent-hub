@@ -4,6 +4,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
+import { authorizeGitHubPreviewClaims, verifyGitHubActionsOidc } from "./github-oidc";
 import {
   getRorkStorageCredentials,
   presignRorkStorageUrl,
@@ -12,18 +13,23 @@ import {
 import {
   REPO_PREVIEW_MAX_ARCHIVE_BYTES,
   REPO_PREVIEW_MAX_LOG_CHARS,
-  REPO_PREVIEW_TOKEN_TTL_MS,
+  REPO_PREVIEW_RUNNER_TTL_MS,
   REPO_PREVIEW_TTL_MS,
   REPO_PREVIEW_WORKFLOW_PATH,
   detectRepoPreviewProject,
+  isRepoPreviewAccessToken,
   isRepoPreviewId,
   normalizeRepoPreviewDirectory,
   normalizeRepoPreviewManifest,
   normalizeRepoPreviewRef,
   parseRepoPreviewRepository,
   redactRepoPreviewLog,
+  repoPreviewContentSecurityPolicy,
   repoPreviewContentType,
+  repoPreviewPublicPrefix,
   repoPreviewRunnerVersion,
+  repoPreviewSafeRouteLabel,
+  repoPreviewWorkflowRunMatches,
   repoPreviewWorkflowMatches,
   repoPreviewWorkflowSource,
   rewriteRepoPreviewHtml,
@@ -47,7 +53,8 @@ const QUEUED_TIMEOUT_MS = 20 * 60_000;
 const HTML_REWRITE_LIMIT = 2_000_000;
 const MANIFEST_BODY_LIMIT = 1_000_000;
 const CONTROL_BODY_LIMIT = 32_000;
-const PREVIEW_ID_PART = /^[A-Za-z0-9_-]{20,80}$/;
+const GITHUB_OIDC_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const GITHUB_OIDC_MAX_CHARS = 20_000;
 
 export type RepoPreviewStoreEnv = RorkStorageEnv & {
   DO?: { fetch(request: Request): Promise<Response> };
@@ -66,13 +73,15 @@ type PreviewRow = {
   package_manager: string;
   phase: string;
   run_id: string;
+  workflow_ref: string;
+  workflow_sha: string;
+  runner_expires_at: number;
+  access_token: string;
   actions_url: string;
   setup_pr_url: string;
   created_at: number;
   updated_at: number;
   expires_at: number;
-  token_hash: string;
-  token_expires_at: number;
   archive_key: string;
   archive_bytes: number;
   manifest: string;
@@ -88,6 +97,15 @@ type InspectInput = {
   rootDirectory?: unknown;
   outputDirectory?: unknown;
 };
+
+function constantTimeEqual(expected: string, provided: string): boolean {
+  if (expected.length !== provided.length) return false;
+  let difference = 0;
+  for (let index = 0; index < expected.length; index += 1) {
+    difference |= expected.charCodeAt(index) ^ provided.charCodeAt(index);
+  }
+  return difference === 0;
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -310,11 +328,6 @@ function randomPart(): string {
   return `${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`;
 }
 
-async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 function requestOwner(request: Request): { email: string; key: string } | null {
   const encoded = request.headers.get("X-Gera-Email") ?? "";
   let email = "";
@@ -332,9 +345,9 @@ function githubAuth(request: Request): string {
   return value.length <= 1_000 && /^(?:Bearer|token)\s+[^\r\n]+$/i.test(value) ? value : "";
 }
 
-function requestPreviewToken(request: Request): string {
-  const value = request.headers.get("X-Gera-Preview-Token") ?? "";
-  return value.length <= 200 && PREVIEW_ID_PART.test(value) ? value : "";
+function requestGitHubOidc(request: Request): string {
+  const value = request.headers.get("X-Gera-GitHub-OIDC") ?? "";
+  return value.length <= GITHUB_OIDC_MAX_CHARS && GITHUB_OIDC_PATTERN.test(value) ? value : "";
 }
 
 const ACTIVE_PHASE_RANK: Record<ActiveRepoPreviewPhase, number> = {
@@ -416,6 +429,7 @@ function packageManagerValue(value: string): RepoPreviewPackageManager {
 
 function rowToJob(row: PreviewRow, origin: string): RepoPreviewJob {
   const phase = row.expires_at <= Date.now() && row.phase !== "cancelled" ? "expired" : phaseValue(row.phase);
+  const previewPrefix = repoPreviewPublicPrefix(row.id, row.access_token);
   return {
     id: row.id,
     repository: row.repository,
@@ -429,7 +443,7 @@ function rowToJob(row: PreviewRow, origin: string): RepoPreviewJob {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     expiresAt: row.expires_at,
-    ...(phase === "ready" ? { previewUrl: `${origin}/repo-preview/${row.id}/` } : {}),
+    ...(phase === "ready" && previewPrefix ? { previewUrl: `${origin}${previewPrefix}` } : {}),
     ...(row.actions_url ? { actionsUrl: row.actions_url } : {}),
     ...(row.setup_pr_url ? { setupPullRequestUrl: row.setup_pr_url } : {}),
     ...(row.logs ? { logs: row.logs } : {}),
@@ -444,7 +458,7 @@ function safeError(error: unknown): { status: number; message: string } {
   return { status: 502, message: error instanceof Error ? error.message.slice(0, 300) : "Preview backend failed." };
 }
 
-function previewHeaders(contentType: string, html: boolean): Headers {
+function previewHeaders(contentType: string, contentSecurityPolicy?: string): Headers {
   const headers = new Headers({
     "Content-Type": contentType,
     "X-Content-Type-Options": "nosniff",
@@ -453,11 +467,8 @@ function previewHeaders(contentType: string, html: boolean): Headers {
     "Access-Control-Allow-Origin": "*",
     "Cache-Control": "private, no-store",
   });
-  if (html) {
-    headers.set(
-      "Content-Security-Policy",
-      "sandbox allow-scripts allow-forms allow-popups allow-modals; default-src 'self' https: data: blob:; base-uri 'self'; object-src 'none'; frame-ancestors *; script-src 'self' 'unsafe-inline' 'unsafe-eval' https: blob:; style-src 'self' 'unsafe-inline' https:; connect-src 'self' https: wss:; img-src 'self' https: data: blob:; media-src 'self' https: data: blob:; font-src 'self' https: data:; worker-src 'self' blob:;",
-    );
+  if (contentSecurityPolicy) {
+    headers.set("Content-Security-Policy", contentSecurityPolicy);
   }
   return headers;
 }
@@ -481,6 +492,10 @@ export class RepoPreviewStore extends DurableObject {
         package_manager TEXT NOT NULL,
         phase TEXT NOT NULL,
         run_id TEXT NOT NULL DEFAULT '',
+        workflow_ref TEXT NOT NULL DEFAULT '',
+        workflow_sha TEXT NOT NULL DEFAULT '',
+        runner_expires_at INTEGER NOT NULL DEFAULT 0,
+        access_token TEXT NOT NULL DEFAULT '',
         actions_url TEXT NOT NULL DEFAULT '',
         setup_pr_url TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL,
@@ -495,6 +510,30 @@ export class RepoPreviewStore extends DurableObject {
         error TEXT NOT NULL DEFAULT ''
       )
     `);
+    const previewColumns = new Set(
+      this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(repo_previews)").toArray().map((column) => column.name),
+    );
+    const additions: Array<[string, string]> = [
+      ["workflow_ref", "TEXT NOT NULL DEFAULT ''"],
+      ["workflow_sha", "TEXT NOT NULL DEFAULT ''"],
+      ["runner_expires_at", "INTEGER NOT NULL DEFAULT 0"],
+      ["access_token", "TEXT NOT NULL DEFAULT ''"],
+    ];
+    for (const [name, definition] of additions) {
+      if (!previewColumns.has(name)) {
+        this.ctx.storage.sql.exec(`ALTER TABLE repo_previews ADD COLUMN ${name} ${definition}`);
+      }
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE repo_previews SET phase = 'failed', updated_at = ?, error = ?
+        WHERE access_token = '' AND phase IN ('queued','installing','building','packaging','uploading')`,
+      Date.now(),
+      "This preview predates isolated read capabilities. Rebuild it safely.",
+    );
+    this.ctx.storage.sql.exec(
+      "UPDATE repo_previews SET phase = 'expired', updated_at = ? WHERE access_token = '' AND phase = 'ready'",
+      Date.now(),
+    );
     this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_repo_previews_owner_created ON repo_previews (owner_email, created_at DESC)");
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS repo_preview_owners (
@@ -541,7 +580,7 @@ export class RepoPreviewStore extends DurableObject {
       return json({ error: "not_found" }, 404);
     } catch (error) {
       const safe = safeError(error);
-      const routeLabel = url.pathname.startsWith("/hook/") ? "/hook/[redacted]" : url.pathname;
+      const routeLabel = repoPreviewSafeRouteLabel(url.pathname);
       console.error("repo preview route failed", routeLabel, safe.message);
       return json({ error: safe.message }, safe.status);
     }
@@ -550,12 +589,7 @@ export class RepoPreviewStore extends DurableObject {
   private internalAuthorized(request: Request): boolean {
     const expected = this.workerEnv.RORK_AUTH_SECRET_KEY ?? "";
     const provided = request.headers.get("X-Gera-Internal-Secret") ?? "";
-    if (!expected || expected.length !== provided.length) return false;
-    let difference = 0;
-    for (let index = 0; index < expected.length; index += 1) {
-      difference |= expected.charCodeAt(index) ^ provided.charCodeAt(index);
-    }
-    return difference === 0;
+    return Boolean(expected) && constantTimeEqual(expected, provided);
   }
 
   private async handleInternal(request: Request, url: URL): Promise<Response> {
@@ -653,7 +687,7 @@ export class RepoPreviewStore extends DurableObject {
     const row = this.ctx.storage.sql
       .exec<{ next_at: number | null }>(
         `SELECT MIN(CASE
-          WHEN phase IN ('queued','installing','building','packaging','uploading') THEN token_expires_at
+          WHEN phase IN ('queued','installing','building','packaging','uploading') THEN runner_expires_at
           WHEN archive_bytes < 0 THEN ?
           ELSE expires_at END) AS next_at
          FROM repo_previews
@@ -756,8 +790,9 @@ export class RepoPreviewStore extends DurableObject {
           "",
           "- checks out an immutable commit",
           "- receives no repository, Gera, or Rork secrets",
-          "- uploads only the static build output through a short-lived preview-scoped token",
-          "- keeps GitHub permissions at `contents: read`",
+          "- runs repository install/build code in a read-only job with OIDC explicitly disabled",
+          "- passes only a bounded handoff to a separate trusted publish job",
+          "- authenticates callbacks with GitHub Actions OIDC, never a shared secret",
         ].join("\n"),
       },
     }));
@@ -766,6 +801,135 @@ export class RepoPreviewStore extends DurableObject {
       throw new PreviewGitHubError(502, `The runner branch was created (${branch}), but GitHub returned no setup PR URL.`);
     }
     return json({ ready: false, branch, pullRequestUrl, inspection });
+  }
+
+  private activeDuplicate(ownerEmail: string, inspection: RepoPreviewInspection): PreviewRow | undefined {
+    return this.ctx.storage.sql
+      .exec<PreviewRow>(
+        `SELECT * FROM repo_previews
+          WHERE owner_email = ? AND repository = ? AND commit_sha = ? AND root_directory = ?
+            AND output_directory = ? AND phase IN ('queued','installing','building','packaging','uploading')
+          ORDER BY created_at DESC LIMIT 1`,
+        ownerEmail,
+        inspection.repository,
+        inspection.commitSha,
+        inspection.rootDirectory,
+        inspection.outputDirectory ?? "",
+      )
+      .toArray()[0];
+  }
+
+  private activeCount(ownerEmail: string): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM repo_previews
+          WHERE owner_email = ? AND phase IN ('queued','installing','building','packaging','uploading')`,
+        ownerEmail,
+      )
+      .toArray()[0]?.n ?? 0;
+  }
+
+  private async prepareHistorySlot(ownerEmail: string): Promise<"available" | "active_full" | "cleanup_pending"> {
+    const count = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM repo_previews WHERE owner_email = ?", ownerEmail)
+      .toArray()[0]?.n ?? 0;
+    if (count < MAX_RECENT_JOBS) return "available";
+    const oldest = this.ctx.storage.sql
+      .exec<PreviewRow>(
+        `SELECT * FROM repo_previews WHERE owner_email = ?
+          AND phase NOT IN ('queued','installing','building','packaging','uploading')
+          ORDER BY created_at ASC LIMIT 1`,
+        ownerEmail,
+      )
+      .toArray()[0];
+    if (!oldest) return "active_full";
+    if (!(await this.deleteArchive(oldest))) {
+      this.ctx.storage.sql.exec(
+        "UPDATE repo_previews SET archive_bytes = -2, manifest = '', updated_at = ? WHERE id = ?",
+        Date.now(),
+        oldest.id,
+      );
+      return "cleanup_pending";
+    }
+    this.ctx.storage.sql.exec(
+      `DELETE FROM repo_previews WHERE id = ?
+        AND phase NOT IN ('queued','installing','building','packaging','uploading')`,
+      oldest.id,
+    );
+    return "available";
+  }
+
+  /** One SQLite statement checks both quotas and reserves the slot without an async interleave. */
+  private reservePreview(
+    ownerEmail: string,
+    inspection: RepoPreviewInspection,
+    reservation: {
+      id: string;
+      workflowRef: string;
+      workflowSha: string;
+      accessToken: string;
+      actionsUrl: string;
+      now: number;
+      archiveKey: string;
+    },
+  ):
+    | { kind: "created"; row: PreviewRow }
+    | { kind: "duplicate"; row: PreviewRow }
+    | { kind: "active_limit" }
+    | { kind: "history_limit" }
+    | { kind: "failed" } {
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO repo_previews
+        (id, owner_email, repository, ref, commit_sha, root_directory, output_directory,
+         framework, package_manager, phase, run_id, workflow_ref, workflow_sha, runner_expires_at,
+         access_token, actions_url, setup_pr_url, created_at, updated_at, expires_at, token_hash, token_expires_at,
+         archive_key, archive_bytes, manifest, logs, error)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', ?, ?, ?, ?, ?, '', ?, ?, ?, '', 0, ?, 0, '', '', ''
+       WHERE (SELECT COUNT(*) FROM repo_previews
+                WHERE owner_email = ? AND phase IN ('queued','installing','building','packaging','uploading')) < ?
+         AND (SELECT COUNT(*) FROM repo_previews WHERE owner_email = ?) < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM repo_previews
+            WHERE owner_email = ? AND repository = ? AND commit_sha = ? AND root_directory = ?
+              AND output_directory = ? AND phase IN ('queued','installing','building','packaging','uploading')
+         )`,
+      reservation.id,
+      ownerEmail,
+      inspection.repository,
+      inspection.ref,
+      inspection.commitSha,
+      inspection.rootDirectory,
+      inspection.outputDirectory ?? "",
+      inspection.framework,
+      inspection.packageManager,
+      reservation.workflowRef,
+      reservation.workflowSha,
+      reservation.now + REPO_PREVIEW_RUNNER_TTL_MS,
+      reservation.accessToken,
+      reservation.actionsUrl,
+      reservation.now,
+      reservation.now,
+      reservation.now + REPO_PREVIEW_TTL_MS,
+      reservation.archiveKey,
+      ownerEmail,
+      MAX_ACTIVE_JOBS,
+      ownerEmail,
+      MAX_RECENT_JOBS,
+      ownerEmail,
+      inspection.repository,
+      inspection.commitSha,
+      inspection.rootDirectory,
+      inspection.outputDirectory ?? "",
+    );
+    const created = this.row(reservation.id);
+    if (created) return { kind: "created", row: created };
+    const duplicate = this.activeDuplicate(ownerEmail, inspection);
+    if (duplicate) return { kind: "duplicate", row: duplicate };
+    if (this.activeCount(ownerEmail) >= MAX_ACTIVE_JOBS) return { kind: "active_limit" };
+    const count = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM repo_previews WHERE owner_email = ?", ownerEmail)
+      .toArray()[0]?.n ?? 0;
+    return count >= MAX_RECENT_JOBS ? { kind: "history_limit" } : { kind: "failed" };
   }
 
   private async handleStart(
@@ -785,53 +949,44 @@ export class RepoPreviewStore extends DurableObject {
     if (!inspection.projectFound) {
       return json({ error: "No runnable package.json or index.html was found at this project root.", inspection }, 422);
     }
-    const duplicate = this.ctx.storage.sql
-      .exec<PreviewRow>(
-        `SELECT * FROM repo_previews
-          WHERE owner_email = ? AND repository = ? AND commit_sha = ? AND root_directory = ?
-            AND output_directory = ? AND phase IN ('queued','installing','building','packaging','uploading')
-          ORDER BY created_at DESC LIMIT 1`,
-        owner.email,
-        inspection.repository,
-        inspection.commitSha,
-        inspection.rootDirectory,
-        inspection.outputDirectory ?? "",
-      )
-      .toArray()[0];
+    const duplicate = this.activeDuplicate(owner.email, inspection);
     if (duplicate) {
       return json({ job: rowToJob(duplicate, origin), deduplicated: true }, 200);
     }
-    const activeCount = this.ctx.storage.sql
-      .exec<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM repo_previews WHERE owner_email = ? AND phase IN ('queued','installing','building','packaging','uploading')`,
-        owner.email,
-      )
-      .toArray()[0]?.n ?? 0;
-    if (activeCount >= MAX_ACTIVE_JOBS) {
+    if (this.activeCount(owner.email) >= MAX_ACTIVE_JOBS) {
       return json({ error: "Two repository previews are already building. Stop one or wait for it to finish." }, 429);
     }
-    const count = this.ctx.storage.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM repo_previews WHERE owner_email = ?", owner.email)
-      .toArray()[0]?.n ?? 0;
-    if (count >= MAX_RECENT_JOBS) {
-      const oldest = this.ctx.storage.sql
-        .exec<PreviewRow>(
-          "SELECT * FROM repo_previews WHERE owner_email = ? AND phase NOT IN ('queued','installing','building','packaging','uploading') ORDER BY created_at ASC LIMIT 1",
-          owner.email,
-        )
-        .toArray()[0];
-      if (!oldest) {
-        return json({ error: "Preview history is full while builds are active." }, 429);
-      }
-      if (!(await this.deleteArchive(oldest))) {
-        this.ctx.storage.sql.exec(
-          "UPDATE repo_previews SET archive_bytes = -2, manifest = '', updated_at = ? WHERE id = ?",
-          Date.now(),
-          oldest.id,
-        );
-        return json({ error: "Rork storage cleanup is pending; retry this launch shortly." }, 503);
-      }
-      this.ctx.storage.sql.exec("DELETE FROM repo_previews WHERE id = ?", oldest.id);
+    const historySlot = await this.prepareHistorySlot(owner.email);
+    if (historySlot === "active_full") {
+      return json({ error: "Preview history is full while builds are active." }, 429);
+    }
+    if (historySlot === "cleanup_pending") {
+      return json({ error: "Rork storage cleanup is pending; retry this launch shortly." }, 503);
+    }
+
+    const repository = parseRepoPreviewRepository(inspection.repository);
+    if (!repository) {
+      return json({ error: "invalid_repository" }, 400);
+    }
+    const workflowCommit = asRecord(
+      await githubJson(
+        auth,
+        repoPath(repository.owner, repository.repo, `/commits/${encodeURIComponent(inspection.defaultBranch)}`),
+      ),
+    );
+    const workflowSha = stringValue(workflowCommit?.sha, 40).toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(workflowSha)) {
+      throw new PreviewGitHubError(502, "GitHub returned no immutable commit for the preview workflow.");
+    }
+    const canonicalRunner = await readRepoFile(
+      auth,
+      repository.owner,
+      repository.repo,
+      REPO_PREVIEW_WORKFLOW_PATH,
+      workflowSha,
+    );
+    if (!repoPreviewWorkflowMatches(canonicalRunner?.content ?? null)) {
+      return json({ error: "runner_setup_required", inspection: { ...inspection, runner: "outdated" } }, 428);
     }
 
     const previewSecret = this.workerEnv.RORK_AUTH_SECRET_KEY ?? "";
@@ -839,41 +994,39 @@ export class RepoPreviewStore extends DurableObject {
       return json({ error: "preview_identity_unavailable" }, 503);
     }
     const random = randomPart();
+    const accessToken = randomPart().slice(0, 48);
     const id = await signRepoPreviewId(owner.key, random.slice(0, 48), previewSecret);
-    const uploadToken = randomPart();
-    const tokenHash = await sha256(uploadToken);
-    const now = Date.now();
-    const repository = parseRepoPreviewRepository(inspection.repository);
-    if (!repository || !isRepoPreviewId(id)) {
+    if (!isRepoPreviewId(id) || !isRepoPreviewAccessToken(accessToken)) {
       return json({ error: "invalid_preview_identity" }, 400);
     }
+    const now = Date.now();
     const archiveKey = `previews/${owner.key}/${random.slice(0, 64)}.tar`;
     const workflowName = REPO_PREVIEW_WORKFLOW_PATH.split("/").pop() ?? "gera-web-preview.yml";
     const actionsUrl = `https://github.com/${inspection.repository}/actions/workflows/${workflowName}`;
-    this.ctx.storage.sql.exec(
-      `INSERT INTO repo_previews
-        (id, owner_email, repository, ref, commit_sha, root_directory, output_directory,
-         framework, package_manager, phase, run_id, actions_url, setup_pr_url,
-         created_at, updated_at, expires_at, token_hash, token_expires_at,
-         archive_key, archive_bytes, manifest, logs, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', '', ?, '', ?, ?, ?, ?, ?, ?, 0, '', '', '')`,
+    const workflowRef = `refs/heads/${inspection.defaultBranch}`;
+    const reservation = this.reservePreview(owner.email, inspection, {
       id,
-      owner.email,
-      inspection.repository,
-      inspection.ref,
-      inspection.commitSha,
-      inspection.rootDirectory,
-      inspection.outputDirectory ?? "",
-      inspection.framework,
-      inspection.packageManager,
+      workflowRef,
+      workflowSha,
+      accessToken,
       actionsUrl,
       now,
-      now,
-      now + REPO_PREVIEW_TTL_MS,
-      tokenHash,
-      now + REPO_PREVIEW_TOKEN_TTL_MS,
       archiveKey,
-    );
+    });
+    if (reservation.kind === "duplicate") {
+      return json({ job: rowToJob(reservation.row, origin), deduplicated: true }, 200);
+    }
+    if (reservation.kind === "active_limit") {
+      return json({ error: "Two repository previews are already building. Stop one or wait for it to finish." }, 429);
+    }
+    if (reservation.kind === "history_limit") {
+      return json({ error: "Preview history filled during launch. Retry once another preview finishes." }, 429);
+    }
+    if (reservation.kind === "failed") {
+      return json({ error: "preview_reservation_failed" }, 503);
+    }
+
+    let dispatchedRunId = "";
     try {
       const dispatch = asRecord(await githubJson(
         auth,
@@ -889,28 +1042,57 @@ export class RepoPreviewStore extends DurableObject {
               root_directory: inspection.rootDirectory,
               output_directory: inspection.outputDirectory ?? "",
               callback_url: origin,
-              upload_token: uploadToken,
             },
           },
         },
       ));
       const runId = typeof dispatch?.workflow_run_id === "number" ? String(Math.floor(dispatch.workflow_run_id)) : "";
-      const runUrl = stringValue(dispatch?.html_url, 2_000);
-      if (!/^\d+$/.test(runId) || !runUrl.startsWith(`https://github.com/${inspection.repository}/actions/runs/`)) {
+      const dispatchUrl = stringValue(dispatch?.html_url, 2_000);
+      const expectedRunPrefix = `https://github.com/${inspection.repository}/actions/runs/`.toLowerCase();
+      if (!/^\d+$/.test(runId) || !dispatchUrl.toLowerCase().startsWith(expectedRunPrefix)) {
         throw new PreviewGitHubError(502, "GitHub dispatched the workflow but returned no verifiable run identity.");
+      }
+      dispatchedRunId = runId;
+      const run = asRecord(
+        await githubJson(auth, repoPath(repository.owner, repository.repo, `/actions/runs/${runId}`)),
+      );
+      const runUrl = stringValue(run?.html_url, 2_000);
+      if (!repoPreviewWorkflowRunMatches(run, {
+        repository: inspection.repository,
+        defaultBranch: inspection.defaultBranch,
+        workflowSha,
+        workflowPath: REPO_PREVIEW_WORKFLOW_PATH,
+        runId,
+      })) {
+        throw new PreviewGitHubError(
+          409,
+          "The repository workflow changed while launch was starting. The run was stopped; inspect and retry.",
+        );
       }
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET run_id = ?, actions_url = ?, updated_at = ?
-          WHERE id = ? AND run_id = ''`,
+          WHERE id = ? AND run_id = '' AND workflow_sha = ? AND phase = 'queued'`,
         runId,
         runUrl,
         Date.now(),
         id,
+        workflowSha,
       );
+      const dispatched = this.row(id);
+      if (!dispatched || dispatched.run_id !== runId) {
+        throw new PreviewGitHubError(502, "The dispatched workflow identity could not be persisted.");
+      }
     } catch (error) {
+      if (/^\d+$/.test(dispatchedRunId)) {
+        await githubJson(
+          auth,
+          repoPath(repository.owner, repository.repo, `/actions/runs/${dispatchedRunId}/cancel`),
+          { method: "POST" },
+        ).catch(() => null);
+      }
       const safe = safeError(error);
       this.ctx.storage.sql.exec(
-        "UPDATE repo_previews SET phase = 'failed', updated_at = ?, token_hash = '', error = ? WHERE id = ?",
+        "UPDATE repo_previews SET phase = 'failed', updated_at = ?, error = ? WHERE id = ? AND phase = 'queued'",
         Date.now(),
         safe.message,
         id,
@@ -921,7 +1103,7 @@ export class RepoPreviewStore extends DurableObject {
     if (!created) {
       return json({ error: "preview_state_unavailable" }, 502);
     }
-    console.log("repo preview dispatched", inspection.repository, inspection.framework, id.slice(0, 30));
+    console.log("repo preview dispatched", inspection.repository, inspection.framework, created.run_id);
     return json({ job: rowToJob(created, origin) }, 202);
   }
 
@@ -933,7 +1115,7 @@ export class RepoPreviewStore extends DurableObject {
     }
     if (row.phase === "queued" && Date.now() - row.updated_at > QUEUED_TIMEOUT_MS) {
       this.ctx.storage.sql.exec(
-        "UPDATE repo_previews SET phase = 'failed', updated_at = ?, token_hash = '', error = ? WHERE id = ?",
+        "UPDATE repo_previews SET phase = 'failed', updated_at = ?, error = ? WHERE id = ?",
         Date.now(),
         "GitHub did not start the preview workflow within 20 minutes. Check whether Actions are enabled for this repository.",
         id,
@@ -954,7 +1136,7 @@ export class RepoPreviewStore extends DurableObject {
     if (!row || row.owner_email !== owner.email || !id.startsWith(`${owner.key}.`)) {
       return json({ error: "preview_not_found" }, 404);
     }
-    if (ACTIVE_PHASES.includes(phaseValue(row.phase))) {
+    if (isActivePhase(phaseValue(row.phase))) {
       const auth = githubAuth(request);
       const repository = parseRepoPreviewRepository(row.repository);
       if (!auth || !repository || !/^\d+$/.test(row.run_id)) {
@@ -966,11 +1148,11 @@ export class RepoPreviewStore extends DurableObject {
         { method: "POST" },
       );
       const beforeMark = this.row(id);
-      if (!beforeMark || !ACTIVE_PHASES.includes(phaseValue(beforeMark.phase))) {
+      if (!beforeMark || !isActivePhase(phaseValue(beforeMark.phase))) {
         return json({ job: rowToJob(beforeMark ?? row, origin) });
       }
       this.ctx.storage.sql.exec(
-        `UPDATE repo_previews SET phase = 'cancelled', updated_at = ?, token_hash = '', error = ''
+        `UPDATE repo_previews SET phase = 'cancelled', updated_at = ?, error = ''
           WHERE id = ? AND phase = ?`,
         Date.now(),
         id,
@@ -990,24 +1172,41 @@ export class RepoPreviewStore extends DurableObject {
     return json({ job: rowToJob(current, origin) });
   }
 
-  private async authenticatedHook(request: Request, url: URL): Promise<{ row: PreviewRow; id: string; action: string; token: string } | null> {
+  private async authenticatedHook(
+    request: Request,
+    url: URL,
+  ): Promise<{ row: PreviewRow; id: string; action: string; oidcToken: string; runId: string } | null> {
     const parts = url.pathname.slice("/hook/".length).split("/");
-    if (parts.length !== 2) {
-      return null;
-    }
+    if (parts.length !== 2) return null;
     const [id, action] = parts;
-    const token = requestPreviewToken(request);
-    if (!isRepoPreviewId(id) || !PREVIEW_ID_PART.test(token) || !["started", "phase", "archive", "manifest", "logs", "complete"].includes(action)) {
+    if (!isRepoPreviewId(id) || !["configuration", "started", "phase", "archive", "manifest", "logs", "complete"].includes(action)) {
       return null;
     }
     const row = this.row(id);
-    if (!row || !row.token_hash || row.token_expires_at <= Date.now() || row.token_hash !== await sha256(token)) {
+    if (
+      !row ||
+      !/^\d+$/.test(row.run_id) ||
+      !/^refs\/heads\//.test(row.workflow_ref) ||
+      !/^[0-9a-f]{40}$/.test(row.workflow_sha) ||
+      !isRepoPreviewAccessToken(row.access_token) ||
+      row.runner_expires_at <= Date.now() ||
+      !isActivePhase(phaseValue(row.phase))
+    ) {
       return null;
     }
-    if (row.phase === "cancelled" || row.phase === "expired" || row.phase === "ready") {
+    const oidcToken = requestGitHubOidc(request);
+    if (!oidcToken) return null;
+    const claims = await verifyGitHubActionsOidc(oidcToken);
+    if (!claims || !authorizeGitHubPreviewClaims(claims, {
+      repository: row.repository,
+      runId: row.run_id,
+      workflowPath: REPO_PREVIEW_WORKFLOW_PATH,
+      workflowRef: row.workflow_ref,
+      workflowSha: row.workflow_sha,
+    })) {
       return null;
     }
-    return { row, id, action, token };
+    return { row, id, action, oidcToken, runId: row.run_id };
   }
 
   private async handleHook(request: Request, url: URL): Promise<Response> {
@@ -1015,7 +1214,7 @@ export class RepoPreviewStore extends DurableObject {
     if (!auth) {
       return json({ error: "hook_not_found" }, 404);
     }
-    const { row, id, action, token } = auth;
+    const { row, id, action, oidcToken, runId } = auth;
     const expectedMethod = ["archive", "manifest", "logs"].includes(action) ? "PUT" : "POST";
     if (request.method !== expectedMethod) {
       return json({ error: "method_not_allowed" }, 405);
@@ -1030,13 +1229,16 @@ export class RepoPreviewStore extends DurableObject {
       return json({ error: "unsupported_content_type" }, 415);
     }
     const now = Date.now();
+    if (action === "configuration") {
+      return json({ previewBase: repoPreviewPublicPrefix(id, row.access_token) });
+    }
     if (action === "started") {
       if (row.phase === "queued") {
         this.ctx.storage.sql.exec(
-          "UPDATE repo_previews SET phase = 'installing', updated_at = ? WHERE id = ? AND token_hash = ? AND phase = 'queued'",
+          "UPDATE repo_previews SET phase = 'installing', updated_at = ? WHERE id = ? AND run_id = ? AND phase = 'queued'",
           now,
           id,
-          row.token_hash,
+          runId,
         );
       }
       return json({ ok: true });
@@ -1045,33 +1247,38 @@ export class RepoPreviewStore extends DurableObject {
       const input = await readRequestJson(request, 4_000);
       const phase = stringValue(input?.phase, 30) as RepoPreviewPhase;
       const current = this.row(id);
-      if (!current || current.token_hash !== row.token_hash || !canAdvancePhase(phaseValue(current.phase), phase) || phase === "queued") {
+      if (!current || current.run_id !== runId || !canAdvancePhase(phaseValue(current.phase), phase) || phase === "queued") {
         return json({ error: "invalid_phase_transition" }, 409);
       }
       this.ctx.storage.sql.exec(
-        "UPDATE repo_previews SET phase = ?, updated_at = ? WHERE id = ? AND token_hash = ? AND phase = ?",
+        "UPDATE repo_previews SET phase = ?, updated_at = ? WHERE id = ? AND run_id = ? AND phase = ?",
         phase,
         now,
         id,
-        row.token_hash,
+        runId,
         current.phase,
       );
       return json({ ok: true });
     }
     if (action === "logs") {
       const rawLogs = await readRequestText(request, REPO_PREVIEW_MAX_LOG_CHARS * 2);
-      const logs = redactRepoPreviewLog(rawLogs.replaceAll(token, "[redacted-upload-capability]"));
+      const logs = redactRepoPreviewLog(
+        rawLogs
+          .replaceAll(oidcToken, "[redacted-oidc-token]")
+          .replaceAll(row.id, "[redacted-preview-id]")
+          .replaceAll(row.access_token, "[redacted-preview-access]"),
+      );
       const current = this.row(id);
-      if (!current || current.token_hash !== row.token_hash || !ACTIVE_PHASES.includes(phaseValue(current.phase))) {
+      if (!current || current.run_id !== runId || !isActivePhase(phaseValue(current.phase))) {
         return json({ error: "preview_not_active" }, 409);
       }
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET logs = ?, updated_at = ?
-          WHERE id = ? AND token_hash = ? AND phase IN ('queued','installing','building','packaging','uploading')`,
+          WHERE id = ? AND run_id = ? AND phase IN ('queued','installing','building','packaging','uploading')`,
         logs,
         now,
         id,
-        row.token_hash,
+        runId,
       );
       return json({ ok: true });
     }
@@ -1088,24 +1295,24 @@ export class RepoPreviewStore extends DurableObject {
       const current = this.row(id);
       if (
         !current ||
-        current.token_hash !== row.token_hash ||
-        !ACTIVE_PHASES.includes(phaseValue(current.phase)) ||
+        current.run_id !== runId ||
+        !isActivePhase(phaseValue(current.phase)) ||
         current.archive_bytes !== 0
       ) {
         return json({ error: "archive_already_claimed" }, 409);
       }
-      const stagingKey = `${row.archive_key}.upload-${row.token_hash.slice(0, 12)}`;
+      const stagingKey = `${row.archive_key}.upload-run-${runId}`;
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET phase = 'uploading', archive_key = ?, archive_bytes = -1, manifest = '', updated_at = ?
-          WHERE id = ? AND token_hash = ? AND archive_bytes = 0
+          WHERE id = ? AND run_id = ? AND archive_bytes = 0
             AND phase IN ('queued','installing','building','packaging','uploading')`,
         stagingKey,
         now,
         id,
-        row.token_hash,
+        runId,
       );
       const claimed = this.row(id);
-      if (!claimed || claimed.token_hash !== row.token_hash || claimed.archive_bytes !== -1 || claimed.phase !== "uploading") {
+      if (!claimed || claimed.run_id !== runId || claimed.archive_bytes !== -1 || claimed.phase !== "uploading") {
         return json({ error: "archive_claim_failed" }, 409);
       }
       const creds = await getRorkStorageCredentials(this.workerEnv);
@@ -1118,21 +1325,21 @@ export class RepoPreviewStore extends DurableObject {
         console.error("repo preview R2 upload failed", upload.status);
         const deleted = await this.deleteStorageKey(stagingKey);
         this.ctx.storage.sql.exec(
-          `UPDATE repo_previews SET phase = 'failed', token_hash = '', archive_bytes = ?, manifest = '', updated_at = ?, error = ?
-            WHERE id = ? AND token_hash = ? AND archive_bytes = -1`,
+          `UPDATE repo_previews SET phase = 'failed', archive_bytes = ?, manifest = '', updated_at = ?, error = ?
+            WHERE id = ? AND run_id = ? AND archive_bytes = -1`,
           deleted ? 0 : -2,
           Date.now(),
           "Rork storage rejected the preview artifact.",
           id,
-          row.token_hash,
+          runId,
         );
         return json({ error: "archive_upload_failed" }, 502);
       }
       const afterUpload = this.row(id);
       if (
         !afterUpload ||
-        afterUpload.token_hash !== row.token_hash ||
-        afterUpload.token_expires_at <= Date.now() ||
+        afterUpload.run_id !== runId ||
+        afterUpload.runner_expires_at <= Date.now() ||
         afterUpload.phase !== "uploading" ||
         afterUpload.archive_bytes !== -1
       ) {
@@ -1148,11 +1355,11 @@ export class RepoPreviewStore extends DurableObject {
       }
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET archive_bytes = ?, updated_at = ?
-          WHERE id = ? AND token_hash = ? AND phase = 'uploading' AND archive_bytes = -1`,
+          WHERE id = ? AND run_id = ? AND phase = 'uploading' AND archive_bytes = -1`,
         contentLength,
         Date.now(),
         id,
-        row.token_hash,
+        runId,
       );
       return json({ ok: true });
     }
@@ -1167,7 +1374,7 @@ export class RepoPreviewStore extends DurableObject {
       const current = this.row(id);
       if (
         !current ||
-        current.token_hash !== row.token_hash ||
+        current.run_id !== runId ||
         current.phase !== "uploading" ||
         current.archive_bytes <= 0 ||
         current.manifest
@@ -1180,11 +1387,11 @@ export class RepoPreviewStore extends DurableObject {
       }
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET manifest = ?, updated_at = ?
-          WHERE id = ? AND token_hash = ? AND phase = 'uploading' AND archive_bytes > 0 AND manifest = ''`,
+          WHERE id = ? AND run_id = ? AND phase = 'uploading' AND archive_bytes > 0 AND manifest = ''`,
         JSON.stringify(manifest),
         now,
         id,
-        row.token_hash,
+        runId,
       );
       return json({ ok: true });
     }
@@ -1193,19 +1400,19 @@ export class RepoPreviewStore extends DurableObject {
       const success = input?.status === "success";
       const message = stringValue(input?.message, 300);
       const current = this.row(id);
-      if (!current || current.token_hash !== row.token_hash || !ACTIVE_PHASES.includes(phaseValue(current.phase))) {
+      if (!current || current.run_id !== runId || !isActivePhase(phaseValue(current.phase))) {
         return json({ error: "preview_not_active" }, 409);
       }
       const ready = success && current.phase === "uploading" && current.archive_bytes > 0 && Boolean(current.manifest);
       this.ctx.storage.sql.exec(
-        "UPDATE repo_previews SET phase = ?, token_hash = '', updated_at = ?, error = ? WHERE id = ? AND token_hash = ?",
+        "UPDATE repo_previews SET phase = ?, updated_at = ?, error = ? WHERE id = ? AND run_id = ?",
         ready ? "ready" : "failed",
         now,
         ready ? "" : message || "The repository build did not produce a valid preview artifact.",
         id,
-        row.token_hash,
+        runId,
       );
-      console.log("repo preview completed", ready ? "ready" : "failed", row.repository, id.slice(0, 30));
+      console.log("repo preview completed", ready ? "ready" : "failed", row.repository, runId);
       return json({ ok: true, ready });
     }
     return json({ error: "not_found" }, 404);
@@ -1225,9 +1432,16 @@ export class RepoPreviewStore extends DurableObject {
     if (!row) {
       return new Response("Preview not found", { status: 404 });
     }
+    const afterId = slash >= 0 ? rest.slice(slash + 1) : "";
+    const accessSlash = afterId.indexOf("/");
+    const providedAccess = accessSlash >= 0 ? afterId.slice(0, accessSlash) : afterId;
+    if (!isRepoPreviewAccessToken(providedAccess) || !constantTimeEqual(row.access_token, providedAccess)) {
+      return new Response("Preview not found", { status: 404 });
+    }
+    const encodedPath = accessSlash >= 0 ? afterId.slice(accessSlash + 1) : "";
     if (row.expires_at <= Date.now()) {
       this.ctx.storage.sql.exec(
-        "UPDATE repo_previews SET phase = 'expired', token_hash = '', updated_at = ? WHERE id = ?",
+        "UPDATE repo_previews SET phase = 'expired', updated_at = ? WHERE id = ?",
         Date.now(),
         id,
       );
@@ -1247,7 +1461,7 @@ export class RepoPreviewStore extends DurableObject {
     }
     let requested = "";
     try {
-      requested = decodeURIComponent(slash >= 0 ? rest.slice(slash + 1) : "").replace(/^\/+/, "");
+      requested = decodeURIComponent(encodedPath).replace(/^\/+/, "");
     } catch {
       return new Response("Bad preview path.", { status: 400 });
     }
@@ -1267,7 +1481,7 @@ export class RepoPreviewStore extends DurableObject {
     if (html && file.size > HTML_REWRITE_LIMIT) {
       return new Response("Preview HTML exceeds the safe rendering limit.", { status: 413 });
     }
-    const headers = previewHeaders(contentType, html);
+    const headers = previewHeaders(contentType, repoPreviewContentSecurityPolicy(file.path));
     if (request.method === "HEAD" || file.size === 0) {
       headers.set("Content-Length", String(file.size));
       return new Response(null, { status: 200, headers });
@@ -1286,7 +1500,10 @@ export class RepoPreviewStore extends DurableObject {
       if (selected.byteLength !== file.size) {
         return new Response("Preview artifact range is invalid.", { status: 502 });
       }
-      body = rewriteRepoPreviewHtml(new TextDecoder().decode(selected), `/repo-preview/${id}/`);
+      body = rewriteRepoPreviewHtml(
+        new TextDecoder().decode(selected),
+        repoPreviewPublicPrefix(id, row.access_token) ?? "/",
+      );
     }
     if (typeof body === "string") {
       headers.set("Content-Length", String(new TextEncoder().encode(body).byteLength));
@@ -1332,11 +1549,11 @@ export class RepoPreviewStore extends DurableObject {
     }
     this.ctx.storage.sql.exec(
       `UPDATE repo_previews
-        SET phase = 'failed', token_hash = '', updated_at = ?, error = ?
-        WHERE owner_email = ? AND token_expires_at <= ?
+        SET phase = 'failed', updated_at = ?, error = ?
+        WHERE owner_email = ? AND runner_expires_at <= ?
           AND phase IN ('queued','installing','building','packaging','uploading')`,
       now,
-      "The isolated runner did not finish before its 45-minute upload capability expired.",
+      "The isolated runner did not finish within 45 minutes.",
       ownerEmail,
       now,
     );
@@ -1350,7 +1567,7 @@ export class RepoPreviewStore extends DurableObject {
     for (const row of expired) {
       const deleted = await this.deleteArchive(row);
       this.ctx.storage.sql.exec(
-        `UPDATE repo_previews SET phase = 'expired', token_hash = '', updated_at = ?,
+        `UPDATE repo_previews SET phase = 'expired', updated_at = ?,
           archive_bytes = ?, manifest = ? WHERE id = ?`,
         now,
         deleted ? 0 : row.archive_bytes,

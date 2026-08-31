@@ -6,32 +6,41 @@ const ISSUER = "https://token.actions.githubusercontent.com";
 const JWKS_URL = `${ISSUER}/.well-known/jwks`;
 const AUDIENCE = "gera-repo-preview";
 const CACHE_MS = 60 * 60_000;
+const MIN_FORCED_REFRESH_MS = 60_000;
 const CLOCK_SKEW_SECONDS = 60;
 const MAX_TOKEN_CHARS = 20_000;
 
-type GitHubOidcClaims = {
+export type GitHubOidcClaims = {
   iss?: unknown;
   aud?: unknown;
+  sub?: unknown;
   exp?: unknown;
   nbf?: unknown;
   iat?: unknown;
+  jti?: unknown;
   repository?: unknown;
   workflow_ref?: unknown;
+  workflow_sha?: unknown;
   workflow?: unknown;
   event_name?: unknown;
+  ref?: unknown;
+  ref_type?: unknown;
+  sha?: unknown;
   run_id?: unknown;
+  run_attempt?: unknown;
   runner_environment?: unknown;
 };
 
-type CachedKeys = { at: number; keys: JsonWebKey[] };
+type GitHubRsaJwk = JsonWebKey & { kid: string; kty: "RSA"; n: string; e: string };
+type CachedKeys = { at: number; keys: GitHubRsaJwk[] };
 let cachedKeys: CachedKeys | null = null;
 
-function decodeBase64Url(value: string): Uint8Array {
+function decodeBase64Url(value: string): ArrayBuffer {
   const padded = `${value.replace(/-/g, "+").replace(/_/g, "/")}${"=".repeat((4 - (value.length % 4)) % 4)}`;
   const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  return bytes;
+  return bytes.buffer;
 }
 
 function decodeJson(value: string): Record<string, unknown> | null {
@@ -45,14 +54,17 @@ function decodeJson(value: string): Record<string, unknown> | null {
   }
 }
 
-function validJwk(value: unknown): value is JsonWebKey {
+function validJwk(value: unknown): value is GitHubRsaJwk {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const key = value as Record<string, unknown>;
   return key.kty === "RSA" && typeof key.kid === "string" && typeof key.n === "string" && typeof key.e === "string";
 }
 
-async function getKeys(force: boolean): Promise<JsonWebKey[]> {
-  if (!force && cachedKeys && Date.now() - cachedKeys.at < CACHE_MS) return cachedKeys.keys;
+async function getKeys(force: boolean): Promise<GitHubRsaJwk[]> {
+  const age = cachedKeys ? Date.now() - cachedKeys.at : Number.POSITIVE_INFINITY;
+  if (cachedKeys && ((!force && age < CACHE_MS) || (force && age < MIN_FORCED_REFRESH_MS))) {
+    return cachedKeys.keys;
+  }
   const response = await fetch(JWKS_URL, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`github_oidc_jwks_${response.status}`);
   const body = await response.json() as { keys?: unknown };
@@ -60,10 +72,6 @@ async function getKeys(force: boolean): Promise<JsonWebKey[]> {
   if (keys.length === 0) throw new Error("github_oidc_jwks_empty");
   cachedKeys = { at: Date.now(), keys };
   return keys;
-}
-
-function audienceMatches(value: unknown): boolean {
-  return value === AUDIENCE || (Array.isArray(value) && value.includes(AUDIENCE));
 }
 
 /** Returns verified claims, or null for an invalid/unauthorized JWT. */
@@ -83,9 +91,15 @@ export async function verifyGitHubActionsOidc(token: string): Promise<GitHubOidc
   const nbf = typeof claims.nbf === "number" ? claims.nbf : iat;
   if (
     claims.iss !== ISSUER ||
-    !audienceMatches(claims.aud) ||
+    claims.aud !== AUDIENCE ||
+    typeof claims.sub !== "string" ||
+    !claims.sub ||
+    typeof claims.jti !== "string" ||
+    !claims.jti ||
+    claims.jti.length > 500 ||
     !exp ||
     !iat ||
+    exp <= iat ||
     exp - iat > 20 * 60 ||
     now > exp + CLOCK_SKEW_SECONDS ||
     now + CLOCK_SKEW_SECONDS < nbf ||
@@ -124,19 +138,33 @@ export async function verifyGitHubActionsOidc(token: string): Promise<GitHubOidc
 /** Pins a valid JWT to the exact preview job the Rork backend dispatched. */
 export function authorizeGitHubPreviewClaims(
   claims: GitHubOidcClaims,
-  expected: { repository: string; runId: string; workflowPath: string },
+  expected: {
+    repository: string;
+    runId: string;
+    workflowPath: string;
+    workflowRef: string;
+    workflowSha: string;
+  },
 ): boolean {
   const repository = typeof claims.repository === "string" ? claims.repository : "";
   const workflowRef = typeof claims.workflow_ref === "string" ? claims.workflow_ref : "";
+  const workflowSha = typeof claims.workflow_sha === "string" ? claims.workflow_sha : "";
+  const sourceSha = typeof claims.sha === "string" ? claims.sha : "";
   const runId = typeof claims.run_id === "string" ? claims.run_id : "";
+  const runAttempt = typeof claims.run_attempt === "string" ? claims.run_attempt : "";
+  const expectedWorkflowRef = `${expected.repository}/${expected.workflowPath}@${expected.workflowRef}`;
   return repository.toLowerCase() === expected.repository.toLowerCase() &&
     runId === expected.runId &&
+    /^\d+$/.test(runId) &&
+    runAttempt === "1" &&
     claims.event_name === "workflow_dispatch" &&
     claims.runner_environment === "github-hosted" &&
     claims.workflow === "Gera web preview" &&
-    workflowRef.toLowerCase().startsWith(
-      `${expected.repository}/${expected.workflowPath}@refs/heads/`.toLowerCase(),
-    );
+    claims.ref_type === "branch" &&
+    claims.ref === expected.workflowRef &&
+    workflowRef.toLowerCase() === expectedWorkflowRef.toLowerCase() &&
+    workflowSha.toLowerCase() === expected.workflowSha.toLowerCase() &&
+    sourceSha.toLowerCase() === expected.workflowSha.toLowerCase();
 }
 
 export const GITHUB_PREVIEW_OIDC_AUDIENCE = AUDIENCE;

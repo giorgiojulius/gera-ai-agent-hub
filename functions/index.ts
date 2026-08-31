@@ -2145,8 +2145,8 @@ async function relayRepoPreviews(request: Request, url: URL, env: Env): Promise<
 }
 
 /**
- * Public artifact/hook plane. Preview ids embed only the account's hash shard;
- * callback tokens are high-entropy, upload-only and never logged here.
+ * Public artifact/hook plane. Signed ids route to an existing account shard;
+ * hooks require GitHub OIDC and assets require a separate DO-checked read capability.
  */
 async function relayRepoPreviewPublic(request: Request, url: URL, env: Env): Promise<Response> {
   const isHook = url.pathname.startsWith("/repo-preview-hook/");
@@ -2160,9 +2160,9 @@ async function relayRepoPreviewPublic(request: Request, url: URL, env: Env): Pro
   const targetPath = `${isHook ? "/hook/" : "/asset/"}${rest}${url.search}`;
   const headers = new Headers(request.headers);
   const hookAuthorization = isHook ? headers.get("Authorization") ?? "" : "";
-  headers.delete("X-Gera-Preview-Token");
-  if (hookAuthorization.startsWith("Bearer ") && hookAuthorization.length <= 1_000) {
-    headers.set("X-Gera-Preview-Token", hookAuthorization.slice("Bearer ".length));
+  headers.delete("X-Gera-GitHub-OIDC");
+  if (hookAuthorization.startsWith("Bearer ") && hookAuthorization.length <= 20_007) {
+    headers.set("X-Gera-GitHub-OIDC", hookAuthorization.slice("Bearer ".length));
   }
   headers.delete("Authorization");
   headers.delete("X-Rork-User-Id");

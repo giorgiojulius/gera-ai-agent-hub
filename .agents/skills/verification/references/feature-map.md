@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `4604f59` (+ Rork-hosted immutable web-
+Last synced: 2026-08-31 · commit `32e3559` (+ Rork-hosted immutable web-
 repository launches, evidence-backed autonomous execution outcomes for
 Automations and project agents, quiet no-change checks, Luna suggestion
 model, fable back in chat, note @-mentions, explicit
@@ -10,7 +10,7 @@ hand-off + pin/access fixes, truthful MCP health + OAuth/account-session/
 sleep/deploy-resume hardening, authenticated file reads, Intercom
 attachments, full 98-entry MCP audit, the four-model primary picker with
 More, and the live code Changes / Preview workbench)
-Drift check: `git log --oneline 4604f59..HEAD`, then compare against
+Drift check: `git log --oneline 32e3559..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -130,8 +130,19 @@ to merge it once, then `repo-launch-start` dispatches that read-only workflow.
 The workflow checks out the exact SHA with persisted Git credentials OFF,
 receives no Rork/Gera/repository secrets, installs with bun/pnpm/yarn/npm,
 builds Vite/React/Next static export/Astro/Nuxt static/SvelteKit/Remix/
-Angular or standalone HTML, and uploads only a bounded static artifact through
-a short-lived preview-scoped capability carried in an Authorization header.
+Angular or standalone HTML, and uploads only a bounded static artifact. The
+repository install/build job has `id-token: none`; only separate trusted begin
+and publish jobs can mint GitHub OIDC, with a pinned immutable Actions artifact
+as the bounded cross-job handoff. No callback secret is dispatched. Rork verifies
+the JWT issuer/JWKS signature, fixed audience, repository, exact run, workflow
+ref + SHA, dispatch ref/event, and GitHub-hosted runner before every callback.
+It also reads back the just-created workflow run and cancels it unless its real
+head SHA/path/branch/event/repository match the canonical revision inspected
+before dispatch. The run title is generic. Its GitHub-visible id is routing-only:
+a separate 48-hex read capability is minted and returned only to the OIDC-
+authenticated publish job, after the public GitHub handoff artifact already
+exists. The build uses a fixed base placeholder; trusted publish rewrites text
+entries and regenerates the tar manifest locally before direct Rork upload.
 
 The launch writes an ordinary user turn + durable `repo-preview-flow` receipt
 into the existing chat — no new IDE/page. Source → Install → Build → Preview
@@ -142,9 +153,14 @@ Ready artifacts run in `repo-preview-frame` (opaque-origin sandboxed iframe +
 fullscreen, never an unsandboxed backend-origin tab) for 24h. The Rork backend stores an uncompressed tar in project R2 and a
 validated path→offset manifest in SQLite; public asset reads are MIME-derived
 R2 Range requests, SPA paths fall back to the indexed root, and Vite/root HTML
-assets are namespaced below the unguessable preview id. Limits: 50 MiB, 1,000
-files, two active and twelve recent jobs per account; expired/cancelled tokens
-cannot upload. Dynamic SSR/server processes are intentionally not claimed —
+assets are namespaced below the id + separate unguessable read capability.
+HTML stays origin-
+sandboxed; SVG keeps image rendering but receives its own no-script CSP sandbox
+so direct navigation cannot gain the backend origin, while active XML is not
+accepted as a public artifact. Capability-bearing hook/asset paths and preview
+ids are redacted from backend/build diagnostics. Limits: 50 MiB, 1,000 files,
+two active and twelve recent jobs per account; one conditional SQLite insert
+reserves both quotas atomically, and expired/cancelled runs cannot upload. Dynamic SSR/server processes are intentionally not claimed —
 v1 requires a static `index.html` build output and says exactly when none was
 found.
 
@@ -992,8 +1008,8 @@ All notify paths fail silent.
 `/share/*` · `/arena/*` (usage, battles, log, clear) · `/chats/sync` ·
 `/runs/*` (start, stream SSE, active, steer/stop) · `/diag/*` ·
 `/repo-previews/{inspect|install|start|status|cancel}` authenticated launch
-control · `/repo-preview-hook/:id/*` scoped-Bearer workflow callback ·
-`/repo-preview/:id/*` public expiring static artifact delivery ·
+control · `/repo-preview-hook/:id/*` GitHub Actions OIDC-authenticated workflow
+callback · `/repo-preview/:id/:access/*` public expiring static artifact delivery ·
 `/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
 `/automations/run-now` · `/projects` +
 `/projects/create` + `/projects/:id/*` (overview, messages, message, read,
@@ -1039,8 +1055,13 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 
 Repository-launch coverage: `repo-preview.test.ts` pins repository/ref/path
 validation, framework + lockfile detection, manifest offset bounds, HTML asset
-namespacing, credential redaction, synced job normalization and the generated
-workflow's immutable/read-only contract. `repo-preview.browser.test.tsx`
+namespacing, SVG sandboxing + XML rejection, capability/credential redaction,
+synced job normalization, dispatch-run + OIDC claim binding, and the generated
+workflow's immutable/read-only/no-dispatched-secret contract. It also asserts
+that repository build steps have OIDC disabled and know only a fixed base
+placeholder; only trusted begin/publish jobs can mint identity, the publish job
+alone receives the separate read capability, and both handoff actions are pinned.
+`repo-preview.browser.test.tsx`
 checks the real preview iframe + expandable bounded log, and
 `github-launch-web-preview` drives the complete pin → dialog → launch → receipt
 flow against network fixtures. No external repository is mutated or workflow

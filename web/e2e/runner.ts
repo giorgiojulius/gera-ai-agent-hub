@@ -13,14 +13,16 @@ export const DEFAULT_STEP_TIMEOUT_MS = 10_000;
 /**
  * What a platform driver must implement. Web: vitest browser locators over
  * `data-testid`. Mobile (future): Detox/Maestro over the same `testID`
- * registry — implement these five methods and the whole scenario catalog
- * plus the shared stats work unchanged.
+ * registry — implement these methods and the whole scenario catalog plus
+ * the shared stats work unchanged.
  */
 export type E2eDriver = {
   goto: (path: string) => Promise<void>;
   tap: (target: string) => Promise<void>;
   fill: (target: string, text: string) => Promise<void>;
   see: (target: string, timeoutMs: number) => Promise<void>;
+  /** Waits until the target is unmounted or visually hidden (fade-outs count). */
+  notSee: (target: string, timeoutMs: number) => Promise<void>;
   seeText: (target: string, text: string, timeoutMs: number) => Promise<void>;
   /** Waits until the current address (path + query) contains the fragment. */
   urlContains: (text: string, timeoutMs: number) => Promise<void>;
@@ -36,6 +38,8 @@ export function stepLabel(step: E2eStep): string {
       return `fill ${step.target}`;
     case "see":
       return `see ${step.target}`;
+    case "notSee":
+      return `not see ${step.target}`;
     case "seeText":
       return `see "${step.text}" in ${step.target}`;
     case "urlContains":
@@ -53,6 +57,8 @@ async function execute(driver: E2eDriver, step: E2eStep): Promise<void> {
       return driver.fill(step.target, step.text);
     case "see":
       return driver.see(step.target, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
+    case "notSee":
+      return driver.notSee(step.target, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
     case "seeText":
       return driver.seeText(step.target, step.text, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
     case "urlContains":

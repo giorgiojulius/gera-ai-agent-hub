@@ -28,6 +28,7 @@ import { MarkdownBody } from "@/components/gera/Markdown";
 import { SparkMark } from "@/components/gera/Spark";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useAgent } from "@/hooks/use-agent";
+import { useAutoGrow } from "@/hooks/use-autogrow";
 import { estimateAnswerCost, estimateMediaCost } from "@/lib/arena";
 import { isCodeMutationToolName } from "@/lib/code-changes";
 import { downloadOrOpenMedia } from "@/lib/media-actions";
@@ -291,6 +292,9 @@ function UserBubble({ message, busy, readOnly }: { message: ChatMessage; busy: b
   const { editMessage } = useAgent();
   const [editing, setEditing] = useState<boolean>(false);
   const [draft, setDraft] = useState<string>("");
+  // The edit box grows with the draft (smoothly, via the height transition)
+  // and scrolls past its cap — long messages stay fully reviewable.
+  const editRef = useAutoGrow(draft, 320);
   const hasFiles = (message.attachments?.length ?? 0) > 0;
 
   const submitEdit = () => {
@@ -340,6 +344,7 @@ function UserBubble({ message, busy, readOnly }: { message: ChatMessage; busy: b
       {editing ? (
         <div className="rounded-3xl rounded-br-md border border-border bg-card p-2 shadow-sm">
           <textarea
+            ref={editRef}
             autoFocus
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
@@ -351,8 +356,8 @@ function UserBubble({ message, busy, readOnly }: { message: ChatMessage; busy: b
                 setEditing(false);
               }
             }}
-            rows={Math.min(8, Math.max(2, draft.split("\n").length))}
-            className="w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-none"
+            rows={2}
+            className="min-h-[60px] w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-none transition-[height] duration-200 ease-out motion-reduce:transition-none"
           />
           <div className="flex items-center justify-end gap-1.5 px-1 pb-0.5">
             <button

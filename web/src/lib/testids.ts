@@ -13,6 +13,8 @@
 export const TID = {
   /** Empty-thread hero screen with the big composer. */
   launchpad: "launchpad",
+  /** Starter-prompt chip row under the hero composer — hidden while typing. */
+  launchpadStarters: "launchpad-starters",
   /** Main prompt textarea inside the composer. */
   composerInput: "composer-input",
   /** Round send button in the composer's bottom rail. */

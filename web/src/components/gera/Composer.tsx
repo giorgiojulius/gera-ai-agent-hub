@@ -30,6 +30,7 @@ import {
 import { useMemo, useRef, useState, useSyncExternalStore, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { useNavigate } from "react-router-dom";
 
+import { useAutoGrow } from "@/hooks/use-autogrow";
 import { useIsMobile } from "@/hooks/use-mobile";
 
 import { Button } from "@/components/ui/button";
@@ -136,6 +137,10 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
   } = useAgent();
   const fileRef = useRef<HTMLInputElement>(null);
   const isMobile = useIsMobile();
+  // The prompt box grows line by line (animated by the height-transition
+  // class) and only scrolls past its cap — long prompts stay reviewable.
+  const inputMaxHeight = variant === "hero" ? (isMobile ? 224 : 320) : isMobile ? 192 : 256;
+  const inputRef = useAutoGrow(state.input, inputMaxHeight);
 
   const settings = state.settings;
   const isChat = mode === "chat";
@@ -549,6 +554,7 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
         )}
       >
         <textarea
+          ref={inputRef}
           data-testid={TID.composerInput}
           value={state.input}
           onChange={(event) => setInput(event.target.value)}
@@ -556,8 +562,8 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
           placeholder={placeholder}
           rows={1}
           className={cn(
-            "w-full resize-none bg-transparent px-5 pt-4 text-[15px] leading-relaxed outline-none placeholder:text-muted-foreground",
-            variant === "hero" ? "max-h-56 min-h-[64px]" : "max-h-48 min-h-[52px]",
+            "w-full resize-none bg-transparent px-5 pt-4 text-[15px] leading-relaxed outline-none transition-[height] duration-200 ease-out placeholder:text-muted-foreground motion-reduce:transition-none",
+            variant === "hero" ? "min-h-[64px]" : "min-h-[52px]",
           )}
         />
         <div className="flex items-center justify-between gap-2 px-2 pb-2">

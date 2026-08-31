@@ -12,7 +12,7 @@
 export type E2ePlatform = "web" | "ios" | "android";
 
 /**
- * The five verbs every platform driver can execute. Targets are testids from
+ * The verbs every platform driver can execute. Targets are testids from
  * `src/lib/testids.ts` — web queries `data-testid`, mobile queries `testID`.
  */
 export type E2eStep =
@@ -20,6 +20,8 @@ export type E2eStep =
   | { do: "tap"; target: string }
   | { do: "fill"; target: string; text: string }
   | { do: "see"; target: string; timeoutMs?: number }
+  /** Asserts the target is unmounted or visually hidden (fade-outs count). */
+  | { do: "notSee"; target: string; timeoutMs?: number }
   | { do: "seeText"; target: string; text: string; timeoutMs?: number }
   /** Asserts the current address (path + query) contains the fragment. */
   | { do: "urlContains"; text: string; timeoutMs?: number };

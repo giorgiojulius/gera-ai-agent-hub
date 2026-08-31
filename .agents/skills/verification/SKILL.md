@@ -54,8 +54,9 @@ sudo -n apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
   `modelOptionTid`, `effortOptionTid`, `studioPageTid`, `studioTabTid`).
   Components attach them as `data-testid`. Never query by text/CSS in
   scenarios; a future mobile app reuses the same constants as `testID`.
-- `web/e2e/scenarios.ts` — platform-neutral scenario catalog. Five verbs:
-  `goto`, `tap`, `fill`, `see`, `seeText`.
+- `web/e2e/scenarios.ts` — platform-neutral scenario catalog. Verbs:
+  `goto`, `tap`, `fill`, `see`, `notSee` (unmounted or visually hidden —
+  aria-hidden fade-outs count), `seeText`, `urlContains`.
 - `web/src/test/e2e.browser.test.tsx` — the web driver. Boots the real
   `<App />`, bypasses the invite gate with a fake JWT in localStorage plus a
   stubbed `/access/status` → `invited`, stubs the whole network (gateway
@@ -64,6 +65,8 @@ sudo -n apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
 - Reports persist to `web/e2e-results/` (`web.latest.json` +
   `history.jsonl`); `cd web && bun run e2e:stats` prints the merged table.
 - `web/src/test/calendar.browser.test.tsx` — screenshot regression test.
+- `web/src/test/autogrow.browser.test.tsx` — composer auto-grow regression
+  (grows per line, clamps at the cap, shrinks back).
 
 ### Adding a scenario for a new feature
 

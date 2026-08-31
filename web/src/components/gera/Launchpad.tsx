@@ -7,6 +7,7 @@ import { useAgent } from "@/hooks/use-agent";
 import { fetchProjectOverview, listProjects, type ProjectListEntry, type ProjectScreen } from "@/lib/projects";
 import { TID } from "@/lib/testids";
 import type { CreateMode } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 const STARTERS: { label: string; prompt: string; mode: CreateMode }[] = [
   {
@@ -54,6 +55,9 @@ export function Launchpad() {
   const incognito = active?.incognito === true;
   // Incognito is "off the record" — no workspace trails above the greeting.
   const showShortcuts = !incognito && state.settings.homeShortcuts;
+  // Starter chips are for a blank prompt — they fade away the moment typing
+  // starts (and return when the box is cleared), keeping the hero uncluttered.
+  const typing = state.input.trim().length > 0;
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 pb-24 pt-10 sm:px-6 sm:pt-14" data-testid={TID.launchpad}>
@@ -83,11 +87,19 @@ export function Launchpad() {
 
       <div className="mx-auto mt-8 max-w-3xl">
         <Composer variant="hero" />
-        <div className="mt-3 flex flex-wrap justify-center gap-2">
+        <div
+          data-testid={TID.launchpadStarters}
+          aria-hidden={typing}
+          className={cn(
+            "mt-3 flex flex-wrap justify-center gap-2 transition-all duration-300 ease-out motion-reduce:transition-none",
+            typing ? "pointer-events-none translate-y-1.5 opacity-0" : "translate-y-0 opacity-100",
+          )}
+        >
           {STARTERS.map((item) => (
             <button
               key={item.label}
               type="button"
+              tabIndex={typing ? -1 : undefined}
               onClick={() => {
                 setMode(item.mode);
                 setInput(item.prompt);

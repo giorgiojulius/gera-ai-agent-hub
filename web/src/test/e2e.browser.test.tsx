@@ -413,7 +413,7 @@ function installNetworkStub(): void {
 // ------------------------------------------------------------- web driver
 
 /**
- * The web implementation of the five driver verbs — vitest browser locators
+ * The web implementation of the driver verbs — vitest browser locators
  * (CDP-driven real clicks) over the shared `data-testid` registry.
  */
 function webDriver(): E2eDriver {
@@ -439,6 +439,24 @@ function webDriver(): E2eDriver {
     },
     async see(target: string, timeoutMs: number) {
       await expect.element(page.getByTestId(target).first(), { timeout: timeoutMs }).toBeVisible();
+    },
+    async notSee(target: string, timeoutMs: number) {
+      // Gone means unmounted or visually hidden — aria-hidden fade-out shells
+      // count, so scenarios can assert on animated dismissals.
+      await expect
+        .poll(
+          () =>
+            [...document.querySelectorAll(`[data-testid="${target}"]`)].every((node) => {
+              const element = node as HTMLElement;
+              if (element.getAttribute("aria-hidden") === "true" || element.hidden) {
+                return true;
+              }
+              const style = window.getComputedStyle(element);
+              return style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0;
+            }),
+          { timeout: timeoutMs },
+        )
+        .toBe(true);
     },
     async seeText(target: string, text: string, timeoutMs: number) {
       // `.last()` — repeated rows (messages) assert against the newest one.

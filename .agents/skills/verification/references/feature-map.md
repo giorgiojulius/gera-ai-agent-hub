@@ -84,7 +84,13 @@ stubbed `/access/status` → `invited`.
 ## Chat (`/`)
 
 Empty thread shows the Launchpad hero (`launchpad`) with the big composer
-(`composer-input`, send `composer-send`). A thread renders `chat-thread`
+(`composer-input`, send `composer-send`). Starter chips under the hero
+composer (`launchpad-starters`) fade out (aria-hidden, no pointer/tab stops)
+the moment the prompt has text and return when it is cleared. The composer
+textarea auto-grows line by line with an animated height (hook
+`use-autogrow.ts`; caps: hero 320px / docked 256px, lower on mobile; scrolls
+internally past the cap) — the same hook powers the edit-and-resend box in
+user bubbles. A thread renders `chat-thread`
 with `message-user` / `message-assistant` rows (markdown, artifacts, media).
 
 Code-change workbench (2026-08-31): the first repository branch/write call
@@ -864,7 +870,7 @@ says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
 OAuth/session/file-content suites. Full verification on 2026-08-31: 731 unit
-checks, 20 browser checks, web build, Worker deploy, live preview/ping and
+checks, 22 browser checks, web build, Worker deploy, live preview/ping and
 unauthenticated relay-gate smoke probes all passed.
 
 ## Settings (`/settings`)
@@ -942,6 +948,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | Scenario | Covers |
 | --- | --- |
 | boot-to-launchpad | Gate bypass, launchpad, composer, sidebar render |
+| starters-hide-while-typing | Starter chips fade out on typing (notSee), return on clear |
 | send-chat-message | Send → user turn + streamed reply + `/c/` address |
 | code-changes-preview | Repository edit event → live Changes diff → runnable sandbox Preview iframe |
 | new-chat-keeps-history | New chat resets view, thread stays listed |

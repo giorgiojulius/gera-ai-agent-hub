@@ -48,6 +48,18 @@ export const E2E_SCENARIOS: E2eScenario[] = [
     ],
   },
   {
+    id: "starters-hide-while-typing",
+    title: "Starter chips fade away while a prompt is being written",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.launchpadStarters, timeoutMs: 20_000 },
+      { do: "fill", target: TID.composerInput, text: "Draft in progress" },
+      { do: "notSee", target: TID.launchpadStarters },
+      { do: "fill", target: TID.composerInput, text: "" },
+      { do: "see", target: TID.launchpadStarters },
+    ],
+  },
+  {
     id: "send-chat-message",
     title: "Sending a message renders the user turn and a streamed reply",
     steps: [

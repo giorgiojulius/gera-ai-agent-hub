@@ -5,6 +5,8 @@
 // that is the whole point of a share link: anyone with the URL can read it.
 import { DurableObject } from "cloudflare:workers";
 
+import { stripRepoPreviewCapabilities } from "./share-safety";
+
 /** Serialized snapshot cap — links must stay light and SQLite rows bounded. */
 const PAYLOAD_LIMIT = 1_400_000;
 const TITLE_LIMIT = 160;
@@ -107,7 +109,7 @@ export class ShareStore extends DurableObject {
     }
     let snapshot: unknown;
     try {
-      snapshot = JSON.parse(row.payload);
+      snapshot = stripRepoPreviewCapabilities(JSON.parse(row.payload) as unknown);
     } catch {
       return json({ error: "not_found" }, 404);
     }
@@ -132,7 +134,7 @@ export class ShareStore extends DurableObject {
     if (!chatId) {
       return json({ error: "invalid_chat" }, 400);
     }
-    const snapshot = body.snapshot;
+    const snapshot = stripRepoPreviewCapabilities(body.snapshot);
     if (!snapshot || typeof snapshot !== "object") {
       return json({ error: "invalid_snapshot" }, 400);
     }

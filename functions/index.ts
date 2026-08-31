@@ -55,6 +55,7 @@
 import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute } from "./knowledge-storage";
+import { verifyRepoPreviewId } from "./repo-preview-shared";
 import { decodeSlackInstallState } from "./native-slack";
 import { isForbiddenHost } from "./network-safety";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
@@ -64,6 +65,7 @@ export { AccessRegistry } from "./access-registry";
 export { ArenaStore } from "./arena-store";
 export { ChatStore } from "./chat-store";
 export { ProjectStore } from "./project-store";
+export { RepoPreviewStore } from "./repo-preview-store";
 export { ShareStore } from "./share-store";
 
 type Env = {
@@ -75,6 +77,8 @@ type Env = {
   RORK_TOOLKIT_SECRET_KEY?: string;
   /** Rork API base — the storage temp-credentials endpoint lives there. */
   EXPO_PUBLIC_RORK_API_BASE_URL?: string;
+  /** Stable private salt for opaque repository-preview account shards. */
+  RORK_AUTH_SECRET_KEY?: string;
 };
 
 type ExecutionCtx = { waitUntil(promise: Promise<unknown>): void };
@@ -113,6 +117,27 @@ function corsJson(data: unknown, status: number): Response {
     status,
     headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
   });
+}
+
+async function readBoundedText(request: Request, limit: number): Promise<string | null> {
+  const declared = Number(request.headers.get("Content-Length") ?? "0");
+  if (Number.isFinite(declared) && declared > limit) return null;
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let result = "";
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    total += chunk.value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    result += decoder.decode(chunk.value, { stream: true });
+  }
+  return result + decoder.decode();
 }
 
 function relayAuthRequired(): Response {
@@ -1984,6 +2009,173 @@ async function relayMcp(request: Request, url: URL, env: Env): Promise<Response>
   return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
 }
 
+async function repoPreviewHmac(secret: string, value: string): Promise<string> {
+  if (!secret) throw new Error("repo_preview_shard_secret_unavailable");
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Stable opaque account shard for repository preview jobs. */
+async function repoPreviewOwnerKey(email: string, env: Env): Promise<string> {
+  return (await repoPreviewHmac(env.RORK_AUTH_SECRET_KEY ?? "", email)).slice(0, 24);
+}
+
+function repoPreviewStoreRequest(
+  env: Env,
+  requestUrl: string,
+  ownerKey: string,
+  path: string,
+  init: { method: string; headers?: Headers; body?: BodyInit | null },
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("X-Rork-DO-Class", "RepoPreviewStore");
+  headers.set("X-Rork-DO-Id", `repo-preview:${ownerKey}`);
+  return env.DO.fetch(
+    new Request(new URL(path, new URL(requestUrl).origin).toString(), {
+      method: init.method,
+      headers,
+      body: init.body,
+    }),
+  );
+}
+
+async function touchRepoPreviewRegistry(
+  env: Env,
+  requestUrl: string,
+  ownerKey: string,
+  nextAt: number,
+): Promise<void> {
+  if (!env.RORK_AUTH_SECRET_KEY) throw new Error("repo_preview_registry_secret_unavailable");
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-Gera-Internal-Secret": env.RORK_AUTH_SECRET_KEY,
+  });
+  const response = await repoPreviewStoreRequest(env, requestUrl, "registry", "/internal/touch", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ownerKey, nextAt }),
+  });
+  if (!response.ok) {
+    throw new Error(`repo_preview_registry_touch_${response.status}`);
+  }
+}
+
+async function sweepRepoPreviewRegistry(env: Env, origin: string): Promise<void> {
+  if (!env.RORK_AUTH_SECRET_KEY) return;
+  const headers = new Headers({ "X-Gera-Internal-Secret": env.RORK_AUTH_SECRET_KEY });
+  const response = await repoPreviewStoreRequest(env, origin, "registry", "/internal/sweep", {
+    method: "POST",
+    headers,
+  });
+  if (!response.ok) {
+    console.error("repo preview registry sweep failed", response.status);
+  }
+}
+
+/** Authenticated control plane: inspect, setup PR, launch, status, cancel. */
+async function relayRepoPreviews(request: Request, url: URL, env: Env): Promise<Response> {
+  const userId = request.headers.get("X-Rork-User-Id");
+  const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
+  if (!userId || !email) {
+    return corsJson({ error: "sign_in_required" }, 401);
+  }
+  const path = url.pathname.slice("/repo-previews".length) || "/";
+  const allowed =
+    (request.method === "GET" && path === "/status") ||
+    (request.method === "POST" && ["/inspect", "/install", "/start", "/cancel"].includes(path));
+  if (!allowed) {
+    return corsJson({ error: "not_found" }, 404);
+  }
+  if (!(await isInvitedCached(env, request.url, email))) {
+    return corsJson({ error: "invite_required" }, 403);
+  }
+  let body: string | undefined;
+  if (request.method === "POST") {
+    const bounded = await readBoundedText(request, 32_000);
+    if (bounded === null) {
+      return corsJson({ error: "body_too_large" }, 413);
+    }
+    body = bounded;
+  }
+  let ownerKey: string;
+  try {
+    ownerKey = await repoPreviewOwnerKey(email, env);
+  } catch {
+    return corsJson({ error: "preview_backend_unavailable" }, 503);
+  }
+  const headers = new Headers();
+  headers.set("X-Gera-Email", encodeURIComponent(email));
+  headers.set("X-Gera-Preview-Owner-Key", ownerKey);
+  if (body !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
+  const github = request.headers.get("X-Gera-Upstream-Authorization");
+  if (github) {
+    headers.set("X-Gera-GitHub-Authorization", github);
+  }
+  if (path === "/start") {
+    try {
+      await touchRepoPreviewRegistry(env, request.url, ownerKey, Date.now() + 10 * 60_000);
+    } catch {
+      return corsJson({ error: "preview_maintenance_unavailable" }, 503);
+    }
+  }
+  const upstream = await repoPreviewStoreRequest(
+    env,
+    request.url,
+    ownerKey,
+    `${path}${url.search}`,
+    { method: request.method, headers, body },
+  );
+  const text = await upstream.text();
+  if (path !== "/status") {
+    console.log("repo previews", request.method, path, upstream.status);
+  }
+  return new Response(text, {
+    status: upstream.status,
+    headers: { ...CORS_HEADERS, "Content-Type": upstream.headers.get("Content-Type") ?? "application/json" },
+  });
+}
+
+/**
+ * Public artifact/hook plane. Preview ids embed only the account's hash shard;
+ * callback tokens are high-entropy, upload-only and never logged here.
+ */
+async function relayRepoPreviewPublic(request: Request, url: URL, env: Env): Promise<Response> {
+  const isHook = url.pathname.startsWith("/repo-preview-hook/");
+  const prefix = isHook ? "/repo-preview-hook/" : "/repo-preview/";
+  const rest = url.pathname.slice(prefix.length);
+  const id = rest.split("/", 1)[0] ?? "";
+  if (!(await verifyRepoPreviewId(id, env.RORK_AUTH_SECRET_KEY ?? ""))) {
+    return new Response("Preview not found", { status: 404 });
+  }
+  const ownerKey = id.split(".", 1)[0] ?? "";
+  const targetPath = `${isHook ? "/hook/" : "/asset/"}${rest}${url.search}`;
+  const headers = new Headers(request.headers);
+  const hookAuthorization = isHook ? headers.get("Authorization") ?? "" : "";
+  headers.delete("X-Gera-Preview-Token");
+  if (hookAuthorization.startsWith("Bearer ") && hookAuthorization.length <= 1_000) {
+    headers.set("X-Gera-Preview-Token", hookAuthorization.slice("Bearer ".length));
+  }
+  headers.delete("Authorization");
+  headers.delete("X-Rork-User-Id");
+  headers.delete("X-Rork-User-Email");
+  headers.delete("X-Rork-User-Name");
+  const upstream = await repoPreviewStoreRequest(env, request.url, ownerKey, targetPath, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+  });
+  return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+}
+
 /**
  * /knowledge/* — per-account cloud storage for large knowledge files. The
  * client keeps a short excerpt in the synced profile blob and stores the
@@ -2021,6 +2213,9 @@ export default {
       // Answer QStash fast; sweep + fire continue after the response.
       ctx.waitUntil(
         (async () => {
+          // Preview cleanup is bounded and resource-protecting, so it runs
+          // before automation work that may legitimately occupy the tick.
+          await sweepRepoPreviewRegistry(env, url.origin);
           await sweepGlobalMigrations(env, url.origin);
           await fireDueAutomations(env, url.origin);
         })().catch((error) =>
@@ -2041,6 +2236,12 @@ export default {
     }
     if (url.pathname === "/ping") {
       return corsJson({ ok: true, now: new Date().toISOString() }, 200);
+    }
+    if (url.pathname.startsWith("/repo-preview/") || url.pathname.startsWith("/repo-preview-hook/")) {
+      return relayRepoPreviewPublic(request, url, env);
+    }
+    if (url.pathname === "/repo-previews" || url.pathname.startsWith("/repo-previews/")) {
+      return relayRepoPreviews(request, url, env);
     }
     if (url.pathname === "/access" || url.pathname.startsWith("/access/")) {
       return relayAccess(request, url, env);

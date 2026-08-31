@@ -1,8 +1,9 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `4604f59` (+ evidence-backed autonomous
-execution outcomes for Automations and project agents, quiet no-change
-checks, Luna suggestion model, fable back in chat, note @-mentions, explicit
+Last synced: 2026-08-31 · commit `4604f59` (+ Rork-hosted immutable web-
+repository launches, evidence-backed autonomous execution outcomes for
+Automations and project agents, quiet no-change checks, Luna suggestion
+model, fable back in chat, note @-mentions, explicit
 inbox ranking, home & composer shortcut strips, settings redesign,
 attachment image shrink, stop/steering hardening, GitHub run credential
 hand-off + pin/access fixes, truthful MCP health + OAuth/account-session/
@@ -117,6 +118,35 @@ server or invented URL. External preview, PR, and checks links accept HTTPS only
 reject embedded credentials, and synced workbench payloads are size/type
 validated before rendering. Tests: `code-change-flow.test.ts`; E2E:
 `code-changes-preview` switches Changes → Preview and sees the running iframe.
+
+Repository launch (2026-08-31): pin a GitHub repo, then tap the cyan Play
+button `composer-repo-launch` beside its pill. `repo-launch-dialog` performs a
+server-side inspection before spending build time: immutable commit SHA,
+framework/lockfile detection, monorepo root suggestions, optional output
+folder, and whether the one-time runner is installed. A missing/outdated
+runner never triggers mystery code: `repo-launch-install` creates a reviewable
+PR containing `.github/workflows/gera-web-preview.yml`; the app asks the user
+to merge it once, then `repo-launch-start` dispatches that read-only workflow.
+The workflow checks out the exact SHA with persisted Git credentials OFF,
+receives no Rork/Gera/repository secrets, installs with bun/pnpm/yarn/npm,
+builds Vite/React/Next static export/Astro/Nuxt static/SvelteKit/Remix/
+Angular or standalone HTML, and uploads only a bounded static artifact through
+a short-lived preview-scoped capability carried in an Authorization header.
+
+The launch writes an ordinary user turn + durable `repo-preview-flow` receipt
+into the existing chat — no new IDE/page. Source → Install → Build → Preview
+phases poll the account's Rork Durable Object and survive tab close, reload and
+cloud sync. The receipt links the exact GitHub Actions run, exposes bounded
+credential-redacted logs (`repo-preview-logs`), Stop, and terminal Rebuild.
+Ready artifacts run in `repo-preview-frame` (opaque-origin sandboxed iframe +
+fullscreen, never an unsandboxed backend-origin tab) for 24h. The Rork backend stores an uncompressed tar in project R2 and a
+validated path→offset manifest in SQLite; public asset reads are MIME-derived
+R2 Range requests, SPA paths fall back to the indexed root, and Vite/root HTML
+assets are namespaced below the unguessable preview id. Limits: 50 MiB, 1,000
+files, two active and twelve recent jobs per account; expired/cancelled tokens
+cannot upload. Dynamic SSR/server processes are intentionally not claimed —
+v1 requires a static `index.html` build output and says exactly when none was
+found.
 
 Above the greeting a Shortcuts strip (`home-shortcuts`, toggle in
 Settings → Shortcuts; hidden in incognito, while loading/failed, and
@@ -961,6 +991,9 @@ All notify paths fail silent.
 `functions/index.ts` dispatch: `/ping` health · `/access/*` gate+admin ·
 `/share/*` · `/arena/*` (usage, battles, log, clear) · `/chats/sync` ·
 `/runs/*` (start, stream SSE, active, steer/stop) · `/diag/*` ·
+`/repo-previews/{inspect|install|start|status|cancel}` authenticated launch
+control · `/repo-preview-hook/:id/*` scoped-Bearer workflow callback ·
+`/repo-preview/:id/*` public expiring static artifact delivery ·
 `/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
 `/automations/run-now` · `/projects` +
 `/projects/create` + `/projects/:id/*` (overview, messages, message, read,
@@ -992,6 +1025,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | code-changes-preview | Repository edit event → live Changes diff → runnable sandbox Preview iframe |
 | new-chat-keeps-history | New chat resets view, thread stays listed |
 | github-pin-and-send | Connected GitHub → private repo list → pin → `/runs/start` carries exact repo + credential |
+| github-launch-web-preview | Pin private repo → cloud Play → server inspection → immutable launch → live Rork iframe |
 | switch-chat-model | Picker root → four main models → More → secondary selection sticks |
 | switch-chat-effort | Picker root → Effort submenu → budget pins |
 | switch-run-mode | Model-style mode picker engages Deep research, trigger reflects it |
@@ -1002,6 +1036,16 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
+
+Repository-launch coverage: `repo-preview.test.ts` pins repository/ref/path
+validation, framework + lockfile detection, manifest offset bounds, HTML asset
+namespacing, credential redaction, synced job normalization and the generated
+workflow's immutable/read-only contract. `repo-preview.browser.test.tsx`
+checks the real preview iframe + expandable bounded log, and
+`github-launch-web-preview` drives the complete pin → dialog → launch → receipt
+flow against network fixtures. No external repository is mutated or workflow
+dispatched by CI; the setup PR + real GitHub runner callback remains an honest
+manual/live integration check.
 
 Outcome coverage: `execution-outcome.test.ts` pins strict completion,
 draft-as-artifact, blocked handoff, quiet no-change, failed/mutating-check
@@ -1019,7 +1063,8 @@ that a new bundle adopts the MCP pair escrowed before the old response vanished.
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
 Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
 Share dialog, Settings toggles, media modes,
-Julius/Deep Research runs, incognito, thread menu (pin/rename/delete),
+Julius/Deep Research runs, repository setup-PR merge + real external build
+callback, dynamic SSR previews, incognito, thread menu (pin/rename/delete),
 Project workspace internals (posting, threads, agent editor, members,
 screens tab, screen desk / Intercom widgets) — only the list page render
 is clicked; the shared outcome receipt itself has a real-browser component

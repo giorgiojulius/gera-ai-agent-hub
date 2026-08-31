@@ -2,6 +2,7 @@ import { defaultAgents } from "@/lib/agents";
 import { normalizeAutomation } from "@/lib/automations";
 import { newId } from "@/lib/env";
 import { normalizeExecutionOutcome } from "@/lib/execution-outcome";
+import { normalizeRepoPreviewJob } from "@/lib/repo-preview";
 import { clampImageCount } from "@/lib/image-count";
 import { MAX_DOCS_PER_AGENT, MAX_FILE_CHARS } from "@/lib/knowledge";
 import { defaultJuliusSettings, JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES } from "@/lib/julius";
@@ -185,9 +186,15 @@ export function normalizeCodeChangeState(value: unknown): CodeChangeState | unde
 export function reviveMessage(message: ChatMessage): ChatMessage {
   const normalizedCodeChanges = normalizeCodeChangeState(message.codeChanges);
   const normalizedExecution = normalizeExecutionOutcome(message.execution);
+  const normalizedRepoPreview = normalizeRepoPreviewJob(message.repoPreview);
   let next =
-    message.codeChanges || message.execution
-      ? { ...message, codeChanges: normalizedCodeChanges, execution: normalizedExecution }
+    message.codeChanges || message.execution || message.repoPreview
+      ? {
+          ...message,
+          codeChanges: normalizedCodeChanges,
+          execution: normalizedExecution,
+          repoPreview: normalizedRepoPreview,
+        }
       : message;
   if (message.pending) {
     // A run was writing into this message when the tab died (reload after a

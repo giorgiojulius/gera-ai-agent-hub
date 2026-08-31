@@ -38,13 +38,23 @@ import {
   modelIdForMode,
   withStaticModels,
 } from "@/lib/models";
-import type { AgentSettings, CreateMode, ExecutionOutcome, LifeState, QueuedMessage } from "@/lib/types";
+import type { AgentSettings, CreateMode, ExecutionOutcome, LifeState, QueuedMessage, RepoPreviewJob } from "@/lib/types";
 
 export { useAgent } from "@/hooks/agent-context";
 export type { AgentDraftInput } from "@/hooks/agent-context";
 
 /** A server-confirmed stop must visibly settle the UI within this window even when the terminal event is lost. */
 const STOP_SETTLE_GRACE_MS = 6_000;
+
+/** Chat sync carries lifecycle evidence, never private build logs or preview capabilities. */
+function persistableRepoPreview(job: RepoPreviewJob): RepoPreviewJob {
+  const stored: RepoPreviewJob = { ...job };
+  delete stored.logs;
+  delete stored.previewUrl;
+  delete stored.actionsUrl;
+  delete stored.setupPullRequestUrl;
+  return stored;
+}
 
 export function AgentProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AgentState>(() => initialAgentState());
@@ -271,6 +281,74 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       return { ...prev, conversations };
     });
   }, []);
+
+  const recordRepoPreview = useCallback((job: RepoPreviewJob, conversationId?: string) => {
+    const now = Date.now();
+    const storedJob = persistableRepoPreview(job);
+    setState((prev) => {
+      const existing = conversationId
+        ? prev.conversations.find((item) => item.id === conversationId)
+        : prev.conversations.find((item) => item.id === prev.activeId);
+      if (existing?.incognito === true) {
+        return prev;
+      }
+      const current = existing ?? {
+        ...createConversation(prev.settings.modelId),
+        githubRepo: job.repository,
+      };
+      const shortName = job.repository.split("/").pop() ?? job.repository;
+      const messages = [
+        ...current.messages,
+        {
+          id: newId(),
+          role: "user" as const,
+          content: `Launch ${job.repository} as a web preview.`,
+          createdAt: now,
+        },
+        {
+          id: newId(),
+          role: "assistant" as const,
+          content: "",
+          repoPreview: storedJob,
+          createdAt: now,
+        },
+      ];
+      const conversation = {
+        ...current,
+        title: current.title === "New thread" ? `Preview · ${shortName}` : current.title,
+        githubRepo: job.repository,
+        messages,
+        updatedAt: now,
+      };
+      const conversations = upsertConversation(prev.conversations, conversation);
+      saveConversations(conversations);
+      return { ...prev, conversations, activeId: prev.activeId ?? conversation.id };
+    });
+    scheduleSync(800);
+  }, [scheduleSync]);
+
+  const updateRepoPreview = useCallback((job: RepoPreviewJob) => {
+    const storedJob = persistableRepoPreview(job);
+    let changed = false;
+    setState((prev) => {
+      const conversations = prev.conversations.map((conversation) => {
+        let conversationChanged = false;
+        const messages = conversation.messages.map((message) => {
+          if (message.repoPreview?.id !== job.id) return message;
+          const current = persistableRepoPreview(message.repoPreview);
+          if (JSON.stringify(current) === JSON.stringify(storedJob)) return message;
+          changed = true;
+          conversationChanged = true;
+          return { ...message, repoPreview: storedJob };
+        });
+        return conversationChanged ? { ...conversation, messages, updatedAt: Date.now() } : conversation;
+      });
+      if (!changed) return prev;
+      saveConversations(conversations);
+      return { ...prev, conversations };
+    });
+    scheduleSync(800);
+  }, [scheduleSync]);
 
   const createAgent = useCallback((input: AgentDraftInput): string => {
     const id = newId();
@@ -1348,6 +1426,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       newChatWithAgent,
       setChatAgent,
       setChatRepo,
+      recordRepoPreview,
+      updateRepoPreview,
       createAgent,
       updateAgent,
       deleteAgent,
@@ -1400,6 +1480,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     newChatWithAgent,
     setChatAgent,
     setChatRepo,
+    recordRepoPreview,
+    updateRepoPreview,
     createAgent,
     updateAgent,
     deleteAgent,

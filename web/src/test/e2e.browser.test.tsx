@@ -143,6 +143,32 @@ let lastStubRunBody: StubRunBody | null = null;
 let hangStubRun = false;
 let codeStubRun = false;
 
+const PREVIEW_STUB_ID = `${"a".repeat(24)}.${"b".repeat(32)}.${"c".repeat(24)}`;
+
+function previewStubJob(phase: "queued" | "ready") {
+  const now = Date.now();
+  return {
+    id: PREVIEW_STUB_ID,
+    repository: "acme/private-app",
+    ref: "main",
+    commitSha: "c".repeat(40),
+    rootDirectory: ".",
+    framework: "vite",
+    packageManager: "bun",
+    phase,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + 24 * 60 * 60_000,
+    actionsUrl: "https://github.com/acme/private-app/actions/runs/42",
+    ...(phase === "ready"
+      ? {
+          previewUrl: `https://gera-ai-agent-hub-backend.rork.app/repo-preview/${PREVIEW_STUB_ID}/`,
+          logs: "Installed dependencies\nBuilt in 1.2s\nPackaged 14 files",
+        }
+      : {}),
+  };
+}
+
 function runStreamResponse(): Response {
   const run = lastStubRun;
   const html = "<!doctype html><html><body><h1>Hello from preview</h1></body></html>";
@@ -326,6 +352,36 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
         });
       }
       throw new Error(`Unstubbed MCP method: ${body.method ?? "missing"}`);
+    }
+    if (url.includes("/repo-previews/inspect")) {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("X-Gera-Upstream-Authorization")).toBe("Bearer ghp_e2e_fixture");
+      return jsonResponse({
+        inspection: {
+          repository: "acme/private-app",
+          defaultBranch: "main",
+          ref: "main",
+          commitSha: "c".repeat(40),
+          rootDirectory: ".",
+          rootSuggestions: ["."],
+          runner: "ready",
+          runnerVersion: 1,
+          framework: "vite",
+          packageManager: "bun",
+          projectFound: true,
+        },
+      });
+    }
+    if (url.includes("/repo-previews/start")) {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("X-Gera-Upstream-Authorization")).toBe("Bearer ghp_e2e_fixture");
+      return jsonResponse({ job: previewStubJob("queued") });
+    }
+    if (url.includes("/repo-previews/status")) {
+      return jsonResponse({ job: previewStubJob("ready") });
+    }
+    if (url.includes("/repo-previews/cancel")) {
+      return jsonResponse({ job: { ...previewStubJob("queued"), phase: "cancelled" } });
     }
     if (url.includes("/runs/start")) {
       const raw = typeof init?.body === "string" ? init.body : "";
@@ -518,7 +574,7 @@ test("e2e · Dropping a file onto the composer attaches it", { timeout: 90_000 }
 
 for (const scenario of E2E_SCENARIOS) {
   test(`e2e · ${scenario.title}`, { timeout: 90_000 }, async () => {
-    if (scenario.id === "github-pin-and-send") {
+    if (scenario.id === "github-pin-and-send" || scenario.id === "github-launch-web-preview") {
       localStorage.setItem(
         "gera.settings.v1",
         JSON.stringify({
@@ -560,6 +616,20 @@ for (const scenario of E2E_SCENARIOS) {
         (server) => (server.catalogId ?? server.id) === "github",
       );
       expect(github?.token).toBe("ghp_e2e_fixture");
+    }
+    if (scenario.id === "github-launch-web-preview") {
+      const readPersisted = (): Record<string, unknown> | undefined => {
+        const conversations = JSON.parse(localStorage.getItem("gera.conversations.v1") ?? "[]") as Array<{
+          messages?: Array<{ repoPreview?: Record<string, unknown> }>;
+        }>;
+        return conversations.flatMap((conversation) => conversation.messages ?? [])
+          .find((message) => message.repoPreview)?.repoPreview;
+      };
+      await expect.poll(() => readPersisted()?.phase, { timeout: 5_000 }).toBe("ready");
+      const persisted = readPersisted();
+      expect(persisted?.previewUrl).toBeUndefined();
+      expect(persisted?.actionsUrl).toBeUndefined();
+      expect(persisted?.logs).toBeUndefined();
     }
   });
 }

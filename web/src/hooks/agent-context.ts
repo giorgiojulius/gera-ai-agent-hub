@@ -14,6 +14,7 @@ import type {
   GatewayModel,
   LifeState,
   McpServerConfig,
+  RepoPreviewJob,
 } from "@/lib/types";
 
 export type AgentDraftInput = Omit<AgentProfile, "id" | "createdAt">;
@@ -34,6 +35,10 @@ export type AgentContextValue = {
   setChatAgent: (agentId: string | null) => void;
   /** Pins/unpins a GitHub repository ("owner/repo") on the active thread — runs default their GitHub tools to it. */
   setChatRepo: (repo: string | null) => void;
+  /** Appends a durable repository launch receipt to its originating thread. */
+  recordRepoPreview: (job: RepoPreviewJob, conversationId?: string) => void;
+  /** Persists phase changes without syncing private preview URLs or build logs. */
+  updateRepoPreview: (job: RepoPreviewJob) => void;
   createAgent: (input: AgentDraftInput) => string;
   updateAgent: (id: string, patch: Partial<AgentDraftInput>) => void;
   deleteAgent: (id: string) => void;

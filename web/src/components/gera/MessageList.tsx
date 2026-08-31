@@ -22,6 +22,7 @@ import {
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { CodeChangeFlow } from "@/components/gera/CodeChangeFlow";
+import { RepoPreviewFlow } from "@/components/gera/RepoPreviewFlow";
 import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { JuliusPanel } from "@/components/gera/JuliusPanel";
 import { MediaAudioCard, MediaImageCard, MediaImageGrid, MediaVideoCard } from "@/components/gera/VaultMedia";
@@ -175,6 +176,7 @@ function MessageBubble({
           />
         ) : null}
         {message.codeChanges ? <CodeChangeFlow flow={message.codeChanges} /> : null}
+        {message.repoPreview ? <RepoPreviewFlow initialJob={message.repoPreview} readOnly={readOnly} /> : null}
         {ordinaryToolCalls.length > 0 ? (
           <div className="mb-3 flex flex-col gap-1.5">
             {ordinaryToolCalls.map((call) => {
@@ -211,7 +213,7 @@ function MessageBubble({
         ) : null}
         {message.content ? (
           <MarkdownBody text={message.content} streaming={streaming} sources={citationSources} />
-        ) : streaming && message.research?.status !== "running" && !message.julius ? (
+        ) : streaming && message.research?.status !== "running" && !message.julius && !message.repoPreview ? (
           <TypingDots />
         ) : null}
         {message.images && message.images.length > 0 ? (

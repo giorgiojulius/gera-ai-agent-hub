@@ -17,6 +17,7 @@ import {
   ListEnd,
   MessageSquare,
   Paperclip,
+  Play,
   Plug,
   Plus,
   Settings2,
@@ -50,6 +51,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { ModelPicker } from "@/components/gera/ModelPicker";
+import { RepoLaunchDialog } from "@/components/gera/RepoLaunchDialog";
 import { MediaImg } from "@/components/gera/VaultMedia";
 import { useAgent } from "@/hooks/use-agent";
 import { agentHue, agentMonogram } from "@/lib/agents";
@@ -1283,6 +1285,8 @@ function GitHubRepoPin() {
   const [repos, setRepos] = useState<RepoOption[] | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
+  const [launchOpen, setLaunchOpen] = useState<boolean>(false);
+  const [launchConversationId, setLaunchConversationId] = useState<string>("");
 
   const active = state.conversations.find((item) => item.id === state.activeId);
   const activeAgent = active?.agentId
@@ -1362,7 +1366,8 @@ function GitHubRepoPin() {
   const shortName = pinned.includes("/") ? pinned.slice(pinned.indexOf("/") + 1) : pinned;
 
   return (
-    <Popover
+    <>
+      <Popover
       open={open}
       onOpenChange={(next) => {
         setOpen(next);
@@ -1511,7 +1516,33 @@ function GitHubRepoPin() {
           </p>
         </div>
       </PopoverContent>
-    </Popover>
+      </Popover>
+      {pinned && active?.incognito !== true ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          data-testid={TID.composerRepoLaunch}
+          disabled={Boolean(active && state.runningIds.includes(active.id))}
+          onClick={() => {
+            setLaunchConversationId(active?.id ?? "");
+            setLaunchOpen(true);
+          }}
+          className="h-9 w-9 rounded-full text-cyan-700 hover:bg-cyan-500/10 hover:text-cyan-800 disabled:opacity-35"
+          aria-label={`Run ${pinned} as a web preview`}
+          title="Build this repository in the cloud and open a live Rork preview"
+        >
+          <Play className="h-3.5 w-3.5 fill-current" />
+        </Button>
+      ) : null}
+      <RepoLaunchDialog
+        open={launchOpen}
+        onOpenChange={setLaunchOpen}
+        repository={pinned}
+        conversationId={launchConversationId}
+        server={server}
+      />
+    </>
   );
 }
 

@@ -78,6 +78,12 @@ function slimForShare(message: ChatMessage, budget: MediaBudget): ChatMessage {
   const settled = reviveMessage(message);
   return {
     ...settled,
+    ...(settled.repoPreview
+      ? {
+          content: "Repository preview details stay private to the account that launched it.",
+          repoPreview: undefined,
+        }
+      : {}),
     attachments: settled.attachments?.map((item) => slimAttachment(item, budget)),
     images: settled.images
       ?.map((item) => keepMedia(item, budget))

@@ -65,6 +65,24 @@ export const TID = {
   composerRepoDiagnose: "composer-repo-diagnose",
   /** Verdict card of the repo access check. */
   composerRepoVerdict: "composer-repo-verdict",
+  /** Cloud-play action shown beside a pinned repository. */
+  composerRepoLaunch: "composer-repo-launch",
+  /** Repository launch configuration and one-time runner setup dialog. */
+  repoLaunchDialog: "repo-launch-dialog",
+  /** Explicit setup-PR action for the bounded repository runner. */
+  repoLaunchInstall: "repo-launch-install",
+  /** Starts one immutable repository build. */
+  repoLaunchStart: "repo-launch-start",
+  /** Durable Rork web-repository launch receipt in the thread. */
+  repoPreviewFlow: "repo-preview-flow",
+  /** Sandboxed iframe serving the built repository from Rork storage. */
+  repoPreviewFrame: "repo-preview-frame",
+  /** Expands/collapses the bounded redacted build log. */
+  repoPreviewLogs: "repo-preview-logs",
+  /** Stops an active repository launch. */
+  repoPreviewStop: "repo-preview-stop",
+  /** Starts a fresh build of a terminal repository launch. */
+  repoPreviewRebuild: "repo-preview-rebuild",
   /** Model picker trigger in the composer rail. */
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */

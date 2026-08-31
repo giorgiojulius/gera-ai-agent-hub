@@ -9,13 +9,15 @@
 // global, and re-fetched near expiry (single-flight). SigV4 presigning is
 // implemented manually on crypto.subtle — no SDK, Worker-native, zero deps.
 
-type StorageEnv = {
+export type RorkStorageEnv = {
   EXPO_PUBLIC_RORK_API_BASE_URL?: string;
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
   RORK_TOOLKIT_SECRET_KEY?: string;
 };
 
-type TempCreds = {
+type StorageEnv = RorkStorageEnv;
+
+export type RorkStorageCredentials = {
   accessKeyId: string;
   secretAccessKey: string;
   sessionToken: string;
@@ -38,6 +40,8 @@ const KEY_PATTERN = /^knowledge\/[a-f0-9]{24}\/[A-Za-z0-9_-]{1,64}\.txt$/;
 
 // --- temp credential cache (module global; survives on a warm isolate) ---
 
+type TempCreds = RorkStorageCredentials;
+
 let cachedCreds: TempCreds | null = null;
 let inflight: Promise<TempCreds> | null = null;
 
@@ -59,7 +63,7 @@ async function fetchTempCreds(env: StorageEnv): Promise<TempCreds> {
   return (await response.json()) as TempCreds;
 }
 
-async function getCreds(env: StorageEnv): Promise<TempCreds> {
+export async function getRorkStorageCredentials(env: RorkStorageEnv): Promise<RorkStorageCredentials> {
   if (cachedCreds && new Date(cachedCreds.expiresAt).getTime() - Date.now() > REFRESH_MARGIN_MS) {
     return cachedCreds;
   }
@@ -114,7 +118,11 @@ function effectiveTtl(creds: TempCreds): number {
   return Math.min(URL_TTL_SECONDS, remaining);
 }
 
-async function presignUrl(creds: TempCreds, method: "PUT" | "GET" | "DELETE", key: string): Promise<string> {
+export async function presignRorkStorageUrl(
+  creds: RorkStorageCredentials,
+  method: "PUT" | "GET" | "DELETE",
+  key: string,
+): Promise<string> {
   const amzDate = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
   const dateStamp = amzDate.slice(0, 8);
   const scope = `${dateStamp}/auto/s3/aws4_request`;
@@ -189,8 +197,8 @@ export async function handleKnowledgeRoute(
         return invalid("bad_content_length");
       }
       const key = `knowledge/${prefix}/${docId}.txt`;
-      const creds = await getCreds(env);
-      return { status: 200, body: { url: await presignUrl(creds, "PUT", key), key } };
+      const creds = await getRorkStorageCredentials(env);
+      return { status: 200, body: { url: await presignRorkStorageUrl(creds, "PUT", key), key } };
     }
 
     const key = typeof payload.key === "string" ? payload.key : "";
@@ -199,13 +207,13 @@ export async function handleKnowledgeRoute(
     }
 
     if (url.pathname === "/knowledge/download-url") {
-      const creds = await getCreds(env);
-      return { status: 200, body: { url: await presignUrl(creds, "GET", key) } };
+      const creds = await getRorkStorageCredentials(env);
+      return { status: 200, body: { url: await presignRorkStorageUrl(creds, "GET", key) } };
     }
 
     if (url.pathname === "/knowledge/delete") {
-      const creds = await getCreds(env);
-      const deleted = await fetch(await presignUrl(creds, "DELETE", key), { method: "DELETE" });
+      const creds = await getRorkStorageCredentials(env);
+      const deleted = await fetch(await presignRorkStorageUrl(creds, "DELETE", key), { method: "DELETE" });
       if (!deleted.ok && deleted.status !== 404) {
         console.error("knowledge delete failed", deleted.status);
         return { status: 502, body: { error: "delete_failed" } };

@@ -120,6 +120,23 @@ export const E2E_SCENARIOS: E2eScenario[] = [
     ],
   },
   {
+    id: "github-launch-web-preview",
+    title: "A pinned GitHub web repository launches into a live Rork preview",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerRepo, timeoutMs: 20_000 },
+      { do: "tap", target: TID.composerRepo },
+      { do: "see", target: TID.composerRepoPanel },
+      { do: "tap", target: TID.composerRepoOption },
+      { do: "tap", target: TID.composerRepoLaunch },
+      { do: "see", target: TID.repoLaunchDialog },
+      { do: "seeText", target: TID.repoLaunchDialog, text: "Vite · bun", timeoutMs: 20_000 },
+      { do: "tap", target: TID.repoLaunchStart },
+      { do: "seeText", target: TID.repoPreviewFlow, text: "Preview running", timeoutMs: 20_000 },
+      { do: "see", target: TID.repoPreviewFrame },
+    ],
+  },
+  {
     id: "switch-chat-model",
     title: "The picker keeps four primary models up front and opens the rest under More",
     steps: [

@@ -120,6 +120,67 @@ export type CodeChangeState = {
   validation?: CodeValidation;
 };
 
+export type RepoPreviewPhase =
+  | "queued"
+  | "installing"
+  | "building"
+  | "packaging"
+  | "uploading"
+  | "ready"
+  | "failed"
+  | "cancelled"
+  | "expired";
+
+export type RepoPreviewFramework =
+  | "vite"
+  | "next"
+  | "astro"
+  | "nuxt"
+  | "sveltekit"
+  | "remix"
+  | "react-scripts"
+  | "angular"
+  | "static"
+  | "unknown";
+
+export type RepoPreviewPackageManager = "bun" | "pnpm" | "yarn" | "npm" | "none";
+
+/** Durable Rork-hosted launch of one immutable GitHub web-project commit. */
+export type RepoPreviewJob = {
+  id: string;
+  repository: string;
+  ref: string;
+  commitSha: string;
+  rootDirectory: string;
+  outputDirectory?: string;
+  framework: RepoPreviewFramework;
+  packageManager: RepoPreviewPackageManager;
+  phase: RepoPreviewPhase;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  previewUrl?: string;
+  actionsUrl?: string;
+  setupPullRequestUrl?: string;
+  logs?: string;
+  error?: string;
+};
+
+export type RepoPreviewInspection = {
+  repository: string;
+  defaultBranch: string;
+  ref: string;
+  commitSha: string;
+  rootDirectory: string;
+  outputDirectory?: string;
+  rootSuggestions: string[];
+  runner: "ready" | "missing" | "outdated";
+  runnerVersion?: number;
+  framework: RepoPreviewFramework;
+  packageManager: RepoPreviewPackageManager;
+  projectFound: boolean;
+};
+
 // Evidence-backed result attached only to autonomous runs (Automations + project agents).
 export type ExecutionOutcomeStatus = "completed" | "needs_review" | "blocked" | "no_change" | "error";
 export type ExecutionArtifactKind = "report" | "draft" | "external_object" | "code_change" | "message" | "check";
@@ -242,6 +303,8 @@ export type ChatMessage = {
   toolCalls?: ToolCallRecord[];
   /** Repository edits, their diff preview, verification, and runnable preview. */
   codeChanges?: CodeChangeState;
+  /** Immutable web-repository build hosted by the Rork preview backend. */
+  repoPreview?: RepoPreviewJob;
   /** Strict result contract for autonomous runs; absent on ordinary chat in v1. */
   execution?: ExecutionOutcome;
   /**

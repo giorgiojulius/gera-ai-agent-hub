@@ -18,10 +18,33 @@ export default defineConfig(({ mode }) => ({
       output: {
         // The preview uploader sends every output file separately. Rolldown's
         // default splitting turns Mermaid and Prism into 100+ tiny chunks,
-        // making an otherwise valid deployment vulnerable to partial uploads.
-        // Keep dynamic-import semantics while shipping one deterministic JS
-        // artifact; workers and public assets remain separate files.
-        codeSplitting: false,
+        // while disabling splitting creates a 7 MB entry that can race the
+        // preview reload. Keep a small entry and collapse each heavy, deferred
+        // feature (including its internal imports) into one durable chunk.
+        codeSplitting: {
+          groups: [
+            {
+              name: "mermaid",
+              test: /node_modules[\\/]mermaid[\\/]/,
+              priority: 40,
+            },
+            {
+              name: "syntax-highlighter",
+              test: /node_modules[\\/](?:react-syntax-highlighter|refractor|prismjs)[\\/]/,
+              priority: 30,
+            },
+            {
+              name: "document-readers",
+              test: /node_modules[\\/](?:pdfjs-dist|mammoth|xlsx)[\\/]/,
+              priority: 20,
+            },
+            {
+              name: "maps",
+              test: /node_modules[\\/]leaflet[\\/]/,
+              priority: 10,
+            },
+          ],
+        },
         strictExecutionOrder: true,
       },
     },

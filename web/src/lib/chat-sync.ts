@@ -6,7 +6,8 @@
 // protocol is want-driven: each response tells the client what the server
 // is missing, so there is no local dirty bookkeeping that could drift —
 // the next sync always heals.
-import { authedFetch, parseOrThrow } from "@/lib/backend";
+import { isAuthSessionCurrent } from "@/lib/auth-tokens";
+import { AuthSessionChangedError, authedFetch, authedFetchForSession, parseOrThrow } from "@/lib/backend";
 import { reviveMessage, slimMessage } from "@/lib/history";
 import {
   applyServerOAuthRotations,
@@ -260,7 +261,15 @@ export async function runChatSync(input: {
   tombstones: LocalTombstones;
   /** The profile blob to reconcile; `dirty` = local changes not yet acked. */
   profile?: { updatedAt: number; payload: string | null; dirty: boolean };
+  /** Pins every round/retry to the account that produced this payload. */
+  authSessionNonce?: string;
 }): Promise<ChatSyncResult> {
+  const ensureCurrentSession = (): void => {
+    if (input.authSessionNonce && !isAuthSessionCurrent(input.authSessionNonce)) {
+      throw new AuthSessionChangedError();
+    }
+  };
+  ensureCurrentSession();
   const running = new Set<string>(input.runningIds);
   const localById = new Map<string, Conversation>(input.conversations.map((item) => [item.id, item]));
 
@@ -286,6 +295,7 @@ export async function runChatSync(input: {
   }
 
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    ensureCurrentSession();
     // What this device has — overlaid with what it already accepted this cycle.
     const haveMap = new Map<string, number>();
     for (const item of input.conversations) {
@@ -335,7 +345,18 @@ export async function runChatSync(input: {
           }
         : undefined;
 
-    const response = await authedFetch("/chats/sync", {
+    const response = await (input.authSessionNonce
+      ? authedFetchForSession("/chats/sync", input.authSessionNonce, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            have: [...haveMap.entries()].map(([id, updatedAt]) => ({ id, updatedAt })),
+            push,
+            delete: deletesToSend,
+            ...(profileBody ? { profile: profileBody } : {}),
+          }),
+        })
+      : authedFetch("/chats/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -344,8 +365,9 @@ export async function runChatSync(input: {
         delete: deletesToSend,
         ...(profileBody ? { profile: profileBody } : {}),
       }),
-    });
+    }));
     const data = await parseOrThrow<SyncResponse>(response, "Sync failed");
+    ensureCurrentSession();
 
     // The server applied (or consciously overruled) everything we sent.
     for (const item of deletesToSend) {
@@ -409,6 +431,7 @@ export async function runChatSync(input: {
     }
 
     if (data.oauthRotations !== undefined) {
+      ensureCurrentSession();
       // Server runs redeem (and thereby rotate) MCP refresh tokens while this
       // browser sleeps — adopt the fresh pairs so the local sign-in survives
       // instead of dying on its next refresh attempt.

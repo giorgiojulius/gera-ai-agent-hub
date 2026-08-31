@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { SparkMark } from "@/components/gera/Spark";
-import { OAUTH_RESULT_KEY } from "@/lib/mcp-oauth";
+import { oauthResultStorageKey } from "@/lib/mcp-oauth";
 
 /**
  * OAuth redirect target for MCP sign-in popups. Hands the authorization code
@@ -20,7 +20,7 @@ export default function OAuthCallback() {
       iss: params.get("iss") ?? "",
     };
     try {
-      window.localStorage.setItem(OAUTH_RESULT_KEY, JSON.stringify(payload));
+      window.localStorage.setItem(oauthResultStorageKey(payload.state), JSON.stringify(payload));
     } catch {
       // storage unavailable; postMessage below still covers same-window openers
     }

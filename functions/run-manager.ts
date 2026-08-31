@@ -29,6 +29,7 @@ import {
   overlayOAuthRotations,
   type CloudOAuthToken,
   type OAuthRotation,
+  type RefreshedOAuth,
 } from "./mcp-cloud";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
 import { runServerJulius } from "./julius-runner";
@@ -711,8 +712,11 @@ export class RunManager {
           const servers = cloudMcpServersForAutomation(config.mcpServers, null, oauthTokens).filter(
             (server) => server.kind === "github",
           );
-          juliusMcp = servers.length > 0 ? await armCloudMcp(servers) : emptyMcpRuntime();
-          await this.persistRefreshedGrants(run.owner, juliusMcp, appliedChains);
+          juliusMcp = servers.length > 0
+            ? await armCloudMcp(servers, (rotated) =>
+                this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+              )
+            : emptyMcpRuntime();
         }
         const result = await runServerJulius({
           authKey,
@@ -795,8 +799,11 @@ export class RunManager {
       try {
         const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
         const servers = cloudMcpServersForAutomation(config.mcpServers, null, oauthTokens);
-        mcp = servers.length > 0 ? await armCloudMcp(servers) : emptyMcpRuntime();
-        await this.persistRefreshedGrants(run.owner, mcp, appliedChains);
+        mcp = servers.length > 0
+          ? await armCloudMcp(servers, (rotated) =>
+              this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+            )
+          : emptyMcpRuntime();
       } catch (error) {
         console.error("mcp arming failed:", error instanceof Error ? error.message : "unknown");
       }
@@ -1594,22 +1601,39 @@ export class RunManager {
    * browser-synced token, so sync (and the browser's rescue call) can
    * recognize the rotation and hand the fresh pair back.
    */
-  private async persistRefreshedGrants(
+  private async persistRefreshedGrant(
     owner: string,
-    mcp: McpRuntime,
+    rotated: RefreshedOAuth,
     appliedChains: Map<string, string[]>,
   ): Promise<void> {
-    for (const rotated of mcp.refreshed) {
-      try {
-        const bases = chainRotationBases(appliedChains, rotated);
-        await this.ctx.storage.put(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`, {
-          bases,
-          token: rotated.token,
-        });
-        appliedChains.set(rotated.serverId, bases);
-      } catch (error) {
-        console.error("oauth grant persist failed:", error instanceof Error ? error.message : "unknown");
-      }
+    const profileRow = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    let parsed: unknown = null;
+    try {
+      parsed = profileRow ? JSON.parse(profileRow.payload) : null;
+    } catch {
+      parsed = null;
     }
+    const raw =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).mcpOAuth
+        : undefined;
+    const currentTokens = cloudOAuthTokens(raw);
+    const key = `${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`;
+    const existing = normalizeOAuthOverride(rotated.serverId, await this.ctx.storage.get<unknown>(key));
+    if (existing) {
+      overlayOAuthRotations(currentTokens, [existing]);
+    }
+    const currentAccess = currentTokens[rotated.serverId]?.accessToken;
+    if (currentAccess !== rotated.baseAccessToken && currentAccess !== rotated.token.accessToken) {
+      throw new Error("stale OAuth refresh result");
+    }
+    const bases = chainRotationBases(appliedChains, rotated);
+    await this.ctx.storage.put(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`, {
+      bases,
+      token: rotated.token,
+    });
+    appliedChains.set(rotated.serverId, bases);
   }
 }

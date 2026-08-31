@@ -24,6 +24,7 @@ import {
   mcpFunctionName,
 } from "@/lib/mcp";
 import {
+  beginOAuthGrantFlow,
   hasOAuthToken,
   oauthAuthHeader,
   safeOAuthEndpoint,
@@ -241,13 +242,14 @@ describe("MCP OAuth boundaries", () => {
   });
 
   it("binds new grants to their MCP endpoint", async () => {
+    const flow = beginOAuthGrantFlow("bound");
     storeExternalOAuthToken("bound", {
       accessToken: "secret",
       refreshToken: "refresh",
       tokenEndpoint: "https://auth.example.com/token",
       clientId: "client",
       mcpUrl: "https://one.example.com/mcp",
-    });
+    }, flow);
     expect(hasOAuthToken("bound", "https://one.example.com/mcp")).toBe(true);
     expect(hasOAuthToken("bound", "https://two.example.com/mcp")).toBe(false);
     await expect(oauthAuthHeader("bound", "https://two.example.com/mcp")).resolves.toBeNull();
@@ -577,6 +579,45 @@ describe("cloud OAuth refresh concurrency", () => {
     expect(requests).toBe(1);
     expect(first.oauth?.accessToken).toBe("next");
     expect(second.oauth?.accessToken).toBe("next");
+  });
+
+  it("keeps a completed exchange reusable until stale callers commit it durably", async () => {
+    const fetchMock = vi.fn(async (): Promise<Response> =>
+      new Response(JSON.stringify({ access_token: "durable-next", refresh_token: "durable-refresh" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const makeServer = (): CloudMcpServer => ({
+      id: "durable",
+      name: "Durable",
+      kind: "mcp",
+      url: "https://durable.example.net/mcp",
+      headers: {},
+      omitMcpHeaders: false,
+      disabledTools: [],
+      oauth: cloudGrant({
+        accessToken: "durable-old",
+        refreshToken: "durable-old-refresh",
+        tokenEndpoint: "https://durable.example.net/token",
+        mcpUrl: "https://durable.example.net/mcp",
+      }),
+    });
+    const commits: string[] = [];
+    const persist = async (rotation: { token: CloudOAuthToken }): Promise<void> => {
+      commits.push(rotation.token.accessToken);
+    };
+    const first = makeServer();
+    const secondStaleCopy = makeServer();
+
+    await forceRefreshCloudOAuth(first, [], persist);
+    await forceRefreshCloudOAuth(secondStaleCopy, [], persist);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(commits).toEqual(["durable-next", "durable-next"]);
+    expect(first.oauth?.accessToken).toBe("durable-next");
+    expect(secondStaleCopy.oauth?.accessToken).toBe("durable-next");
   });
 
   it("never shares a refresh exchange across different resource boundaries", async () => {

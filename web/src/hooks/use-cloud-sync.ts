@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 
 import { useAuth } from "@/hooks/use-auth";
+import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
 import { adoptActiveServerRuns, upsertConversation, type AgentState } from "@/lib/agent-store";
 import {
   initProfileMeta,
@@ -25,6 +26,7 @@ import {
   OAUTH_TOKENS_CHANGED_EVENT,
   OAUTH_TOKENS_KEY,
   adoptProfileOAuthTokens,
+  exportOAuthTokens,
 } from "@/lib/mcp-oauth";
 
 type CloudSyncArgs = {
@@ -78,7 +80,8 @@ export function useCloudSync(args: CloudSyncArgs): {
 
   const performSync = useCallback(async () => {
     const syncUserId = userRef.current?.id;
-    if (!syncUserId || disposedRef.current) {
+    const syncSessionNonce = authSessionSnapshot();
+    if (!syncUserId || disposedRef.current || !isAuthSessionCurrent(syncSessionNonce)) {
       return; // Signed out/unmounted — local-only until the next sign-in.
     }
     if (syncBusyRef.current) {
@@ -89,6 +92,8 @@ export function useCloudSync(args: CloudSyncArgs): {
     try {
       const snapshot = stateRef.current;
       const meta = profileMetaRef.current;
+      const syncProfileRevision = meta.updatedAt;
+      const syncOAuthSnapshot = JSON.stringify(exportOAuthTokens());
       const result = await runChatSync({
         // Incognito threads never leave this tab.
         conversations: snapshot.conversations.filter((item) => item.incognito !== true),
@@ -99,8 +104,13 @@ export function useCloudSync(args: CloudSyncArgs): {
           payload: serializeProfile(snapshot.settings, snapshot.life),
           dirty: meta.updatedAt > meta.ackedAt,
         },
+        authSessionNonce: syncSessionNonce,
       });
-      if (disposedRef.current || userRef.current?.id !== syncUserId) {
+      if (
+        disposedRef.current ||
+        userRef.current?.id !== syncUserId ||
+        !isAuthSessionCurrent(syncSessionNonce)
+      ) {
         return; // A late response from the previous account must change nothing.
       }
       lastSyncAtRef.current = Date.now();
@@ -109,7 +119,10 @@ export function useCloudSync(args: CloudSyncArgs): {
         saveProfileMeta(meta);
       }
       const appliedProfile = result.profileApplied;
-      if (appliedProfile) {
+      const canApplyProfile =
+        meta.updatedAt === syncProfileRevision &&
+        JSON.stringify(exportOAuthTokens()) === syncOAuthSnapshot;
+      if (appliedProfile && canApplyProfile) {
         const parsed = parseProfilePayload(appliedProfile.payload);
         if (parsed) {
           // Settings and their OAuth grants are one account profile. Applying
@@ -124,6 +137,10 @@ export function useCloudSync(args: CloudSyncArgs): {
           meta.ackedAt = appliedProfile.updatedAt;
           saveProfileMeta(meta);
         }
+      } else if (appliedProfile) {
+        // A local settings/OAuth edit won while the pull was in flight. Never
+        // roll it back with this stale profile; reconcile from the fresh clock.
+        syncAgainRef.current = true;
       }
       if (result.oauthAdopted > 0) {
         // Adopted server-rotated MCP grants changed the sign-in map that rides

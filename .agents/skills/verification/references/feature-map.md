@@ -1,16 +1,15 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-30 · commit `6bf0c9c` (+ Luna suggestion model,
+Last synced: 2026-08-31 · commit `60ebb36` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
-stop/steering race fixes + stop watchdog (dead Stop button), GitHub run
-credential hand-off + server contents preflight + structured pin across
-Research/Julius + repo access probe, truthful MCP health + durable OAuth
-grant sync/refresh + server GitHub User-Agent and authenticated raw-file reads,
-Julius Verifier GitHub hand-off, MCP structured/resource content reads, honesty
-rule in default system prompts, skills-as-guidance research fix + empty-question
-guard, Intercom attachments, full 98-entry MCP live audit + relay/OAuth/cloud hardening)
-Drift check: `git log --oneline 6bf0c9c..HEAD`, then compare against
+stop/steering race fixes + stop watchdog, GitHub run credential hand-off +
+server contents preflight + structured pin across Research/Julius + repo access
+probe, truthful MCP health + durable OAuth grant sync/refresh, authenticated
+raw-file reads, Julius Verifier GitHub hand-off, MCP structured/resource reads,
+honesty prompts, skills-as-guidance research fix, Intercom attachments, full
+98-entry MCP audit, and cross-tab/account-session OAuth + sync race hardening)
+Drift check: `git log --oneline 60ebb36..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -743,6 +742,18 @@ sibling/server rotation first, and only a genuinely dead or expired
 non-refreshable grant drops to Sign in. Expired DCR registrations
 (client_secret_expires_at) re-register instead of failing from cache.
 
+Account/race boundary (2026-08-31): every Gera session has a persistent nonce
+shared by tabs; logout or account replacement invalidates pending auth, MCP
+popup, device-flow, refresh, relay and multi-round sync work before it can write
+or retry. PKCE verifiers live per tab, popup callback slots are per OAuth state,
+and only the newest per-server sign-in attempt may commit. Browser refreshes use
+Web Locks across tabs, then compare-and-swap the full grant; independent
+per-server token entries prevent simultaneous connectors from erasing each
+other. A profile pull applies only if neither its profile clock nor OAuth
+snapshot changed while it was in flight. Cloud refresh holds its single-flight
+through durable persistence, keeps a short completed-flight reuse window for
+stale callers, and rejects a rotation whose source grant was replaced meanwhile.
+
 File-result truth (2026-08-30): generic MCP calls preserve plain text,
 embedded text resources and `structuredContent`; opaque image/audio/blob base64
 is replaced by a short descriptor instead of crowding file text out of context.
@@ -758,8 +769,9 @@ in a long-open tab, and when the tab returns (the old mount-only pass often ran
 too early). A `connected` card with missing OAuth/key bypasses the freshness
 window and flips straight to a specific error; checks visibly enter Connecting
 and only return green after handshake + tools/list. GitHub 401 is an auth
-failure; 403/rate-limit is not mislabeled as "sign in again". Unit suites: `mcp-oauth-refresh.test.ts`,
-`mcp-rotation.test.ts`, `mcp-session.test.ts`.
+failure; 403/rate-limit is not mislabeled as "sign in again". Unit suites:
+`auth-boundary.test.ts`, `mcp-oauth-refresh.test.ts`, `mcp-rotation.test.ts`,
+`mcp-session.test.ts`.
 
 Full catalog + transport audit (2026-08-30): all 98 catalog rows were probed
 read-only. Of 94 generic connectable endpoints, 26 completed initialize +
@@ -773,7 +785,7 @@ Bearer, never key-in-URL), Exa (`x-api-key`), SearchAPI (`X-MCP-Token`), open
 Chainstack, Zapier (`/api/v1/connect` + connection token), Octagon's new host,
 and Datadog `/v1/mcp`; persisted legacy URLs migrate to the canonical rows.
 
-Relay/auth safety (2026-08-30): browser MCP, OAuth, and native Intercom relays
+Relay/auth safety (2026-08-31): browser MCP, OAuth, and native Intercom relays
 require a platform-verified invited Gera identity — they are no longer public
 CORS proxies. Gera's JWT occupies `Authorization`; provider Authorization is
 carried in a dedicated internal header and restored only after the account gate,
@@ -784,7 +796,9 @@ unsafe redirect targets; cross-origin POST redirects are refused. OAuth metadata
 must provide absolute HTTPS endpoints, matching issuer metadata and S256 when
 advertised; callback `iss` is checked when present, and every new grant is bound
 to the MCP URL that requested it. URL/key/header edits invalidate the cached
-session; a removed OAuth token cannot ride a stale in-memory header.
+session; a removed OAuth token cannot ride a stale in-memory header. Every
+relay retry and every chat-sync round stays pinned to the session that created
+its payload, so data from account A can never be retried with account B's JWT.
 
 Protocol/runtime parity (2026-08-30): browser and cloud resolve No auth / Bearer /
 custom headers / OAuth / auto identically, including provider-specific token
@@ -797,7 +811,10 @@ response bodies and flattened results are bounded. Mixed text +
 Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message that
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
-Regressions: `mcp-security.test.ts` plus the OAuth/session/file-content suites.
+Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
+OAuth/session/file-content suites. Full verification on 2026-08-31: 704 unit
+checks, 15 browser checks, web build, Worker deploy, live preview/ping and
+unauthenticated relay-gate smoke probes all passed.
 
 ## Settings (`/settings`)
 

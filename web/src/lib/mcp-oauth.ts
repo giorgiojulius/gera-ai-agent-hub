@@ -6,12 +6,20 @@
  * OAuth endpoints directly.
  */
 
+import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
 import { relayFetch } from "@/lib/backend";
 
 export const OAUTH_RESULT_KEY = "gera.mcp.oauth.result.v1";
+
+/** Per-state callback slot so an older popup cannot erase a newer attempt's result. */
+export function oauthResultStorageKey(state: string): string {
+  return state ? `${OAUTH_RESULT_KEY}.${state}` : OAUTH_RESULT_KEY;
+}
 export const OAUTH_TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
 export const OAUTH_TOKENS_CHANGED_EVENT = "gera:mcp-oauth-changed";
 const CLIENTS_KEY = "gera.mcp.oauth.clients.v1";
+const TOKEN_ENTRY_PREFIX = "gera.mcp.oauth.token.v2.";
+const ACTIVE_FLOW_PREFIX = "gera.mcp.oauth.flow.v1.";
 
 type StoredToken = {
   accessToken: string;
@@ -79,15 +87,67 @@ const CLOSED_POPUP_GRACE_MS = 10 * 60_000;
 const refreshInFlight = new Map<string, Promise<string | null>>();
 let oauthOperationGeneration = 0;
 
+/** Same-tab generation plus the persistent account boundary shared across tabs. */
+export type OAuthOperationBoundary = {
+  generation: number;
+  authSessionNonce: string;
+};
+
 /** Invalidates popup/refresh work that began under a previous Gera account. */
 export function invalidateOAuthOperations(): void {
   oauthOperationGeneration += 1;
   refreshInFlight.clear();
 }
 
-/** Snapshot used by external device flows so logout makes their late result inert. */
-export function currentOAuthOperationGeneration(): number {
-  return oauthOperationGeneration;
+/** Snapshot used by popup/device/refresh flows before their first await. */
+export function currentOAuthOperationBoundary(): OAuthOperationBoundary {
+  return {
+    generation: oauthOperationGeneration,
+    authSessionNonce: authSessionSnapshot(),
+  };
+}
+
+function isOAuthOperationCurrent(boundary: OAuthOperationBoundary): boolean {
+  return (
+    boundary.generation === oauthOperationGeneration &&
+    isAuthSessionCurrent(boundary.authSessionNonce)
+  );
+}
+
+export type OAuthGrantFlow = {
+  serverId: string;
+  flowId: string;
+  boundary: OAuthOperationBoundary;
+};
+
+function activeFlowKey(serverId: string): string {
+  return `${ACTIVE_FLOW_PREFIX}${encodeURIComponent(serverId)}`;
+}
+
+/** Registers the only sign-in/device attempt currently allowed to replace this server's grant. */
+export function beginOAuthGrantFlow(serverId: string): OAuthGrantFlow {
+  const flow = {
+    serverId,
+    flowId: randomString(),
+    boundary: currentOAuthOperationBoundary(),
+  };
+  window.localStorage.setItem(activeFlowKey(serverId), flow.flowId);
+  return flow;
+}
+
+function isOAuthGrantFlowCurrent(flow: OAuthGrantFlow): boolean {
+  return (
+    flow.serverId.length > 0 &&
+    isOAuthOperationCurrent(flow.boundary) &&
+    window.localStorage.getItem(activeFlowKey(flow.serverId)) === flow.flowId
+  );
+}
+
+/** Clears an attempt marker without ever cancelling the newer attempt that replaced it. */
+export function finishOAuthGrantFlow(flow: OAuthGrantFlow): void {
+  if (window.localStorage.getItem(activeFlowKey(flow.serverId)) === flow.flowId) {
+    window.localStorage.removeItem(activeFlowKey(flow.serverId));
+  }
 }
 
 /** OAuth discovery, registration, exchange, and refresh all use the authenticated Gera relay. */
@@ -167,6 +227,17 @@ function sameEndpoint(left: string, right: string): boolean {
   return left.replace(/\/$/, "") === right.replace(/\/$/, "");
 }
 
+function sameStoredGrant(left: StoredToken | undefined, right: StoredToken): boolean {
+  return (
+    left?.accessToken === right.accessToken &&
+    left.refreshToken === right.refreshToken &&
+    left.tokenEndpoint === right.tokenEndpoint &&
+    left.clientId === right.clientId &&
+    left.resource === right.resource &&
+    left.mcpUrl === right.mcpUrl
+  );
+}
+
 function tokenMatchesMcpUrl(token: StoredToken, mcpUrl?: string): boolean {
   if (!mcpUrl || !token.mcpUrl) {
     return true;
@@ -195,12 +266,75 @@ function saveJson(key: string, value: unknown): void {
   }
 }
 
-function loadTokens(): Record<string, StoredToken> {
-  return loadJson<Record<string, StoredToken>>(OAUTH_TOKENS_KEY) ?? {};
+function tokenEntryKey(serverId: string): string {
+  return `${TOKEN_ENTRY_PREFIX}${encodeURIComponent(serverId)}`;
 }
 
-/** Persists grants and tells profile sync that auth changed without exposing any credential. */
-function saveTokens(tokens: Record<string, StoredToken>, notify: boolean = true): void {
+function loadTokens(): Record<string, StoredToken> {
+  const tokens = loadJson<Record<string, StoredToken>>(OAUTH_TOKENS_KEY) ?? {};
+  try {
+    // Migrate legacy map entries independently. Per-server keys prevent two
+    // tabs writing different connectors from clobbering one another's grant.
+    for (const [serverId, token] of Object.entries(tokens)) {
+      const key = tokenEntryKey(serverId);
+      if (window.localStorage.getItem(key) === null) {
+        window.localStorage.setItem(key, JSON.stringify(token));
+      }
+    }
+    const storage = window.localStorage;
+    const length = typeof storage.length === "number" ? storage.length : 0;
+    for (let index = 0; index < length; index += 1) {
+      const key = storage.key(index);
+      if (!key?.startsWith(TOKEN_ENTRY_PREFIX)) {
+        continue;
+      }
+      const encodedId = key.slice(TOKEN_ENTRY_PREFIX.length);
+      let serverId: string;
+      try {
+        serverId = decodeURIComponent(encodedId);
+      } catch {
+        continue;
+      }
+      const raw = storage.getItem(key);
+      if (raw === "null") {
+        delete tokens[serverId];
+        continue;
+      }
+      try {
+        const token = parseStoredToken(raw ? JSON.parse(raw) : null);
+        if (token) {
+          tokens[serverId] = token;
+        }
+      } catch {
+        // Ignore malformed per-entry storage; the legacy copy may still recover it.
+      }
+    }
+  } catch {
+    // Restricted storage falls back to the legacy map already loaded above.
+  }
+  return tokens;
+}
+
+/** Commits independent server entries, refreshes the legacy mirror, and wakes profile sync. */
+function commitTokenChanges(
+  changes: Record<string, StoredToken | null>,
+  notify: boolean = true,
+): void {
+  try {
+    for (const [serverId, token] of Object.entries(changes)) {
+      window.localStorage.setItem(tokenEntryKey(serverId), token ? JSON.stringify(token) : "null");
+    }
+  } catch {
+    // The legacy mirror below remains the fallback in restricted storage.
+  }
+  const tokens = loadTokens();
+  for (const [serverId, token] of Object.entries(changes)) {
+    if (token) {
+      tokens[serverId] = token;
+    } else {
+      delete tokens[serverId];
+    }
+  }
   saveJson(OAUTH_TOKENS_KEY, tokens);
   if (!notify) {
     return;
@@ -278,6 +412,7 @@ export function adoptProfileOAuthTokens(raw: unknown): number {
     return 0;
   }
   const tokens = loadTokens();
+  const changes: Record<string, StoredToken | null> = {};
   let adopted = 0;
   for (const [serverId, value] of Object.entries(raw as Record<string, unknown>)) {
     if (!serverId) {
@@ -288,12 +423,13 @@ export function adoptProfileOAuthTokens(raw: unknown): number {
       continue;
     }
     tokens[serverId] = token;
+    changes[serverId] = token;
     adopted += 1;
   }
   if (adopted > 0) {
     // This is a remote profile application, not a new local mutation: do not
     // bump the profile clock and immediately echo it back.
-    saveTokens(tokens, false);
+    commitTokenChanges(changes, false);
   }
   return adopted;
 }
@@ -308,10 +444,8 @@ export function exportOAuthTokens(): Record<string, StoredToken> {
 }
 
 export function clearOAuthToken(serverId: string): void {
-  const tokens = loadTokens();
-  if (tokens[serverId]) {
-    delete tokens[serverId];
-    saveTokens(tokens);
+  if (loadTokens()[serverId]) {
+    commitTokenChanges({ [serverId]: null });
   }
 }
 
@@ -385,6 +519,7 @@ export function applyServerOAuthRotations(rotations: ServerOAuthRotation[]): num
     return 0;
   }
   const tokens = loadTokens();
+  const changes: Record<string, StoredToken | null> = {};
   let adopted = 0;
   for (const rotation of rotations) {
     const stored = tokens[rotation.serverId];
@@ -395,10 +530,11 @@ export function applyServerOAuthRotations(rotations: ServerOAuthRotation[]): num
       continue;
     }
     tokens[rotation.serverId] = rotation.token;
+    changes[rotation.serverId] = rotation.token;
     adopted += 1;
   }
   if (adopted > 0) {
-    saveTokens(tokens, false);
+    commitTokenChanges(changes, false);
   }
   return adopted;
 }
@@ -409,30 +545,32 @@ export function applyServerOAuthRotations(rotations: ServerOAuthRotation[]): num
  * repairs the session without a new sign-in; only a genuinely dead grant
  * falls through to Sign in.
  */
-async function adoptRotationFromServer(
+async function findRotationFromServer(
   serverId: string,
   currentAccessToken: string,
-): Promise<string | null> {
+  boundary: OAuthOperationBoundary,
+): Promise<StoredToken | null> {
   try {
+    if (!isOAuthOperationCurrent(boundary)) {
+      return null;
+    }
     const { authedFetch } = await import("@/lib/backend");
     const response = await authedFetch("/mcp/oauth-rotations");
-    if (!response.ok) {
+    if (!isOAuthOperationCurrent(boundary) || !response.ok) {
       return null;
     }
     const data = (await response.json()) as { rotations?: unknown };
-    const match = parseServerOAuthRotations(data.rotations).find(
-      (rotation) =>
-        rotation.serverId === serverId &&
-        rotation.token.accessToken !== currentAccessToken &&
-        rotation.bases.includes(currentAccessToken),
-    );
-    if (!match) {
+    if (!isOAuthOperationCurrent(boundary)) {
       return null;
     }
-    const tokens = loadTokens();
-    tokens[serverId] = match.token;
-    saveTokens(tokens);
-    return match.token.accessToken;
+    return (
+      parseServerOAuthRotations(data.rotations).find(
+        (rotation) =>
+          rotation.serverId === serverId &&
+          rotation.token.accessToken !== currentAccessToken &&
+          rotation.bases.includes(currentAccessToken),
+      )?.token ?? null
+    );
   } catch {
     return null;
   }
@@ -450,16 +588,15 @@ export function storeExternalOAuthToken(
     expiresAt?: number;
     tokenEndpoint: string;
     clientId: string;
+    resource?: string;
     mcpUrl?: string;
   },
-  expectedGeneration: number = oauthOperationGeneration,
+  flow: OAuthGrantFlow,
 ): boolean {
-  if (expectedGeneration !== oauthOperationGeneration) {
+  if (flow.serverId !== serverId || !isOAuthGrantFlowCurrent(flow)) {
     return false;
   }
-  const tokens = loadTokens();
-  tokens[serverId] = token;
-  saveTokens(tokens);
+  commitTokenChanges({ [serverId]: token });
   return true;
 }
 
@@ -501,75 +638,92 @@ export async function forceRefreshOAuthHeader(serverId: string): Promise<string 
   return refreshed ? `Bearer ${refreshed}` : null;
 }
 
+async function withCrossTabOAuthLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
+  if (typeof navigator !== "undefined" && navigator.locks) {
+    return navigator.locks.request(name, operation);
+  }
+  return operation();
+}
+
+function refreshLockName(stored: StoredToken): string {
+  // Exact same-origin lock key. It is neither logged nor persisted, and keeps
+  // duplicate server cards sharing one rotating grant in the same critical section.
+  return `gera:mcp-refresh:${JSON.stringify([
+    stored.tokenEndpoint,
+    stored.clientId,
+    stored.refreshToken ?? "",
+    stored.resource ?? "",
+    stored.mcpUrl ?? "",
+  ])}`;
+}
+
 /**
- * Single-flight refresh per server: concurrent tool calls share one token
- * request. Servers with refresh-token rotation revoke the whole grant when
- * the same refresh token is redeemed twice, so this must never race.
+ * Single-flight refresh across calls and browser tabs. The Web Lock is held
+ * through provider exchange + local commit, so a rotating token is redeemed once.
  */
 function refreshServerToken(serverId: string): Promise<string | null> {
   const inFlight = refreshInFlight.get(serverId);
   if (inFlight) {
     return inFlight;
   }
-  const generation = oauthOperationGeneration;
-  const task = (async (): Promise<string | null> => {
-    const stored = loadTokens()[serverId];
-    if (!stored?.refreshToken) {
+  const boundary = currentOAuthOperationBoundary();
+  const stored = loadTokens()[serverId];
+  if (!stored?.refreshToken) {
+    return Promise.resolve(null);
+  }
+  const task = withCrossTabOAuthLock(refreshLockName(stored), async (): Promise<string | null> => {
+    if (!isOAuthOperationCurrent(boundary)) {
+      return null;
+    }
+    const before = loadTokens()[serverId];
+    if (before?.accessToken && !sameStoredGrant(before, stored)) {
+      return before.accessToken;
+    }
+    if (!sameStoredGrant(before, stored)) {
       return null;
     }
     try {
       const refreshed = await refreshAccessToken(stored);
-      if (generation !== oauthOperationGeneration) {
+      if (!isOAuthOperationCurrent(boundary)) {
         return null;
       }
-      const tokens = loadTokens();
-      const latest = tokens[serverId];
-      // A user or sibling tab may have completed a fresh sign-in while this
-      // refresh was in flight. Never let the old grant overwrite that winner.
-      if (
-        latest?.accessToken &&
-        (latest.accessToken !== stored.accessToken || latest.refreshToken !== stored.refreshToken)
-      ) {
+      const latest = loadTokens()[serverId];
+      if (latest?.accessToken && !sameStoredGrant(latest, stored)) {
         return latest.accessToken;
       }
-      tokens[serverId] = refreshed;
-      saveTokens(tokens);
+      if (!sameStoredGrant(latest, stored)) {
+        return null;
+      }
+      commitTokenChanges({ [serverId]: refreshed });
       return refreshed.accessToken;
     } catch (error) {
-      if (generation !== oauthOperationGeneration) {
+      if (!isOAuthOperationCurrent(boundary)) {
         return null;
       }
       if (error instanceof OAuthTokenError && FATAL_REFRESH_CODES.has(error.code)) {
-        // Rotation makes refresh tokens single-use: when another tab redeemed
-        // this pair first, its success is our invalid_grant. Never destroy
-        // the fresher pair that tab stored — adopt it instead.
         const sibling = loadTokens()[serverId];
-        if (
-          sibling?.accessToken &&
-          (sibling.accessToken !== stored.accessToken || sibling.refreshToken !== stored.refreshToken)
-        ) {
+        if (sibling?.accessToken && !sameStoredGrant(sibling, stored)) {
           return sibling.accessToken;
         }
-        // "Dead" also happens when a server run rotated this grant while the
-        // browser slept — adopt the server's fresh pair when it chains from ours.
-        const rescued = await adoptRotationFromServer(serverId, stored.accessToken);
-        if (rescued) {
-          return rescued;
+        const rescued = await findRotationFromServer(serverId, stored.accessToken, boundary);
+        if (!isOAuthOperationCurrent(boundary)) {
+          return null;
         }
-        // The rescue took network time — re-check for a sibling write before
-        // the destructive step. Only a genuinely dead grant drops to Sign in.
         const latest = loadTokens()[serverId];
-        if (
-          latest?.accessToken &&
-          (latest.accessToken !== stored.accessToken || latest.refreshToken !== stored.refreshToken)
-        ) {
+        if (latest?.accessToken && !sameStoredGrant(latest, stored)) {
           return latest.accessToken;
         }
-        clearOAuthToken(serverId);
+        if (rescued && sameStoredGrant(latest, stored)) {
+          commitTokenChanges({ [serverId]: rescued });
+          return rescued.accessToken;
+        }
+        if (sameStoredGrant(latest, stored)) {
+          commitTokenChanges({ [serverId]: null });
+        }
       }
       return null;
     }
-  })();
+  });
   refreshInFlight.set(serverId, task);
   void task.finally(() => {
     if (refreshInFlight.get(serverId) === task) {
@@ -595,13 +749,14 @@ export async function runOAuthSignIn(
   if (!popup) {
     throw new Error("Popup was blocked. Allow popups for this site and press Sign in again.");
   }
-  const generation = oauthOperationGeneration;
+  const flow = beginOAuthGrantFlow(server.id);
   const ensureCurrentAccount = (): void => {
-    if (generation !== oauthOperationGeneration) {
+    if (!isOAuthGrantFlowCurrent(flow)) {
       throw new Error("The Gera account changed while this sign-in was open. Start it again.");
     }
   };
   let registrationKey: string | null = null;
+  let resultKey: string | null = null;
   try {
     const redirectUri = `${window.location.origin}/oauth/callback`;
     const mcpUrl = canonicalMcpUrl(server.url);
@@ -609,12 +764,15 @@ export async function runOAuthSignIn(
     ensureCurrentAccount();
     registrationKey = meta.registrationEndpoint ?? "";
     const clientId = await ensureClient(meta.registrationEndpoint, redirectUri);
+    ensureCurrentAccount();
     const verifier = randomString();
     const challenge = await sha256Base64Url(verifier);
+    ensureCurrentAccount();
     const state = randomString();
+    resultKey = oauthResultStorageKey(state);
 
     try {
-      window.localStorage.removeItem(OAUTH_RESULT_KEY);
+      window.localStorage.removeItem(resultKey);
     } catch {
       // ignore
     }
@@ -636,7 +794,7 @@ export async function runOAuthSignIn(
 
     popup.location.replace(authorizeUrl.toString());
 
-    const code = await waitForCallback(state, popup, meta.issuer);
+    const code = await waitForCallback(state, popup, meta.issuer, resultKey);
     ensureCurrentAccount();
     const token = await exchangeCode({
       tokenEndpoint: meta.tokenEndpoint,
@@ -649,9 +807,9 @@ export async function runOAuthSignIn(
     });
 
     ensureCurrentAccount();
-    const tokens = loadTokens();
-    tokens[server.id] = token;
-    saveTokens(tokens);
+    if (!storeExternalOAuthToken(server.id, token, flow)) {
+      throw new Error("The Gera account changed while this sign-in was open. Start it again.");
+    }
   } catch (error) {
     // A registration the provider expired or revoked would fail every future
     // sign-in straight from cache — forget it so the next attempt re-registers.
@@ -665,8 +823,11 @@ export async function runOAuthSignIn(
     }
     throw error;
   } finally {
+    finishOAuthGrantFlow(flow);
     try {
-      window.localStorage.removeItem(OAUTH_RESULT_KEY);
+      if (resultKey) {
+        window.localStorage.removeItem(resultKey);
+      }
     } catch {
       // ignore
     }
@@ -890,7 +1051,12 @@ async function ensureClient(registrationEndpoint: string | undefined, redirectUr
   return clientId;
 }
 
-function waitForCallback(state: string, popup: Window, expectedIssuer?: string): Promise<string> {
+function waitForCallback(
+  state: string,
+  popup: Window,
+  expectedIssuer: string | undefined,
+  resultKey: string,
+): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     let settled = false;
     let closeGraceTimer: number | null = null;
@@ -939,7 +1105,7 @@ function waitForCallback(state: string, popup: Window, expectedIssuer?: string):
       }
     };
     const onStorage = (event: StorageEvent) => {
-      if (event.key === OAUTH_RESULT_KEY && event.newValue) {
+      if (event.key === resultKey && event.newValue) {
         try {
           handlePayload(JSON.parse(event.newValue) as CallbackPayload);
         } catch {
@@ -952,14 +1118,14 @@ function waitForCallback(state: string, popup: Window, expectedIssuer?: string):
     window.addEventListener("storage", onStorage);
 
     const poller = window.setInterval(() => {
-      const raw = loadJson<CallbackPayload>(OAUTH_RESULT_KEY);
+      const raw = loadJson<CallbackPayload>(resultKey);
       if (raw) {
         handlePayload(raw);
         return;
       }
       if (popup.closed && closeGraceTimer === null) {
         closeGraceTimer = window.setTimeout(() => {
-          const late = loadJson<CallbackPayload>(OAUTH_RESULT_KEY);
+          const late = loadJson<CallbackPayload>(resultKey);
           if (late) {
             handlePayload(late);
           }

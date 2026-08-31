@@ -6,10 +6,16 @@ import { invalidateOAuthOperations } from "@/lib/mcp-oauth";
 import {
   ACCESS_TOKEN_KEY,
   APP_KEY,
+  AUTH_FLOW_ATTEMPT_KEY,
+  AUTH_FLOW_NONCE_KEY,
+  AUTH_SESSION_NONCE_KEY,
   AUTH_URL,
   CODE_VERIFIER_KEY,
   REFRESH_TOKEN_KEY,
+  authSessionSnapshot,
   clearTokens,
+  invalidateAuthSession,
+  isAuthSessionCurrent,
   refreshAccessToken,
 } from "@/lib/auth-tokens";
 
@@ -29,6 +35,23 @@ function generateCodeVerifier(): string {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
+}
+
+function isAuthFlowCurrent(attemptId: string, sessionNonce: string): boolean {
+  return (
+    attemptId.length > 0 &&
+    sessionStorage.getItem(AUTH_FLOW_ATTEMPT_KEY) === attemptId &&
+    isAuthSessionCurrent(sessionNonce)
+  );
+}
+
+function clearAuthFlowIfCurrent(attemptId: string): void {
+  if (sessionStorage.getItem(AUTH_FLOW_ATTEMPT_KEY) !== attemptId) {
+    return;
+  }
+  sessionStorage.removeItem(CODE_VERIFIER_KEY);
+  sessionStorage.removeItem(AUTH_FLOW_NONCE_KEY);
+  sessionStorage.removeItem(AUTH_FLOW_ATTEMPT_KEY);
 }
 
 async function generateCodeChallenge(verifier: string): Promise<string> {
@@ -80,6 +103,17 @@ function userFromToken(token: string): AuthUser | null {
   }
 }
 
+function bindLocalStateToAccount(nextUser: AuthUser): void {
+  const previousOwner = localStorage.getItem(ACCOUNT_OWNER_KEY);
+  if (previousOwner && previousOwner !== nextUser.id) {
+    invalidateAuthSession();
+    invalidateOAuthOperations();
+    clearMcpSessionCache();
+    clearLocalAccountState();
+  }
+  localStorage.setItem(ACCOUNT_OWNER_KEY, nextUser.id);
+}
+
 type AuthContextType = {
   user: AuthUser | null;
   isLoading: boolean;
@@ -100,12 +134,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const messageListenerRef = useRef<((event: MessageEvent) => void) | null>(null);
+  const signInAttemptRef = useRef<string | null>(null);
 
   const clearError = useCallback(() => setError(null), []);
 
   const signOut = useCallback(() => {
     // GitHub/MCP credentials, private repo names, chats, and profile clocks
     // are account-scoped. Nothing from this identity may survive into the next.
+    invalidateAuthSession();
     invalidateOAuthOperations();
     clearMcpSessionCache();
     clearLocalAccountState();
@@ -116,14 +152,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    const bootSession = authSessionSnapshot();
     const boot = async () => {
       try {
         const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
         if (accessToken) {
           const decoded = userFromToken(accessToken);
           if (decoded) {
-            if (!cancelled) {
-              localStorage.setItem(ACCOUNT_OWNER_KEY, decoded.id);
+            if (!cancelled && isAuthSessionCurrent(bootSession)) {
+              bindLocalStateToAccount(decoded);
               setUser(decoded);
             }
             return;
@@ -131,12 +168,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         if (localStorage.getItem(REFRESH_TOKEN_KEY)) {
           const refreshed = await refreshAccessToken();
-          if (!cancelled) {
-            if (refreshed) {
-              const decoded = userFromToken(refreshed);
-              if (decoded) {
-                localStorage.setItem(ACCOUNT_OWNER_KEY, decoded.id);
-              }
+          if (!cancelled && isAuthSessionCurrent(bootSession)) {
+            const decoded = refreshed ? userFromToken(refreshed) : null;
+            if (decoded) {
+              bindLocalStateToAccount(decoded);
               setUser(decoded);
             } else {
               clearTokens();
@@ -155,7 +190,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    const onStorage = (event: StorageEvent): void => {
+      if (event.key === AUTH_SESSION_NONCE_KEY) {
+        invalidateOAuthOperations();
+        clearMcpSessionCache();
+      }
+      if (event.key === ACCESS_TOKEN_KEY) {
+        setUser(event.newValue ? userFromToken(event.newValue) : null);
+      }
+    };
+    window.addEventListener("storage", onStorage);
     return () => {
+      window.removeEventListener("storage", onStorage);
       if (messageListenerRef.current) {
         window.removeEventListener("message", messageListenerRef.current);
         messageListenerRef.current = null;
@@ -163,23 +209,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const exchangeCode = useCallback(async (code: string) => {
-    const verifier = localStorage.getItem(CODE_VERIFIER_KEY);
-    if (!verifier) {
+  const exchangeCode = useCallback(async (code: string, expectedAttemptId?: string) => {
+    const verifier = sessionStorage.getItem(CODE_VERIFIER_KEY);
+    const flowNonce = sessionStorage.getItem(AUTH_FLOW_NONCE_KEY) ?? "";
+    const attemptId = sessionStorage.getItem(AUTH_FLOW_ATTEMPT_KEY) ?? "";
+    if (
+      !verifier ||
+      !isAuthFlowCurrent(attemptId, flowNonce) ||
+      (expectedAttemptId !== undefined && expectedAttemptId !== attemptId)
+    ) {
       setError("Sign-in session expired — please try again.");
       return;
     }
-    localStorage.removeItem(CODE_VERIFIER_KEY);
 
     const response = await fetch(`${AUTH_URL}/oauth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ app_key: APP_KEY, code, code_verifier: verifier }),
     });
-
+    if (!isAuthFlowCurrent(attemptId, flowNonce)) {
+      return;
+    }
     if (!response.ok) {
       const body = (await response.json().catch(() => ({}))) as { error?: string };
-      setError(body.error ?? `Sign in failed (${response.status})`);
+      if (isAuthFlowCurrent(attemptId, flowNonce)) {
+        setError(body.error ?? `Sign in failed (${response.status})`);
+        clearAuthFlowIfCurrent(attemptId);
+      }
       return;
     }
 
@@ -188,19 +244,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refresh_token: string;
       user: AuthUser;
     };
-    // A different identity starts from a clean browser copy, then pulls only
-    // its cloud state. Re-authenticating the same account keeps unsynced local
-    // drafts/queue instead of destroying them.
+    if (!isAuthFlowCurrent(attemptId, flowNonce)) {
+      return;
+    }
     const nextUser = data.user ?? userFromToken(data.access_token);
+    if (!nextUser) {
+      setError("Sign in returned no account identity — please try again.");
+      clearAuthFlowIfCurrent(attemptId);
+      return;
+    }
+    // Every successful exchange starts a fresh async boundary. A different
+    // identity also starts from an empty browser copy and pulls only its cloud state.
     const previousOwner = localStorage.getItem(ACCOUNT_OWNER_KEY);
+    clearAuthFlowIfCurrent(attemptId);
+    invalidateAuthSession();
+    invalidateOAuthOperations();
     clearMcpSessionCache();
-    if (previousOwner && nextUser && previousOwner !== nextUser.id) {
-      invalidateOAuthOperations();
+    if (previousOwner !== nextUser.id) {
       clearLocalAccountState();
     }
-    if (nextUser) {
-      localStorage.setItem(ACCOUNT_OWNER_KEY, nextUser.id);
-    }
+    localStorage.setItem(ACCOUNT_OWNER_KEY, nextUser.id);
     localStorage.setItem(ACCESS_TOKEN_KEY, data.access_token);
     localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
     setUser(nextUser);
@@ -210,12 +273,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (provider: "google" | "apple") => {
       setIsSigningIn(true);
       setError(null);
+      const flowNonce = authSessionSnapshot();
+      const attemptId = generateCodeVerifier();
+      signInAttemptRef.current = attemptId;
       try {
         const verifier = generateCodeVerifier();
         const challenge = await generateCodeChallenge(verifier);
+        if (!isAuthSessionCurrent(flowNonce) || signInAttemptRef.current !== attemptId) {
+          return;
+        }
         // Persist across the OAuth roundtrip — the popup closes and the
         // production flow navigates away and back.
-        localStorage.setItem(CODE_VERIFIER_KEY, verifier);
+        sessionStorage.setItem(CODE_VERIFIER_KEY, verifier);
+        sessionStorage.setItem(AUTH_FLOW_NONCE_KEY, flowNonce);
+        sessionStorage.setItem(AUTH_FLOW_ATTEMPT_KEY, attemptId);
 
         const isPreview = window.parent !== window;
         const body: Record<string, unknown> = {
@@ -235,8 +306,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           body: JSON.stringify(body),
         });
 
+        if (!isAuthFlowCurrent(attemptId, flowNonce)) {
+          return;
+        }
         if (!response.ok) {
-          localStorage.removeItem(CODE_VERIFIER_KEY);
+          clearAuthFlowIfCurrent(attemptId);
           const errorBody = (await response.json().catch(() => ({}))) as { error?: string };
           setError(errorBody.error ?? `Sign in failed (${response.status})`);
           return;
@@ -248,14 +322,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const popup = window.open(authUrl, "_blank", "width=500,height=650");
           if (!popup) {
             setError("Popup blocked — please allow popups for this site.");
-            localStorage.removeItem(CODE_VERIFIER_KEY);
+            clearAuthFlowIfCurrent(attemptId);
             return;
           }
 
           await new Promise<void>((resolve) => {
             const onMessage = (event: MessageEvent) => {
               const payload = event.data as { type?: string; code?: string } | null;
-              if (!payload || payload.type !== "rork_auth_callback") {
+              if (
+                !payload ||
+                payload.type !== "rork_auth_callback" ||
+                !isAuthFlowCurrent(attemptId, flowNonce)
+              ) {
                 return;
               }
               window.removeEventListener("message", onMessage);
@@ -263,7 +341,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               clearInterval(pollTimer);
               const finish = async () => {
                 if (payload.code) {
-                  await exchangeCode(payload.code);
+                  await exchangeCode(payload.code, attemptId);
                 }
                 resolve();
               };
@@ -277,7 +355,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 clearInterval(pollTimer);
                 window.removeEventListener("message", onMessage);
                 messageListenerRef.current = null;
-                localStorage.removeItem(CODE_VERIFIER_KEY);
+                clearAuthFlowIfCurrent(attemptId);
                 resolve();
               }
             }, 500);
@@ -286,11 +364,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           window.location.href = authUrl;
         }
       } catch (err) {
-        console.error("Sign in failed:", err);
-        setError(err instanceof Error ? err.message : "Sign in failed");
-        localStorage.removeItem(CODE_VERIFIER_KEY);
+        if (isAuthFlowCurrent(attemptId, flowNonce)) {
+          console.error("Sign in failed:", err);
+          setError(err instanceof Error ? err.message : "Sign in failed");
+          clearAuthFlowIfCurrent(attemptId);
+        }
       } finally {
-        setIsSigningIn(false);
+        if (signInAttemptRef.current === attemptId) {
+          signInAttemptRef.current = null;
+          setIsSigningIn(false);
+        }
       }
     },
     [exchangeCode],

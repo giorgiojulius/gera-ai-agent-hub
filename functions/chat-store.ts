@@ -477,6 +477,16 @@ export class ChatStore extends DurableObject {
     for (const id of staleIds) {
       await this.ctx.storage.delete(`${oauthRefPrefix}${id}`);
     }
+    const persistOAuth = async (rotated: RefreshedOAuth): Promise<void> => {
+      await this.assertOAuthRotationCurrent(owner, rotated);
+      const bases = chainRotationBases(appliedChains, rotated);
+      await this.ctx.storage.put(`${oauthRefPrefix}${rotated.serverId}`, {
+        bases,
+        token: rotated.token,
+      });
+      appliedChains.set(rotated.serverId, bases);
+      oauthTokens[rotated.serverId] = rotated.token;
+    };
 
     const automations = (Array.isArray(settings.automations) ? settings.automations : [])
       .map(storedAutomation)
@@ -588,7 +598,7 @@ export class ChatStore extends DurableObject {
       const job = this.buildClaimJob(owner, { ...item.auto, prompt: runPrompt }, settings, life, oauthTokens);
       let result: AutomationRunResult;
       try {
-        result = await runAutomationJob(job, authKey, deadlineAt);
+        result = await runAutomationJob(job, authKey, deadlineAt, persistOAuth);
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown error";
         console.error("automation run failed", item.auto.id, message);
@@ -598,20 +608,6 @@ export class ChatStore extends DurableObject {
           sources: [],
           refreshedOAuth: [],
         };
-      }
-      // Persist rotated grants before anything else — with refresh-token
-      // rotation the old pair is already dead at the provider, so losing the
-      // new one would strand every later run. The chain keeps every
-      // superseded access token, so sync and the browser's own copy can
-      // recognize the rotation and adopt the fresh pair.
-      for (const rotated of result.refreshedOAuth) {
-        const bases = chainRotationBases(appliedChains, rotated);
-        await this.ctx.storage.put(`${oauthRefPrefix}${rotated.serverId}`, {
-          bases,
-          token: rotated.token,
-        });
-        appliedChains.set(rotated.serverId, bases);
-        oauthTokens[rotated.serverId] = rotated.token; // later jobs in this batch use the live grant
       }
       this.appendRun(owner, {
         automationId: item.auto.id,
@@ -632,6 +628,30 @@ export class ChatStore extends DurableObject {
       [NEXT_DUE_HEADER]: String(finalNext),
       [HOOKS_HEADER]: this.hooksIndexValue(profileRow.payload),
     });
+  }
+
+  /** Rejects a late refresh when the synced/overlaid grant changed while the provider request awaited. */
+  private async assertOAuthRotationCurrent(owner: string, rotated: RefreshedOAuth): Promise<void> {
+    const profileRow = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    let parsed: unknown = null;
+    try {
+      parsed = profileRow ? JSON.parse(profileRow.payload) : null;
+    } catch {
+      parsed = null;
+    }
+    const raw = isRecord(parsed) ? parsed.mcpOAuth : undefined;
+    const tokens = cloudOAuthTokens(raw);
+    const key = `${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`;
+    const existing = normalizeOAuthOverride(rotated.serverId, await this.ctx.storage.get<unknown>(key));
+    if (existing) {
+      overlayOAuthRotations(tokens, [existing]);
+    }
+    const currentAccess = tokens[rotated.serverId]?.accessToken;
+    if (currentAccess !== rotated.baseAccessToken && currentAccess !== rotated.token.accessToken) {
+      throw new Error("stale OAuth refresh result");
+    }
   }
 
   /**
@@ -710,20 +730,21 @@ export class ChatStore extends DurableObject {
       (server) => server.kind === "mcp",
     );
     const refreshed: RefreshedOAuth[] = [];
+    const persistOAuth = async (rotated: RefreshedOAuth): Promise<void> => {
+      await this.assertOAuthRotationCurrent(owner, rotated);
+      const bases = chainRotationBases(appliedChains, rotated);
+      await this.ctx.storage.put(`${prefix}${rotated.serverId}`, { bases, token: rotated.token });
+      appliedChains.set(rotated.serverId, bases);
+    };
     for (const server of servers) {
       if (!server.oauth) {
         continue;
       }
       if (force.has(server.id)) {
-        await forceRefreshCloudOAuth(server, refreshed);
+        await forceRefreshCloudOAuth(server, refreshed, persistOAuth);
       } else {
-        await ensureFreshCloudOAuth(server, refreshed);
+        await ensureFreshCloudOAuth(server, refreshed, persistOAuth);
       }
-    }
-    for (const rotated of refreshed) {
-      const bases = chainRotationBases(appliedChains, rotated);
-      await this.ctx.storage.put(`${prefix}${rotated.serverId}`, { bases, token: rotated.token });
-      appliedChains.set(rotated.serverId, bases);
     }
     return json({ servers });
   }

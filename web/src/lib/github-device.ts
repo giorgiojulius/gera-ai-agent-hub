@@ -9,8 +9,10 @@
 // forwards them verbatim and never stores tokens.
 import { relayFetch } from "@/lib/backend";
 import {
-  currentOAuthOperationGeneration,
+  beginOAuthGrantFlow,
+  finishOAuthGrantFlow,
   storeExternalOAuthToken,
+  type OAuthGrantFlow,
 } from "@/lib/mcp-oauth";
 
 const DEVICE_CODE_URL = "https://github.com/login/device/code";
@@ -43,8 +45,8 @@ export type GitHubDeviceSession = {
   verificationUri: string;
   intervalMs: number;
   expiresAt: number;
-  /** Account-generation snapshot; a logout makes this device flow inert. */
-  operationGeneration?: number;
+  /** Per-server attempt + cross-tab account boundary. */
+  operationFlow: OAuthGrantFlow;
 };
 
 /** Identity + granted scopes behind a GitHub token — the honest "who am I". */
@@ -172,13 +174,22 @@ export async function startGitHubDeviceFlow(): Promise<GitHubDeviceSession> {
   if (!clientId) {
     throw new Error("GitHub sign-in is not configured for this workspace yet.");
   }
-  const data = await postForm(DEVICE_CODE_URL, { client_id: clientId, scope: SCOPES });
+  const operationFlow = beginOAuthGrantFlow("github");
+  let data: Record<string, unknown>;
+  try {
+    data = await postForm(DEVICE_CODE_URL, { client_id: clientId, scope: SCOPES });
+  } catch (error) {
+    finishOAuthGrantFlow(operationFlow);
+    throw error;
+  }
   if (typeof data.error === "string" && data.error) {
+    finishOAuthGrantFlow(operationFlow);
     throw new Error(deviceErrorMessage(data));
   }
   const deviceCode = typeof data.device_code === "string" ? data.device_code : "";
   const userCode = typeof data.user_code === "string" ? data.user_code : "";
   if (!deviceCode || !userCode) {
+    finishOAuthGrantFlow(operationFlow);
     throw new Error("GitHub did not return a device code — double-check the OAuth app's client ID.");
   }
   const interval = typeof data.interval === "number" ? data.interval : 5;
@@ -192,7 +203,7 @@ export async function startGitHubDeviceFlow(): Promise<GitHubDeviceSession> {
         : "https://github.com/login/device",
     intervalMs: Math.max(interval, 5) * 1000,
     expiresAt: Date.now() + expiresIn * 1000,
-    operationGeneration: currentOAuthOperationGeneration(),
+    operationFlow,
   };
 }
 
@@ -210,7 +221,8 @@ export async function pollGitHubDeviceToken(
     return false;
   }
   let interval = session.intervalMs;
-  while (!isCancelled()) {
+  try {
+    while (!isCancelled()) {
     if (Date.now() > session.expiresAt) {
       throw new Error("The code expired before authorization — start sign-in again.");
     }
@@ -218,12 +230,15 @@ export async function pollGitHubDeviceToken(
     if (isCancelled()) {
       return false;
     }
-    const data = await postForm(TOKEN_URL, {
-      client_id: clientId,
-      device_code: session.deviceCode,
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-    });
-    if (typeof data.access_token === "string" && data.access_token) {
+      const data = await postForm(TOKEN_URL, {
+        client_id: clientId,
+        device_code: session.deviceCode,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      });
+      if (isCancelled()) {
+        return false;
+      }
+      if (typeof data.access_token === "string" && data.access_token) {
       const expiresIn = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in);
       const stored = storeExternalOAuthToken("github", {
         accessToken: data.access_token,
@@ -232,9 +247,9 @@ export async function pollGitHubDeviceToken(
         tokenEndpoint: TOKEN_URL,
         clientId,
         mcpUrl: "https://api.github.com",
-      }, session.operationGeneration ?? currentOAuthOperationGeneration());
-      return stored;
-    }
+      }, session.operationFlow);
+        return stored;
+      }
     const code = typeof data.error === "string" ? data.error : "";
     if (code === "authorization_pending") {
       continue;
@@ -243,9 +258,12 @@ export async function pollGitHubDeviceToken(
       interval += 5000;
       continue;
     }
-    throw new Error(deviceErrorMessage(data));
+      throw new Error(deviceErrorMessage(data));
+    }
+    return false;
+  } finally {
+    finishOAuthGrantFlow(session.operationFlow);
   }
-  return false;
 }
 
 function sleep(ms: number): Promise<void> {

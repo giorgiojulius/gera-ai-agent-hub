@@ -5,15 +5,20 @@
 // defense for each mechanism.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { invalidateAuthSession } from "@/lib/auth-tokens";
 import {
   OAUTH_TOKENS_CHANGED_EVENT,
   adoptProfileOAuthTokens,
+  beginOAuthGrantFlow,
   composeAuthScope,
+  exportOAuthTokens,
   forceRefreshOAuthHeader,
   hasOAuthToken,
   isClientRegistrationUsable,
   invalidateOAuthOperations,
   oauthAuthHeader,
+  oauthResultStorageKey,
+  storeExternalOAuthToken,
 } from "@/lib/mcp-oauth";
 
 const TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
@@ -28,6 +33,10 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     store = new Map<string, string>();
     dispatchEvent = vi.fn();
     const storage = {
+      get length(): number {
+        return store.size;
+      },
+      key: (index: number): string | null => [...store.keys()][index] ?? null,
       getItem: (key: string) => store.get(key) ?? null,
       setItem: (key: string, value: string) => void store.set(key, value),
       removeItem: (key: string) => void store.delete(key),
@@ -42,7 +51,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
 
   function seedToken(id: string, accessToken: string, refreshToken: string): void {
     const map = JSON.parse(store.get(TOKENS_KEY) ?? "{}") as Record<string, unknown>;
-    map[id] = {
+    const token = {
       accessToken,
       refreshToken,
       tokenEndpoint: "https://auth.example/token",
@@ -50,7 +59,17 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
       // Long expired so forceRefresh has a reason to redeem.
       expiresAt: 1,
     };
+    map[id] = token;
     store.set(TOKENS_KEY, JSON.stringify(map));
+    store.set(`gera.mcp.oauth.token.v2.${encodeURIComponent(id)}`, JSON.stringify(token));
+  }
+
+  function clearStoredOAuth(): void {
+    for (const key of [...store.keys()]) {
+      if (key.startsWith("gera.mcp.oauth.")) {
+        store.delete(key);
+      }
+    }
   }
 
   function storedToken(id: string): { accessToken: string; refreshToken?: string } | undefined {
@@ -94,7 +113,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     expect(storedToken("race")?.refreshToken).toBe("RU");
   });
 
-  it("cannot repopulate an old account after logout invalidates an in-flight refresh", async () => {
+  it("cannot repopulate an old account after another tab replaces the auth session", async () => {
     seedToken("logout-race", "A", "RA");
     let finish: ((response: StubResponse) => void) | undefined;
     vi.stubGlobal(
@@ -109,8 +128,8 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
 
     const pending = forceRefreshOAuthHeader("logout-race");
     await Promise.resolve();
-    invalidateOAuthOperations();
-    store.delete(TOKENS_KEY);
+    invalidateAuthSession();
+    clearStoredOAuth();
     finish?.({
       ok: true,
       status: 200,
@@ -119,6 +138,111 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
 
     await expect(pending).resolves.toBeNull();
     expect(storedToken("logout-race")).toBeUndefined();
+  });
+
+  it("cannot commit a delayed server-rotation rescue after logout", async () => {
+    seedToken("rescue-race", "A", "RA");
+    let finishRescue: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+        if (String(input).includes("oauth-proxy")) {
+          return new Response(JSON.stringify({ error: "invalid_grant" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Promise<Response>((resolve) => {
+          finishRescue = resolve;
+        });
+      }),
+    );
+
+    const pending = forceRefreshOAuthHeader("rescue-race");
+    for (let turn = 0; turn < 20 && !finishRescue; turn += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(finishRescue).toBeTypeOf("function");
+    invalidateAuthSession();
+    clearStoredOAuth();
+    finishRescue?.(
+      new Response(
+        JSON.stringify({
+          rotations: [
+            {
+              serverId: "rescue-race",
+              bases: ["A"],
+              token: {
+                accessToken: "SERVER-NEW",
+                refreshToken: "SERVER-REFRESH",
+                tokenEndpoint: "https://auth.example/token",
+                clientId: "client-1",
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await expect(pending).resolves.toBeNull();
+    expect(storedToken("rescue-race")).toBeUndefined();
+  });
+
+  it("rejects a late external/device token across the persistent account boundary", () => {
+    const flow = beginOAuthGrantFlow("github");
+    invalidateAuthSession();
+    const stored = storeExternalOAuthToken(
+      "github",
+      {
+        accessToken: "old-account-token",
+        tokenEndpoint: "https://github.com/login/oauth/access_token",
+        clientId: "client",
+      },
+      flow,
+    );
+    expect(stored).toBe(false);
+    expect(storedToken("github")).toBeUndefined();
+  });
+
+  it("lets only the newest sign-in attempt replace a server grant", () => {
+    const oldFlow = beginOAuthGrantFlow("same-server");
+    const newFlow = beginOAuthGrantFlow("same-server");
+    const oldStored = storeExternalOAuthToken(
+      "same-server",
+      { accessToken: "old", tokenEndpoint: "https://auth.example/token", clientId: "client-1" },
+      oldFlow,
+    );
+    const newStored = storeExternalOAuthToken(
+      "same-server",
+      { accessToken: "new", tokenEndpoint: "https://auth.example/token", clientId: "client-1" },
+      newFlow,
+    );
+    expect(oldStored).toBe(false);
+    expect(newStored).toBe(true);
+    expect(storedToken("same-server")?.accessToken).toBe("new");
+  });
+
+  it("keeps unrelated grants in independent per-server storage", () => {
+    const firstFlow = beginOAuthGrantFlow("first");
+    const secondFlow = beginOAuthGrantFlow("second");
+    storeExternalOAuthToken(
+      "first",
+      { accessToken: "one", tokenEndpoint: "https://auth.example/token", clientId: "client-1" },
+      firstFlow,
+    );
+    storeExternalOAuthToken(
+      "second",
+      { accessToken: "two", tokenEndpoint: "https://auth.example/token", clientId: "client-1" },
+      secondFlow,
+    );
+    // Simulate a stale tab clobbering only the legacy compatibility mirror.
+    store.set(TOKENS_KEY, JSON.stringify({ second: storedToken("second") }));
+    expect(Object.keys(exportOAuthTokens()).sort()).toEqual(["first", "second"]);
+  });
+
+  it("isolates popup callback storage by OAuth state", () => {
+    expect(oauthResultStorageKey("state-a")).not.toBe(oauthResultStorageKey("state-b"));
   });
 
   it("does not overwrite a fresh sign-in when an older successful refresh lands late", async () => {

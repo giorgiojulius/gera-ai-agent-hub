@@ -1,6 +1,11 @@
 // Shared client for the Gera backend Worker — one base URL, one
 // Bearer-token fetch with a single refresh retry, one error parser.
-import { getAccessToken, refreshAccessToken } from "@/lib/auth-tokens";
+import {
+  authSessionSnapshot,
+  getAccessToken,
+  isAuthSessionCurrent,
+  refreshAccessToken,
+} from "@/lib/auth-tokens";
 
 export const FUNCTIONS_URL: string = (() => {
   const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
@@ -10,24 +15,61 @@ export const FUNCTIONS_URL: string = (() => {
   return "https://gera-ai-agent-hub-backend.rork.app";
 })();
 
-/** Fetch with the stored Bearer token; retries once after a token refresh on 401. */
-export async function authedFetch(path: string, init?: RequestInit): Promise<Response> {
-  const attempt = (token: string | null) =>
-    fetch(`${FUNCTIONS_URL}${path}`, {
+export class AuthSessionChangedError extends Error {
+  constructor() {
+    super("The signed-in Gera account changed while this request was running.");
+    this.name = "AuthSessionChangedError";
+  }
+}
+
+function accessTokenForSession(sessionNonce: string): string | null {
+  if (!isAuthSessionCurrent(sessionNonce)) {
+    throw new AuthSessionChangedError();
+  }
+  const token = getAccessToken();
+  if (!isAuthSessionCurrent(sessionNonce)) {
+    throw new AuthSessionChangedError();
+  }
+  return token;
+}
+
+/** Authenticated fetch pinned to one account session across retries and multi-round callers. */
+export async function authedFetchForSession(
+  path: string,
+  sessionNonce: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const attempt = (token: string | null): Promise<Response> => {
+    if (!isAuthSessionCurrent(sessionNonce)) {
+      throw new AuthSessionChangedError();
+    }
+    return fetch(`${FUNCTIONS_URL}${path}`, {
       ...init,
       headers: {
         ...(init?.headers ?? {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
     });
-  let response = await attempt(getAccessToken());
+  };
+  let response = await attempt(accessTokenForSession(sessionNonce));
+  if (!isAuthSessionCurrent(sessionNonce)) {
+    throw new AuthSessionChangedError();
+  }
   if (response.status === 401) {
     const refreshed = await refreshAccessToken();
+    if (!isAuthSessionCurrent(sessionNonce)) {
+      throw new AuthSessionChangedError();
+    }
     if (refreshed) {
       response = await attempt(refreshed);
     }
   }
   return response;
+}
+
+/** Fetch with the current stored Bearer token, pinned through its refresh retry. */
+export function authedFetch(path: string, init?: RequestInit): Promise<Response> {
+  return authedFetchForSession(path, authSessionSnapshot(), init);
 }
 
 export class RelayAccessError extends Error {
@@ -44,6 +86,7 @@ export class RelayAccessError extends Error {
  * A 401 from the provider is not mistaken for a dead Gera session.
  */
 export async function relayFetch(path: string, target: string, init?: RequestInit): Promise<Response> {
+  const sessionNonce = authSessionSnapshot();
   const baseHeaders = new Headers(init?.headers);
   const upstreamAuthorization = baseHeaders.get("Authorization");
   baseHeaders.delete("Authorization");
@@ -52,15 +95,24 @@ export async function relayFetch(path: string, target: string, init?: RequestIni
     baseHeaders.set("X-Gera-Upstream-Authorization", upstreamAuthorization);
   }
   const attempt = (token: string | null): Promise<Response> => {
+    if (!isAuthSessionCurrent(sessionNonce)) {
+      throw new AuthSessionChangedError();
+    }
     const headers = new Headers(baseHeaders);
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
     return fetch(`${FUNCTIONS_URL}${path}`, { ...init, headers });
   };
-  let response = await attempt(getAccessToken());
+  let response = await attempt(accessTokenForSession(sessionNonce));
+  if (!isAuthSessionCurrent(sessionNonce)) {
+    throw new AuthSessionChangedError();
+  }
   if (response.status === 401 && response.headers?.get?.("X-Gera-Relay-Auth") === "required") {
     const refreshed = await refreshAccessToken();
+    if (!isAuthSessionCurrent(sessionNonce)) {
+      throw new AuthSessionChangedError();
+    }
     if (refreshed) {
       response = await attempt(refreshed);
     }

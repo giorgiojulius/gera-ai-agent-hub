@@ -31,6 +31,9 @@ export type RefreshedOAuth = {
   token: CloudOAuthToken;
 };
 
+/** Durable commit hook invoked before a rotated credential is used. */
+export type PersistRefreshedOAuth = (rotation: RefreshedOAuth) => Promise<void>;
+
 export type CloudMcpServer = {
   id: string;
   name: string;
@@ -508,7 +511,29 @@ export function chainRotationBases(
 /** Refresh this long before the recorded expiry — clock skew + run latency. */
 const OAUTH_EXPIRY_SKEW_MS = 60_000;
 
-const cloudRefreshInFlight = new Map<string, Promise<CloudOAuthToken | null>>();
+const CLOUD_REFRESH_REUSE_MS = 2 * 60_000;
+type CloudRefreshFlight = { task: Promise<CloudOAuthToken | null>; expiresAt: number };
+const cloudRefreshInFlight = new Map<string, CloudRefreshFlight>();
+
+function pruneCloudRefreshFlights(now: number): void {
+  for (const [key, flight] of cloudRefreshInFlight) {
+    if (flight.expiresAt <= now) {
+      cloudRefreshInFlight.delete(key);
+    }
+  }
+  if (cloudRefreshInFlight.size > 1_000) {
+    for (const [key, flight] of cloudRefreshInFlight) {
+      if (cloudRefreshInFlight.size <= 1_000) {
+        break;
+      }
+      // Never evict a pending redeem: doing so would permit a duplicate use
+      // of the same rotating refresh token under load.
+      if (Number.isFinite(flight.expiresAt)) {
+        cloudRefreshInFlight.delete(key);
+      }
+    }
+  }
+}
 
 function refreshFlightKey(grant: CloudOAuthToken): string {
   // Exact, process-local key: never logged or persisted. Resource and MCP URL
@@ -527,15 +552,18 @@ function refreshFlightKey(grant: CloudOAuthToken): string {
 async function redeemCloudRefreshToken(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
+  persist?: PersistRefreshedOAuth,
 ): Promise<boolean> {
   const grant = server.oauth;
   if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId || !safePublicHttpsUrl(grant.tokenEndpoint)) {
     return false;
   }
   const key = refreshFlightKey(grant);
-  let task = cloudRefreshInFlight.get(key);
-  if (!task) {
-    task = (async (): Promise<CloudOAuthToken | null> => {
+  const now = Date.now();
+  pruneCloudRefreshFlights(now);
+  let flight = cloudRefreshInFlight.get(key);
+  if (!flight || flight.expiresAt <= now) {
+    const task = (async (): Promise<CloudOAuthToken | null> => {
       const params = new URLSearchParams({
         grant_type: "refresh_token",
         refresh_token: grant.refreshToken ?? "",
@@ -568,14 +596,36 @@ async function redeemCloudRefreshToken(
         mcpUrl: grant.mcpUrl,
       };
     })();
-    cloudRefreshInFlight.set(key, task);
-    void task.finally(() => cloudRefreshInFlight.delete(key));
+    flight = { task, expiresAt: Number.POSITIVE_INFINITY };
+    cloudRefreshInFlight.set(key, flight);
+    void task.then(
+      (result) => {
+        const current = cloudRefreshInFlight.get(key);
+        if (current !== flight) {
+          return;
+        }
+        if (result) {
+          current.expiresAt = Date.now() + CLOUD_REFRESH_REUSE_MS;
+        } else {
+          cloudRefreshInFlight.delete(key);
+        }
+      },
+      () => {
+        if (cloudRefreshInFlight.get(key) === flight) {
+          cloudRefreshInFlight.delete(key);
+        }
+      },
+    );
   }
-  const next = await task;
+  const next = await flight.task;
   if (!next) {
     return false;
   }
-  refreshed.push({ serverId: server.id, baseAccessToken: grant.accessToken, token: next });
+  const rotation = { serverId: server.id, baseAccessToken: grant.accessToken, token: next };
+  if (persist) {
+    await persist(rotation);
+  }
+  refreshed.push(rotation);
   server.oauth = next;
   return true;
 }
@@ -584,6 +634,7 @@ async function redeemCloudRefreshToken(
 export async function ensureFreshCloudOAuth(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
+  persist?: PersistRefreshedOAuth,
 ): Promise<void> {
   const grant = server.oauth;
   if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId) {
@@ -593,7 +644,7 @@ export async function ensureFreshCloudOAuth(
   if (!expiring) {
     return;
   }
-  await redeemCloudRefreshToken(server, refreshed);
+  await redeemCloudRefreshToken(server, refreshed, persist);
 }
 
 /**
@@ -605,8 +656,9 @@ export async function ensureFreshCloudOAuth(
 export async function forceRefreshCloudOAuth(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
+  persist?: PersistRefreshedOAuth,
 ): Promise<boolean> {
-  return redeemCloudRefreshToken(server, refreshed);
+  return redeemCloudRefreshToken(server, refreshed, persist);
 }
 
 type JsonRpcResponse = {

@@ -298,12 +298,15 @@ function armNativeServer(runtime: McpRuntime, server: CloudMcpServer): void {
  * parallel. Failures never kill the run — they surface as honest tool
  * records in the thread.
  */
-export async function armCloudMcp(servers: CloudMcpServer[]): Promise<McpRuntime> {
+export async function armCloudMcp(
+  servers: CloudMcpServer[],
+  persist?: (rotation: RefreshedOAuth) => Promise<void>,
+): Promise<McpRuntime> {
   const runtime = emptyMcpRuntime();
   for (const server of servers) {
     if (server.oauth) {
       try {
-        await ensureFreshCloudOAuth(server, runtime.refreshed);
+        await ensureFreshCloudOAuth(server, runtime.refreshed, persist);
       } catch {
         // keep the synced token — a real auth failure surfaces honestly below
       }
@@ -325,7 +328,7 @@ export async function armCloudMcp(servers: CloudMcpServer[]): Promise<McpRuntime
           // the refresh token once and retry — mirrors the browser's 401
           // replay, so a sleeping sign-in repairs instead of failing.
           if (message.includes("auth rejected") && server.oauth?.refreshToken) {
-            const repaired = await forceRefreshCloudOAuth(server, runtime.refreshed).catch(() => false);
+            const repaired = await forceRefreshCloudOAuth(server, runtime.refreshed, persist).catch(() => false);
             if (repaired) {
               try {
                 return { server, connection: await connectCloudMcp(server) };
@@ -435,10 +438,11 @@ export async function runAutomationJob(
   job: ClaimJob,
   authKey: string,
   deadlineAt?: number,
+  persistOAuth?: (rotation: RefreshedOAuth) => Promise<void>,
 ): Promise<AutomationRunResult> {
   // MCP first, so the system prompt lists what actually connected and the
   // thread shows honest records for servers that did not.
-  const mcp = job.mcpServers.length > 0 ? await armCloudMcp(job.mcpServers) : emptyMcpRuntime();
+  const mcp = job.mcpServers.length > 0 ? await armCloudMcp(job.mcpServers, persistOAuth) : emptyMcpRuntime();
   const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs];
   const messages: GatewayMessage[] = [{ role: "system", content: buildSystemPrompt(job, mcp.summary) }];
   for (const item of job.prior) {

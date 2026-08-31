@@ -144,59 +144,11 @@ export function safePublicHttpsUrl(value: string): URL | null {
   return parsed;
 }
 
-const DNS_CACHE_MS = 5 * 60_000;
-const dnsCache = new Map<string, { expiresAt: number; isPublic: boolean }>();
-
-/** Resolves A + AAAA through Cloudflare and rejects any private answer. */
-export async function assertPublicDns(hostname: string): Promise<void> {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (parseIpv4(host) || host.includes(":")) {
-    if (isForbiddenHost(host)) {
-      throw new Error("outbound host is not public");
-    }
-    return;
-  }
-  const cached = dnsCache.get(host);
-  if (cached && cached.expiresAt > Date.now()) {
-    if (!cached.isPublic) {
-      throw new Error("outbound DNS resolved to a non-public address");
-    }
-    return;
-  }
-  const lookup = async (type: "A" | "AAAA"): Promise<string[]> => {
-    const endpoint = new URL("https://cloudflare-dns.com/dns-query");
-    endpoint.searchParams.set("name", host);
-    endpoint.searchParams.set("type", type);
-    const response = await fetch(endpoint.toString(), {
-      headers: { Accept: "application/dns-json" },
-      signal: AbortSignal.timeout(4_000),
-      redirect: "error",
-    });
-    if (!response.ok) {
-      throw new Error("public DNS safety lookup failed");
-    }
-    const payload = (await response.json()) as { Answer?: Array<{ type?: number; data?: string }> };
-    return (payload.Answer ?? [])
-      .filter((answer) => answer.type === 1 || answer.type === 28)
-      .map((answer) => answer.data ?? "")
-      .filter(Boolean);
-  };
-  const answers = (await Promise.all([lookup("A"), lookup("AAAA")])).flat();
-  const isPublic = answers.length > 0 && answers.every((answer) => !isForbiddenHost(answer));
-  if (dnsCache.size > 2_000) {
-    dnsCache.clear();
-  }
-  dnsCache.set(host, { expiresAt: Date.now() + DNS_CACHE_MS, isPublic });
-  if (!isPublic) {
-    throw new Error("outbound DNS resolved to a non-public address");
-  }
-}
-
 /** Fetches a public HTTPS URL and validates every redirect before following it. */
 export async function fetchPublicHttps(
   value: string,
   init: RequestInit,
-  options: { maxRedirects?: number; allowCrossOriginGet?: boolean; verifyDns?: boolean } = {},
+  options: { maxRedirects?: number; allowCrossOriginGet?: boolean } = {},
 ): Promise<Response> {
   let current = safePublicHttpsUrl(value);
   if (!current) {
@@ -208,9 +160,6 @@ export async function fetchPublicHttps(
   let headers = new Headers(init.headers);
 
   for (let hop = 0; hop <= maxRedirects; hop += 1) {
-    if (options.verifyDns === true) {
-      await assertPublicDns(current.hostname);
-    }
     const response = await fetch(current.toString(), {
       ...init,
       method,

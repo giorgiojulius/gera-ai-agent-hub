@@ -262,6 +262,41 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     expect(storedToken("success-race")?.refreshToken).toBe("RFRESH");
   });
 
+  it("rescues GitHub's bad_refresh_token spelling from the server rotation chain", async () => {
+    seedToken("github", "A", "RA");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+        if (String(input).includes("oauth-proxy")) {
+          return new Response(JSON.stringify({ error: "bad_refresh_token" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            rotations: [
+              {
+                serverId: "github",
+                bases: ["A"],
+                token: {
+                  accessToken: "SERVER-NEW",
+                  refreshToken: "SERVER-REFRESH",
+                  tokenEndpoint: "https://auth.example/token",
+                  clientId: "client-1",
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+
+    await expect(forceRefreshOAuthHeader("github")).resolves.toBe("Bearer SERVER-NEW");
+    expect(storedToken("github")?.refreshToken).toBe("SERVER-REFRESH");
+  });
+
   it("drops the sign-in only when the failed pair is still the stored one", async () => {
     seedToken("dead", "A", "RA");
     stubFetch(() => ({

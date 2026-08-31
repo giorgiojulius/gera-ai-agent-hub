@@ -27,6 +27,14 @@ class IntercomApiError extends Error {
   }
 }
 
+/** Distinguishes a dead Intercom credential from retryable relay/provider failures. */
+export function isIntercomCredentialError(error: unknown): boolean {
+  return (
+    error instanceof IntercomApiError &&
+    (error.status === 401 || ["unauthorized", "token_unauthorized", "token_expired", "token_revoked"].includes(error.code))
+  );
+}
+
 type IntercomAdmin = { id: string; name: string; email: string; appName: string };
 
 export type IntercomIdentity = { admin: IntercomAdmin; region: IntercomRegion };

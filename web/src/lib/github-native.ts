@@ -1,6 +1,6 @@
 import { relayFetch } from "@/lib/backend";
 import { GitHubAuthError, fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
-import { oauthAuthHeader } from "@/lib/mcp-oauth";
+import { hasOAuthRefreshToken, hasOAuthToken, oauthAuthHeader } from "@/lib/mcp-oauth";
 import type { McpServerConfig, McpToolInfo } from "@/lib/types";
 
 /**
@@ -110,16 +110,20 @@ export async function resolveGitHubAuth(
   if (pasted) {
     return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
   }
-  const oauth = await oauthAuthHeader(config.id);
-  if (oauth) {
-    return oauth;
-  }
+  const oauthIds = [config.id];
   // Device flow stores the catalog credential under the stable `github` key.
   // Legacy/imported rows may have a generated instance id plus catalogId.
   if (config.catalogId && config.catalogId !== config.id) {
-    const catalogOAuth = await oauthAuthHeader(config.catalogId);
-    if (catalogOAuth) {
-      return catalogOAuth;
+    oauthIds.push(config.catalogId);
+  }
+  for (const oauthId of oauthIds) {
+    const hadRefreshableGrant = hasOAuthToken(oauthId) && hasOAuthRefreshToken(oauthId);
+    const oauth = await oauthAuthHeader(oauthId);
+    if (oauth) {
+      return oauth;
+    }
+    if (hadRefreshableGrant && hasOAuthToken(oauthId)) {
+      throw new Error("Could not refresh GitHub sign-in right now — retry shortly; your session was kept.");
     }
   }
   throw new GitHubAuthError('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');

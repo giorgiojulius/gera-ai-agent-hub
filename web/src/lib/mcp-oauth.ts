@@ -68,7 +68,13 @@ class OAuthTokenError extends Error {
 }
 
 /** OAuth error codes that mean the grant is dead and only a new sign-in can help. */
-const FATAL_REFRESH_CODES = new Set<string>(["invalid_grant", "invalid_client", "unauthorized_client"]);
+const FATAL_REFRESH_CODES = new Set<string>([
+  "invalid_grant",
+  // GitHub uses this non-standard spelling when a rotated refresh token is stale.
+  "bad_refresh_token",
+  "invalid_client",
+  "unauthorized_client",
+]);
 
 /** Refresh this long before the recorded expiry to absorb clock skew and latency. */
 const EXPIRY_SKEW_MS = 60_000;

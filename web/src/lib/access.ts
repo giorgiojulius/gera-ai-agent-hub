@@ -1,14 +1,6 @@
 // Invite-only access API — talks to the Gera backend /access routes, which
 // verify the Rork Auth JWT platform-side and consult the AccessRegistry DO.
-import { getAccessToken, refreshAccessToken } from "@/lib/auth-tokens";
-
-const FUNCTIONS_URL: string = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url === "string" && url.length > 0) {
-    return url.replace(/\/+$/, "");
-  }
-  return "https://gera-ai-agent-hub-backend.rork.app";
-})();
+import { authedFetch } from "@/lib/backend";
 
 export type AccessRole = "admin" | "member" | null;
 
@@ -39,24 +31,9 @@ export type AccessOverview = {
   requests: RequestEntry[];
 };
 
-/** Fetch with the stored Bearer token; retries once after a token refresh on 401. */
-async function accessFetch(path: string, init?: RequestInit): Promise<Response> {
-  const attempt = (token: string | null) =>
-    fetch(`${FUNCTIONS_URL}/access${path}`, {
-      ...init,
-      headers: {
-        ...(init?.headers ?? {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    });
-  let response = await attempt(getAccessToken());
-  if (response.status === 401) {
-    const refreshed = await refreshAccessToken();
-    if (refreshed) {
-      response = await attempt(refreshed);
-    }
-  }
-  return response;
+/** Shares the generation-safe authenticated retry used by sync, runs, and relays. */
+function accessFetch(path: string, init?: RequestInit): Promise<Response> {
+  return authedFetch(`/access${path}`, init);
 }
 
 async function parseOrThrow<T>(response: Response, fallback: string): Promise<T> {

@@ -105,17 +105,38 @@ function siblingRefreshResult(sessionNonce: string, originalRefresh: string): st
   return null;
 }
 
+/** A delayed 401 for an older access token adopts the already-refreshed generation. */
+function replacementForRejectedAccess(
+  sessionNonce: string,
+  rejectedAccessToken: string | null | undefined,
+): string | null {
+  if (rejectedAccessToken === undefined || !isAuthSessionCurrent(sessionNonce)) {
+    return null;
+  }
+  const currentAccess = localStorage.getItem(ACCESS_TOKEN_KEY);
+  return currentAccess && currentAccess !== rejectedAccessToken ? currentAccess : null;
+}
+
 /**
  * Exchanges the stored refresh token for a fresh access token. Web Locks make
- * the redeem single-flight across tabs; nonce + refresh CAS makes a response
- * from a logged-out/replaced account inert and adopts a sibling tab's winner.
+ * the redeem single-flight across tabs; nonce + access/refresh CAS makes a
+ * response from a logged-out/replaced account inert and adopts a sibling tab's
+ * winner. When called after a 401, pass the rejected access token: delayed 401s
+ * from the old generation then reuse the new access token instead of rotating
+ * the account session once per concurrent request.
  */
-export function refreshAccessToken(): Promise<string | null> {
+export function refreshAccessToken(
+  rejectedAccessToken?: string | null,
+): Promise<string | null> {
   if (typeof localStorage === "undefined") {
     return Promise.resolve(null);
   }
-  const refresh = localStorage.getItem(REFRESH_TOKEN_KEY);
   const sessionNonce = authSessionSnapshot();
+  const replacement = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
+  if (replacement) {
+    return Promise.resolve(replacement);
+  }
+  const refresh = localStorage.getItem(REFRESH_TOKEN_KEY);
   if (!refresh || !AUTH_URL || !APP_KEY || !sessionNonce) {
     return Promise.resolve(null);
   }
@@ -128,6 +149,10 @@ export function refreshAccessToken(): Promise<string | null> {
     if (!isAuthSessionCurrent(sessionNonce)) {
       return null;
     }
+    const newerBeforeRedeem = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
+    if (newerBeforeRedeem) {
+      return newerBeforeRedeem;
+    }
     if (localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
       return siblingRefreshResult(sessionNonce, refresh);
     }
@@ -137,14 +162,28 @@ export function refreshAccessToken(): Promise<string | null> {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ app_key: APP_KEY, refresh_token: refresh }),
       });
-      if (!isAuthSessionCurrent(sessionNonce) || localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
+      if (!isAuthSessionCurrent(sessionNonce)) {
+        return null;
+      }
+      const newerAfterRedeem = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
+      if (newerAfterRedeem) {
+        return newerAfterRedeem;
+      }
+      if (localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
         return siblingRefreshResult(sessionNonce, refresh);
       }
       if (!response.ok) {
         return null;
       }
       const data = (await response.json()) as { access_token?: unknown; refresh_token?: unknown };
-      if (!isAuthSessionCurrent(sessionNonce) || localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
+      if (!isAuthSessionCurrent(sessionNonce)) {
+        return null;
+      }
+      const newerBeforeCommit = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
+      if (newerBeforeCommit) {
+        return newerBeforeCommit;
+      }
+      if (localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
         return siblingRefreshResult(sessionNonce, refresh);
       }
       if (typeof data.access_token !== "string" || data.access_token.length === 0) {
@@ -156,7 +195,7 @@ export function refreshAccessToken(): Promise<string | null> {
       localStorage.setItem(ACCESS_TOKEN_KEY, data.access_token);
       return data.access_token;
     } catch {
-      return siblingRefreshResult(sessionNonce, refresh);
+      return replacementForRejectedAccess(sessionNonce, rejectedAccessToken) ?? siblingRefreshResult(sessionNonce, refresh);
     }
   });
   refreshInFlight.set(key, task);

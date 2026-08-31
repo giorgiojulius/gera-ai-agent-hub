@@ -51,12 +51,17 @@ export async function authedFetchForSession(
       },
     });
   };
-  let response = await attempt(accessTokenForSession(sessionNonce));
+  const attemptedToken = accessTokenForSession(sessionNonce);
+  let response = await attempt(attemptedToken);
   if (!isAuthSessionCurrent(sessionNonce)) {
     throw new AuthSessionChangedError();
   }
   if (response.status === 401) {
-    const refreshed = await refreshAccessToken();
+    // Tie recovery to the token that actually received this 401. A sibling
+    // request may already have refreshed while this response was in flight;
+    // in that case refreshAccessToken adopts the newer access token instead of
+    // rotating the account session again for every delayed response.
+    const refreshed = await refreshAccessToken(attemptedToken);
     if (!isAuthSessionCurrent(sessionNonce)) {
       throw new AuthSessionChangedError();
     }
@@ -104,12 +109,13 @@ export async function relayFetch(path: string, target: string, init?: RequestIni
     }
     return fetch(`${FUNCTIONS_URL}${path}`, { ...init, headers });
   };
-  let response = await attempt(accessTokenForSession(sessionNonce));
+  const attemptedToken = accessTokenForSession(sessionNonce);
+  let response = await attempt(attemptedToken);
   if (!isAuthSessionCurrent(sessionNonce)) {
     throw new AuthSessionChangedError();
   }
   if (response.status === 401 && response.headers?.get?.("X-Gera-Relay-Auth") === "required") {
-    const refreshed = await refreshAccessToken();
+    const refreshed = await refreshAccessToken(attemptedToken);
     if (!isAuthSessionCurrent(sessionNonce)) {
       throw new AuthSessionChangedError();
     }

@@ -45,7 +45,7 @@ import { buildSkillsBlock, filterSkillsByIds, skillPinnedServerIds, skillsForSur
 import { applySkillOps, buildSkillsEditorContext, extractSkillOps } from "@/lib/skill-ops";
 import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerableRun, watchSteering } from "@/lib/steering";
 import { McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
-import { hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
+import { hasOAuthRefreshToken, hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
 import {
   IMAGE_EDIT_MODEL,
   modelIdForMode,
@@ -1814,6 +1814,20 @@ export async function reconnectMcp(
 
 /** Re-verify a persisted green status after this age, and always once auth disappears. */
 const MCP_REVERIFY_AFTER_MS = 10 * 60_000;
+const mcpLastHealthyAt = new Map<string, number>();
+const mcpRevalidationInFlight = new Set<string>();
+
+/**
+ * Shared auth, relay, network, rate-limit, and provider-outage failures do not
+ * revoke a connector credential. They must stay retryable instead of becoming
+ * a synced, permanent disconnect for every MCP after a sleeping tab resumes.
+ */
+export function isRecoverableMcpHealthError(error: unknown): boolean {
+  const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  return /(?:gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response)/i.test(
+    message,
+  );
+}
 
 /** Returns the exact local credential gap that makes a green card impossible. */
 export function mcpCredentialProblem(server: McpServerConfig): string | null {
@@ -1856,8 +1870,22 @@ export function revalidateMcpServers(
 ): void {
   const candidates: McpServerConfig[] = [];
   const problems = new Map<string, string>();
+  const recoverableIds = new Set<string>();
+  const now = Date.now();
   for (const server of servers) {
-    if (!server.enabled || server.status !== "connected") {
+    if (!server.enabled) {
+      continue;
+    }
+    const catalogId = server.catalogId ?? server.id;
+    const hasRefreshableOAuth =
+      (hasOAuthToken(server.id, server.url) && hasOAuthRefreshToken(server.id)) ||
+      (catalogId !== server.id &&
+        hasOAuthToken(catalogId, server.url) &&
+        hasOAuthRefreshToken(catalogId));
+    const isRecoverableError =
+      server.status === "error" &&
+      (isRecoverableMcpHealthError(server.error) || hasRefreshableOAuth);
+    if (server.status !== "connected" && !isRecoverableError) {
       continue;
     }
     const problem = mcpCredentialProblem(server);
@@ -1865,16 +1893,23 @@ export function revalidateMcpServers(
       problems.set(server.id, problem);
       continue;
     }
+    const lastHealthyAt = Math.max(
+      server.verifiedAt ?? 0,
+      mcpLastHealthyAt.get(server.id) ?? 0,
+    );
     if (
+      isRecoverableError ||
       forceIds.has(server.id) ||
-      !server.verifiedAt ||
-      Date.now() - server.verifiedAt >= MCP_REVERIFY_AFTER_MS
+      lastHealthyAt === 0 ||
+      now - lastHealthyAt >= MCP_REVERIFY_AFTER_MS
     ) {
       candidates.push(server);
+      if (isRecoverableError) {
+        recoverableIds.add(server.id);
+      }
     }
   }
-  if (problems.size > 0 || candidates.length > 0) {
-    const checkingIds = new Set(candidates.map((server) => server.id));
+  if (problems.size > 0 || recoverableIds.size > 0) {
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((server) => {
@@ -1888,15 +1923,27 @@ export function revalidateMcpServers(
             verifiedAt: undefined,
           };
         }
-        return checkingIds.has(server.id)
-          ? { ...server, status: "connecting" as const, error: undefined }
+        // Repair profiles poisoned by an old shared-relay outage. A background
+        // check never moves a healthy connector through persisted "connecting".
+        return recoverableIds.has(server.id)
+          ? { ...server, status: "connected" as const, error: undefined }
           : server;
       }),
     }));
   }
   for (const server of candidates) {
-    void revalidateQuietly(server, setSettings);
+    if (mcpRevalidationInFlight.has(server.id)) {
+      continue;
+    }
+    mcpRevalidationInFlight.add(server.id);
+    void revalidateQuietly(server, setSettings).finally(() => {
+      mcpRevalidationInFlight.delete(server.id);
+    });
   }
+}
+
+function sameMcpTools(left: McpServerConfig["tools"], right: McpServerConfig["tools"]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 async function revalidateQuietly(
@@ -1905,22 +1952,40 @@ async function revalidateQuietly(
 ): Promise<void> {
   try {
     const connection = await connectMcpServer(server);
-    setSettings((prev) => ({
-      ...prev,
-      mcpServers: prev.mcpServers.map((item) =>
-        item.id === server.id
-          ? {
-              ...item,
-              status: "connected",
-              tools: connection.tools,
-              identity: connection.identity,
-              verifiedAt: Date.now(),
-              error: undefined,
-            }
-          : item,
-      ),
-    }));
+    mcpLastHealthyAt.set(server.id, Date.now());
+    setSettings((prev) => {
+      let changed = false;
+      const mcpServers = prev.mcpServers.map((item) => {
+        if (item.id !== server.id) {
+          return item;
+        }
+        if (
+          item.status === "connected" &&
+          item.error === undefined &&
+          item.identity === connection.identity &&
+          sameMcpTools(item.tools, connection.tools)
+        ) {
+          return item;
+        }
+        changed = true;
+        return {
+          ...item,
+          status: "connected" as const,
+          tools: connection.tools,
+          identity: connection.identity,
+          verifiedAt: Date.now(),
+          error: undefined,
+        };
+      });
+      return changed ? { ...prev, mcpServers } : prev;
+    });
   } catch (error) {
+    // A failed Gera refresh, relay outage, sleeping network, provider 5xx, or
+    // rate limit says nothing about the saved provider credential. Keep the
+    // connector armed and retry on a later health tick.
+    if (!(error instanceof McpAuthError) && isRecoverableMcpHealthError(error)) {
+      return;
+    }
     const message = errorFromUnknown(error);
     setSettings((prev) => ({
       ...prev,

@@ -38,6 +38,9 @@ async function saveE2eReport(_ctx: unknown, report: unknown): Promise<{ savedTo:
 
 export default defineConfig({
   plugins: [react()],
+  // Match the production Vite build: Rork's shared public envs include auth
+  // configuration used by browser-only session-expiry regression tests.
+  envPrefix: ["VITE_", "EXPO_PUBLIC_"],
   test: {
     globals: true,
     include: ["src/**/*.browser.{test,spec}.{ts,tsx}"],

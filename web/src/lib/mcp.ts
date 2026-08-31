@@ -1,8 +1,13 @@
-import { relayFetch } from "@/lib/backend";
+import { AuthSessionChangedError, RelayAccessError, relayFetch } from "@/lib/backend";
 import { newId } from "@/lib/env";
 import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
-import { INTERCOM_NATIVE_TOOLS, callIntercomNativeTool, verifyIntercomToken } from "@/lib/intercom-native";
+import {
+  INTERCOM_NATIVE_TOOLS,
+  callIntercomNativeTool,
+  isIntercomCredentialError,
+  verifyIntercomToken,
+} from "@/lib/intercom-native";
 import { findCatalogEntry } from "@/lib/mcp-catalog";
 import {
   clearOAuthToken,
@@ -12,7 +17,12 @@ import {
   oauthAuthHeader,
   oauthTokenFingerprint,
 } from "@/lib/mcp-oauth";
-import { SLACK_NATIVE_TOOLS, callSlackNativeTool, verifySlackToken } from "@/lib/slack-native";
+import {
+  SLACK_NATIVE_TOOLS,
+  callSlackNativeTool,
+  isSlackCredentialError,
+  verifySlackToken,
+} from "@/lib/slack-native";
 import type { McpAuthMode, McpServerConfig, McpToolInfo, OpenAiTool } from "@/lib/types";
 
 type JsonRpcRequest = {
@@ -366,7 +376,10 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
         body: JSON.stringify(request),
         signal: AbortSignal.timeout(method === "tools/call" || method === "resources/read" ? MCP_CALL_TIMEOUT_MS : MCP_CONNECT_TIMEOUT_MS),
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof RelayAccessError || error instanceof AuthSessionChangedError) {
+        throw error;
+      }
       throw new Error("Could not reach the Gera relay. Check your connection and try again.");
     }
 
@@ -444,22 +457,36 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
     if (!token) {
       throw new Error("Paste a Slack Bot token (xoxb-…) or User token (xoxp-…) first.");
     }
-    const slack = await verifySlackToken(token);
-    return {
-      tools: SLACK_NATIVE_TOOLS.map((tool) => ({ ...tool })),
-      identity: `${slack.team} — ${slack.user}`,
-    };
+    try {
+      const slack = await verifySlackToken(token);
+      return {
+        tools: SLACK_NATIVE_TOOLS.map((tool) => ({ ...tool })),
+        identity: `${slack.team} — ${slack.user}`,
+      };
+    } catch (error) {
+      if (isSlackCredentialError(error)) {
+        throw new McpAuthError(error instanceof Error ? error.message : "Slack sign-in expired.");
+      }
+      throw error;
+    }
   }
   if (entry?.native === "intercom") {
     const token = config.token?.trim();
     if (!token) {
       throw new Error("Paste an Intercom Access Token (Developer Hub → Authentication) first.");
     }
-    const intercom = await verifyIntercomToken(token);
-    return {
-      tools: INTERCOM_NATIVE_TOOLS.map((tool) => ({ ...tool })),
-      identity: `${intercom.admin.appName} — ${intercom.admin.name} (${intercom.region.toUpperCase()})`,
-    };
+    try {
+      const intercom = await verifyIntercomToken(token);
+      return {
+        tools: INTERCOM_NATIVE_TOOLS.map((tool) => ({ ...tool })),
+        identity: `${intercom.admin.appName} — ${intercom.admin.name} (${intercom.region.toUpperCase()})`,
+      };
+    } catch (error) {
+      if (isIntercomCredentialError(error)) {
+        throw new McpAuthError(error instanceof Error ? error.message : "Intercom sign-in expired.");
+      }
+      throw error;
+    }
   }
   if (entry?.native === "github") {
     // Native GitHub: REST API straight from the browser with the device-flow
@@ -472,6 +499,31 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
         identity: verified.identity,
       };
     } catch (error) {
+      if (error instanceof GitHubAuthError && !config.token?.trim()) {
+        // GitHub can revoke an access token before its recorded expiry. Mirror
+        // generic MCP: force one refresh for either the instance or stable
+        // catalog grant, then verify the replacement before declaring it dead.
+        const oauthIds = [config.id];
+        if (config.catalogId && config.catalogId !== config.id) {
+          oauthIds.push(config.catalogId);
+        }
+        for (const oauthId of oauthIds) {
+          if (!hasOAuthRefreshToken(oauthId)) {
+            continue;
+          }
+          const refreshed = await forceRefreshOAuthHeader(oauthId);
+          if (refreshed) {
+            const verified = await verifyGitHubNative(refreshed);
+            return {
+              tools: GITHUB_NATIVE_TOOLS.map((tool) => ({ ...tool })),
+              identity: verified.identity,
+            };
+          }
+          if (hasOAuthToken(oauthId) && hasOAuthRefreshToken(oauthId)) {
+            throw new Error("Could not refresh GitHub sign-in right now — retry shortly; your session was kept.");
+          }
+        }
+      }
       if (error instanceof GitHubAuthError) {
         throw new McpAuthError(error.message);
       }

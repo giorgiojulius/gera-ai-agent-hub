@@ -25,6 +25,19 @@ class SlackApiError extends Error {
 
 type SlackJson = { ok: boolean; error?: string; needed?: string } & Record<string, unknown>;
 
+const SLACK_CREDENTIAL_ERROR_CODES = new Set<string>([
+  "invalid_auth",
+  "not_authed",
+  "token_revoked",
+  "token_expired",
+  "account_inactive",
+]);
+
+/** Distinguishes a dead Slack credential from retryable network/rate-limit failures. */
+export function isSlackCredentialError(error: unknown): boolean {
+  return error instanceof SlackApiError && SLACK_CREDENTIAL_ERROR_CODES.has(error.code);
+}
+
 function friendlySlackError(code: string, needed?: string): string {
   switch (code) {
     case "invalid_auth":

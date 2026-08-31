@@ -1,13 +1,14 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `3769c8e` (+ Luna suggestion model,
+Last synced: 2026-08-31 · commit `a89fc17` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering hardening, GitHub run credential hand-off + pin/access fixes,
-truthful MCP health + OAuth/account-session hardening, authenticated file reads,
-Intercom attachments, full 98-entry MCP audit, and the live code Changes /
-Preview workbench with sandboxed HTML and deployment previews)
-Drift check: `git log --oneline 3769c8e..HEAD`, then compare against
+truthful MCP health + OAuth/account-session/sleep-resume hardening,
+authenticated file reads, Intercom attachments, full 98-entry MCP audit, and
+the live code Changes / Preview workbench with sandboxed HTML and deployment
+previews)
+Drift check: `git log --oneline a89fc17..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -771,10 +772,15 @@ or retry. PKCE verifiers live per tab, popup callback slots are per OAuth state,
 and only the newest per-server sign-in attempt may commit. Browser refreshes use
 Web Locks across tabs, then compare-and-swap the full grant; independent
 per-server token entries prevent simultaneous connectors from erasing each
-other. A profile pull applies only if neither its profile clock nor OAuth
-snapshot changed while it was in flight. Cloud refresh holds its single-flight
-through durable persistence, keeps a short completed-flight reuse window for
-stale callers, and rejects a rotation whose source grant was replaced meanwhile.
+other. After a sleeping tab's Gera JWT expires, every relay/sync/access retry is
+now pinned to the rejected access-token generation: the first 401 refreshes,
+while later 401s that belonged to the same old token reuse that winner instead
+of rotating the Gera session once per MCP. This closes the shared ~12-hour cliff
+where a burst of health checks could invalidate one another. A profile pull
+applies only if neither its profile clock nor OAuth snapshot changed while it
+was in flight. Cloud refresh holds its single-flight through durable persistence,
+keeps a short completed-flight reuse window for stale callers, and rejects a
+rotation whose source grant was replaced meanwhile.
 
 File-result truth (2026-08-30): generic MCP calls preserve plain text,
 embedded text resources and `structuredContent`; opaque image/audio/blob base64
@@ -785,15 +791,22 @@ selects the final JSON-RPC response by request id, so progress events no longer
 turn a file read into an empty result. The browser and Worker implementations
 share regression fixtures in `mcp-file-content.test.ts`.
 
-Status truth (2026-08-30): every persisted green card is live-checked once
+Status truth (2026-08-31): every persisted green card is live-checked once
 per browser session, again when synced settings/auth arrive, every 10 minutes
 in a long-open tab, and when the tab returns (the old mount-only pass often ran
 too early). A `connected` card with missing OAuth/key bypasses the freshness
-window and flips straight to a specific error; checks visibly enter Connecting
-and only return green after handshake + tools/list. GitHub 401 is an auth
-failure; 403/rate-limit is not mislabeled as "sign in again". Unit suites:
+window and flips straight to a specific error. Background checks no longer move
+healthy servers through a persisted Connecting state or turn a shared Gera
+refresh/relay outage, sleeping network, 5xx, timeout, or rate limit into a
+permanent synced disconnect; the connector stays armed and retries later.
+Profiles poisoned by the former relay-error behavior self-heal on boot when the
+credential/refresh grant still exists. Only a definitive provider auth rejection
+turns that one card red; native Slack/Intercom classify credential failures
+separately, and GitHub retries an early 401 with its refresh grant. GitHub's
+`bad_refresh_token` spelling also uses the existing rotation rescue. Unit suites:
 `auth-boundary.test.ts`, `mcp-oauth-refresh.test.ts`, `mcp-rotation.test.ts`,
-`mcp-session.test.ts`.
+`mcp-session.test.ts`; real-browser Web Lock/localStorage regression:
+`auth-resume.browser.test.ts`.
 
 Full catalog + transport audit (2026-08-30): all 98 catalog rows were probed
 read-only. Of 94 generic connectable endpoints, 26 completed initialize +
@@ -927,6 +940,10 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
+Browser-only auth coverage: `auth-resume.browser.test.ts` recreates two MCP
+relay requests returning delayed 401s after a sleeping-tab token expiry and
+proves both reuse one refreshed Gera generation (real localStorage + Web Lock).
+
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
 Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
 Share dialog, Settings toggles, media modes,
@@ -947,7 +964,9 @@ read-only GitHub arms zero write tools; missing tokens arm nothing and are
 reported), plus `mcp-rotation`, `mcp-file-content`, `github-security` (all 30
 browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
 account isolation), `mcp-security` (catalog, auth-mode, OAuth/egress/session/
-protocol and native Slack/Intercom parity), `code-change-flow` (diff capture,
+protocol and native Slack/Intercom parity), `auth-boundary` +
+`mcp-oauth-refresh` + `mcp-session` (staggered expired-Gera 401s, provider-token
+rotation rescue, transient health recovery), `code-change-flow` (diff capture,
 HTML/CSS/JS assembly, HTTPS-only deployment previews, continuation merge),
 `agent-steering`, `github-native`.
 Only the Durable

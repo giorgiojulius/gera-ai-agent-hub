@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { mcpCredentialProblem, revalidateMcpServers } from "@/lib/agent-store";
+import {
+  isRecoverableMcpHealthError,
+  mcpCredentialProblem,
+  revalidateMcpServers,
+} from "@/lib/agent-store";
 import { parseProfilePayload } from "@/lib/chat-sync";
 import { normalizeStoredSettings } from "@/lib/history";
 import { isSessionLostRpcMessage, isSessionLostSignal } from "@/lib/mcp";
@@ -168,5 +172,111 @@ describe("honest MCP auth status", () => {
 
     expect(adopted).toBe(1);
     expect(mcpCredentialProblem(github)).toBeNull();
+  });
+
+  it("keeps a connected MCP armed when background revalidation hits a transient relay outage", async () => {
+    let settings: AgentSettings = normalizeStoredSettings({
+      mcpServers: [
+        storedServer({
+          id: "transient-health",
+          authMode: "none",
+          status: "connected",
+          verifiedAt: 1,
+          tools: [{ name: "search" }],
+        }),
+      ],
+    });
+    const fetchMock = vi.fn(async (): Promise<Response> => {
+      throw new TypeError("Failed to fetch");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    revalidateMcpServers(
+      settings.mcpServers,
+      (updater) => {
+        settings = updater(settings);
+      },
+      new Set(["transient-health"]),
+    );
+
+    // Background checks no longer disarm every cloud/browser MCP as "connecting".
+    expect(settings.mcpServers[0]?.status).toBe("connected");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(settings.mcpServers[0]?.status).toBe("connected");
+    expect(settings.mcpServers[0]?.error).toBeUndefined();
+  });
+
+  it("self-heals a persisted shared-relay error once the MCP answers again", async () => {
+    let settings: AgentSettings = normalizeStoredSettings({
+      mcpServers: [
+        storedServer({
+          id: "relay-recovery",
+          authMode: "none",
+          status: "error",
+          error: "Could not reach the Gera relay. Check your connection and try again.",
+          tools: [{ name: "search" }],
+        }),
+      ],
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const request = JSON.parse(String(init?.body ?? "{}")) as {
+          id?: number;
+          method?: string;
+        };
+        if (request.method === "notifications/initialized") {
+          return new Response(null, { status: 202 });
+        }
+        const result =
+          request.method === "initialize"
+            ? {
+                protocolVersion: "2025-06-18",
+                serverInfo: { name: "Recovered MCP", version: "1" },
+              }
+            : { tools: [{ name: "search" }] };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    expect(isRecoverableMcpHealthError(settings.mcpServers[0]?.error)).toBe(true);
+    revalidateMcpServers(settings.mcpServers, (updater) => {
+      settings = updater(settings);
+    });
+    expect(settings.mcpServers[0]?.status).toBe("connected");
+    expect(settings.mcpServers[0]?.error).toBeUndefined();
+    await vi.waitFor(() => expect(settings.mcpServers[0]?.identity).toBe("Recovered MCP v1"));
+  });
+
+  it("still disconnects only the provider whose credential is definitively rejected", async () => {
+    let settings: AgentSettings = normalizeStoredSettings({
+      mcpServers: [
+        storedServer({
+          id: "provider-auth-dead",
+          authMode: "none",
+          status: "connected",
+          verifiedAt: 1,
+          tools: [{ name: "search" }],
+        }),
+      ],
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (): Promise<Response> => new Response("unauthorized", { status: 401 })),
+    );
+
+    revalidateMcpServers(
+      settings.mcpServers,
+      (updater) => {
+        settings = updater(settings);
+      },
+      new Set(["provider-auth-dead"]),
+    );
+    await vi.waitFor(() => expect(settings.mcpServers[0]?.status).toBe("error"));
+    expect(settings.mcpServers[0]?.error).toContain("needs a key or sign-in");
   });
 });

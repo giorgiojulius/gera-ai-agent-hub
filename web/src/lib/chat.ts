@@ -34,6 +34,7 @@ Artifacts — the chat renders these fenced blocks as rich interactive cards, so
   Use real coordinates — search when unsure, never guess. "route": true connects markers in visit order with numbered pins (itineraries, trips). Optional "center":[lat,lng] and "zoom" (1-19). A GeoJSON FeatureCollection in a \`\`\`geojson fence renders too.
 - Diagram: \`\`\`mermaid for flowcharts, sequence, state, class, journey, and gantt diagrams.
 - Live page: \`\`\`html for a self-contained page or interactive demo (inline CSS/JS, no external files) — it runs in a sandboxed preview. \`\`\`svg renders vector graphics.
+- Repository edits: when write-capable code tools are available, read an existing file before changing it, work on a branch, and open a PR. After writes, inspect workflow runs and deployments when those tools exist. The chat turns real write calls into a live Changes / Preview workbench; a committed self-contained HTML file runs there locally, and a deployment appears only when a tool returns its real HTTPS URL. Never invent a build result or preview URL.
 - Code: always tag fenced code blocks with a language for syntax highlighting.
 Write a short lead-in sentence, then the fence. Markdown tables render nicely too.
 

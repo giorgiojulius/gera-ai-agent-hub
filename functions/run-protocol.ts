@@ -40,6 +40,44 @@ export type RunToolRecord = {
   result?: string;
 };
 
+/** One file mutation captured from a repository tool call for the chat workbench. */
+export type RunCodeChangeFile = {
+  id: string;
+  path: string;
+  action: "create" | "update" | "delete" | "patch";
+  status: ToolRecordStatus;
+  language?: string;
+  additions: number;
+  deletions: number;
+  /** Bounded unified-style lines; never the raw credential-bearing tool payload. */
+  patch?: string;
+  truncated?: boolean;
+  error?: string;
+};
+
+/** A runnable preview proven by a committed HTML file or a deployment tool result. */
+export type RunCodePreview =
+  | { kind: "html"; label: string; html: string }
+  | { kind: "url"; label: string; url: string };
+
+export type RunCodeValidation = {
+  status: "running" | "passed" | "failed" | "unknown";
+  label: string;
+  url?: string;
+};
+
+/** Live, persisted code-edit flow shown as Changes / Preview inside the assistant turn. */
+export type RunCodeChangeState = {
+  status: "running" | "done" | "error";
+  files: RunCodeChangeFile[];
+  startedAt: number;
+  repository?: string;
+  branch?: string;
+  pullRequestUrl?: string;
+  preview?: RunCodePreview;
+  validation?: RunCodeValidation;
+};
+
 export type RunSource = { url: string; title: string };
 
 export type ResearchStepKind = "plan" | "search" | "read" | "browse" | "synthesize";
@@ -213,6 +251,7 @@ export type RunFinalMessage = {
   id: string;
   content: string;
   toolCalls?: RunToolRecord[];
+  codeChanges?: RunCodeChangeState;
   sources?: RunSource[];
   servedBy?: string;
   research?: ResearchState;
@@ -236,6 +275,7 @@ export type RunSnapshot = {
   content: string;
   reasoningTail?: string;
   toolCalls?: RunToolRecord[];
+  codeChanges?: RunCodeChangeState;
   sources?: RunSource[];
   research?: ResearchState;
   julius?: JuliusState;
@@ -250,6 +290,7 @@ export type RunEvent =
   | { t: "text"; seq: number; content: string }
   | { t: "reasoning"; seq: number; tail: string }
   | { t: "tools"; seq: number; toolCalls: RunToolRecord[] }
+  | { t: "code"; seq: number; codeChanges: RunCodeChangeState }
   | { t: "sources"; seq: number; sources: RunSource[] }
   | { t: "research"; seq: number; research: ResearchState }
   | { t: "julius"; seq: number; julius: JuliusState; sources?: RunSource[] }

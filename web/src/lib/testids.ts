@@ -25,6 +25,14 @@ export const TID = {
   messageUser: "message-user",
   /** One assistant message row (repeats per turn). */
   messageAssistant: "message-assistant",
+  /** Live repository edit workbench inside an assistant turn. */
+  codeChangeFlow: "code-change-flow",
+  /** Changes tab inside the repository edit workbench. */
+  codeChangeChangesTab: "code-change-changes-tab",
+  /** Preview tab inside the repository edit workbench. */
+  codeChangePreviewTab: "code-change-preview-tab",
+  /** Sandboxed iframe running committed HTML or a real deployment URL. */
+  codeChangePreview: "code-change-preview",
   /** "New chat" action in the navigation rail. */
   sidebarNewChat: "sidebar-new-chat",
   /** One saved conversation row in the rail (repeats). */

@@ -14,6 +14,8 @@ import type {
   Automation,
   BuiltinToolId,
   ChatMessage,
+  CodeChangeFile,
+  CodeChangeState,
   Conversation,
   CreateMode,
   ImageSize,
@@ -96,8 +98,92 @@ export function loadConversations(): Conversation[] {
  * Also reused when building share snapshots so a frozen public page never
  * shows a "running" state.
  */
+function boundedString(value: unknown, limit: number): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, limit) : undefined;
+}
+
+function boundedHttpsUrl(value: unknown): string | undefined {
+  const raw = boundedString(value, 2_000);
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" && !url.username && !url.password ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Distrust synced history before rendering a runnable code preview. */
+export function normalizeCodeChangeState(value: unknown): CodeChangeState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Partial<CodeChangeState>;
+  if (raw.status !== "running" && raw.status !== "done" && raw.status !== "error") {
+    return undefined;
+  }
+  const files: CodeChangeFile[] = Array.isArray(raw.files)
+    ? raw.files.flatMap((entry): CodeChangeFile[] => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          return [];
+        }
+        const file = entry as Partial<CodeChangeFile>;
+        const id = boundedString(file.id, 120);
+        const path = boundedString(file.path, 300);
+        if (
+          !id ||
+          !path ||
+          (file.action !== "create" && file.action !== "update" && file.action !== "delete" && file.action !== "patch") ||
+          (file.status !== "running" && file.status !== "done" && file.status !== "error")
+        ) {
+          return [];
+        }
+        return [{
+          id,
+          path: path.replace(/[\r\n\0]/g, " "),
+          action: file.action,
+          status: file.status,
+          ...(boundedString(file.language, 40) ? { language: boundedString(file.language, 40) } : {}),
+          additions: Number.isFinite(file.additions) ? Math.max(0, Math.floor(file.additions ?? 0)) : 0,
+          deletions: Number.isFinite(file.deletions) ? Math.max(0, Math.floor(file.deletions ?? 0)) : 0,
+          ...(boundedString(file.patch, 30_100) ? { patch: boundedString(file.patch, 30_100) } : {}),
+          ...(file.truncated === true ? { truncated: true } : {}),
+          ...(boundedString(file.error, 300) ? { error: boundedString(file.error, 300) } : {}),
+        }];
+      }).slice(-24)
+    : [];
+  const previewRaw = raw.preview;
+  const preview = previewRaw?.kind === "html" && typeof previewRaw.html === "string" && previewRaw.html.length <= 180_000
+    ? { kind: "html" as const, label: boundedString(previewRaw.label, 300) ?? "HTML preview", html: previewRaw.html }
+    : previewRaw?.kind === "url" && boundedHttpsUrl(previewRaw.url)
+      ? { kind: "url" as const, label: boundedString(previewRaw.label, 300) ?? "Live deployment", url: boundedHttpsUrl(previewRaw.url) as string }
+      : undefined;
+  const validationRaw = raw.validation;
+  const validation = validationRaw &&
+    (validationRaw.status === "running" || validationRaw.status === "passed" || validationRaw.status === "failed" || validationRaw.status === "unknown")
+    ? {
+        status: validationRaw.status,
+        label: boundedString(validationRaw.label, 200) ?? "Verification",
+        ...(boundedHttpsUrl(validationRaw.url) ? { url: boundedHttpsUrl(validationRaw.url) } : {}),
+      }
+    : undefined;
+  return {
+    status: raw.status,
+    files,
+    startedAt: typeof raw.startedAt === "number" && Number.isFinite(raw.startedAt) ? raw.startedAt : Date.now(),
+    ...(boundedString(raw.repository, 200) ? { repository: boundedString(raw.repository, 200) } : {}),
+    ...(boundedString(raw.branch, 180) ? { branch: boundedString(raw.branch, 180) } : {}),
+    ...(boundedHttpsUrl(raw.pullRequestUrl) ? { pullRequestUrl: boundedHttpsUrl(raw.pullRequestUrl) } : {}),
+    ...(preview ? { preview } : {}),
+    ...(validation ? { validation } : {}),
+  };
+}
+
 export function reviveMessage(message: ChatMessage): ChatMessage {
-  let next = message;
+  const normalizedCodeChanges = normalizeCodeChangeState(message.codeChanges);
+  let next = message.codeChanges ? { ...message, codeChanges: normalizedCodeChanges } : message;
   if (message.pending) {
     // A run was writing into this message when the tab died (reload after a
     // publish, crash). Media that already landed means the turn essentially
@@ -110,6 +196,20 @@ export function reviveMessage(message: ChatMessage): ChatMessage {
     next = delivered
       ? { ...next, pending: undefined }
       : { ...next, pending: undefined, interrupted: true };
+  }
+  if (message.pending && next.codeChanges?.status === "running") {
+    next = {
+      ...next,
+      codeChanges: {
+        ...next.codeChanges,
+        status: "error",
+        files: next.codeChanges.files.map((file) =>
+          file.status === "running"
+            ? { ...file, status: "error" as const, error: file.error ?? "Interrupted before this write finished." }
+            : file,
+        ),
+      },
+    };
   }
   if (message.research && message.research.status === "running") {
     next = {
@@ -216,6 +316,17 @@ export function slimMessage(message: ChatMessage): ChatMessage {
         ? { ...call, result: trimStored(call.result, 2000) }
         : call,
     ),
+    codeChanges: message.codeChanges
+      ? {
+          ...message.codeChanges,
+          preview: message.codeChanges.preview?.kind === "url" ? message.codeChanges.preview : undefined,
+          files: message.codeChanges.files.map((file) => ({
+            ...file,
+            patch: file.patch ? trimStored(file.patch, 2_000) : undefined,
+            truncated: file.patch && file.patch.length > 2_000 ? true : file.truncated,
+          })),
+        }
+      : undefined,
     sources: message.sources && message.sources.length > 24 ? message.sources.slice(0, 24) : message.sources,
     julius: message.julius
       ? {

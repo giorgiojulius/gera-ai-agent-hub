@@ -21,6 +21,7 @@ import {
   type EngineToolRecord,
 } from "./agent-engine";
 import { armCloudMcp, emptyMcpRuntime, type McpRuntime } from "./automation-runner";
+import { deriveCodeChangeFlow, finalizeCodeChangeFlow, mergeRunCodeChangeStates } from "./code-change-flow";
 import {
   chainRotationBases,
   cloudMcpServersForAutomation,
@@ -45,6 +46,7 @@ import {
   cloudMediaRef,
   type JuliusState,
   type ResearchState,
+  type RunCodeChangeState,
   type RunEvent,
   type RunFinalMessage,
   type RunKind,
@@ -126,6 +128,7 @@ type LiveRun = {
   content: string;
   reasoningTail: string;
   toolCalls: RunToolRecord[];
+  codeChanges?: RunCodeChangeState;
   sources: RunSource[];
   research?: ResearchState;
   julius?: JuliusState;
@@ -933,6 +936,7 @@ export class RunManager {
           onToolCalls: (calls) => {
             run.toolCalls = [...failureRecords, ...calls];
             this.emitTools(run);
+            this.captureCodeChanges(run, calls);
           },
         },
         onUsage,
@@ -1000,6 +1004,16 @@ export class RunManager {
     }, 80);
   }
 
+  private captureCodeChanges(run: LiveRun, calls: RunToolRecord[]): void {
+    const next = deriveCodeChangeFlow(calls, run.startedAt, run.codeChanges);
+    if (!next || JSON.stringify(next) === JSON.stringify(run.codeChanges)) {
+      return;
+    }
+    run.codeChanges = next;
+    this.emit(run, { t: "code", seq: 0, codeChanges: next });
+    this.scheduleFlush(run);
+  }
+
   private emitTools(run: LiveRun): void {
     this.scheduleFlush(run);
     if (run.toolsTimer !== null) {
@@ -1033,6 +1047,7 @@ export class RunManager {
       ...(run.toolCalls.length > 0
         ? { toolCalls: this.cappedToolCalls(run.toolCalls, SNAP_TOOL_RESULT_CHARS) }
         : {}),
+      ...(run.codeChanges ? { codeChanges: run.codeChanges } : {}),
       ...(run.sources.length > 0 ? { sources: run.sources.slice(0, FINAL_SOURCES) } : {}),
       ...(run.research ? { research: run.research } : {}),
       ...(run.julius ? { julius: run.julius } : {}),
@@ -1159,6 +1174,7 @@ export class RunManager {
       ...(run.toolCalls.length > 0
         ? { toolCalls: this.cappedToolCalls(run.toolCalls, FINAL_TOOL_RESULT_CHARS).slice(-FINAL_TOOLCALLS) }
         : {}),
+      ...(run.codeChanges ? { codeChanges: run.codeChanges } : {}),
       ...(sources.length > 0 ? { sources } : {}),
       ...(extra.servedBy ? { servedBy: extra.servedBy } : {}),
       ...(extra.research ? { research: extra.research } : {}),
@@ -1177,6 +1193,11 @@ export class RunManager {
   ): void {
     if (run.done) {
       return;
+    }
+    const settledCodeChanges = finalizeCodeChangeFlow(run.toolCalls, run.startedAt, run.codeChanges);
+    if (settledCodeChanges) {
+      run.codeChanges = settledCodeChanges;
+      outcome.message.codeChanges = settledCodeChanges;
     }
     run.done = true;
     if (run.textTimer !== null) {
@@ -1292,6 +1313,7 @@ export class RunManager {
       content: message.content,
       createdAt: now,
       ...(message.toolCalls ? { toolCalls: message.toolCalls } : {}),
+      ...(message.codeChanges ? { codeChanges: message.codeChanges } : {}),
       ...(message.sources ? { sources: message.sources } : {}),
       ...(message.servedBy ? { servedBy: message.servedBy } : {}),
       ...(message.research ? { research: message.research } : {}),
@@ -1309,12 +1331,15 @@ export class RunManager {
       const baseCalls = Array.isArray(base.toolCalls) ? (base.toolCalls as RunToolRecord[]) : [];
       const baseSources = Array.isArray(base.sources) ? (base.sources as RunSource[]) : [];
       const knownUrls = new Set(baseSources.map((item) => item.url));
+      const baseCodeChanges = base.codeChanges as RunCodeChangeState | undefined;
+      const mergedCodeChanges = mergeRunCodeChangeStates(baseCodeChanges, message.codeChanges);
       const merged: LooseMessage = {
         ...base,
         content: assistant.content,
         pending: undefined,
         interrupted: message.interrupted ? true : undefined,
         toolCalls: [...baseCalls, ...(message.toolCalls ?? [])].slice(-FINAL_TOOLCALLS),
+        ...(mergedCodeChanges ? { codeChanges: mergedCodeChanges } : {}),
         sources: [...baseSources, ...(message.sources ?? []).filter((item) => !knownUrls.has(item.url))].slice(
           0,
           FINAL_SOURCES,
@@ -1339,6 +1364,26 @@ export class RunManager {
     chat.updatedAt = updatedAt;
 
     let payload = JSON.stringify(chat);
+    if (payload.length > CHAT_PAYLOAD_LIMIT) {
+      // Runnable HTML and long patches are the first optional payload to trim;
+      // the compact file ledger remains so the chat still tells what changed.
+      for (const entry of messages) {
+        const code = entry.codeChanges as RunCodeChangeState | undefined;
+        if (!code) {
+          continue;
+        }
+        entry.codeChanges = {
+          ...code,
+          preview: code.preview?.kind === "url" ? code.preview : undefined,
+          files: code.files.map((file) => ({
+            ...file,
+            patch: file.patch ? capStr(file.patch, 2_000) : undefined,
+            truncated: file.patch && file.patch.length > 2_000 ? true : file.truncated,
+          })),
+        };
+      }
+      payload = JSON.stringify(chat);
+    }
     if (payload.length > CHAT_PAYLOAD_LIMIT) {
       // Progressive honest trims: shrink tool results, then drop them.
       for (const entry of messages) {

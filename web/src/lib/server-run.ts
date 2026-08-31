@@ -14,6 +14,7 @@ import type {
   Attachment,
   BuiltinToolId,
   ChatMessage,
+  CodeChangeState,
   Conversation,
   JuliusSettings,
   JuliusState,
@@ -90,6 +91,7 @@ export type ServerRunFinalMessage = {
   id: string;
   content: string;
   toolCalls?: ToolCallRecord[];
+  codeChanges?: CodeChangeState;
   sources?: ResearchSource[];
   servedBy?: string;
   research?: ResearchState;
@@ -118,6 +120,7 @@ export type ServerRunSnapshot = {
   content: string;
   reasoningTail?: string;
   toolCalls?: ToolCallRecord[];
+  codeChanges?: CodeChangeState;
   sources?: ResearchSource[];
   research?: ResearchState;
   julius?: JuliusState;
@@ -129,6 +132,7 @@ export type ServerRunEvent =
   | { t: "text"; seq: number; content: string }
   | { t: "reasoning"; seq: number; tail: string }
   | { t: "tools"; seq: number; toolCalls: ToolCallRecord[] }
+  | { t: "code"; seq: number; codeChanges: CodeChangeState }
   | { t: "sources"; seq: number; sources: ResearchSource[] }
   | { t: "research"; seq: number; research: ResearchState }
   | { t: "julius"; seq: number; julius: JuliusState; sources?: ResearchSource[] }

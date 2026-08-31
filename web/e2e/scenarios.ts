@@ -29,6 +29,9 @@ export const STUB_REPLY_SNIPPET = "Gera e2e reply";
  */
 export const STUB_HANG_PROMPT = "Hang this run for the stop regression";
 
+/** Prompt marker that makes the platform stub stream a code edit + runnable HTML preview. */
+export const STUB_CODE_PROMPT = "Build a tiny runnable code preview";
+
 /** Curated chat model every platform's picker must offer. */
 export const SWITCH_TARGET_MODEL_ID = "anthropic/claude-opus-5";
 export const SWITCH_TARGET_MODEL_NAME = "Claude Opus 5";
@@ -57,6 +60,22 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
       // Every chat gets its own address once it has a message.
       { do: "urlContains", text: "/c/" },
+    ],
+  },
+  {
+    id: "code-changes-preview",
+    title: "Code edits open a live Changes workbench and runnable preview",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "fill", target: TID.composerInput, text: STUB_CODE_PROMPT },
+      { do: "tap", target: TID.composerSend },
+      { do: "seeText", target: TID.codeChangeFlow, text: "index.html", timeoutMs: 20_000 },
+      { do: "tap", target: TID.codeChangeChangesTab },
+      { do: "seeText", target: TID.codeChangeFlow, text: "Hello from preview" },
+      { do: "tap", target: TID.codeChangePreviewTab },
+      { do: "seeText", target: TID.codeChangeFlow, text: "Preview running" },
+      { do: "see", target: TID.codeChangePreview },
     ],
   },
   {

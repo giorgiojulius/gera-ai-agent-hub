@@ -1311,6 +1311,7 @@ async function listDeployments(auth: string, input: Record<string, unknown>): Pr
   const withStatus = await Promise.all(
     deployments.slice(0, 10).map(async (deployment) => {
       let state = "unknown";
+      let previewUrl = "";
       try {
         const statuses = asRecordArray(
           await ghFetch(
@@ -1320,10 +1321,12 @@ async function listDeployments(auth: string, input: Record<string, unknown>): Pr
           ),
         );
         state = str(statuses[0]?.state) || "pending";
+        previewUrl = str(statuses[0]?.environment_url) || str(statuses[0]?.target_url);
       } catch {
         // status listing can fail on old deployments — keep "unknown"
       }
-      return `${str(deployment.environment) || "env?"} [${state}] ref ${str(deployment.ref)}@${str(deployment.sha).slice(0, 7)} · ${day(deployment.created_at)} · by @${str(((deployment.creator ?? {}) as Record<string, unknown>).login) || "unknown"}`;
+      const summary = `${str(deployment.environment) || "env?"} [${state}] ref ${str(deployment.ref)}@${str(deployment.sha).slice(0, 7)} · ${day(deployment.created_at)} · by @${str(((deployment.creator ?? {}) as Record<string, unknown>).login) || "unknown"}`;
+      return previewUrl ? `${summary}\n  preview: ${previewUrl}` : summary;
     }),
   );
   return `${deployments.length} deployments in ${owner}/${repo} (latest first):\n${withStatus.join("\n")}`;
@@ -1670,7 +1673,7 @@ export const GITHUB_NATIVE_TOOLS: McpToolInfo[] = [
   {
     name: "list_deployments",
     description:
-      "List deployments with environment, ref, and latest status — covers Vercel/Netlify-style integrations that record deploys on GitHub.",
+      "List deployments with environment, ref, latest status, and the real preview URL when the provider publishes one — covers Vercel/Netlify-style integrations recorded on GitHub.",
     inputSchema: {
       type: "object",
       properties: {

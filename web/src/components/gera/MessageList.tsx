@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
+import { CodeChangeFlow } from "@/components/gera/CodeChangeFlow";
 import { JuliusPanel } from "@/components/gera/JuliusPanel";
 import { MediaAudioCard, MediaImageCard, MediaImageGrid, MediaVideoCard } from "@/components/gera/VaultMedia";
 import { MarkdownBody } from "@/components/gera/Markdown";
@@ -28,6 +29,7 @@ import { SparkMark } from "@/components/gera/Spark";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useAgent } from "@/hooks/use-agent";
 import { estimateAnswerCost, estimateMediaCost } from "@/lib/arena";
+import { isCodeMutationToolName } from "@/lib/code-changes";
 import { downloadOrOpenMedia } from "@/lib/media-actions";
 import { findModel, formatUsd, modelShortName } from "@/lib/models";
 import { TID } from "@/lib/testids";
@@ -127,6 +129,9 @@ function MessageBubble({
   }
 
   const citationSources = citationSourcesOf(message);
+  const ordinaryToolCalls = message.codeChanges
+    ? (message.toolCalls ?? []).filter((call) => !isCodeMutationToolName(call.name))
+    : message.toolCalls ?? [];
 
   return (
     <div className="flex gap-3" data-testid={TID.messageAssistant}>
@@ -167,9 +172,10 @@ function MessageBubble({
             readOnly={readOnly}
           />
         ) : null}
-        {message.toolCalls && message.toolCalls.length > 0 ? (
+        {message.codeChanges ? <CodeChangeFlow flow={message.codeChanges} /> : null}
+        {ordinaryToolCalls.length > 0 ? (
           <div className="mb-3 flex flex-col gap-1.5">
-            {message.toolCalls.map((call) => {
+            {ordinaryToolCalls.map((call) => {
               const view = describeToolCall(call);
               return (
                 <div

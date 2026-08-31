@@ -26,6 +26,7 @@ import { getToolkitUrl } from "@/lib/env";
 import { buildRunReport, runScenario, type E2eDriver } from "../../e2e/runner";
 import {
   E2E_SCENARIOS,
+  STUB_CODE_PROMPT,
   STUB_HANG_PROMPT,
   STUB_REPLY_SNIPPET,
   SWITCH_TARGET_MODEL_ID,
@@ -129,6 +130,7 @@ type StubRunBody = {
   conversationId?: string;
   assistantMessageId?: string;
   config?: {
+    prompt?: string;
     githubRepo?: string;
     mcpServers?: Array<{ id?: string; catalogId?: string; token?: string }>;
   };
@@ -137,9 +139,31 @@ let lastStubRun: StubRun | null = null;
 let lastStubRunBody: StubRunBody | null = null;
 /** Set by /runs/start when the prompt carries STUB_HANG_PROMPT — the stream then never terminates. */
 let hangStubRun = false;
+let codeStubRun = false;
 
 function runStreamResponse(): Response {
   const run = lastStubRun;
+  const html = "<!doctype html><html><body><h1>Hello from preview</h1></body></html>";
+  const codeChanges = {
+    status: "done",
+    startedAt: Date.now(),
+    repository: "acme/private-app",
+    branch: "gera/live-preview",
+    files: [
+      {
+        id: "code-write",
+        path: "index.html",
+        action: "create",
+        status: "done",
+        language: "html",
+        additions: 1,
+        deletions: 0,
+        patch: `+${html}`,
+      },
+    ],
+    preview: { kind: "html", label: "index.html", html },
+    validation: { status: "passed", label: "Checks passed" },
+  } as const;
   const events: unknown[] = [
     {
       t: "snapshot",
@@ -153,13 +177,32 @@ function runStreamResponse(): Response {
         content: "",
       },
     },
-    { t: "text", seq: 2, content: REPLY_TEXT.slice(0, 14) },
-    { t: "text", seq: 3, content: REPLY_TEXT },
+    ...(codeStubRun
+      ? [
+          {
+            t: "code",
+            seq: 2,
+            codeChanges: {
+              ...codeChanges,
+              status: "running",
+              files: codeChanges.files.map((file) => ({ ...file, status: "running" })),
+              preview: undefined,
+            },
+          },
+          { t: "code", seq: 3, codeChanges },
+        ]
+      : []),
+    { t: "text", seq: codeStubRun ? 4 : 2, content: REPLY_TEXT.slice(0, 14) },
+    { t: "text", seq: codeStubRun ? 5 : 3, content: REPLY_TEXT },
     {
       t: "done",
-      seq: 4,
+      seq: codeStubRun ? 6 : 4,
       status: "done",
-      message: { id: run?.assistantMessageId ?? "e2e-assistant", content: REPLY_TEXT },
+      message: {
+        id: run?.assistantMessageId ?? "e2e-assistant",
+        content: REPLY_TEXT,
+        ...(codeStubRun ? { codeChanges } : {}),
+      },
       usageEvents: [
         { modelId: "stub/model", usage: { prompt_tokens: 42, completion_tokens: 12, total_tokens: 54 } },
       ],
@@ -297,6 +340,7 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
         assistantMessageId: body.assistantMessageId ?? "e2e-assistant",
       };
       hangStubRun = raw.includes(STUB_HANG_PROMPT);
+      codeStubRun = body.config?.prompt === STUB_CODE_PROMPT;
       return jsonResponse({ ok: true, runId: lastStubRun.runId, historyOnServer: true });
     }
     if (url.includes("/runs/stream")) {
@@ -417,6 +461,8 @@ beforeEach(() => {
   sessionStorage.clear();
   lastStubRun = null;
   lastStubRunBody = null;
+  hangStubRun = false;
+  codeStubRun = false;
   localStorage.setItem(ACCESS_TOKEN_KEY, fakeAccessToken());
   installNetworkStub();
 });

@@ -1,15 +1,13 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `60ebb36` (+ Luna suggestion model,
+Last synced: 2026-08-31 · commit `3769c8e` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
-stop/steering race fixes + stop watchdog, GitHub run credential hand-off +
-server contents preflight + structured pin across Research/Julius + repo access
-probe, truthful MCP health + durable OAuth grant sync/refresh, authenticated
-raw-file reads, Julius Verifier GitHub hand-off, MCP structured/resource reads,
-honesty prompts, skills-as-guidance research fix, Intercom attachments, full
-98-entry MCP audit, and cross-tab/account-session OAuth + sync race hardening)
-Drift check: `git log --oneline 60ebb36..HEAD`, then compare against
+stop/steering hardening, GitHub run credential hand-off + pin/access fixes,
+truthful MCP health + OAuth/account-session hardening, authenticated file reads,
+Intercom attachments, full 98-entry MCP audit, and the live code Changes /
+Preview workbench with sandboxed HTML and deployment previews)
+Drift check: `git log --oneline 3769c8e..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -87,6 +85,30 @@ stubbed `/access/status` → `invited`.
 Empty thread shows the Launchpad hero (`launchpad`) with the big composer
 (`composer-input`, send `composer-send`). A thread renders `chat-thread`
 with `message-user` / `message-assistant` rows (markdown, artifacts, media).
+
+Code-change workbench (2026-08-31): the first repository branch/write call
+streams a `code` run event and opens `code-change-flow` inside that assistant
+turn — no need to wait for the final answer. Its live Branch → Changes → Checks
+→ Preview rail mirrors real tool status; mutation chips are folded into this one
+card while unrelated reads/tools stay visible. Changes (`code-change-changes-tab`)
+shows the touched-file list, create/update/delete state, +/− totals, per-file
+errors, and a bounded line diff. When the agent read the old GitHub file first,
+the diff is old vs complete new body; without a readable old body it honestly
+shows the available new/patch side instead of inventing a baseline. The ledger
+survives snapshots, reconnects, sync, reload recovery, and resumed turns; large
+HTML/diffs are the first optional payload trimmed under history limits.
+
+Preview (`code-change-preview-tab`) starts automatically after a runnable result:
+a committed standalone HTML page runs in `code-change-preview`, with CSS/JS files
+changed in the same turn inlined when referenced locally. It runs in a sandboxed
+iframe with no same-origin privilege. For built apps (React/Vite/etc.), Gera asks
+GitHub for workflow/deployment status; a provider-published public HTTPS
+`environment_url` becomes an embedded live preview plus Open link. If neither
+committed HTML nor a real deployment URL exists, the tab says so — no fake local
+server or invented URL. External preview, PR, and checks links accept HTTPS only,
+reject embedded credentials, and synced workbench payloads are size/type
+validated before rendering. Tests: `code-change-flow.test.ts`; E2E:
+`code-changes-preview` switches Changes → Preview and sees the running iframe.
 
 Above the greeting a Shortcuts strip (`home-shortcuts`, toggle in
 Settings → Shortcuts; hidden in incognito, while loading/failed, and
@@ -891,6 +913,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | --- | --- |
 | boot-to-launchpad | Gate bypass, launchpad, composer, sidebar render |
 | send-chat-message | Send → user turn + streamed reply + `/c/` address |
+| code-changes-preview | Repository edit event → live Changes diff → runnable sandbox Preview iframe |
 | new-chat-keeps-history | New chat resets view, thread stays listed |
 | github-pin-and-send | Connected GitHub → private repo list → pin → `/runs/start` carries exact repo + credential |
 | switch-chat-model | Picker root → Model submenu → selection sticks |
@@ -924,7 +947,9 @@ read-only GitHub arms zero write tools; missing tokens arm nothing and are
 reported), plus `mcp-rotation`, `mcp-file-content`, `github-security` (all 30
 browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
 account isolation), `mcp-security` (catalog, auth-mode, OAuth/egress/session/
-protocol and native Slack/Intercom parity), `agent-steering`, `github-native`.
+protocol and native Slack/Intercom parity), `code-change-flow` (diff capture,
+HTML/CSS/JS assembly, HTTPS-only deployment previews, continuation merge),
+`agent-steering`, `github-native`.
 Only the Durable
 Object glue in `chat-store.ts` / `project-store.ts` stays untested — its
 typecheck happens at the functions deploy (`runChecks functions`), not in

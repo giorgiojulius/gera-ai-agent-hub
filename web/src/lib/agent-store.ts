@@ -1,6 +1,7 @@
 import { toast } from "sonner";
 
 import { serializeConversation } from "@/lib/chat-sync";
+import { mergeCodeChangeStates } from "@/lib/code-changes";
 import { githubRepoRefs, injectGitHubRunAuth, pinnedRepoPromptBlock, resolveGitHubAuth } from "@/lib/github-native";
 import {
   ackServerRun,
@@ -353,6 +354,7 @@ function applyRunEvent(
       patchAssistant({
         ...(snap.content ? { content: snap.content } : {}),
         ...(snap.toolCalls && snap.toolCalls.length > 0 ? { toolCalls: snap.toolCalls } : {}),
+        ...(snap.codeChanges ? { codeChanges: snap.codeChanges } : {}),
         ...(snap.sources && snap.sources.length > 0 ? { sources: snap.sources } : {}),
         ...(snap.research ? { research: snap.research } : {}),
         ...(snap.julius ? { julius: snap.julius } : {}),
@@ -364,6 +366,9 @@ function applyRunEvent(
       return;
     case "tools":
       patchAssistant({ toolCalls: event.toolCalls });
+      return;
+    case "code":
+      patchAssistant({ codeChanges: event.codeChanges });
       return;
     case "sources":
       patchAssistant({ sources: event.sources });
@@ -414,6 +419,7 @@ async function settleDone(done: ServerRunDone): Promise<Partial<ChatMessage>> {
   return {
     content: message.content,
     toolCalls: message.toolCalls && message.toolCalls.length > 0 ? message.toolCalls : undefined,
+    codeChanges: message.codeChanges,
     sources: message.sources && message.sources.length > 0 ? message.sources : undefined,
     ...(message.servedBy ? { servedBy: message.servedBy } : {}),
     ...(message.research ? { research: message.research } : {}),
@@ -1451,12 +1457,14 @@ export async function resumePrompt(params: {
     const knownUrls = new Set(baseSources.map((item) => item.url));
     const sources = [...baseSources, ...(patch.sources ?? []).filter((item) => !knownUrls.has(item.url))];
     const toolCalls = [...baseToolCalls, ...(patch.toolCalls ?? [])];
+    const codeChanges = mergeCodeChangeStates(message.codeChanges, patch.codeChanges);
     patchAssistant({
       ...patch,
       images: images.length > 0 ? images : undefined,
       videos: videos.length > 0 ? videos : undefined,
       audioUrl: patch.audioUrl ?? message.audioUrl,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      codeChanges,
       sources: sources.length > 0 ? sources : undefined,
     });
     reconcileServerClock(params.setState, conversationId, done.chatUpdatedAt);

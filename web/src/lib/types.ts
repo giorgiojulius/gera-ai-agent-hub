@@ -83,6 +83,43 @@ export type ToolCallRecord = {
   result?: string;
 };
 
+/** One repository file mutation rendered inside a chat turn's code workbench. */
+export type CodeChangeFile = {
+  id: string;
+  path: string;
+  action: "create" | "update" | "delete" | "patch";
+  status: ToolCallStatus;
+  language?: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+  truncated?: boolean;
+  error?: string;
+};
+
+/** A runnable preview captured from committed HTML or a real deployment result. */
+export type CodePreview =
+  | { kind: "html"; label: string; html: string }
+  | { kind: "url"; label: string; url: string };
+
+export type CodeValidation = {
+  status: "running" | "passed" | "failed" | "unknown";
+  label: string;
+  url?: string;
+};
+
+/** Live, persisted code-edit flow shown as Changes / Preview in the assistant message. */
+export type CodeChangeState = {
+  status: "running" | "done" | "error";
+  files: CodeChangeFile[];
+  startedAt: number;
+  repository?: string;
+  branch?: string;
+  pullRequestUrl?: string;
+  preview?: CodePreview;
+  validation?: CodeValidation;
+};
+
 export type ResearchStepKind = "plan" | "search" | "read" | "browse" | "synthesize";
 
 /** Resource budget preset for a deep-research run: iterations, reads, live browsing. */
@@ -155,6 +192,8 @@ export type ChatMessage = {
   videos?: string[];
   audioUrl?: string;
   toolCalls?: ToolCallRecord[];
+  /** Repository edits, their diff preview, verification, and runnable preview. */
+  codeChanges?: CodeChangeState;
   /**
    * Web sources actually consulted this turn (from web_search / fetch_url),
    * in citation order: a [n] marker in the content refers to sources[n-1].

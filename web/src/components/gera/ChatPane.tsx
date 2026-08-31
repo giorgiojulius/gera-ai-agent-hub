@@ -256,6 +256,9 @@ export function ChatPane() {
   // hide the handle with CSS from the first paint so phones never flash it.
   const floating = !isMobile && (dragging || !isDefaultOffset(offset));
   const live = isMobile ? { x: 0, y: 0 } : offset;
+  // Keep the thread ending at the composer's top: a lifted card leaves a hole
+  // below rather than covering the latest messages.
+  const reserved = floating ? Math.max(0, boxHeight + live.y) : 0;
 
   return (
     <div ref={paneRef} className="relative flex min-h-0 flex-1 flex-col">
@@ -275,9 +278,7 @@ export function ChatPane() {
           </button>
         ) : null}
       </div>
-      {floating ? (
-        <div aria-hidden className="shrink-0" style={{ height: Math.max(0, boxHeight - live.y) }} />
-      ) : null}
+      {reserved > 0 ? <div aria-hidden className="shrink-0" style={{ height: reserved }} /> : null}
       <div
         ref={attachBox}
         className={cn("w-full", floating && "absolute z-20 max-w-3xl", dragging && "pointer-events-none")}

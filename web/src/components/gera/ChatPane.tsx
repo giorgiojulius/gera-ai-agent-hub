@@ -252,6 +252,8 @@ export function ChatPane() {
     );
   }
 
+  // useIsMobile starts undefined (false) until the matchMedia effect runs —
+  // hide the handle with CSS from the first paint so phones never flash it.
   const floating = !isMobile && (dragging || !isDefaultOffset(offset));
   const live = isMobile ? { x: 0, y: 0 } : offset;
 
@@ -290,25 +292,23 @@ export function ChatPane() {
             : undefined
         }
       >
-        {isMobile ? null : (
-          <div className={cn("flex justify-center", dragging && "pointer-events-auto")}>
-            <button
-              type="button"
-              data-testid={TID.composerDragHandle}
-              aria-label="Move composer"
-              title="Drag to move · double-click to dock"
-              onPointerDown={onDragStart}
-              onPointerMove={onDragMove}
-              onPointerUp={onDragEnd}
-              onPointerCancel={onDragEnd}
-              onDoubleClick={resetComposerPos}
-              className="flex h-5 w-12 items-center justify-center rounded-full text-muted-foreground/70 transition-colors hover:bg-foreground/5 hover:text-foreground touch-none"
-              style={{ cursor: dragging ? "grabbing" : "grab" }}
-            >
-              <GripHorizontal className="h-4 w-4" aria-hidden />
-            </button>
-          </div>
-        )}
+        <div className={cn("hidden justify-center md:flex", dragging && "pointer-events-auto")}>
+          <button
+            type="button"
+            data-testid={TID.composerDragHandle}
+            aria-label="Move composer"
+            title="Drag to move · double-click to dock"
+            onPointerDown={onDragStart}
+            onPointerMove={onDragMove}
+            onPointerUp={onDragEnd}
+            onPointerCancel={onDragEnd}
+            onDoubleClick={resetComposerPos}
+            className="flex h-5 w-12 items-center justify-center rounded-full text-muted-foreground/70 transition-colors hover:bg-foreground/5 hover:text-foreground touch-none"
+            style={{ cursor: dragging ? "grabbing" : "grab" }}
+          >
+            <GripHorizontal className="h-4 w-4" aria-hidden />
+          </button>
+        </div>
         <div className={dragging ? "pointer-events-none" : undefined}>
           <Composer />
         </div>

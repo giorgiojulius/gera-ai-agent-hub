@@ -31,6 +31,8 @@ export const TID = {
   messageUser: "message-user",
   /** One assistant message row (repeats per turn). */
   messageAssistant: "message-assistant",
+  /** Evidence-backed outcome receipt under an autonomous agent reply. */
+  executionOutcome: "execution-outcome",
   /** Live repository edit workbench inside an assistant turn. */
   codeChangeFlow: "code-change-flow",
   /** Changes tab inside the repository edit workbench. */

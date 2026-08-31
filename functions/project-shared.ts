@@ -9,6 +9,7 @@
 import { GITHUB_NATIVE_TOOLS } from "./native-github";
 import { INTERCOM_NATIVE_TOOLS } from "./native-intercom";
 import { SLACK_NATIVE_TOOLS } from "./native-slack";
+import type { ExecutionOutcome } from "./run-protocol";
 
 export type ProjectRole = "owner" | "admin" | "member";
 
@@ -111,6 +112,7 @@ export type ProjectMessageWire = {
   body: string;
   /** True while an agent reply is still being produced. */
   pending: boolean;
+  execution?: ExecutionOutcome;
   createdAt: number;
   updatedAt: number;
 };
@@ -165,6 +167,7 @@ export type ScreenChatMessageWire = {
   authorName: string;
   body: string;
   pending: boolean;
+  execution?: ExecutionOutcome;
   createdAt: number;
   updatedAt: number;
 };

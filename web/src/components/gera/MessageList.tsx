@@ -22,6 +22,7 @@ import {
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { CodeChangeFlow } from "@/components/gera/CodeChangeFlow";
+import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { JuliusPanel } from "@/components/gera/JuliusPanel";
 import { MediaAudioCard, MediaImageCard, MediaImageGrid, MediaVideoCard } from "@/components/gera/VaultMedia";
 import { MarkdownBody } from "@/components/gera/Markdown";
@@ -231,6 +232,7 @@ function MessageBubble({
         {message.audioUrl ? (
           <MediaAudioCard className="mt-3" src={message.audioUrl} downloadName="gera-audio" />
         ) : null}
+        {!streaming && message.execution ? <ExecutionOutcomeCard outcome={message.execution} /> : null}
         {message.interrupted && !readOnly ? (
           <InterruptedNotice message={message} busy={busy} />
         ) : null}

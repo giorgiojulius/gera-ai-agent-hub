@@ -43,7 +43,14 @@ import {
   type ServerToolContext,
 } from "./run-tools";
 import {
+  buildExecutionOutcome,
   cloudMediaRef,
+  executionOutcomeSystemPrompt,
+  executionOutcomeToolDefinition,
+  extractExecutionOutcomeMarker,
+  parseExecutionOutcomeClaim,
+  visibleExecutionToolCalls,
+  type ExecutionOutcomeClaim,
   type JuliusState,
   type ResearchState,
   type RunCodeChangeState,
@@ -134,6 +141,8 @@ type LiveRun = {
   julius?: JuliusState;
   steered: RunSteerItem[];
   usageEvents: RunUsageEvent[];
+  /** Model claim captured by gera_submit_outcome; runtime evidence still validates it. */
+  executionClaim?: ExecutionOutcomeClaim;
   // Control.
   seq: number;
   inbox: RunSteerItem[];
@@ -640,6 +649,11 @@ export class RunManager {
 
   private async executeRun(run: LiveRun, authKey: string): Promise<void> {
     const config = run.body.config;
+    const isAutomation = Boolean(run.body.automationId);
+    const contractPrompt = isAutomation
+      ? executionOutcomeSystemPrompt(run.kind === "research" ? "marker" : "tool", "automation")
+      : "";
+    const systemPrompt = [config.systemPrompt?.trim() ?? "", contractPrompt].filter(Boolean).join("\n\n") || undefined;
     const deadlineAt = run.startedAt + TIME_BUDGET_MS[run.kind];
     const onUsage = (modelId: string, usage: unknown, service?: boolean): void => {
       run.usageEvents.push({ modelId, usage, ...(service ? { service: true } : {}) });
@@ -653,7 +667,7 @@ export class RunManager {
           prompt: config.prompt,
           history: config.history,
           modelId: run.body.modelId,
-          systemPrompt: config.systemPrompt,
+          systemPrompt,
           depth: config.research?.depth ?? "balanced",
           githubAuth: config.research?.githubAuth,
           githubDisabledTools: config.research?.githubDisabledTools,
@@ -729,7 +743,7 @@ export class RunManager {
           builtins: config.builtins,
           mcpToolDefs: juliusMcp.toolDefs,
           mcpRoutes: juliusMcp.routes,
-          systemPrompt: config.systemPrompt,
+          systemPrompt,
           isCancelled,
           research: juliusConfig.research
             ? async ({ modelId, onText, onResearch }) => {
@@ -883,9 +897,13 @@ export class RunManager {
       surf: createServerSurfSession(),
       mcpRoutes: mcp.routes.size > 0 ? mcp.routes : null,
     };
-    const tools = [...builtinToolDefs(config.builtins), ...mcp.toolDefs.map((def) => ({ ...def }))];
+    const tools = [
+      ...builtinToolDefs(config.builtins),
+      ...mcp.toolDefs.map((def) => ({ ...def })),
+      ...(isAutomation ? [executionOutcomeToolDefinition()] : []),
+    ];
 
-    const apiMessages = buildApiMessages(config.history, config.systemPrompt);
+    const apiMessages = buildApiMessages(config.history, systemPrompt);
     if (pinnedGitHubBlock) {
       apiMessages.push({ role: "system", content: pinnedGitHubBlock });
     }
@@ -913,6 +931,15 @@ export class RunManager {
         apiMessages,
         tools,
         executeTool: async (name, argsJson) => {
+          if (isAutomation && name === executionOutcomeToolDefinition().function.name) {
+            run.executionClaim = parseExecutionOutcomeClaim(argsJson) ?? undefined;
+            return {
+              text: run.executionClaim
+                ? "Execution outcome recorded. Do not repeat the deliverable."
+                : "Execution outcome was invalid. Submit it again with every required field.",
+              ...(run.executionClaim ? {} : { isError: true }),
+            };
+          }
           const outcome = await executeServerTool(name, argsJson, toolCtx);
           syncSources();
           return outcome;
@@ -934,9 +961,10 @@ export class RunManager {
             this.emit(run, { t: "reasoning", seq: 0, tail: run.reasoningTail });
           },
           onToolCalls: (calls) => {
-            run.toolCalls = [...failureRecords, ...calls];
+            const visibleCalls = visibleExecutionToolCalls(calls);
+            run.toolCalls = [...failureRecords, ...visibleCalls];
             this.emitTools(run);
-            this.captureCodeChanges(run, calls);
+            this.captureCodeChanges(run, visibleCalls);
           },
         },
         onUsage,
@@ -1199,6 +1227,27 @@ export class RunManager {
       run.codeChanges = settledCodeChanges;
       outcome.message.codeChanges = settledCodeChanges;
     }
+    if (run.body.automationId) {
+      const marked = extractExecutionOutcomeMarker(outcome.message.content);
+      outcome.message.content = marked.content;
+      outcome.message.execution = buildExecutionOutcome({
+        claim: run.executionClaim ?? marked.claim,
+        content: marked.content,
+        sources: outcome.message.sources ?? run.sources,
+        toolCalls: run.toolCalls,
+        codeChanges: outcome.message.codeChanges,
+        technicalStatus:
+          status === "done"
+            ? "done"
+            : status === "stopped"
+              ? "stopped"
+              : status === "interrupted"
+                ? "interrupted"
+                : "error",
+        surface: "automation",
+        error: outcome.error,
+      });
+    }
     run.done = true;
     if (run.textTimer !== null) {
       clearTimeout(run.textTimer);
@@ -1314,6 +1363,7 @@ export class RunManager {
       createdAt: now,
       ...(message.toolCalls ? { toolCalls: message.toolCalls } : {}),
       ...(message.codeChanges ? { codeChanges: message.codeChanges } : {}),
+      ...(message.execution ? { execution: message.execution } : {}),
       ...(message.sources ? { sources: message.sources } : {}),
       ...(message.servedBy ? { servedBy: message.servedBy } : {}),
       ...(message.research ? { research: message.research } : {}),
@@ -1340,6 +1390,7 @@ export class RunManager {
         interrupted: message.interrupted ? true : undefined,
         toolCalls: [...baseCalls, ...(message.toolCalls ?? [])].slice(-FINAL_TOOLCALLS),
         ...(mergedCodeChanges ? { codeChanges: mergedCodeChanges } : {}),
+        ...(message.execution ? { execution: message.execution } : {}),
         sources: [...baseSources, ...(message.sources ?? []).filter((item) => !knownUrls.has(item.url))].slice(
           0,
           FINAL_SOURCES,
@@ -1535,6 +1586,22 @@ export class RunManager {
           finishedAt: Date.now(),
         }
       : undefined;
+    let automationId: string | undefined;
+    const chatRow = this.ctx.storage.sql
+      .exec<{ payload: string }>(
+        "SELECT payload FROM chats WHERE owner_email = ? AND id = ?",
+        row.owner_email,
+        row.conversation_id,
+      )
+      .toArray()[0];
+    if (chatRow) {
+      try {
+        const chat = JSON.parse(chatRow.payload) as { automationId?: unknown };
+        automationId = typeof chat.automationId === "string" && chat.automationId ? chat.automationId : undefined;
+      } catch {
+        automationId = undefined;
+      }
+    }
     const message: RunFinalMessage = {
       id: row.assistant_message_id,
       content,
@@ -1542,6 +1609,18 @@ export class RunManager {
       ...(snapshot?.sources ? { sources: snapshot.sources } : {}),
       ...(research ? { research } : {}),
       ...(julius ? { julius } : {}),
+      ...(automationId
+        ? {
+            execution: buildExecutionOutcome({
+              content,
+              sources: snapshot?.sources,
+              toolCalls: snapshot?.toolCalls,
+              technicalStatus: "interrupted",
+              surface: "automation",
+              error: "The server node restarted before the autonomous run finished.",
+            }),
+          }
+        : {}),
       interrupted: true,
     };
     let chatUpdatedAt = 0;
@@ -1559,6 +1638,7 @@ export class RunManager {
           kind: (row.kind as RunKind) || "chat",
           title: row.title,
           modelId: row.model_id,
+          ...(automationId ? { automationId } : {}),
           config: { history: [], prompt: "", builtins: {} as never, mcpServers: [] },
         },
         chatWritable: true,

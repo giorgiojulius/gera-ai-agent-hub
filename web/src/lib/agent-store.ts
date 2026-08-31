@@ -22,6 +22,7 @@ import {
 } from "@/lib/server-run";
 import { newId } from "@/lib/env";
 import { errorFromUnknown } from "@/lib/errors";
+import { normalizeExecutionOutcome } from "@/lib/execution-outcome";
 import { filterMcpServersByIds } from "@/lib/automations";
 import {
   loadActiveId,
@@ -72,6 +73,7 @@ import type {
   ChatMessage,
   Conversation,
   CreateMode,
+  ExecutionOutcome,
   JuliusState,
   LifeState,
   McpServerConfig,
@@ -420,6 +422,7 @@ async function settleDone(done: ServerRunDone): Promise<Partial<ChatMessage>> {
     content: message.content,
     toolCalls: message.toolCalls && message.toolCalls.length > 0 ? message.toolCalls : undefined,
     codeChanges: message.codeChanges,
+    execution: normalizeExecutionOutcome(message.execution),
     sources: message.sources && message.sources.length > 0 ? message.sources : undefined,
     ...(message.servedBy ? { servedBy: message.servedBy } : {}),
     ...(message.research ? { research: message.research } : {}),
@@ -604,7 +607,7 @@ export async function sendPrompt(params: {
   /** Fires once the target conversation id is known, before streaming starts. */
   onRun?: (conversationId: string) => void;
   /** Fires after the run settles; `stoppedManually` holds the follow-up queue. */
-  onDone?: (conversationId: string, stoppedManually?: boolean) => void;
+  onDone?: (conversationId: string, stoppedManually?: boolean, execution?: ExecutionOutcome) => void;
 }): Promise<void> {
   const settings = params.state.settings;
   const overrides = params.overrides;
@@ -771,6 +774,7 @@ export async function sendPrompt(params: {
   let turnFailed = false;
   /** Set when the server confirms a manual stop — the follow-up queue holds. */
   let manualStop = false;
+  let executionOutcome: ExecutionOutcome | undefined;
   // Image/video runs may honestly reroute to a capable model — telemetry
   // reports the model that actually ran.
   let effectiveModelId = modelId;
@@ -1053,6 +1057,7 @@ export async function sendPrompt(params: {
         patchAssistant,
       });
       manualStop = done.status === "stopped";
+      executionOutcome = normalizeExecutionOutcome(done.message.execution);
       const patch = await settleDone(done);
       if (wantJulius && patch.julius) {
         if (patch.julius.status === "error") {
@@ -1193,6 +1198,7 @@ export async function sendPrompt(params: {
       patchAssistant,
     });
     manualStop = done.status === "stopped";
+    executionOutcome = normalizeExecutionOutcome(done.message.execution);
     patchAssistant(await settleDone(done));
     reconcileServerClock(params.setState, seeded.id, done.chatUpdatedAt);
     if (done.status === "error") {
@@ -1272,7 +1278,7 @@ export async function sendPrompt(params: {
             : prev.unreadIds,
       }));
     }
-    params.onDone?.(seeded.id, manualStop);
+    params.onDone?.(seeded.id, manualStop, executionOutcome);
   }
 }
 
@@ -1291,7 +1297,7 @@ export async function resumePrompt(params: {
   conversationId: string;
   messageId: string;
   onRun?: (conversationId: string) => void;
-  onDone?: (conversationId: string, stoppedManually?: boolean) => void;
+  onDone?: (conversationId: string, stoppedManually?: boolean, execution?: ExecutionOutcome) => void;
 }): Promise<void> {
   const state = params.state;
   const conversation = state.conversations.find((item) => item.id === params.conversationId);
@@ -1368,6 +1374,7 @@ export async function resumePrompt(params: {
   const usageCapture = beginUsageCapture();
   let turnFailed = false;
   let manualStop = false;
+  let executionOutcome: ExecutionOutcome | undefined;
 
   // This resume owns the thread's run slot; see sendPrompt's owner note.
   const turnToken = Symbol("turn");
@@ -1450,6 +1457,7 @@ export async function resumePrompt(params: {
       patchAssistant,
     });
     manualStop = done.status === "stopped";
+    executionOutcome = normalizeExecutionOutcome(done.message.execution);
     const patch = await settleDone(done);
     const images = [...(message.images ?? []), ...(patch.images ?? [])];
     const videos = [...(message.videos ?? []), ...(patch.videos ?? [])];
@@ -1535,7 +1543,7 @@ export async function resumePrompt(params: {
             : prev.unreadIds,
       }));
     }
-    params.onDone?.(conversationId, manualStop);
+    params.onDone?.(conversationId, manualStop, executionOutcome);
   }
 }
 
@@ -1572,7 +1580,7 @@ type AdoptParams = {
   getState: () => AgentState;
   setState: SetAgentState;
   /** Fires when an adopted run settles; `stoppedManually` holds the queue. */
-  onDone?: (conversationId: string, stoppedManually?: boolean) => void;
+  onDone?: (conversationId: string, stoppedManually?: boolean, execution?: ExecutionOutcome) => void;
 };
 
 /**
@@ -1644,6 +1652,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
   const stopBridge = run.kind === "chat" ? createSteerBridge(conversationId, params.setState) : undefined;
   const usageCapture = beginUsageCapture();
   let manualStop = false;
+  let executionOutcome: ExecutionOutcome | undefined;
   void (async () => {
     try {
       const done = await attachServerRun({
@@ -1651,6 +1660,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
         onEvent: (event) => applyRunEvent(event, patchAssistant, insertSteered),
       });
       manualStop = done.status === "stopped";
+      executionOutcome = normalizeExecutionOutcome(done.message.execution);
       patchAssistant(await settleDone(done));
       reconcileServerClock(params.setState, conversationId, done.chatUpdatedAt);
       void ackServerRun(run.runId);
@@ -1691,7 +1701,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
               : prev.unreadIds,
         }));
       }
-      params.onDone?.(conversationId, manualStop);
+      params.onDone?.(conversationId, manualStop, executionOutcome);
     }
   })();
 }

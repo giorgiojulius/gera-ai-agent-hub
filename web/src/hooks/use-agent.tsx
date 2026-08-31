@@ -18,6 +18,7 @@ import {
 import { fileToAttachment } from "@/lib/attachments";
 import { getAccessToken } from "@/lib/auth-tokens";
 import { errorFromUnknown } from "@/lib/errors";
+import { shouldSignalExecution } from "@/lib/execution-outcome";
 import { hasActiveCloudRun, stopServerRun } from "@/lib/server-run";
 import { computeNextRunAt, type AutomationDraftInput } from "@/lib/automations";
 import { newId } from "@/lib/env";
@@ -37,7 +38,7 @@ import {
   modelIdForMode,
   withStaticModels,
 } from "@/lib/models";
-import type { AgentSettings, CreateMode, LifeState, QueuedMessage } from "@/lib/types";
+import type { AgentSettings, CreateMode, ExecutionOutcome, LifeState, QueuedMessage } from "@/lib/types";
 
 export { useAgent } from "@/hooks/agent-context";
 export type { AgentDraftInput } from "@/hooks/agent-context";
@@ -52,7 +53,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   /** Threads where an explicit "stop & send" awaits its dispatch on settle. */
   const interruptPendingRef = useRef<Set<string>>(new Set());
   /** Completion signals (chime + desktop notification); a ref so every settle path can call it. */
-  const notifyRef = useRef<(conversationId: string) => void>(() => {});
+  const notifyRef = useRef<(conversationId: string, execution?: ExecutionOutcome) => void>(() => {});
   /** Server runs are adopted once per session (boot or first sign-in). */
   const adoptedRef = useRef<boolean>(false);
   const stateRef = useRef(state);
@@ -352,7 +353,10 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   // Completion signals per settings: the chime plays for settled runs
   // (scope: off / out-of-view / always), the desktop notification fires only
   // while the tab is hidden. Manual stops and takeovers never signal.
-  notifyRef.current = (conversationId: string) => {
+  notifyRef.current = (conversationId: string, execution?: ExecutionOutcome) => {
+    if (!shouldSignalExecution(execution)) {
+      return;
+    }
     const snapshot = stateRef.current;
     const inBackground = document.hidden || snapshot.activeId !== conversationId;
     if (shouldPlaySound(snapshot.settings.notifySound, inBackground)) {
@@ -625,7 +629,12 @@ export function AgentProvider({ children }: { children: ReactNode }) {
 
   /** Clears the run's controller and, unless it was stopped, fires the next queued follow-up. */
   const finishRun = useCallback(
-    (conversationId: string, controller: AbortController, stoppedManually?: boolean) => {
+    (
+      conversationId: string,
+      controller: AbortController,
+      stoppedManually?: boolean,
+      execution?: ExecutionOutcome,
+    ) => {
       if (abortMapRef.current.get(conversationId) === controller) {
         abortMapRef.current.delete(conversationId);
       }
@@ -633,7 +642,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       // except an explicit "stop & send", which dispatches its message now.
       const interrupted = interruptPendingRef.current.delete(conversationId);
       if (!controller.signal.aborted && stoppedManually !== true) {
-        notifyRef.current(conversationId);
+        notifyRef.current(conversationId, execution);
       }
       if (!controller.signal.aborted && (stoppedManually !== true || interrupted)) {
         window.setTimeout(() => drainRef.current(conversationId), 60);
@@ -687,9 +696,13 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         abortMapRef.current.get(id)?.abort();
         abortMapRef.current.set(id, controller);
       },
-      onDone: (id, stopped) => {
-        finishRun(id, controller, stopped);
-        if (controller.signal.aborted || stateRef.current.activeId === id) {
+      onDone: (id, stopped, execution) => {
+        finishRun(id, controller, stopped, execution);
+        if (
+          controller.signal.aborted ||
+          stateRef.current.activeId === id ||
+          !shouldSignalExecution(execution)
+        ) {
           return;
         }
         const thread = stateRef.current.conversations.find((entry) => entry.id === id);
@@ -924,9 +937,13 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         abortMapRef.current.get(conversationId)?.abort();
         abortMapRef.current.set(conversationId, controller);
       },
-      onDone: (conversationId, stopped) => {
-        finishRun(conversationId, controller, stopped);
-        if (controller.signal.aborted || stateRef.current.activeId === conversationId) {
+      onDone: (conversationId, stopped, execution) => {
+        finishRun(conversationId, controller, stopped, execution);
+        if (
+          controller.signal.aborted ||
+          stateRef.current.activeId === conversationId ||
+          !shouldSignalExecution(execution)
+        ) {
           return;
         }
         const conversation = stateRef.current.conversations.find((item) => item.id === conversationId);
@@ -988,8 +1005,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         abortMapRef.current.get(conversationId)?.abort();
         abortMapRef.current.set(conversationId, controller);
       },
-      onDone: (conversationId, stopped) => {
-        finishRun(conversationId, controller, stopped);
+      onDone: (conversationId, stopped, execution) => {
+        finishRun(conversationId, controller, stopped, execution);
       },
     });
   }, [finishRun]);
@@ -1026,9 +1043,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         abortMapRef.current.get(id)?.abort();
         abortMapRef.current.set(id, controller);
       },
-      onDone: (id, stopped) => {
+      onDone: (id, stopped, execution) => {
         resumingRef.current.delete(messageId);
-        finishRun(id, controller, stopped);
+        finishRun(id, controller, stopped, execution);
       },
     });
   }, [finishRun]);
@@ -1079,8 +1096,8 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         abortMapRef.current.get(id)?.abort();
         abortMapRef.current.set(id, controller);
       },
-      onDone: (id, stopped) => {
-        finishRun(id, controller, stopped);
+      onDone: (id, stopped, execution) => {
+        finishRun(id, controller, stopped, execution);
       },
     });
   }, [finishRun]);
@@ -1110,9 +1127,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
           const result = await adoptActiveServerRuns({
             getState: () => stateRef.current,
             setState,
-            onDone: (conversationId, stopped) => {
+            onDone: (conversationId, stopped, execution) => {
               if (stopped !== true) {
-                notifyRef.current(conversationId);
+                notifyRef.current(conversationId, execution);
                 window.setTimeout(() => drainRef.current(conversationId), 60);
               }
             },
@@ -1205,9 +1222,13 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         abortMapRef.current.get(conversationId)?.abort();
         abortMapRef.current.set(conversationId, controller);
       },
-      onDone: (conversationId, stopped) => {
-        finishRun(conversationId, controller, stopped);
-        if (controller.signal.aborted || stateRef.current.activeId === conversationId) {
+      onDone: (conversationId, stopped, execution) => {
+        finishRun(conversationId, controller, stopped, execution);
+        if (
+          controller.signal.aborted ||
+          stateRef.current.activeId === conversationId ||
+          !shouldSignalExecution(execution)
+        ) {
           return;
         }
         toast.success(automation.name, {

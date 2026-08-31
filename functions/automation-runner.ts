@@ -32,6 +32,16 @@ import {
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
 import { callIntercomNativeTool, INTERCOM_NATIVE_TOOLS } from "./native-intercom";
 import { callSlackNativeTool, SLACK_NATIVE_TOOLS } from "./native-slack";
+import {
+  buildExecutionOutcome,
+  EXECUTION_OUTCOME_TOOL_NAME,
+  executionOutcomeSystemPrompt,
+  executionOutcomeToolDefinition,
+  extractExecutionOutcomeMarker,
+  parseExecutionOutcomeClaim,
+  type ExecutionOutcome,
+  type ExecutionOutcomeClaim,
+} from "./run-protocol";
 
 /** Everything one cloud run needs, assembled by the shard from the profile. */
 export type ClaimJob = {
@@ -58,6 +68,7 @@ export type AutomationRunResult = {
   content: string;
   toolCalls: ToolRecord[];
   sources: SourceRef[];
+  execution: ExecutionOutcome;
   /** OAuth grants rotated during this run — the account shard persists them. */
   refreshedOAuth: RefreshedOAuth[];
 };
@@ -415,6 +426,7 @@ function buildSystemPrompt(job: ClaimJob, mcpSummary: string[]): string {
       "- Write the deliverable directly — compact, structured, skimmable. ```chart and ```mermaid fences render fine when they help.",
       "- If the thread's earlier runs are shown, focus on what is NEW since the previous run.",
       `- Current UTC time: ${new Date().toISOString()}.`,
+      executionOutcomeSystemPrompt("tool", "automation"),
     ].join("\n"),
   ];
   if (job.systemPrompt.trim().length > 0) {
@@ -443,7 +455,7 @@ export async function runAutomationJob(
   // MCP first, so the system prompt lists what actually connected and the
   // thread shows honest records for servers that did not.
   const mcp = job.mcpServers.length > 0 ? await armCloudMcp(job.mcpServers, persistOAuth) : emptyMcpRuntime();
-  const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs];
+  const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs, executionOutcomeToolDefinition()];
   const messages: GatewayMessage[] = [{ role: "system", content: buildSystemPrompt(job, mcp.summary) }];
   for (const item of job.prior) {
     messages.push({ role: item.role, content: item.content });
@@ -454,6 +466,25 @@ export async function runAutomationJob(
   const ledger = createSourceLedger();
   const surf: SurfState = { jar: {}, pages: [] };
   let lastContent = "";
+  let executionClaim: ExecutionOutcomeClaim | null = null;
+  const finish = (content: string): AutomationRunResult => {
+    const marked = extractExecutionOutcomeMarker(content);
+    const sources = ledger.list();
+    return {
+      content: marked.content,
+      toolCalls: records,
+      sources,
+      execution: buildExecutionOutcome({
+        claim: executionClaim ?? marked.claim,
+        content: marked.content,
+        sources,
+        toolCalls: records,
+        technicalStatus: "done",
+        surface: "automation",
+      }),
+      refreshedOAuth: mcp.refreshed,
+    };
+  };
 
   for (let step = 0; step < MAX_STEPS; step += 1) {
     if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
@@ -464,12 +495,7 @@ export async function runAutomationJob(
       lastContent = completion.content;
     }
     if (completion.toolCalls.length === 0) {
-      return {
-        content: completion.content || lastContent,
-        toolCalls: records,
-        sources: ledger.list(),
-        refreshedOAuth: mcp.refreshed,
-      };
+      return finish(completion.content || lastContent);
     }
     messages.push({
       role: "assistant",
@@ -477,12 +503,22 @@ export async function runAutomationJob(
       tool_calls: completion.toolCalls,
     });
     for (const call of completion.toolCalls) {
-      const result = await executeTool(call.function.name, call.function.arguments, authKey, ledger, surf, mcp.routes);
-      records.push({
-        name: call.function.name,
-        arguments: cap(call.function.arguments, 500),
-        result: cap(result, 1_500),
-      });
+      const isOutcome = call.function.name === EXECUTION_OUTCOME_TOOL_NAME;
+      if (isOutcome) {
+        executionClaim = parseExecutionOutcomeClaim(call.function.arguments);
+      }
+      const result = isOutcome
+        ? executionClaim
+          ? "Execution outcome recorded. Do not repeat the deliverable."
+          : "Execution outcome was invalid. Submit it again with every required field."
+        : await executeTool(call.function.name, call.function.arguments, authKey, ledger, surf, mcp.routes);
+      if (!isOutcome) {
+        records.push({
+          name: call.function.name,
+          arguments: cap(call.function.arguments, 500),
+          result: cap(result, 1_500),
+        });
+      }
       messages.push({
         role: "tool",
         tool_call_id: call.id,
@@ -498,12 +534,7 @@ export async function runAutomationJob(
       "Stop using tools now. Write your complete final answer using everything gathered above; note plainly anything that could not be determined.",
   });
   const wrapUp = await chatCompletion(job.modelId, messages, null, authKey);
-  return {
-    content: wrapUp.content || lastContent || "(no output)",
-    toolCalls: records,
-    sources: ledger.list(),
-    refreshedOAuth: mcp.refreshed,
-  };
+  return finish(wrapUp.content || lastContent || "(no output)");
 }
 
 /** Splits a "model:effort" selection like the web client does. */

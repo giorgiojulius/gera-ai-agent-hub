@@ -41,6 +41,7 @@ import {
   type SourceRef,
   type ToolRecord,
 } from "./automation-runner";
+import { buildExecutionOutcome, type ExecutionOutcome } from "./run-protocol";
 import {
   automationDue,
   cloudSkillsBlock,
@@ -607,10 +608,17 @@ export class ChatStore extends DurableObject {
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown error";
         console.error("automation run failed", item.auto.id, message);
+        const content = `⚠️ Cloud run failed: ${message}\n\nThe next scheduled run will try again.`;
         result = {
-          content: `⚠️ Cloud run failed: ${message}\n\nThe next scheduled run will try again.`,
+          content,
           toolCalls: [],
           sources: [],
+          execution: buildExecutionOutcome({
+            content,
+            technicalStatus: "error",
+            surface: "automation",
+            error: message,
+          }),
           refreshedOAuth: [],
         };
       }
@@ -624,6 +632,7 @@ export class ChatStore extends DurableObject {
         assistantText: result.content,
         toolCalls: result.toolCalls,
         sources: result.sources,
+        execution: result.execution,
         startedAt,
       });
     }
@@ -1307,6 +1316,7 @@ export class ChatStore extends DurableObject {
       assistantText: string;
       toolCalls: ToolRecord[];
       sources: SourceRef[];
+      execution: ExecutionOutcome;
       startedAt: number;
     },
   ): void {
@@ -1410,6 +1420,7 @@ export class ChatStore extends DurableObject {
         content: assistantText,
         createdAt: now,
         ...(toolCalls.length > 0 ? { toolCalls } : {}),
+        execution: input.execution,
         ...(sources.length > 0 ? { sources } : {}),
       },
     );

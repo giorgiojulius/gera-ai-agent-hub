@@ -22,6 +22,7 @@ import {
 } from "@/lib/chat-sync";
 import { normalizeStoredSettings, saveActiveId, saveConversations } from "@/lib/history";
 import { normalizeLife } from "@/lib/life";
+import type { ExecutionOutcome } from "@/lib/types";
 import {
   OAUTH_TOKENS_CHANGED_EVENT,
   OAUTH_TOKENS_KEY,
@@ -35,7 +36,7 @@ type CloudSyncArgs = {
   stateRef: { current: AgentState };
   /** Server runs are adopted once per session (boot or first sign-in). */
   adoptedRef: { current: boolean };
-  notifyRef: { current: (conversationId: string) => void };
+  notifyRef: { current: (conversationId: string, execution?: ExecutionOutcome) => void };
   drainRef: { current: (conversationId: string) => void };
 };
 
@@ -248,9 +249,9 @@ export function useCloudSync(args: CloudSyncArgs): {
       void adoptActiveServerRuns({
         getState: () => stateRef.current,
         setState,
-        onDone: (conversationId, stopped) => {
+        onDone: (conversationId, stopped, execution) => {
           if (stopped !== true) {
-            notifyRef.current(conversationId);
+            notifyRef.current(conversationId, execution);
             window.setTimeout(() => drainRef.current(conversationId), 60);
           }
         },

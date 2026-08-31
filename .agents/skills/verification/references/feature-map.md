@@ -1,14 +1,15 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `e1c652a` (+ Luna suggestion model,
-fable back in chat, note @-mentions, explicit inbox ranking, home &
-composer shortcut strips, settings redesign, attachment image shrink,
-stop/steering hardening, GitHub run credential hand-off + pin/access fixes,
-truthful MCP health + OAuth/account-session/sleep/deploy-resume hardening,
-authenticated file reads, Intercom attachments, full 98-entry MCP audit, the
-four-model primary picker with More, and the live code Changes / Preview
-workbench with sandboxed HTML and deployment previews)
-Drift check: `git log --oneline e1c652a..HEAD`, then compare against
+Last synced: 2026-08-31 · commit `4604f59` (+ evidence-backed autonomous
+execution outcomes for Automations and project agents, quiet no-change
+checks, Luna suggestion model, fable back in chat, note @-mentions, explicit
+inbox ranking, home & composer shortcut strips, settings redesign,
+attachment image shrink, stop/steering hardening, GitHub run credential
+hand-off + pin/access fixes, truthful MCP health + OAuth/account-session/
+sleep/deploy-resume hardening, authenticated file reads, Intercom
+attachments, full 98-entry MCP audit, the four-model primary picker with
+More, and the live code Changes / Preview workbench)
+Drift check: `git log --oneline 4604f59..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -406,6 +407,19 @@ Team spaces: scoped agents + Slack-style channels with threads + screens
 at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
 `?conversation=<id>`, the performance panel `?panel=performance`).
 
+- **Autonomous outcome contract (2026-08-31)**: every channel mention,
+  private screen-assistant turn (including Ask Gera), and inbound Slack
+  mention ends with one typed outcome: Ready · Needs review · Blocked · No
+  material change · Error. A compact expandable receipt sits under the
+  answer and carries the named artifact, runtime-derived evidence, next
+  owner and exact unblock request. Project jobs persist that semantic status
+  instead of treating an LLM call returning as `done`; existing rows remain
+  valid without a receipt. The external `slack.com` surface receives the
+  same contract as a short mrkdwn footer through the existing Events API →
+  `chat.postMessage` path; it is not the internal project-channel UI. The
+  model submits a claim through a metadata-only tool, but
+  the shard independently validates real sources/tool results before
+  accepting completion; unsupported claims downgrade to Needs review.
 - **Create / list**: New project → creator becomes owner; the list comes
   from the ProjectStore registry singleton (instant after create).
 - **Roles**: owner (delete project) > admin (channels, agents, members,
@@ -739,6 +753,18 @@ statuses lives on the page. "Start from a template": Morning brief, Weekly
 deep dive, Competitor pulse, Feature map drift-check (dogfood — daily
 GitHub audit of this very map that opens a correcting PR).
 
+Every browser and cloud run now persists an evidence-backed execution
+receipt in its existing thread: named artifact, objective sources/tool/code/
+check/preview evidence, typed handoff, and structured significance. Ready is
+accepted only when runtime records corroborate the claimed artifact; factual
+reports/checks require actual sources or read tools, while a delivered draft
+can prove itself as the artifact. Missing proof downgrades to Needs review;
+blocked work requires one concrete request to a human. A validated No
+material change check still writes its audit row but suppresses completion
+sound, background toast and desktop notification. Manual Run now follows the
+same rule. Deep-research automations submit the same claim through a stripped
+hidden marker because that pipeline has no final tool round.
+
 Editor: Basics, Schedule, and Where-it-runs stay expanded; Webhook trigger,
 Run as, MCP servers, Skills, and Browser extras are collapsed rows whose
 header shows the current value (e.g. "Gera (default)", "All connected
@@ -925,6 +951,9 @@ The share page renders without an account, on purpose.
 On run finish: chime per preference (default only when tab hidden or
 another thread active); desktop notification only when the tab is hidden,
 click focuses the thread. Manual stops and steer-interrupts never signal.
+Validated automation outcomes with `significance.notify = false` (No
+material change) also suppress sound, background toast and desktop signals;
+the thread entry and normal unread behavior remain as the audit trail.
 All notify paths fail silent.
 
 ## Worker route map
@@ -974,6 +1003,13 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
+Outcome coverage: `execution-outcome.test.ts` pins strict completion,
+draft-as-artifact, blocked handoff, quiet no-change, failed/mutating-check
+downgrades, interruption, marker parsing, sync normalization, Slack footer,
+and the real cloud-automation outcome-tool loop. Browser regression
+`execution-outcome.browser.test.tsx` expands the compact receipt and checks
+artifact, evidence, and next owner.
+
 Browser-only auth coverage: `auth-resume.browser.test.ts` recreates two MCP
 relay requests returning delayed 401s after a sleeping-tab token expiry and
 proves both reuse one refreshed Gera generation (real localStorage + Web Lock).
@@ -986,7 +1022,9 @@ Share dialog, Settings toggles, media modes,
 Julius/Deep Research runs, incognito, thread menu (pin/rename/delete),
 Project workspace internals (posting, threads, agent editor, members,
 screens tab, screen desk / Intercom widgets) — only the list page render
-is clicked. Screen-widget validation IS unit-tested
+is clicked; the shared outcome receipt itself has a real-browser component
+regression, while channel/screen/Slack transport is contract-tested below
+the UI. Screen-widget validation IS unit-tested
 (`project-shared.test.ts`).
 
 Worker logic IS unit-tested from `web/src/test` — suites import `functions/`

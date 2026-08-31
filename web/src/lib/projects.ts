@@ -2,6 +2,8 @@
 // Slack-style channels. Mirrors the worker's wire types; secrets never come
 // back from the server (only set/unset flags).
 import { FUNCTIONS_URL, authedFetch, parseOrThrow } from "@/lib/backend";
+import { normalizeExecutionOutcome } from "@/lib/execution-outcome";
+import type { ExecutionOutcome } from "@/lib/types";
 
 export type ProjectRole = "owner" | "admin" | "member";
 
@@ -70,6 +72,7 @@ export type ProjectMessage = {
   authorName: string;
   body: string;
   pending: boolean;
+  execution?: ExecutionOutcome;
   createdAt: number;
   updatedAt: number;
 };
@@ -103,6 +106,7 @@ export type ScreenChatMessage = {
   authorName: string;
   body: string;
   pending: boolean;
+  execution?: ExecutionOutcome;
   createdAt: number;
   updatedAt: number;
 };
@@ -399,7 +403,14 @@ export async function fetchProjectMessages(
     params.set("root", options.root);
   }
   const response = await authedFetch(`/projects/${projectId}/messages?${params.toString()}`);
-  return parseOrThrow(response, "Could not load messages");
+  const page = await parseOrThrow<MessagesPage>(response, "Could not load messages");
+  return {
+    ...page,
+    messages: page.messages.map((message) => ({
+      ...message,
+      execution: normalizeExecutionOutcome(message.execution),
+    })),
+  };
 }
 
 export async function postProjectMessage(
@@ -645,7 +656,10 @@ export async function fetchScreenChat(
     response,
     "Could not load the assistant chat",
   );
-  return data.messages ?? [];
+  return (data.messages ?? []).map((message) => ({
+    ...message,
+    execution: normalizeExecutionOutcome(message.execution),
+  }));
 }
 
 export async function sendScreenChatMessage(
@@ -720,6 +734,7 @@ export type DeskAskStatus = {
     status: "running" | "done" | "error";
     question: string;
     answer: string;
+    execution?: ExecutionOutcome;
     by: string;
     at: number;
   } | null;
@@ -834,7 +849,10 @@ export async function fetchDeskAskStatus(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  return parseOrThrow(response, "Could not check the investigation");
+  const status = await parseOrThrow<DeskAskStatus>(response, "Could not check the investigation");
+  return status.ask
+    ? { ...status, ask: { ...status.ask, execution: normalizeExecutionOutcome(status.ask.execution) } }
+    : status;
 }
 
 export async function fetchDeskStats(projectId: string, screenId: string): Promise<DeskStats> {

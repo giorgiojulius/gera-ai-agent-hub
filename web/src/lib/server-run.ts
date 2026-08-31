@@ -16,6 +16,7 @@ import type {
   ChatMessage,
   CodeChangeState,
   Conversation,
+  ExecutionOutcome,
   JuliusSettings,
   JuliusState,
   McpServerConfig,
@@ -92,6 +93,7 @@ export type ServerRunFinalMessage = {
   content: string;
   toolCalls?: ToolCallRecord[];
   codeChanges?: CodeChangeState;
+  execution?: ExecutionOutcome;
   sources?: ResearchSource[];
   servedBy?: string;
   research?: ResearchState;

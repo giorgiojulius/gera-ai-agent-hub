@@ -42,6 +42,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type Point
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
+import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { MarkdownBody } from "@/components/gera/Markdown";
 import { Button } from "@/components/ui/button";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -1438,6 +1439,7 @@ function SuggestStrip({
                   </button>
                 </>
               ) : null}
+              {ask.execution ? <ExecutionOutcomeCard outcome={ask.execution} className="mt-2" /> : null}
             </div>
           ) : null}
 
@@ -2353,7 +2355,12 @@ function AssistantOverlay({
                       thinking…
                     </p>
                   ) : (
-                    <MarkdownBody text={message.body} className="mt-0.5 text-sm" />
+                    <>
+                      <MarkdownBody text={message.body} className="mt-0.5 text-sm" />
+                      {message.execution ? (
+                        <ExecutionOutcomeCard outcome={message.execution} className="mt-2" />
+                      ) : null}
+                    </>
                   )}
                 </div>
               ),

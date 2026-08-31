@@ -15,6 +15,7 @@ import {
 } from "react";
 import { toast } from "sonner";
 
+import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { MarkdownBody } from "@/components/gera/Markdown";
 import {
   fetchProjectMessages,
@@ -403,7 +404,10 @@ function MessageRow({
               thinking…
             </p>
           ) : isAgent ? (
-            <MarkdownBody text={message.body} className="mt-0.5 text-sm" />
+            <>
+              <MarkdownBody text={message.body} className="mt-0.5 text-sm" />
+              {message.execution ? <ExecutionOutcomeCard outcome={message.execution} className="mt-2" /> : null}
+            </>
           ) : (
             <UserBody body={message.body} agents={agents} />
           )}

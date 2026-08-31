@@ -157,6 +157,18 @@ import {
   executeServerTool,
   type ServerToolContext,
 } from "./run-tools";
+import {
+  buildExecutionOutcome,
+  EXECUTION_OUTCOME_TOOL_NAME,
+  executionOutcomeSlackFooter,
+  executionOutcomeSystemPrompt,
+  executionOutcomeToolDefinition,
+  normalizeExecutionOutcome,
+  parseExecutionOutcomeClaim,
+  visibleExecutionToolCalls,
+  type ExecutionOutcome,
+  type ExecutionOutcomeClaim,
+} from "./run-protocol";
 
 type ProjectStoreEnv = {
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
@@ -233,6 +245,7 @@ type MessageRow = {
   author_name: string;
   body: string;
   pending: number;
+  outcome: string;
   created_at: number;
   updated_at: number;
 };
@@ -263,6 +276,7 @@ type ScreenChatRow = {
   author_name: string;
   body: string;
   pending: number;
+  outcome: string;
   created_at: number;
   updated_at: number;
 };
@@ -353,6 +367,7 @@ type SlackJobRow = {
   user_id: string;
   text: string;
   status: string;
+  outcome: string;
 };
 
 function newId(prefix: string): string {
@@ -475,19 +490,33 @@ function screenWire(row: ScreenRow): ProjectScreenWire {
   };
 }
 
+function storedExecutionOutcome(value: string): ExecutionOutcome | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return normalizeExecutionOutcome(JSON.parse(value) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
 function screenChatWire(row: ScreenChatRow): ScreenChatMessageWire {
+  const execution = storedExecutionOutcome(row.outcome);
   return {
     id: row.id,
     kind: row.author_kind === "agent" ? "agent" : "user",
     authorName: row.author_name,
     body: row.body,
     pending: row.pending === 1,
+    ...(execution ? { execution } : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
 function messageWire(row: MessageRow): ProjectMessageWire {
+  const execution = storedExecutionOutcome(row.outcome);
   return {
     id: row.id,
     channelId: row.channel_id,
@@ -497,9 +526,47 @@ function messageWire(row: MessageRow): ProjectMessageWire {
     authorName: row.author_name,
     body: row.body,
     pending: row.pending === 1,
+    ...(execution ? { execution } : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function blockedProjectExecution(options: {
+  content: string;
+  requester: { id?: string; name?: string };
+  unblockRequest: string;
+  nextStep: string;
+}): ExecutionOutcome {
+  return buildExecutionOutcome({
+    claim: {
+      outcome: "blocked",
+      summary: options.content,
+      artifacts: [{ kind: "message", label: "Blocked-run report" }],
+      handoff: {
+        kind: "requester",
+        ...(options.requester.id ? { ownerId: options.requester.id } : {}),
+        ...(options.requester.name ? { ownerName: options.requester.name } : {}),
+        nextStep: options.nextStep,
+        unblockRequest: options.unblockRequest,
+      },
+      significance: { kind: "human_required", summary: options.unblockRequest },
+    },
+    content: options.content,
+    technicalStatus: "done",
+    surface: "project",
+    requester: options.requester,
+  });
+}
+
+function failedProjectExecution(content: string, error: string, requester: { id?: string; name?: string }): ExecutionOutcome {
+  return buildExecutionOutcome({
+    content,
+    technicalStatus: "error",
+    surface: "project",
+    requester,
+    error,
+  });
 }
 
 export class ProjectStore extends DurableObject {
@@ -563,6 +630,7 @@ export class ProjectStore extends DurableObject {
         author_name TEXT NOT NULL,
         body TEXT NOT NULL,
         pending INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
@@ -612,6 +680,7 @@ export class ProjectStore extends DurableObject {
         author_name TEXT NOT NULL,
         body TEXT NOT NULL,
         pending INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
@@ -743,9 +812,17 @@ export class ProjectStore extends DurableObject {
         user_id TEXT NOT NULL,
         text TEXT NOT NULL,
         status TEXT NOT NULL,
+        outcome TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL
       )
     `);
+    for (const table of ["messages", "screen_chat", "slack_jobs"]) {
+      try {
+        sql.exec(`ALTER TABLE ${table} ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`);
+      } catch {
+        // Column already exists.
+      }
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -1149,7 +1226,7 @@ export class ProjectStore extends DurableObject {
     if (root) {
       const rows = sql
         .exec<MessageRow>(
-          `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, created_at, updated_at
+          `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, outcome, created_at, updated_at
            FROM messages WHERE channel_id = ? AND (id = ? OR root_id = ?)
            ORDER BY created_at ASC LIMIT ?`,
           channelId,
@@ -1165,7 +1242,7 @@ export class ProjectStore extends DurableObject {
     if (Number.isFinite(since) && since > 0) {
       rows = sql
         .exec<MessageRow>(
-          `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, created_at, updated_at
+          `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, outcome, created_at, updated_at
            FROM messages WHERE channel_id = ? AND updated_at > ?
            ORDER BY updated_at ASC LIMIT ?`,
           channelId,
@@ -1176,7 +1253,7 @@ export class ProjectStore extends DurableObject {
     } else {
       rows = sql
         .exec<MessageRow>(
-          `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, created_at, updated_at
+          `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, outcome, created_at, updated_at
            FROM messages WHERE channel_id = ?
            ORDER BY created_at DESC LIMIT ?`,
           channelId,
@@ -2920,7 +2997,7 @@ export class ProjectStore extends DurableObject {
     }
     const placeholder = sql
       .exec<ScreenChatRow>(
-        `SELECT id, screen_id, widget_id, email, author_kind, author_name, body, pending, created_at, updated_at
+        `SELECT id, screen_id, widget_id, email, author_kind, author_name, body, pending, outcome, created_at, updated_at
          FROM screen_chat WHERE id = ?`,
         job.placeholder_id,
       )
@@ -2946,11 +3023,13 @@ export class ProjectStore extends DurableObject {
         : placeholder.pending === 1 || job.status === "queued" || job.status === "running"
           ? "running"
           : "done";
+    const execution = storedExecutionOutcome(placeholder.outcome);
     return json({
       ask: {
         status,
         question: (questionRow?.body ?? "").replace(/^Ask Gera:\s*/i, ""),
         answer: placeholder.pending === 1 ? "" : placeholder.body,
+        ...(execution ? { execution } : {}),
         by: member?.display_name || job.email.split("@")[0],
         at: job.created_at,
       },
@@ -3322,7 +3401,7 @@ export class ProjectStore extends DurableObject {
     }
     const rows = this.ctx.storage.sql
       .exec<ScreenChatRow>(
-        `SELECT id, screen_id, widget_id, email, author_kind, author_name, body, pending, created_at, updated_at
+        `SELECT id, screen_id, widget_id, email, author_kind, author_name, body, pending, outcome, created_at, updated_at
          FROM screen_chat WHERE screen_id = ? AND widget_id = ? AND email = ?
          ORDER BY created_at DESC LIMIT ?`,
         screenId,
@@ -3440,21 +3519,27 @@ export class ProjectStore extends DurableObject {
     }
     sql.exec("UPDATE jobs SET status = 'running' WHERE id = ?", jobId);
     try {
-      await this.runAgentJob(job);
-      sql.exec("UPDATE jobs SET status = 'done' WHERE id = ?", jobId);
+      const execution = await this.runAgentJob(job);
+      sql.exec("UPDATE jobs SET status = ? WHERE id = ?", execution.status, jobId);
     } catch (error) {
       const message = error instanceof Error ? error.message : "run failed";
+      const content = `⚠️ Agent run failed: ${capText(message, 400)}`;
       console.error("project agent run failed", job.agent_id, message);
-      this.finishPlaceholder(job.placeholder_id, `⚠️ Agent run failed: ${capText(message, 400)}`);
+      this.finishPlaceholder(
+        job.placeholder_id,
+        content,
+        failedProjectExecution(content, message, { id: job.requested_by }),
+      );
       sql.exec("UPDATE jobs SET status = 'error' WHERE id = ?", jobId);
     }
     return json({ ok: true });
   }
 
-  private finishPlaceholder(placeholderId: string, text: string): void {
+  private finishPlaceholder(placeholderId: string, text: string, execution: ExecutionOutcome): void {
     this.ctx.storage.sql.exec(
-      "UPDATE messages SET body = ?, pending = 0, updated_at = ? WHERE id = ?",
+      "UPDATE messages SET body = ?, pending = 0, outcome = ?, updated_at = ? WHERE id = ?",
       capText(text, AGENT_REPLY_LIMIT),
+      JSON.stringify(execution),
       Date.now(),
       placeholderId,
     );
@@ -3671,18 +3756,37 @@ export class ProjectStore extends DurableObject {
     }
   }
 
-  private async runAgentJob(job: JobRow): Promise<void> {
+  private async runAgentJob(job: JobRow): Promise<ExecutionOutcome> {
     const sql = this.ctx.storage.sql;
+    const requesterMember = this.loadMember(job.requested_by);
+    const requester = {
+      id: job.requested_by,
+      name: requesterMember?.display_name || job.requested_by.split("@")[0],
+    };
     const agent = this.loadAgent(job.agent_id);
     if (!agent) {
-      this.finishPlaceholder(job.placeholder_id, "This agent was deleted before it could reply.");
-      return;
+      const content = "This agent was deleted before it could reply.";
+      const execution = blockedProjectExecution({
+        content,
+        requester,
+        unblockRequest: "Ask a project admin to restore this agent or mention an existing agent.",
+        nextStep: "Restore or replace the deleted project agent.",
+      });
+      this.finishPlaceholder(job.placeholder_id, content, execution);
+      return execution;
     }
     const authKey =
       this.workerEnv.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.workerEnv.RORK_TOOLKIT_SECRET_KEY ?? "";
     if (!authKey) {
-      this.finishPlaceholder(job.placeholder_id, "⚠️ The backend has no AI key configured — ask the workspace admin.");
-      return;
+      const content = "⚠️ The backend has no AI key configured — ask the workspace admin.";
+      const execution = blockedProjectExecution({
+        content,
+        requester,
+        unblockRequest: "Ask the workspace admin to configure the backend AI toolkit key.",
+        nextStep: "Configure the backend AI toolkit key, then run the request again.",
+      });
+      this.finishPlaceholder(job.placeholder_id, content, execution);
+      return execution;
     }
     const channel = sql
       .exec<ChannelRow>("SELECT id, name, topic, created_at FROM channels WHERE id = ?", job.channel_id)
@@ -3693,7 +3797,7 @@ export class ProjectStore extends DurableObject {
     // Thread transcript: root + settled replies, oldest first, capped.
     const threadRows = sql
       .exec<MessageRow>(
-        `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, created_at, updated_at
+        `SELECT id, channel_id, root_id, author_kind, author, author_name, body, pending, outcome, created_at, updated_at
          FROM messages WHERE channel_id = ? AND (id = ? OR root_id = ?) AND pending = 0 AND body != ''
          ORDER BY created_at ASC LIMIT ?`,
         job.channel_id,
@@ -3718,6 +3822,7 @@ export class ProjectStore extends DurableObject {
       `You are "${agent.name}" (@${agent.handle}) — a scoped team agent inside the project "${this.metaValue("name")}". You reply in channel #${channel?.name ?? "general"}${channel?.topic ? ` (topic: ${channel.topic})` : ""}, inside a thread. Everyone in the project can read your reply.`,
       agent.instructions.trim().length > 0 ? `Your role instructions:\n${agent.instructions.trim()}` : "",
       `Access granted to this agent (honest — never claim more):\n${describeAgentAccess(plan, access)}${mcpNote}${missingNote}`,
+      executionOutcomeSystemPrompt("tool", "project"),
       [
         "Rules:",
         "- Write one complete reply to the thread. Markdown renders (tables, fenced code, lists).",
@@ -3730,12 +3835,12 @@ export class ProjectStore extends DurableObject {
       .filter((part) => part.length > 0)
       .join("\n\n");
 
-    const requester = threadRows.length > 0 ? threadRows[threadRows.length - 1].author_name : job.requested_by;
+    const requesterName = threadRows.length > 0 ? threadRows[threadRows.length - 1].author_name : requester.name;
     const apiMessages: EngineMessage[] = [
       { role: "system", content: system },
       {
         role: "user",
-        content: `Thread transcript:\n\n${transcript || "(empty thread)"}\n\n---\nYou were mentioned by ${requester} in the latest message above. Reply to the thread now.`,
+        content: `Thread transcript:\n\n${transcript || "(empty thread)"}\n\n---\nYou were mentioned by ${requesterName} in the latest message above. Reply to the thread now.`,
       },
     ];
 
@@ -3746,12 +3851,24 @@ export class ProjectStore extends DurableObject {
       surf: createServerSurfSession(),
       mcpRoutes: routes.size > 0 ? routes : null,
     };
+    let executionClaim: ExecutionOutcomeClaim | null = null;
     const result = await runEngineTurn({
       authKey,
       modelId: agent.model || DEFAULT_CHAT_MODEL,
       apiMessages,
-      tools,
-      executeTool: (name, argsJson) => executeServerTool(name, argsJson, toolCtx),
+      tools: [...tools, executionOutcomeToolDefinition()],
+      executeTool: (name, argsJson) => {
+        if (name === EXECUTION_OUTCOME_TOOL_NAME) {
+          executionClaim = parseExecutionOutcomeClaim(argsJson);
+          return Promise.resolve({
+            text: executionClaim
+              ? "Execution outcome recorded. Do not repeat the deliverable."
+              : "Execution outcome was invalid. Submit it again with every required field.",
+            ...(executionClaim ? {} : { isError: true }),
+          });
+        }
+        return executeServerTool(name, argsJson, toolCtx);
+      },
       deadlineAt: Date.now() + AGENT_RUN_BUDGET_MS,
       handlers: { onText: () => undefined },
     });
@@ -3762,7 +3879,20 @@ export class ProjectStore extends DurableObject {
         ? `\n\n---\nSources:\n${sources.map((source, index) => `[${index + 1}] ${source.title === source.url ? source.url : `${source.title} — ${source.url}`}`).join("\n")}`
         : "";
     const content = result.content.trim().length > 0 ? result.content : "(no output)";
-    this.finishPlaceholder(job.placeholder_id, `${content}${sourcesBlock}`);
+    const allowedMemberIds = sql.exec<{ email: string }>("SELECT email FROM members").toArray().map((row) => row.email);
+    const execution = buildExecutionOutcome({
+      claim: executionClaim,
+      content,
+      sources,
+      toolCalls: visibleExecutionToolCalls(result.toolCalls),
+      technicalStatus: result.stopReason === "completed" ? "done" : "interrupted",
+      surface: "project",
+      requester,
+      allowedMemberIds,
+      ...(result.stopReason === "completed" ? {} : { error: `Run ended at ${result.stopReason}.` }),
+    });
+    this.finishPlaceholder(job.placeholder_id, `${content}${sourcesBlock}`, execution);
+    return execution;
   }
 
   // --- Screen assistant runs ----------------------------------------------
@@ -3787,52 +3917,70 @@ export class ProjectStore extends DurableObject {
     }
     sql.exec("UPDATE screen_jobs SET status = 'running' WHERE id = ?", jobId);
     try {
-      await this.runScreenJob(job);
-      sql.exec("UPDATE screen_jobs SET status = 'done' WHERE id = ?", jobId);
+      const execution = await this.runScreenJob(job);
+      sql.exec("UPDATE screen_jobs SET status = ? WHERE id = ?", execution.status, jobId);
     } catch (error) {
       const message = error instanceof Error ? error.message : "run failed";
+      const content = `⚠️ Assistant run failed: ${capText(message, 400)}`;
       console.error("screen assistant run failed", job.agent_id, message);
-      this.finishScreenPlaceholder(job.placeholder_id, `⚠️ Assistant run failed: ${capText(message, 400)}`);
+      this.finishScreenPlaceholder(
+        job.placeholder_id,
+        content,
+        failedProjectExecution(content, message, { id: job.email, name: job.email.split("@")[0] }),
+      );
       sql.exec("UPDATE screen_jobs SET status = 'error' WHERE id = ?", jobId);
     }
     return json({ ok: true });
   }
 
-  private finishScreenPlaceholder(placeholderId: string, text: string): void {
+  private finishScreenPlaceholder(placeholderId: string, text: string, execution: ExecutionOutcome): void {
     this.ctx.storage.sql.exec(
-      "UPDATE screen_chat SET body = ?, pending = 0, updated_at = ? WHERE id = ?",
+      "UPDATE screen_chat SET body = ?, pending = 0, outcome = ?, updated_at = ? WHERE id = ?",
       capText(text, AGENT_REPLY_LIMIT),
+      JSON.stringify(execution),
       Date.now(),
       placeholderId,
     );
   }
 
-  private async runScreenJob(job: ScreenJobRow): Promise<void> {
+  private async runScreenJob(job: ScreenJobRow): Promise<ExecutionOutcome> {
     const sql = this.ctx.storage.sql;
+    const member = this.loadMember(job.email);
+    const memberName = member?.display_name || job.email.split("@")[0];
+    const requester = { id: job.email, name: memberName };
     const agent = this.loadAgent(job.agent_id);
     if (!agent) {
-      this.finishScreenPlaceholder(job.placeholder_id, "This agent was deleted before it could reply.");
-      return;
+      const content = "This agent was deleted before it could reply.";
+      const execution = blockedProjectExecution({
+        content,
+        requester,
+        unblockRequest: "Ask a project admin to restore this assistant or re-link the screen to an existing agent.",
+        nextStep: "Restore or replace the deleted screen assistant.",
+      });
+      this.finishScreenPlaceholder(job.placeholder_id, content, execution);
+      return execution;
     }
     const authKey =
       this.workerEnv.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.workerEnv.RORK_TOOLKIT_SECRET_KEY ?? "";
     if (!authKey) {
-      this.finishScreenPlaceholder(
-        job.placeholder_id,
-        "⚠️ The backend has no AI key configured — ask the workspace admin.",
-      );
-      return;
+      const content = "⚠️ The backend has no AI key configured — ask the workspace admin.";
+      const execution = blockedProjectExecution({
+        content,
+        requester,
+        unblockRequest: "Ask the workspace admin to configure the backend AI toolkit key.",
+        nextStep: "Configure the backend AI toolkit key, then run the request again.",
+      });
+      this.finishScreenPlaceholder(job.placeholder_id, content, execution);
+      return execution;
     }
     const screen = this.loadScreen(job.screen_id);
-    const member = this.loadMember(job.email);
-    const memberName = member?.display_name || job.email.split("@")[0];
 
     const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent);
 
     // Private desk history — settled rows; the fresh member message is last.
     const historyRows = sql
       .exec<ScreenChatRow>(
-        `SELECT id, screen_id, widget_id, email, author_kind, author_name, body, pending, created_at, updated_at
+        `SELECT id, screen_id, widget_id, email, author_kind, author_name, body, pending, outcome, created_at, updated_at
          FROM screen_chat
          WHERE screen_id = ? AND widget_id = ? AND email = ? AND pending = 0 AND body != ''
          ORDER BY created_at DESC LIMIT ?`,
@@ -3872,6 +4020,7 @@ export class ProjectStore extends DurableObject {
       `You are "${agent.name}" (@${agent.handle}) — the assistant docked on the screen "${screen?.name ?? "desk"}" in the project "${this.metaValue("name")}". This is a PRIVATE 1:1 chat with ${memberName}; every member has their own copy of this chat.`,
       agent.instructions.trim().length > 0 ? `Your role instructions:\n${agent.instructions.trim()}` : "",
       `Access granted to this agent (honest — never claim more):\n${describeAgentAccess(plan, access)}${mcpNote}${missingNote}`,
+      executionOutcomeSystemPrompt("tool", "project"),
       [
         "Rules:",
         "- The member is working a real case on this screen — often the Intercom conversation attached below. Help fast: draft replies, dig into the repo, explain causes.",
@@ -3917,12 +4066,24 @@ export class ProjectStore extends DurableObject {
       surf: createServerSurfSession(),
       mcpRoutes: routes.size > 0 ? routes : null,
     };
+    let executionClaim: ExecutionOutcomeClaim | null = null;
     const result = await runEngineTurn({
       authKey,
       modelId: agent.model || DEFAULT_CHAT_MODEL,
       apiMessages,
-      tools,
-      executeTool: (name, argsJson) => executeServerTool(name, argsJson, toolCtx),
+      tools: [...tools, executionOutcomeToolDefinition()],
+      executeTool: (name, argsJson) => {
+        if (name === EXECUTION_OUTCOME_TOOL_NAME) {
+          executionClaim = parseExecutionOutcomeClaim(argsJson);
+          return Promise.resolve({
+            text: executionClaim
+              ? "Execution outcome recorded. Do not repeat the deliverable."
+              : "Execution outcome was invalid. Submit it again with every required field.",
+            ...(executionClaim ? {} : { isError: true }),
+          });
+        }
+        return executeServerTool(name, argsJson, toolCtx);
+      },
       deadlineAt: Date.now() + AGENT_RUN_BUDGET_MS,
       handlers: { onText: () => undefined },
     });
@@ -3933,7 +4094,20 @@ export class ProjectStore extends DurableObject {
         ? `\n\n---\nSources:\n${sources.map((source, index) => `[${index + 1}] ${source.title === source.url ? source.url : `${source.title} — ${source.url}`}`).join("\n")}`
         : "";
     const content = result.content.trim().length > 0 ? result.content : "(no output)";
-    this.finishScreenPlaceholder(job.placeholder_id, `${content}${sourcesBlock}`);
+    const allowedMemberIds = sql.exec<{ email: string }>("SELECT email FROM members").toArray().map((row) => row.email);
+    const execution = buildExecutionOutcome({
+      claim: executionClaim,
+      content,
+      sources,
+      toolCalls: visibleExecutionToolCalls(result.toolCalls),
+      technicalStatus: result.stopReason === "completed" ? "done" : "interrupted",
+      surface: "project",
+      requester,
+      allowedMemberIds,
+      ...(result.stopReason === "completed" ? {} : { error: `Run ended at ${result.stopReason}.` }),
+    });
+    this.finishScreenPlaceholder(job.placeholder_id, `${content}${sourcesBlock}`, execution);
+    return execution;
   }
 
   // --- Inbound Slack bot runs -----------------------------------------------
@@ -4023,7 +4197,7 @@ export class ProjectStore extends DurableObject {
     const sql = this.ctx.storage.sql;
     const job = sql
       .exec<SlackJobRow>(
-        "SELECT id, agent_id, channel, thread_ts, event_ts, user_id, text, status FROM slack_jobs WHERE id = ?",
+        "SELECT id, agent_id, channel, thread_ts, event_ts, user_id, text, status, outcome FROM slack_jobs WHERE id = ?",
         jobId,
       )
       .toArray()[0];
@@ -4035,12 +4209,26 @@ export class ProjectStore extends DurableObject {
     }
     sql.exec("UPDATE slack_jobs SET status = 'running' WHERE id = ?", jobId);
     try {
-      await this.runSlackJob(job);
-      sql.exec("UPDATE slack_jobs SET status = 'done' WHERE id = ?", jobId);
+      const execution = await this.runSlackJob(job);
+      sql.exec(
+        "UPDATE slack_jobs SET status = ?, outcome = ? WHERE id = ?",
+        execution.status,
+        JSON.stringify(execution),
+        jobId,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "run failed";
+      const content = `⚠️ Agent run failed: ${capText(message, 300)}`;
+      const execution = failedProjectExecution(content, message, {
+        id: job.user_id,
+        name: `<@${job.user_id}>`,
+      });
       console.error("slack bot run failed", job.agent_id, message);
-      sql.exec("UPDATE slack_jobs SET status = 'error' WHERE id = ?", jobId);
+      sql.exec(
+        "UPDATE slack_jobs SET status = 'error', outcome = ? WHERE id = ?",
+        JSON.stringify(execution),
+        jobId,
+      );
       // Honest failure note into the Slack thread while the token still works.
       const agent = this.loadAgent(job.agent_id);
       const token = agent ? parseSecrets(agent.secrets).slackToken : undefined;
@@ -4050,7 +4238,7 @@ export class ProjectStore extends DurableObject {
             token,
             job.channel,
             job.thread_ts,
-            `⚠️ Agent run failed: ${capText(message, 300)}`,
+            `${content}\n\n---\n${executionOutcomeSlackFooter(execution)}`,
           );
         } catch {
           // nothing honest left to do — the thread stays silent
@@ -4060,7 +4248,7 @@ export class ProjectStore extends DurableObject {
     return json({ ok: true });
   }
 
-  private async runSlackJob(job: SlackJobRow): Promise<void> {
+  private async runSlackJob(job: SlackJobRow): Promise<ExecutionOutcome> {
     const agent = this.loadAgent(job.agent_id);
     if (!agent) {
       throw new Error("This agent was deleted before it could reply.");
@@ -4073,13 +4261,20 @@ export class ProjectStore extends DurableObject {
     const authKey =
       this.workerEnv.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.workerEnv.RORK_TOOLKIT_SECRET_KEY ?? "";
     if (!authKey) {
+      const content = "⚠️ The backend has no AI key configured — ask the workspace admin.";
+      const execution = blockedProjectExecution({
+        content,
+        requester: { id: job.user_id, name: `<@${job.user_id}>` },
+        unblockRequest: "Ask the workspace admin to configure the backend AI toolkit key.",
+        nextStep: "Configure the backend AI toolkit key, then mention the agent again.",
+      });
       await postSlackThreadReply(
         token,
         job.channel,
         job.thread_ts,
-        "⚠️ The backend has no AI key configured — ask the workspace admin.",
+        `${content}\n\n---\n${executionOutcomeSlackFooter(execution)}`,
       );
-      return;
+      return execution;
     }
     const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent, "slack");
 
@@ -4111,6 +4306,7 @@ export class ProjectStore extends DurableObject {
       `You are "${agent.name}" (@${agent.handle}) — a scoped team agent of the project "${this.metaValue("name")}". A teammate mentioned you in Slack${workspace ? ` (workspace ${workspace})` : ""}; your reply is posted into that Slack thread automatically.`,
       agent.instructions.trim().length > 0 ? `Your role instructions:\n${agent.instructions.trim()}` : "",
       `Access granted to this agent (honest — never claim more):\n${describeAgentAccess(plan, access)}${mcpNote}${missingNote}`,
+      executionOutcomeSystemPrompt("tool", "project"),
       [
         "Rules:",
         "- Slack renders mrkdwn, NOT Markdown: *bold*, _italic_, `code`, ``` blocks, - bullets, <https://url|label> links. No # headings and no tables — use short lines.",
@@ -4139,12 +4335,24 @@ export class ProjectStore extends DurableObject {
       surf: createServerSurfSession(),
       mcpRoutes: routes.size > 0 ? routes : null,
     };
+    let executionClaim: ExecutionOutcomeClaim | null = null;
     const result = await runEngineTurn({
       authKey,
       modelId: agent.model || DEFAULT_CHAT_MODEL,
       apiMessages,
-      tools,
-      executeTool: (name, argsJson) => executeServerTool(name, argsJson, toolCtx),
+      tools: [...tools, executionOutcomeToolDefinition()],
+      executeTool: (name, argsJson) => {
+        if (name === EXECUTION_OUTCOME_TOOL_NAME) {
+          executionClaim = parseExecutionOutcomeClaim(argsJson);
+          return Promise.resolve({
+            text: executionClaim
+              ? "Execution outcome recorded. Do not repeat the deliverable."
+              : "Execution outcome was invalid. Submit it again with every required field.",
+            ...(executionClaim ? {} : { isError: true }),
+          });
+        }
+        return executeServerTool(name, argsJson, toolCtx);
+      },
       deadlineAt: Date.now() + AGENT_RUN_BUDGET_MS,
       handlers: { onText: () => undefined },
     });
@@ -4155,11 +4363,23 @@ export class ProjectStore extends DurableObject {
         ? `\n\n---\nSources:\n${sources.map((source, index) => `[${index + 1}] ${source.title === source.url ? source.url : `${source.title} — ${source.url}`}`).join("\n")}`
         : "";
     const content = result.content.trim().length > 0 ? result.content : "(no output)";
+    const execution = buildExecutionOutcome({
+      claim: executionClaim,
+      content,
+      sources,
+      toolCalls: visibleExecutionToolCalls(result.toolCalls),
+      technicalStatus: result.stopReason === "completed" ? "done" : "interrupted",
+      surface: "project",
+      requester: { id: job.user_id, name: `<@${job.user_id}>` },
+      allowedMemberIds: [],
+      ...(result.stopReason === "completed" ? {} : { error: `Run ended at ${result.stopReason}.` }),
+    });
     await postSlackThreadReply(
       token,
       job.channel,
       job.thread_ts,
-      capText(`${content}${sourcesBlock}`, SLACK_REPLY_LIMIT),
+      capText(`${content}${sourcesBlock}\n\n---\n${executionOutcomeSlackFooter(execution)}`, SLACK_REPLY_LIMIT),
     );
+    return execution;
   }
 }

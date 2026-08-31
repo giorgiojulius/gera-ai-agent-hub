@@ -1,6 +1,7 @@
 import { defaultAgents } from "@/lib/agents";
 import { normalizeAutomation } from "@/lib/automations";
 import { newId } from "@/lib/env";
+import { normalizeExecutionOutcome } from "@/lib/execution-outcome";
 import { clampImageCount } from "@/lib/image-count";
 import { MAX_DOCS_PER_AGENT, MAX_FILE_CHARS } from "@/lib/knowledge";
 import { defaultJuliusSettings, JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES } from "@/lib/julius";
@@ -183,7 +184,11 @@ export function normalizeCodeChangeState(value: unknown): CodeChangeState | unde
 
 export function reviveMessage(message: ChatMessage): ChatMessage {
   const normalizedCodeChanges = normalizeCodeChangeState(message.codeChanges);
-  let next = message.codeChanges ? { ...message, codeChanges: normalizedCodeChanges } : message;
+  const normalizedExecution = normalizeExecutionOutcome(message.execution);
+  let next =
+    message.codeChanges || message.execution
+      ? { ...message, codeChanges: normalizedCodeChanges, execution: normalizedExecution }
+      : message;
   if (message.pending) {
     // A run was writing into this message when the tab died (reload after a
     // publish, crash). Media that already landed means the turn essentially

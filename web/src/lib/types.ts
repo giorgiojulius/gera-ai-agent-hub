@@ -120,6 +120,54 @@ export type CodeChangeState = {
   validation?: CodeValidation;
 };
 
+// Evidence-backed result attached only to autonomous runs (Automations + project agents).
+export type ExecutionOutcomeStatus = "completed" | "needs_review" | "blocked" | "no_change" | "error";
+export type ExecutionArtifactKind = "report" | "draft" | "external_object" | "code_change" | "message" | "check";
+export type ExecutionEvidenceKind = "source" | "tool_result" | "code_change" | "check" | "preview" | "delivery";
+export type ExecutionHandoffKind = "gera" | "requester" | "member";
+export type ExecutionSignificanceKind = "none" | "change" | "risk" | "action" | "human_required";
+
+export type ExecutionArtifact = {
+  id: string;
+  kind: ExecutionArtifactKind;
+  label: string;
+  url?: string;
+};
+
+export type ExecutionEvidence = {
+  id: string;
+  kind: ExecutionEvidenceKind;
+  label: string;
+  status: "verified" | "failed";
+  url?: string;
+  toolName?: string;
+};
+
+export type ExecutionHandoff = {
+  kind: ExecutionHandoffKind;
+  ownerId?: string;
+  ownerName?: string;
+  nextStep: string;
+  unblockRequest?: string;
+};
+
+export type ExecutionOutcome = {
+  version: 1;
+  status: ExecutionOutcomeStatus;
+  summary: string;
+  artifacts: ExecutionArtifact[];
+  evidence: ExecutionEvidence[];
+  handoff: ExecutionHandoff;
+  significance: {
+    kind: ExecutionSignificanceKind;
+    summary: string;
+    notify: boolean;
+  };
+  validation: "verified" | "downgraded";
+  validationReason?: string;
+  validatedAt: number;
+};
+
 export type ResearchStepKind = "plan" | "search" | "read" | "browse" | "synthesize";
 
 /** Resource budget preset for a deep-research run: iterations, reads, live browsing. */
@@ -194,6 +242,8 @@ export type ChatMessage = {
   toolCalls?: ToolCallRecord[];
   /** Repository edits, their diff preview, verification, and runnable preview. */
   codeChanges?: CodeChangeState;
+  /** Strict result contract for autonomous runs; absent on ordinary chat in v1. */
+  execution?: ExecutionOutcome;
   /**
    * Web sources actually consulted this turn (from web_search / fetch_url),
    * in citation order: a [n] marker in the content refers to sources[n-1].

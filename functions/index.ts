@@ -9,8 +9,9 @@
 // the app flows through /mcp-proxy because most servers reject browser CORS.
 // All three relays require an invited Gera identity: Gera's JWT remains in
 // Authorization for platform verification, while a provider credential rides
-// in a dedicated internal header and is restored only after that gate. Tokens
-// are never stored or logged.
+// in a dedicated internal header and is restored only after that gate. Generic
+// relay payloads are never stored or logged; rotating MCP refresh results use a
+// dedicated account-shard escrow so a web deploy cannot lose the replacement.
 //
 // /access/* routes are invite-only gatekeeping: the platform verifies the
 // caller's Rork Auth JWT and stamps X-Rork-User-* headers; the entrypoint
@@ -1503,11 +1504,47 @@ async function relayOAuthRotations(request: Request, url: URL, env: Env): Promis
     const text = await upstream.text();
     return new Response(text, {
       status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
   } catch (error) {
     console.error("oauth rotations relay failed", error instanceof Error ? error.message : "error");
     return corsJson({ error: "upstream_unreachable" }, 502);
+  }
+}
+
+const MCP_OAUTH_REFRESH_BODY_LIMIT = 16_384;
+
+/**
+ * POST /mcp/oauth-refresh — refreshes a browser MCP grant inside its account
+ * shard and durably records a rotating response before returning it. The body
+ * is never logged; platform identity and invite checks match sync/rotations.
+ */
+async function relayBrowserOAuthRefresh(request: Request, env: Env): Promise<Response> {
+  try {
+    if (request.method !== "POST") {
+      return corsJson({ error: "not_found" }, 404);
+    }
+    const userId = request.headers.get("X-Rork-User-Id");
+    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
+    if (!userId || !email) {
+      return corsJson({ error: "sign_in_required" }, 401);
+    }
+    const body = await request.text();
+    if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
+      return corsJson({ error: "body_too_large" }, 413);
+    }
+    if (!(await isInvitedCached(env, request.url, email))) {
+      return corsJson({ error: "invite_required" }, 403);
+    }
+    const upstream = await shardCall(env, request.url, email, "/mcp/oauth-refresh", { method: "POST", body });
+    const text = await upstream.text();
+    return new Response(text, {
+      status: upstream.status,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  } catch (error) {
+    console.error("browser oauth refresh relay failed", error instanceof Error ? error.message : "error");
+    return corsJson({ error: "upstream_unreachable", transient: true }, 502);
   }
 }
 
@@ -2025,6 +2062,9 @@ export default {
     }
     if (url.pathname === "/mcp/oauth-rotations") {
       return relayOAuthRotations(request, url, env);
+    }
+    if (url.pathname === "/mcp/oauth-refresh") {
+      return relayBrowserOAuthRefresh(request, env);
     }
     if (url.pathname === "/automations/run-now") {
       return relayRunNow(request, url, env, ctx);

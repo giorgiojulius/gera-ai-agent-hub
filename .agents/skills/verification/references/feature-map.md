@@ -1,14 +1,14 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `a89fc17` (+ Luna suggestion model,
+Last synced: 2026-08-31 · commit `e1c652a` (+ Luna suggestion model,
 fable back in chat, note @-mentions, explicit inbox ranking, home &
 composer shortcut strips, settings redesign, attachment image shrink,
 stop/steering hardening, GitHub run credential hand-off + pin/access fixes,
-truthful MCP health + OAuth/account-session/sleep-resume hardening,
+truthful MCP health + OAuth/account-session/sleep/deploy-resume hardening,
 authenticated file reads, Intercom attachments, full 98-entry MCP audit, and
 the live code Changes / Preview workbench with sandboxed HTML and deployment
 previews)
-Drift check: `git log --oneline a89fc17..HEAD`, then compare against
+Drift check: `git log --oneline e1c652a..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
 
@@ -737,7 +737,7 @@ HubStudio (view, edit, delete entries).
 
 Connector studio: add MCP servers from a catalog or by URL, OAuth sign-in
 flows relayed through the worker (`/oauth-proxy`, `/mcp-proxy`,
-`/mcp/oauth-rotations`), per-server tool listing and health, native
+`/mcp/oauth-refresh`, `/mcp/oauth-rotations`), per-server tool listing and health, native
 GitHub / Slack / Intercom connectors. Connected servers appear in the
 composer Studio popover, in Profiles, and can bind to Skills.
 
@@ -762,8 +762,15 @@ green flags); local-only grants remain. A transient relay/provider refresh
 failure keeps the recoverable grant and says retry — it never deletes it or
 asks for re-login; a fatal refresh (invalid_grant) still adopts the freshest
 sibling/server rotation first, and only a genuinely dead or expired
-non-refreshable grant drops to Sign in. Expired DCR registrations
-(client_secret_expires_at) re-register instead of failing from cache.
+non-refreshable grant drops to Sign in. Browser refresh now runs through the
+account shard (`POST /mcp/oauth-refresh`): a rotating provider response is
+persisted before the tab receives it. If a deploy replaces the old bundle after
+the provider consumed its refresh token but before the response reached
+localStorage, the new bundle presents the old base and receives the durable tip
+without another provider redeem. The endpoint is identity/invite gated,
+no-store, URL-safe, CAS-protected against fresh sign-ins, and `keepalive`-eligible.
+Expired DCR registrations (client_secret_expires_at) re-register instead of
+failing from cache.
 
 Account/race boundary (2026-08-31): every Gera session has a persistent nonce
 shared by tabs; logout or account replacement invalidates pending auth, MCP
@@ -780,7 +787,12 @@ where a burst of health checks could invalidate one another. A profile pull
 applies only if neither its profile clock nor OAuth snapshot changed while it
 was in flight. Cloud refresh holds its single-flight through durable persistence,
 keeps a short completed-flight reuse window for stale callers, and rejects a
-rotation whose source grant was replaced meanwhile.
+rotation whose source grant was replaced meanwhile. A deploy-time network/5xx
+failure while renewing Gera itself is also tri-stated as unavailable rather than
+rejected: stored tokens and expired identity context remain, boot retries in the
+background/on reconnect, and only an explicit revoked/invalid refresh grant
+shows signed-out. Equal profile clocks are ACKed only for byte-identical blobs,
+so a revived stale bundle cannot use an uncommitted profile to prune OAuth escrow.
 
 File-result truth (2026-08-30): generic MCP calls preserve plain text,
 embedded text resources and `structuredContent`; opaque image/audio/blob base64
@@ -806,7 +818,8 @@ separately, and GitHub retries an early 401 with its refresh grant. GitHub's
 `bad_refresh_token` spelling also uses the existing rotation rescue. Unit suites:
 `auth-boundary.test.ts`, `mcp-oauth-refresh.test.ts`, `mcp-rotation.test.ts`,
 `mcp-session.test.ts`; real-browser Web Lock/localStorage regression:
-`auth-resume.browser.test.ts`.
+`auth-resume.browser.test.ts` (sleeping-tab single-flight, transient Gera boot,
+and lost-old-bundle-response → durable MCP replay).
 
 Full catalog + transport audit (2026-08-30): all 98 catalog rows were probed
 read-only. Of 94 generic connectable endpoints, 26 completed initialize +
@@ -847,8 +860,8 @@ Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message t
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
-OAuth/session/file-content suites. Full verification on 2026-08-31: 704 unit
-checks, 15 browser checks, web build, Worker deploy, live preview/ping and
+OAuth/session/file-content suites. Full verification on 2026-08-31: 730 unit
+checks, 20 browser checks, web build, Worker deploy, live preview/ping and
 unauthenticated relay-gate smoke probes all passed.
 
 ## Settings (`/settings`)
@@ -900,7 +913,8 @@ All notify paths fail silent.
 `functions/index.ts` dispatch: `/ping` health · `/access/*` gate+admin ·
 `/share/*` · `/arena/*` (usage, battles, log, clear) · `/chats/sync` ·
 `/runs/*` (start, stream SSE, active, steer/stop) · `/diag/*` ·
-`/mcp/oauth-rotations` · `/automations/run-now` · `/projects` +
+`/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
+`/automations/run-now` · `/projects` +
 `/projects/create` + `/projects/:id/*` (overview, messages, message, read,
 channels/create, members/*, agents/*, screens/*, intercom/inbox|thread|details|
 reply|mention-admins|suggest(+rate)|action|ask-gera|ask-status|slack-related|stats(+refresh|link),
@@ -943,6 +957,8 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 Browser-only auth coverage: `auth-resume.browser.test.ts` recreates two MCP
 relay requests returning delayed 401s after a sleeping-tab token expiry and
 proves both reuse one refreshed Gera generation (real localStorage + Web Lock).
+It also proves a rollout-time Gera refresh failure keeps the stored identity and
+that a new bundle adopts the MCP pair escrowed before the old response vanished.
 
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
 Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
@@ -966,7 +982,8 @@ browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
 account isolation), `mcp-security` (catalog, auth-mode, OAuth/egress/session/
 protocol and native Slack/Intercom parity), `auth-boundary` +
 `mcp-oauth-refresh` + `mcp-session` (staggered expired-Gera 401s, provider-token
-rotation rescue, transient health recovery), `code-change-flow` (diff capture,
+rotation rescue, deploy-response escrow/replay, transient health recovery),
+`code-change-flow` (diff capture,
 HTML/CSS/JS assembly, HTTPS-only deployment previews, continuation merge),
 `agent-steering`, `github-native`.
 Only the Durable

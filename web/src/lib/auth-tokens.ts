@@ -11,7 +11,12 @@ export const AUTH_SESSION_NONCE_KEY = "rork:auth_session_nonce";
 export const AUTH_URL: string = import.meta.env.EXPO_PUBLIC_RORK_AUTH_URL ?? "";
 export const APP_KEY: string = import.meta.env.EXPO_PUBLIC_RORK_APP_KEY ?? "";
 
-const refreshInFlight = new Map<string, Promise<string | null>>();
+export type AccessTokenRefreshResult =
+  | { status: "refreshed"; accessToken: string }
+  | { status: "rejected" }
+  | { status: "unavailable" };
+
+const refreshInFlight = new Map<string, Promise<AccessTokenRefreshResult>>();
 let memorySessionNonce = "";
 
 function newSessionNonce(): string {
@@ -125,36 +130,58 @@ function replacementForRejectedAccess(
  * from the old generation then reuse the new access token instead of rotating
  * the account session once per concurrent request.
  */
-export function refreshAccessToken(
+function refreshed(accessToken: string): AccessTokenRefreshResult {
+  return { status: "refreshed", accessToken };
+}
+
+function siblingRefreshOutcome(sessionNonce: string, originalRefresh: string): AccessTokenRefreshResult {
+  const accessToken = siblingRefreshResult(sessionNonce, originalRefresh);
+  return accessToken ? refreshed(accessToken) : { status: "unavailable" };
+}
+
+const DEFINITIVE_REFRESH_ERRORS = new Set<string>([
+  "invalid_grant",
+  "invalid_refresh_token",
+  "refresh_token_expired",
+  "refresh_token_reused",
+  "bad_refresh_token",
+  "unauthorized_client",
+]);
+
+/** Same refresh operation with an explicit transient-vs-rejected result for boot recovery. */
+export function refreshAccessTokenResult(
   rejectedAccessToken?: string | null,
-): Promise<string | null> {
+): Promise<AccessTokenRefreshResult> {
   if (typeof localStorage === "undefined") {
-    return Promise.resolve(null);
+    return Promise.resolve({ status: "unavailable" });
   }
   const sessionNonce = authSessionSnapshot();
   const replacement = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
   if (replacement) {
-    return Promise.resolve(replacement);
+    return Promise.resolve(refreshed(replacement));
   }
   const refresh = localStorage.getItem(REFRESH_TOKEN_KEY);
-  if (!refresh || !AUTH_URL || !APP_KEY || !sessionNonce) {
-    return Promise.resolve(null);
+  if (!refresh) {
+    return Promise.resolve({ status: "rejected" });
+  }
+  if (!AUTH_URL || !APP_KEY || !sessionNonce) {
+    return Promise.resolve({ status: "unavailable" });
   }
   const key = JSON.stringify([sessionNonce, refresh]);
   const existing = refreshInFlight.get(key);
   if (existing) {
     return existing;
   }
-  const task = withCrossTabLock("gera:auth-refresh", async (): Promise<string | null> => {
+  const task = withCrossTabLock("gera:auth-refresh", async (): Promise<AccessTokenRefreshResult> => {
     if (!isAuthSessionCurrent(sessionNonce)) {
-      return null;
+      return { status: "unavailable" };
     }
     const newerBeforeRedeem = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
     if (newerBeforeRedeem) {
-      return newerBeforeRedeem;
+      return refreshed(newerBeforeRedeem);
     }
     if (localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
-      return siblingRefreshResult(sessionNonce, refresh);
+      return siblingRefreshOutcome(sessionNonce, refresh);
     }
     try {
       const response = await fetch(`${AUTH_URL}/oauth/refresh`, {
@@ -163,39 +190,48 @@ export function refreshAccessToken(
         body: JSON.stringify({ app_key: APP_KEY, refresh_token: refresh }),
       });
       if (!isAuthSessionCurrent(sessionNonce)) {
-        return null;
+        return { status: "unavailable" };
       }
       const newerAfterRedeem = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
       if (newerAfterRedeem) {
-        return newerAfterRedeem;
+        return refreshed(newerAfterRedeem);
       }
       if (localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
-        return siblingRefreshResult(sessionNonce, refresh);
+        return siblingRefreshOutcome(sessionNonce, refresh);
       }
+      const data = (await response.json().catch(() => ({}))) as {
+        access_token?: unknown;
+        refresh_token?: unknown;
+        error?: unknown;
+      };
       if (!response.ok) {
-        return null;
+        const code = typeof data.error === "string" ? data.error : "";
+        const isRejected = response.status === 401 || DEFINITIVE_REFRESH_ERRORS.has(code);
+        return { status: isRejected ? "rejected" : "unavailable" };
       }
-      const data = (await response.json()) as { access_token?: unknown; refresh_token?: unknown };
       if (!isAuthSessionCurrent(sessionNonce)) {
-        return null;
+        return { status: "unavailable" };
       }
       const newerBeforeCommit = replacementForRejectedAccess(sessionNonce, rejectedAccessToken);
       if (newerBeforeCommit) {
-        return newerBeforeCommit;
+        return refreshed(newerBeforeCommit);
       }
       if (localStorage.getItem(REFRESH_TOKEN_KEY) !== refresh) {
-        return siblingRefreshResult(sessionNonce, refresh);
+        return siblingRefreshOutcome(sessionNonce, refresh);
       }
       if (typeof data.access_token !== "string" || data.access_token.length === 0) {
-        return null;
+        return { status: "unavailable" };
       }
       if (typeof data.refresh_token === "string" && data.refresh_token.length > 0) {
         localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
       }
       localStorage.setItem(ACCESS_TOKEN_KEY, data.access_token);
-      return data.access_token;
+      return refreshed(data.access_token);
     } catch {
-      return replacementForRejectedAccess(sessionNonce, rejectedAccessToken) ?? siblingRefreshResult(sessionNonce, refresh);
+      const winner =
+        replacementForRejectedAccess(sessionNonce, rejectedAccessToken) ??
+        siblingRefreshResult(sessionNonce, refresh);
+      return winner ? refreshed(winner) : { status: "unavailable" };
     }
   });
   refreshInFlight.set(key, task);
@@ -205,4 +241,12 @@ export function refreshAccessToken(
     }
   });
   return task;
+}
+
+/** Exchanges the stored refresh token and returns only the usable access token. */
+export async function refreshAccessToken(
+  rejectedAccessToken?: string | null,
+): Promise<string | null> {
+  const result = await refreshAccessTokenResult(rejectedAccessToken);
+  return result.status === "refreshed" ? result.accessToken : null;
 }

@@ -35,7 +35,6 @@ describe("Gera auth session boundary", () => {
 
     const first = auth.refreshAccessToken();
     const second = auth.refreshAccessToken();
-    expect(second).toBe(first);
     finish?.(
       new Response(JSON.stringify({ access_token: "access-b", refresh_token: "refresh-b" }), {
         status: 200,
@@ -107,6 +106,44 @@ describe("Gera auth session boundary", () => {
       expect(store.get(auth.REFRESH_TOKEN_KEY)).toBe(nextRefreshToken);
     },
   );
+
+  it("classifies deploy/network refresh gaps without deleting the stored session", async () => {
+    const auth = await import("@/lib/auth-tokens");
+    store.set(auth.ACCESS_TOKEN_KEY, "expired-access");
+    store.set(auth.REFRESH_TOKEN_KEY, "refresh-a");
+    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => {
+      throw new TypeError("deployment connection reset");
+    }));
+
+    await expect(auth.refreshAccessTokenResult()).resolves.toEqual({ status: "unavailable" });
+    expect(store.get(auth.ACCESS_TOKEN_KEY)).toBe("expired-access");
+    expect(store.get(auth.REFRESH_TOKEN_KEY)).toBe("refresh-a");
+  });
+
+  it("treats auth 5xx as retryable but an explicit invalid_grant as rejected", async () => {
+    const auth = await import("@/lib/auth-tokens");
+    store.set(auth.ACCESS_TOKEN_KEY, "expired-access");
+    store.set(auth.REFRESH_TOKEN_KEY, "refresh-a");
+    const fetchMock = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "server_error" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "invalid_grant" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(auth.refreshAccessTokenResult()).resolves.toEqual({ status: "unavailable" });
+    await expect(auth.refreshAccessTokenResult()).resolves.toEqual({ status: "rejected" });
+    expect(store.get(auth.REFRESH_TOKEN_KEY)).toBe("refresh-a");
+  });
 
   it("adopts the rotated pair another tab saved for the same session", async () => {
     const auth = await import("@/lib/auth-tokens");

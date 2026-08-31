@@ -11,6 +11,7 @@ import {
   chainRotationBases,
   normalizeOAuthOverride,
   overlayOAuthRotations,
+  refreshCloudOAuthGrant,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
@@ -29,6 +30,10 @@ function grant(accessToken: string, refreshToken?: string): CloudOAuthToken {
 }
 
 describe("server rotation chain (functions/mcp-cloud)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("normalizes the legacy single-base override shape", () => {
     const rotation = normalizeOAuthOverride("linear", {
       baseAccessToken: "A",
@@ -118,6 +123,46 @@ describe("server rotation chain (functions/mcp-cloud)", () => {
     expect(capped.slice(0, 4)).toEqual(["t0", "t1", "t2", "t3"]); // browser anchor survives
     expect(capped.slice(-4)).toEqual(["t7", "t8", "t9"].length === 3 ? capped.slice(-4) : capped.slice(-4));
     expect(capped[capped.length - 1]).toBe("t9"); // freshest link survives
+  });
+
+  it("durably commits a rotating browser grant before resolving the refresh", async () => {
+    const providerFetch = vi.fn(async (): Promise<Response> =>
+      new Response(JSON.stringify({ access_token: "DEPLOY-B", refresh_token: "DEPLOY-RB", expires_in: 3600 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", providerFetch);
+    const server = {
+      id: "deploy-escrow",
+      name: "Deploy escrow",
+      kind: "mcp" as const,
+      url: "https://mcp.example.org/mcp",
+      headers: {},
+      omitMcpHeaders: false,
+      disabledTools: [],
+      oauth: {
+        accessToken: "DEPLOY-A",
+        refreshToken: "DEPLOY-RA",
+        tokenEndpoint: "https://auth.example.org/token",
+        clientId: "client-1",
+        mcpUrl: "https://mcp.example.org/mcp",
+      },
+    };
+    let persisted: RefreshedOAuth | null = null;
+
+    const outcome = await refreshCloudOAuthGrant(server, async (rotation) => {
+      persisted = rotation;
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.ok ? outcome.token.accessToken : null).toBe("DEPLOY-B");
+    expect(persisted).toMatchObject({
+      serverId: "deploy-escrow",
+      baseAccessToken: "DEPLOY-A",
+      token: { accessToken: "DEPLOY-B", refreshToken: "DEPLOY-RB" },
+    });
+    expect(providerFetch).toHaveBeenCalledTimes(1);
   });
 });
 

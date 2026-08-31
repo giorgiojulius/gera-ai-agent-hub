@@ -34,6 +34,11 @@ export type RefreshedOAuth = {
 /** Durable commit hook invoked before a rotated credential is used. */
 export type PersistRefreshedOAuth = (rotation: RefreshedOAuth) => Promise<void>;
 
+/** Provider refresh result, preserving whether retrying later is safe. */
+export type CloudOAuthRefreshOutcome =
+  | { ok: true; token: CloudOAuthToken }
+  | { ok: false; status: number; code: string; detail?: string; transient: boolean };
+
 export type CloudMcpServer = {
   id: string;
   name: string;
@@ -512,7 +517,7 @@ export function chainRotationBases(
 const OAUTH_EXPIRY_SKEW_MS = 60_000;
 
 const CLOUD_REFRESH_REUSE_MS = 2 * 60_000;
-type CloudRefreshFlight = { task: Promise<CloudOAuthToken | null>; expiresAt: number };
+type CloudRefreshFlight = { task: Promise<CloudOAuthRefreshOutcome>; expiresAt: number };
 const cloudRefreshInFlight = new Map<string, CloudRefreshFlight>();
 
 function pruneCloudRefreshFlights(now: number): void {
@@ -548,86 +553,110 @@ function refreshFlightKey(grant: CloudOAuthToken): string {
   ]);
 }
 
-/** Redeems one rotating grant; concurrent cloud runs share the same exchange. */
+function oauthRefreshFailure(status: number, data: Record<string, unknown> | null): CloudOAuthRefreshOutcome {
+  const code = typeof data?.error === "string" && data.error ? data.error : status >= 500 ? "server_error" : "request_failed";
+  const rawDetail = typeof data?.error_description === "string" ? data.error_description : "";
+  const detail = rawDetail ? rawDetail.slice(0, 300) : undefined;
+  const transient =
+    status === 429 ||
+    status >= 500 ||
+    ["temporarily_unavailable", "server_error", "slow_down", "timeout"].includes(code);
+  return { ok: false, status, code, detail, transient };
+}
+
+/** One provider exchange shared by browser, interactive, and scheduled refreshes. */
+async function requestCloudOAuthRefresh(grant: CloudOAuthToken): Promise<CloudOAuthRefreshOutcome> {
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: grant.refreshToken ?? "",
+    client_id: grant.clientId,
+  });
+  if (grant.resource) {
+    params.set("resource", grant.resource);
+  }
+  let response: Response;
+  try {
+    response = await fetchPublicHttps(grant.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: params.toString(),
+      signal: AbortSignal.timeout(12_000),
+    });
+  } catch {
+    return { ok: false, status: 502, code: "temporarily_unavailable", transient: true };
+  }
+  const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!response.ok) {
+    return oauthRefreshFailure(response.status, data);
+  }
+  if (!data || typeof data.access_token !== "string" || !data.access_token) {
+    return { ok: false, status: 502, code: "invalid_response", transient: true };
+  }
+  const expiresIn = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in);
+  return {
+    ok: true,
+    token: {
+      accessToken: data.access_token,
+      refreshToken:
+        typeof data.refresh_token === "string" && data.refresh_token ? data.refresh_token : grant.refreshToken,
+      expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1_000 : undefined,
+      tokenEndpoint: grant.tokenEndpoint,
+      clientId: grant.clientId,
+      resource: grant.resource,
+      mcpUrl: grant.mcpUrl,
+    },
+  };
+}
+
+/** Redeems one rotating grant; concurrent cloud and browser callers share the exchange. */
 async function redeemCloudRefreshToken(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
-): Promise<boolean> {
+): Promise<CloudOAuthRefreshOutcome> {
   const grant = server.oauth;
   if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId || !safePublicHttpsUrl(grant.tokenEndpoint)) {
-    return false;
+    return { ok: false, status: 400, code: "invalid_grant", transient: false };
   }
   const key = refreshFlightKey(grant);
   const now = Date.now();
   pruneCloudRefreshFlights(now);
   let flight = cloudRefreshInFlight.get(key);
   if (!flight || flight.expiresAt <= now) {
-    const task = (async (): Promise<CloudOAuthToken | null> => {
-      const params = new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: grant.refreshToken ?? "",
-        client_id: grant.clientId,
-      });
-      if (grant.resource) {
-        params.set("resource", grant.resource);
-      }
-      const response = await fetchPublicHttps(grant.tokenEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-        body: params.toString(),
-        signal: AbortSignal.timeout(12_000),
-      });
-      const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-      if (!response.ok || !data || typeof data.access_token !== "string" || !data.access_token) {
-        return null;
-      }
-      return {
-        accessToken: data.access_token,
-        refreshToken:
-          typeof data.refresh_token === "string" && data.refresh_token ? data.refresh_token : grant.refreshToken,
-        expiresAt:
-          typeof data.expires_in === "number" && Number.isFinite(data.expires_in)
-            ? Date.now() + data.expires_in * 1_000
-            : undefined,
-        tokenEndpoint: grant.tokenEndpoint,
-        clientId: grant.clientId,
-        resource: grant.resource,
-        mcpUrl: grant.mcpUrl,
-      };
-    })();
+    const task = requestCloudOAuthRefresh(grant);
     flight = { task, expiresAt: Number.POSITIVE_INFINITY };
     cloudRefreshInFlight.set(key, flight);
-    void task.then(
-      (result) => {
-        const current = cloudRefreshInFlight.get(key);
-        if (current !== flight) {
-          return;
-        }
-        if (result) {
-          current.expiresAt = Date.now() + CLOUD_REFRESH_REUSE_MS;
-        } else {
-          cloudRefreshInFlight.delete(key);
-        }
-      },
-      () => {
-        if (cloudRefreshInFlight.get(key) === flight) {
-          cloudRefreshInFlight.delete(key);
-        }
-      },
-    );
+    void task.then((result) => {
+      const current = cloudRefreshInFlight.get(key);
+      if (current !== flight) {
+        return;
+      }
+      if (result.ok) {
+        current.expiresAt = Date.now() + CLOUD_REFRESH_REUSE_MS;
+      } else {
+        cloudRefreshInFlight.delete(key);
+      }
+    });
   }
-  const next = await flight.task;
-  if (!next) {
-    return false;
+  const outcome = await flight.task;
+  if (!outcome.ok) {
+    return outcome;
   }
-  const rotation = { serverId: server.id, baseAccessToken: grant.accessToken, token: next };
+  const rotation = { serverId: server.id, baseAccessToken: grant.accessToken, token: outcome.token };
   if (persist) {
     await persist(rotation);
   }
   refreshed.push(rotation);
-  server.oauth = next;
-  return true;
+  server.oauth = outcome.token;
+  return outcome;
+}
+
+/** Refreshes and durably commits a browser grant before the response is returned. */
+export function refreshCloudOAuthGrant(
+  server: CloudMcpServer,
+  persist: PersistRefreshedOAuth,
+): Promise<CloudOAuthRefreshOutcome> {
+  return redeemCloudRefreshToken(server, [], persist);
 }
 
 /** Refreshes an expiring synced grant in place; no-op while it still looks fresh. */
@@ -658,7 +687,7 @@ export async function forceRefreshCloudOAuth(
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
 ): Promise<boolean> {
-  return redeemCloudRefreshToken(server, refreshed, persist);
+  return (await redeemCloudRefreshToken(server, refreshed, persist)).ok;
 }
 
 type JsonRpcResponse = {

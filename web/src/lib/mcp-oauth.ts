@@ -7,7 +7,7 @@
  */
 
 import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
-import { relayFetch } from "@/lib/backend";
+import { authedFetch, relayFetch } from "@/lib/backend";
 
 export const OAUTH_RESULT_KEY = "gera.mcp.oauth.result.v1";
 
@@ -551,34 +551,39 @@ export function applyServerOAuthRotations(rotations: ServerOAuthRotation[]): num
  * repairs the session without a new sign-in; only a genuinely dead grant
  * falls through to Sign in.
  */
+type ServerRotationLookup =
+  | { status: "found"; token: StoredToken }
+  | { status: "missing" }
+  | { status: "unavailable" };
+
 async function findRotationFromServer(
   serverId: string,
   currentAccessToken: string,
   boundary: OAuthOperationBoundary,
-): Promise<StoredToken | null> {
+): Promise<ServerRotationLookup> {
   try {
     if (!isOAuthOperationCurrent(boundary)) {
-      return null;
+      return { status: "unavailable" };
     }
-    const { authedFetch } = await import("@/lib/backend");
     const response = await authedFetch("/mcp/oauth-rotations");
     if (!isOAuthOperationCurrent(boundary) || !response.ok) {
-      return null;
+      return { status: "unavailable" };
     }
     const data = (await response.json()) as { rotations?: unknown };
     if (!isOAuthOperationCurrent(boundary)) {
-      return null;
+      return { status: "unavailable" };
     }
-    return (
-      parseServerOAuthRotations(data.rotations).find(
-        (rotation) =>
-          rotation.serverId === serverId &&
-          rotation.token.accessToken !== currentAccessToken &&
-          rotation.bases.includes(currentAccessToken),
-      )?.token ?? null
-    );
+    const token = parseServerOAuthRotations(data.rotations).find(
+      (rotation) =>
+        rotation.serverId === serverId &&
+        rotation.token.accessToken !== currentAccessToken &&
+        rotation.bases.includes(currentAccessToken),
+    )?.token;
+    return token ? { status: "found", token } : { status: "missing" };
   } catch {
-    return null;
+    // A deployment/network gap proves nothing about the provider credential.
+    // Keep the local pair so the next boot can retrieve a durable rotation tip.
+    return { status: "unavailable" };
   }
 }
 
@@ -689,7 +694,7 @@ function refreshServerToken(serverId: string): Promise<string | null> {
       return null;
     }
     try {
-      const refreshed = await refreshAccessToken(stored);
+      const refreshed = await refreshAccessToken(serverId, stored);
       if (!isOAuthOperationCurrent(boundary)) {
         return null;
       }
@@ -719,11 +724,14 @@ function refreshServerToken(serverId: string): Promise<string | null> {
         if (latest?.accessToken && !sameStoredGrant(latest, stored)) {
           return latest.accessToken;
         }
-        if (rescued && sameStoredGrant(latest, stored)) {
-          commitTokenChanges({ [serverId]: rescued });
-          return rescued.accessToken;
+        if (rescued.status === "found" && sameStoredGrant(latest, stored)) {
+          commitTokenChanges({ [serverId]: rescued.token });
+          return rescued.token.accessToken;
         }
-        if (sameStoredGrant(latest, stored)) {
+        // Only a successful account-shard lookup that confirms no rotation
+        // makes a fatal provider rejection definitive. A rollout/relay failure
+        // keeps the grant for the next deploy-safe retry.
+        if (rescued.status === "missing" && sameStoredGrant(latest, stored)) {
           commitTokenChanges({ [serverId]: null });
         }
       }
@@ -1218,28 +1226,46 @@ async function exchangeCode(params: {
   };
 }
 
-async function refreshAccessToken(stored: StoredToken): Promise<StoredToken> {
+async function refreshAccessToken(serverId: string, stored: StoredToken): Promise<StoredToken> {
   if (!stored.refreshToken) {
     throw new OAuthTokenError("No refresh token stored.", "invalid_grant");
   }
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: stored.refreshToken,
-    client_id: stored.clientId,
-  });
-  if (stored.resource) {
-    body.set("resource", stored.resource);
+  let response: Response;
+  try {
+    response = await authedFetch("/mcp/oauth-refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // keepalive lets a publish-triggered page unload leave the small request
+      // running long enough for the account shard to escrow the rotated pair.
+      keepalive: true,
+      body: JSON.stringify({ serverId, token: stored }),
+    });
+  } catch {
+    throw new Error("Could not reach the Gera relay. Check your connection and try again.");
   }
-  const token = await requestToken(stored.tokenEndpoint, body);
-  return {
-    accessToken: token.accessToken,
-    refreshToken: token.refreshToken ?? stored.refreshToken,
-    expiresAt: token.expiresAt,
-    tokenEndpoint: stored.tokenEndpoint,
-    clientId: stored.clientId,
-    resource: stored.resource,
-    mcpUrl: stored.mcpUrl,
+  const data = (await response.json().catch(() => ({}))) as {
+    token?: unknown;
+    error?: unknown;
+    error_description?: unknown;
   };
+  const token = parseStoredToken(data.token);
+  if (!response.ok || !token) {
+    const code = typeof data.error === "string" ? data.error : "request_failed";
+    const detail =
+      (typeof data.error_description === "string" && data.error_description) ||
+      code ||
+      `token request failed (${response.status})`;
+    throw new OAuthTokenError(`Sign-in failed: ${detail}`, code);
+  }
+  if (
+    token.clientId !== stored.clientId ||
+    !sameEndpoint(token.tokenEndpoint, stored.tokenEndpoint) ||
+    token.resource !== stored.resource ||
+    token.mcpUrl !== stored.mcpUrl
+  ) {
+    throw new Error("The refreshed sign-in did not match the stored MCP grant boundary.");
+  }
+  return token;
 }
 
 function base64Url(bytes: Uint8Array): string {

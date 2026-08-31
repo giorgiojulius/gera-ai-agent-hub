@@ -16,7 +16,7 @@ import {
   clearTokens,
   invalidateAuthSession,
   isAuthSessionCurrent,
-  refreshAccessToken,
+  refreshAccessTokenResult,
 } from "@/lib/auth-tokens";
 
 const ACCOUNT_OWNER_KEY = "rork:gera_account_owner";
@@ -73,7 +73,7 @@ function decodeBase64UrlUtf8(segment: string): string {
 }
 
 /** Decodes the JWT payload for display identity and expiry checking. */
-function userFromToken(token: string): AuthUser | null {
+function userFromToken(token: string, allowExpired: boolean = false): AuthUser | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) {
@@ -86,7 +86,7 @@ function userFromToken(token: string): AuthUser | null {
       picture?: string;
       exp?: number;
     };
-    if (payload.exp && payload.exp * 1000 < Date.now()) {
+    if (!allowExpired && payload.exp && payload.exp * 1000 < Date.now()) {
       return null;
     }
     if (!payload.sub) {
@@ -152,30 +152,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: number | null = null;
     const bootSession = authSessionSnapshot();
-    const boot = async () => {
+    const scheduleRetry = (): void => {
+      if (cancelled || retryTimer !== null) {
+        return;
+      }
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void boot();
+      }, 5_000);
+    };
+    const boot = async (): Promise<void> => {
       try {
         const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-        if (accessToken) {
-          const decoded = userFromToken(accessToken);
-          if (decoded) {
-            if (!cancelled && isAuthSessionCurrent(bootSession)) {
-              bindLocalStateToAccount(decoded);
-              setUser(decoded);
-            }
-            return;
-          }
-        }
-        if (localStorage.getItem(REFRESH_TOKEN_KEY)) {
-          const refreshed = await refreshAccessToken();
+        const decoded = accessToken ? userFromToken(accessToken) : null;
+        if (decoded) {
           if (!cancelled && isAuthSessionCurrent(bootSession)) {
-            const decoded = refreshed ? userFromToken(refreshed) : null;
-            if (decoded) {
-              bindLocalStateToAccount(decoded);
-              setUser(decoded);
-            } else {
+            bindLocalStateToAccount(decoded);
+            setUser(decoded);
+          }
+          return;
+        }
+        const staleIdentity = accessToken ? userFromToken(accessToken, true) : null;
+        if (localStorage.getItem(REFRESH_TOKEN_KEY)) {
+          const result = await refreshAccessTokenResult();
+          if (!cancelled && isAuthSessionCurrent(bootSession)) {
+            const renewed = result.status === "refreshed" ? userFromToken(result.accessToken) : null;
+            if (renewed) {
+              bindLocalStateToAccount(renewed);
+              setUser(renewed);
+            } else if (result.status === "rejected") {
+              // Only an explicit invalid/revoked refresh grant signs out. A
+              // deploy-time network/5xx gap keeps both tokens and retries.
               clearTokens();
               setUser(null);
+            } else {
+              if (staleIdentity) {
+                // An expired JWT is identity context only; every server request
+                // still requires a freshly platform-verified token.
+                bindLocalStateToAccount(staleIdentity);
+                setUser(staleIdentity);
+              }
+              scheduleRetry();
             }
           }
         }
@@ -183,9 +202,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!cancelled) setIsLoading(false);
       }
     };
+    const onOnline = (): void => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      void boot();
+    };
+    window.addEventListener("online", onOnline);
     void boot();
     return () => {
       cancelled = true;
+      window.removeEventListener("online", onOnline);
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
   }, []);
 

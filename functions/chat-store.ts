@@ -109,12 +109,14 @@ import {
 import {
   chainRotationBases,
   cloudMcpServersForAutomation,
+  cloudOAuthToken,
   cloudOAuthTokens,
   ensureFreshCloudOAuth,
   forceRefreshCloudOAuth,
   intersectMcpAllowIds,
   normalizeOAuthOverride,
   overlayOAuthRotations,
+  refreshCloudOAuthGrant,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
@@ -277,6 +279,9 @@ export class ChatStore extends DurableObject {
     }
     if (request.method === "GET" && url.pathname === "/mcp/oauth-rotations") {
       return this.handleOAuthRotations(email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/oauth-refresh") {
+      return this.handleBrowserOAuthRefresh(request, email);
     }
     // Internal (worker-only — no public relay forwards this path): project
     // agents resolve their linked MCP servers through this account.
@@ -630,19 +635,25 @@ export class ChatStore extends DurableObject {
     });
   }
 
-  /** Rejects a late refresh when the synced/overlaid grant changed while the provider request awaited. */
-  private async assertOAuthRotationCurrent(owner: string, rotated: RefreshedOAuth): Promise<void> {
+  /** Reads the account's durable OAuth map without ever trusting a caller copy. */
+  private profileOAuthTokens(owner: string): Record<string, CloudOAuthToken> {
     const profileRow = this.ctx.storage.sql
       .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
       .toArray()[0];
-    let parsed: unknown = null;
-    try {
-      parsed = profileRow ? JSON.parse(profileRow.payload) : null;
-    } catch {
-      parsed = null;
+    if (!profileRow) {
+      return {};
     }
-    const raw = isRecord(parsed) ? parsed.mcpOAuth : undefined;
-    const tokens = cloudOAuthTokens(raw);
+    try {
+      const parsed = JSON.parse(profileRow.payload) as unknown;
+      return cloudOAuthTokens(isRecord(parsed) ? parsed.mcpOAuth : undefined);
+    } catch {
+      return {};
+    }
+  }
+
+  /** Rejects a late refresh when the synced/overlaid grant changed while the provider request awaited. */
+  private async assertOAuthRotationCurrent(owner: string, rotated: RefreshedOAuth): Promise<void> {
+    const tokens = this.profileOAuthTokens(owner);
     const key = `${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`;
     const existing = normalizeOAuthOverride(rotated.serverId, await this.ctx.storage.get<unknown>(key));
     if (existing) {
@@ -651,6 +662,123 @@ export class ChatStore extends DurableObject {
     const currentAccess = tokens[rotated.serverId]?.accessToken;
     if (currentAccess !== rotated.baseAccessToken && currentAccess !== rotated.token.accessToken) {
       throw new Error("stale OAuth refresh result");
+    }
+  }
+
+  /**
+   * POST /mcp/oauth-refresh — deployment-safe browser refresh. The provider's
+   * rotating response is committed to this account shard before it is returned
+   * to the tab. If a publish reload loses that response, the next bundle sends
+   * the old base again and receives the durable tip without redeeming twice.
+   */
+  private async handleBrowserOAuthRefresh(request: Request, owner: string): Promise<Response> {
+    let body: { serverId?: unknown; token?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const serverId = typeof body.serverId === "string" ? body.serverId : "";
+    const incoming = cloudOAuthToken(body.token);
+    if (!isValidId(serverId) || !incoming?.refreshToken || !incoming.tokenEndpoint || !incoming.clientId) {
+      return json({ error: "invalid_grant" }, 400);
+    }
+
+    const key = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
+    let existing = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
+    const profileGrant = this.profileOAuthTokens(owner)[serverId];
+    if (existing?.bases.includes(incoming.accessToken)) {
+      const profileStillOnChain =
+        Boolean(profileGrant) &&
+        (profileGrant?.accessToken === existing.token.accessToken || existing.bases.includes(profileGrant?.accessToken ?? ""));
+      if (!profileStillOnChain) {
+        // A sign-out or fresh sign-in in the durable profile outranks a stale
+        // tab. Escrow repairs deploy loss, never resurrects a removed account grant.
+        return json({ error: "stale_grant" }, 409);
+      }
+      return json({ token: existing.token, replayed: true });
+    }
+
+    if (
+      existing &&
+      existing.token.accessToken !== incoming.accessToken &&
+      profileGrant?.accessToken === incoming.accessToken
+    ) {
+      // The durable profile proves this is a fresh sign-in outside the old
+      // chain. Retire the obsolete escrow before refreshing the new grant.
+      await this.ctx.storage.delete(key);
+      existing = null;
+    }
+    if (profileGrant && profileGrant.accessToken !== incoming.accessToken) {
+      return json({ error: "stale_grant" }, 409);
+    }
+
+    const appliedChains = new Map<string, string[]>();
+    const grant = existing?.token.accessToken === incoming.accessToken ? existing.token : incoming;
+    if (existing?.token.accessToken === grant.accessToken) {
+      appliedChains.set(serverId, existing.bases);
+    }
+    const profileAnchor = profileGrant?.accessToken ?? null;
+    const server = {
+      id: serverId,
+      name: serverId,
+      kind: "mcp" as const,
+      url: grant.mcpUrl ?? grant.tokenEndpoint,
+      headers: {},
+      omitMcpHeaders: false,
+      disabledTools: [],
+      oauth: grant,
+    };
+    const persist = async (rotated: RefreshedOAuth): Promise<void> => {
+      const latestProfile = this.profileOAuthTokens(owner)[serverId];
+      if (
+        (profileAnchor !== null && latestProfile?.accessToken !== profileAnchor && latestProfile?.accessToken !== rotated.token.accessToken) ||
+        (profileAnchor === null && latestProfile && latestProfile.accessToken !== rotated.baseAccessToken && latestProfile.accessToken !== rotated.token.accessToken)
+      ) {
+        throw new Error("stale OAuth refresh result");
+      }
+      const latestOverride = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
+      if (latestOverride?.bases.includes(rotated.baseAccessToken)) {
+        throw new Error("OAuth refresh already committed");
+      }
+      if (
+        latestOverride &&
+        latestOverride.token.accessToken !== rotated.baseAccessToken &&
+        latestOverride.token.accessToken !== rotated.token.accessToken
+      ) {
+        throw new Error("stale OAuth refresh result");
+      }
+      if (latestOverride) {
+        appliedChains.set(serverId, latestOverride.bases);
+      }
+      const bases = chainRotationBases(appliedChains, rotated);
+      await this.ctx.storage.put(key, { bases, token: rotated.token });
+      appliedChains.set(serverId, bases);
+    };
+
+    try {
+      const outcome = await refreshCloudOAuthGrant(server, persist);
+      if (!outcome.ok) {
+        const status = outcome.transient ? (outcome.status === 429 ? 429 : 503) : 400;
+        return json(
+          {
+            error: outcome.code,
+            ...(outcome.detail ? { error_description: outcome.detail } : {}),
+            transient: outcome.transient,
+          },
+          status,
+        );
+      }
+      return json({ token: outcome.token, replayed: false });
+    } catch {
+      // A sibling request may have durably committed the shared provider
+      // response first. Return that winner; otherwise keep the caller's local
+      // grant untouched and let a later retry reconcile it.
+      const winner = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
+      if (winner?.bases.includes(incoming.accessToken)) {
+        return json({ token: winner.token, replayed: true });
+      }
+      return json({ error: "refresh_commit_unavailable", transient: true }, 503);
     }
   }
 
@@ -1488,14 +1616,20 @@ export class ChatStore extends DurableObject {
         )
         .toArray()[0];
       const serverAt = row?.updated_at ?? 0;
-      if (row && serverAt > clientAt) {
+      if (
+        row &&
+        (serverAt > clientAt || (serverAt === clientAt && payload !== null && row.payload !== payload))
+      ) {
+        // Equal clocks are ACK-safe only for byte-identical blobs. A deploy can
+        // revive an older tab at the same millisecond; the durable copy wins
+        // rather than letting an uncommitted payload prune OAuth escrow.
         profileOut = { updatedAt: serverAt, payload: row.payload };
         profileSeen = row.payload;
       } else if (payload !== null) {
         if (payload.length > PROFILE_PAYLOAD_LIMIT) {
           profileSkipped = true;
         } else {
-          if (clientAt > serverAt) {
+          if (!row || clientAt > serverAt) {
             this.ctx.storage.sql.exec(
               "INSERT OR REPLACE INTO profiles (owner_email, payload, updated_at) VALUES (?, ?, ?)",
               email,
@@ -1503,7 +1637,7 @@ export class ChatStore extends DurableObject {
               clientAt,
             );
           }
-          profileAck = clientAt; // stored now, or already identical
+          profileAck = clientAt; // stored now, or already byte-identical
           profileSeen = payload;
         }
       } else if (clientAt > serverAt) {

@@ -80,16 +80,43 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     return map[id];
   }
 
+  function brokerToken(accessToken: string, refreshToken?: string): Record<string, unknown> {
+    return {
+      accessToken,
+      refreshToken,
+      expiresAt: Date.now() + 3_600_000,
+      tokenEndpoint: "https://auth.example/token",
+      clientId: "client-1",
+    };
+  }
+
   function stubFetch(onTokenRequest: () => StubResponse): void {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: unknown): Promise<StubResponse> => {
         const url = String(input);
-        if (url.includes("oauth-proxy")) {
-          return onTokenRequest();
+        if (url.includes("/mcp/oauth-refresh")) {
+          const provider = onTokenRequest();
+          const data = (await provider.json()) as {
+            access_token?: unknown;
+            refresh_token?: unknown;
+          };
+          if (provider.ok && typeof data.access_token === "string") {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                token: brokerToken(
+                  data.access_token as string,
+                  typeof data.refresh_token === "string" ? data.refresh_token : undefined,
+                ),
+              }),
+            };
+          }
+          return { ...provider, json: async () => data };
         }
-        // The rotation-rescue endpoint: 403 keeps authedFetch from retrying.
-        return { ok: false, status: 403, json: async () => ({}) };
+        // A completed durable lookup confirms this fatal pair has no newer tip.
+        return { ok: true, status: 200, json: async () => ({ rotations: [] }) };
       }),
     );
   }
@@ -133,7 +160,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     finish?.({
       ok: true,
       status: 200,
-      json: async () => ({ access_token: "OLD-ACCOUNT", refresh_token: "OLD-REFRESH", expires_in: 3600 }),
+      json: async () => ({ token: brokerToken("OLD-ACCOUNT", "OLD-REFRESH") }),
     });
 
     await expect(pending).resolves.toBeNull();
@@ -146,7 +173,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
-        if (String(input).includes("oauth-proxy")) {
+        if (String(input).includes("/mcp/oauth-refresh")) {
           return new Response(JSON.stringify({ error: "invalid_grant" }), {
             status: 400,
             headers: { "Content-Type": "application/json" },
@@ -267,7 +294,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
-        if (String(input).includes("oauth-proxy")) {
+        if (String(input).includes("/mcp/oauth-refresh")) {
           return new Response(JSON.stringify({ error: "bad_refresh_token" }), {
             status: 400,
             headers: { "Content-Type": "application/json" },
@@ -322,6 +349,66 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     expect(header).toBeNull();
     expect(storedToken("transient")?.accessToken).toBe("A");
     expect(storedToken("transient")?.refreshToken).toBe("RA");
+  });
+
+  it("keeps a fatal-looking pair when rotation lookup is unavailable during deploy", async () => {
+    seedToken("deploy-gap", "A", "RA");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+        if (String(input).includes("/mcp/oauth-refresh")) {
+          return new Response(JSON.stringify({ error: "invalid_grant" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ error: "upstream_unreachable" }), {
+          status: 502,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    await expect(forceRefreshOAuthHeader("deploy-gap")).resolves.toBeNull();
+    expect(storedToken("deploy-gap")?.accessToken).toBe("A");
+    expect(storedToken("deploy-gap")?.refreshToken).toBe("RA");
+  });
+
+  it("adopts the escrowed pair after a deploy loses the first browser response", async () => {
+    seedToken("deploy-replay", "A", "RA");
+    const durableTip = brokerToken("B", "RB");
+    let attempts = 0;
+    let firstInit: RequestInit | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (!String(input).includes("/mcp/oauth-refresh")) {
+          return new Response(JSON.stringify({ rotations: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        attempts += 1;
+        if (attempts === 1) {
+          firstInit = init;
+          // The account shard already committed B/RB, but the old bundle was
+          // replaced before its fetch promise received the response.
+          throw new TypeError("page unloaded during deploy");
+        }
+        return new Response(JSON.stringify({ token: durableTip, replayed: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    await expect(forceRefreshOAuthHeader("deploy-replay")).resolves.toBeNull();
+    expect(storedToken("deploy-replay")?.accessToken).toBe("A");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await expect(forceRefreshOAuthHeader("deploy-replay")).resolves.toBe("Bearer B");
+    expect(storedToken("deploy-replay")?.refreshToken).toBe("RB");
+    expect(firstInit?.keepalive).toBe(true);
+    expect(JSON.parse(String(firstInit?.body))).toMatchObject({ serverId: "deploy-replay" });
   });
 
   it("stores the rotated pair on a successful refresh and wakes profile sync", async () => {

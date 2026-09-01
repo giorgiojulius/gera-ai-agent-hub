@@ -1187,6 +1187,39 @@ export class ChatStore extends DurableObject {
     }
   }
 
+  /**
+   * All connector ids that resolve to the native GitHub integration for this
+   * account: the canonical "github" id plus any profile card whose catalogId
+   * points at it. Used to clear stale pasted/legacy tokens after a fresh
+   * device-flow sign-in — the auth lease prefers manual secrets, so leaving
+   * one behind would shadow the new grant forever.
+   */
+  private githubConnectorIds(owner: string): string[] {
+    const ids = new Set<string>(["github"]);
+    const row = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    if (row) {
+      try {
+        const profile = JSON.parse(row.payload) as Record<string, unknown>;
+        const settings = isRecord(profile.settings) ? profile.settings : {};
+        const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
+        for (const item of servers) {
+          if (!isRecord(item) || typeof item.id !== "string" || !isValidId(item.id)) {
+            continue;
+          }
+          const catalogId = typeof item.catalogId === "string" ? item.catalogId : "";
+          if (item.id === "github" || catalogId === "github") {
+            ids.add(item.id);
+          }
+        }
+      } catch {
+        // Malformed legacy profile: fall back to the canonical id only.
+      }
+    }
+    return [...ids];
+  }
+
   private oauthGrantState(owner: string, serverId: string): string {
     return this.ctx.storage.sql
       .exec<{ state: string }>(
@@ -1459,6 +1492,16 @@ export class ChatStore extends DurableObject {
         "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = 'github'",
         owner,
       );
+      // Latest credential wins: a fresh sign-in supersedes any pasted PAT or
+      // legacy-migrated token, which the auth lease would otherwise prefer
+      // forever (stale read-only/dead tokens made GitHub look read-only).
+      for (const staleId of this.githubConnectorIds(owner)) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
+          owner,
+          staleId,
+        );
+      }
       this.markOAuthReady(owner, "github");
       this.ctx.storage.sql.exec(
         "UPDATE mcp_github_device_pending SET status = 'completed', error = '', updated_at = ? WHERE owner_email = ? AND flow_id = ?",

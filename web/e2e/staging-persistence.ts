@@ -40,7 +40,7 @@ try {
       syncResponses += 1;
       responseBodyReads.push(response.text().then((body) => {
         if (
-          /\"(?:access_?token|refresh_?token|client_?secret|code_?verifier|authorization_?code|token|headersJson|Authorization)\"\s*:/i.test(body) ||
+          /"(?:access_?token|refresh_?token|client_?secret|code_?verifier|authorization_?code|token|headersJson|Authorization)"\s*:/i.test(body) ||
           body.includes(redactionSentinel)
         ) {
           responseCredentialLeak = true;

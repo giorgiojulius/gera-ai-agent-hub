@@ -125,7 +125,15 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
     }
     setSettings((prev) => ({
       ...prev,
-      mcpServers: prev.mcpServers.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+      mcpServers: prev.mcpServers.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              ...patch,
+              ...(connectionChanged ? { credentialStored: false } : {}),
+            }
+          : item,
+      ),
     }));
   }, [setSettings, stateRef]);
 
@@ -147,7 +155,13 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
     );
     const server = existing ?? catalogEntryToServer(entry);
     const hasToken = Boolean(server.token?.trim());
-    if (entry.auth === "none" || entry.tokenOptional || hasToken || server.status === "connected") {
+    if (
+      entry.auth === "none" ||
+      entry.tokenOptional ||
+      hasToken ||
+      server.credentialStored === true ||
+      server.status === "connected"
+    ) {
       void reconnectMcp(server, setSettings);
       return;
     }
@@ -209,6 +223,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
     const needsOAuth =
       (entry?.auth === "oauth" || server.authMode === "oauth") &&
       !server.token?.trim() &&
+      !server.credentialStored &&
       server.status !== "connected";
     if (needsOAuth) {
       const popup = openOAuthPopup();

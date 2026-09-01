@@ -812,6 +812,8 @@ function normalizeServer(server: McpServerConfig): McpServerConfig {
     error: typeof server.error === "string" ? server.error : undefined,
     identity: typeof server.identity === "string" ? server.identity : undefined,
     verifiedAt: typeof server.verifiedAt === "number" ? server.verifiedAt : undefined,
+    credentialStored:
+      typeof server.credentialStored === "boolean" ? server.credentialStored : undefined,
     tools: Array.isArray(server.tools) ? server.tools : [],
     disabledTools: unlockGithubChatWrites(
       catalogId ?? (typeof server.id === "string" ? server.id : ""),

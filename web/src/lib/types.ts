@@ -644,6 +644,8 @@ export type McpServerConfig = {
   identity?: string;
   /** Epoch ms of the last successful handshake + tool listing. */
   verifiedAt?: number;
+  /** Non-secret proof that this account shard holds auth for the connector. */
+  credentialStored?: boolean;
   tools: McpToolInfo[];
   disabledTools: string[];
 };

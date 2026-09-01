@@ -1,7 +1,8 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-01 · commit `4a0fa26` (+ project Settings tab replaces
-  the ··· menu, Diagnostics journals cloud-run
+Last synced: 2026-09-01 · commit `a8167e0` (+ MCP server-owned credential
+  recovery and bounded health checks, project Settings tab replaces the ··· menu,
+  Diagnostics journals cloud-run
   failures and real MCP disconnects again, Gera-chat GitHub writes on by
   default, MCP no longer asks to reconnect when the browser has no local
   grant, Rork-hosted immutable web-
@@ -857,7 +858,11 @@ custom headers, refresh single-flight, connection checks, protocol sessions and
 tool calls are owned by the signed-in account's ChatStore shard. `/mcp/oauth-store`
 persists a newly authorized grant before the popup/device flow reports success;
 `/mcp/check` stores submitted key/header material in the server vault and returns
-only redacted tool/status metadata. Browser profile and local settings serializers
+only redacted tool/status metadata plus a non-secret `credentialStored` flag. The
+health request sends only connection fields—not cached tool schemas—so large
+servers cannot exceed the control-route body cap. Re-checks always return the full
+tool table (including locally disabled tools), and legacy instance IDs can reuse
+their catalog ID's server-owned key or OAuth grant. Browser profile and local settings serializers
 strip `token`, `headersJson`, and `mcpOAuth`; old local OAuth grants migrate once
 to the shard and are deleted only after its durable acknowledgement.
 
@@ -875,7 +880,9 @@ is loading or signed out; an account-level `sign_in_required` response stays sil
 and keeps every connector armed instead of masquerading as provider revocation. A
 missing browser token/OAuth grant is likewise not a disconnect — credentials live
 in the shard, so a green card without localStorage material stays connected and
-cloud-ready until `/mcp/check` reports a real provider rejection. A
+cloud-ready until `/mcp/check` reports a real provider rejection. Re-checking an
+OAuth connector with a server-held grant does not incorrectly reopen sign-in; the
+key field says the credential is stored server-side and accepts a replacement. A
 network/provider outage is likewise retryable and does not erase a credential; only
 a definitive provider rejection marks that connector disconnected. Generic MCP parsing preserves text resources,
 `structuredContent`, resource links and request-id matching. Legacy direct-browser

@@ -854,6 +854,14 @@ export class ChatStore extends DurableObject {
       token: typeof rawServer.token === "string" ? rawServer.token : "",
       headersJson: typeof rawServer.headersJson === "string" ? rawServer.headersJson : "",
     };
+    const catalogId = typeof rawServer.catalogId === "string" ? rawServer.catalogId : "";
+    if (rawServer.credentialStored === false && !secret.token && !secret.headersJson) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
+        owner,
+        serverId,
+      );
+    }
     if (secret.token || secret.headersJson) {
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
@@ -864,8 +872,22 @@ export class ChatStore extends DurableObject {
       );
     }
     const storedSecret = this.mcpServerSecret(owner, serverId);
+    const legacyCatalogSecret = catalogId && catalogId !== serverId ? this.mcpServerSecret(owner, catalogId) : {};
+    const resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
     const oauthTokens = this.profileOAuthTokens(owner);
-    const candidate = { ...rawServer, ...storedSecret, enabled: true, status: "connected" };
+    if (!oauthTokens[serverId] && catalogId && oauthTokens[catalogId]) {
+      oauthTokens[serverId] = oauthTokens[catalogId];
+    }
+    // A health check must always return the complete remote tool table. The
+    // account's disabled-tool preferences stay in the profile and are applied
+    // when a run arms; filtering here made disabled tools disappear forever.
+    const candidate = {
+      ...rawServer,
+      ...resolvedSecret,
+      disabledTools: [],
+      enabled: true,
+      status: "connected",
+    };
     const servers = cloudMcpServersForAutomation([candidate], [serverId], oauthTokens);
     if (servers.length === 0) {
       return json({ error: "server_auth_missing" }, 400);
@@ -895,7 +917,12 @@ export class ChatStore extends DurableObject {
         inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
       };
     });
-    return json({ tools, identity: `${servers[0].name} · server verified` });
+    const credentialStored = Boolean(
+      resolvedSecret.token ||
+      resolvedSecret.headersJson ||
+      oauthTokens[serverId],
+    );
+    return json({ tools, identity: `${servers[0].name} · server verified`, credentialStored });
   }
 
   /** Rejects a late refresh when the synced/overlaid grant changed while the provider request awaited. */

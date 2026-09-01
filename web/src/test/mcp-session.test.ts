@@ -7,7 +7,7 @@ import {
 } from "@/lib/agent-store";
 import { parseProfilePayload } from "@/lib/chat-sync";
 import { normalizeStoredSettings } from "@/lib/history";
-import { isSessionLostRpcMessage, isSessionLostSignal } from "@/lib/mcp";
+import { isSessionLostRpcMessage, isSessionLostSignal, mcpCheckServerPayload } from "@/lib/mcp";
 import { adoptProfileOAuthTokens } from "@/lib/mcp-oauth";
 import type { AgentSettings, McpServerConfig } from "@/lib/types";
 
@@ -56,6 +56,32 @@ describe("session-lost detection", () => {
 });
 
 describe("MCP connection persistence — connect once and forget", () => {
+  it("keeps health-check payloads small even after a server listed huge tool schemas", () => {
+    const server = storedServer({
+      id: "large-server",
+      status: "connected",
+      credentialStored: true,
+      disabledTools: ["mutate"],
+      tools: Array.from({ length: 200 }, (_, index) => ({
+        name: `tool_${index}`,
+        description: "x".repeat(1_000),
+        inputSchema: { type: "object", properties: { payload: { type: "string", description: "y".repeat(1_000) } } },
+      })),
+    });
+
+    const payload = mcpCheckServerPayload(server);
+    expect(JSON.stringify(payload).length).toBeLessThan(1_000);
+    expect(payload).not.toHaveProperty("tools");
+    expect(payload).not.toHaveProperty("disabledTools");
+    expect(payload.credentialStored).toBe(true);
+  });
+
+  it("does not invent a missing server credential flag for legacy profiles", () => {
+    const legacy = normalizeStoredSettings({ mcpServers: [storedServer({ status: "connected" })] });
+    expect(legacy.mcpServers[0]?.credentialStored).toBeUndefined();
+    expect(mcpCheckServerPayload(legacy.mcpServers[0])).not.toHaveProperty("credentialStored");
+  });
+
   it("keeps the OAuth half of a synced profile available to the caller", () => {
     const oauth = {
       github: {

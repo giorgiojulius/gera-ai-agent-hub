@@ -1805,6 +1805,7 @@ export async function reconnectMcp(
               tools: connection.tools,
               identity: connection.identity,
               verifiedAt: Date.now(),
+              credentialStored: connection.credentialStored === true,
               error: undefined,
               name: item.name || server.name,
             }

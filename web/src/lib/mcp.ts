@@ -459,7 +459,28 @@ export type McpConnection = {
   tools: McpToolInfo[];
   /** Human-readable proof of what was verified: workspace + admin for native connectors, server name for MCP. */
   identity?: string;
+  /** The account shard has a key, custom headers, or OAuth grant for this connector. */
+  credentialStored?: boolean;
 };
+
+/**
+ * Minimal server-check wire shape. Remote tool schemas can be hundreds of KB;
+ * echoing them back exceeded the control-route body limit and broke re-checks.
+ */
+export function mcpCheckServerPayload(config: McpServerConfig): Record<string, unknown> {
+  return {
+    id: config.id,
+    name: config.name,
+    url: config.url,
+    headersJson: config.headersJson,
+    token: config.token ?? "",
+    authMode: config.authMode,
+    catalogId: config.catalogId,
+    ...(typeof config.credentialStored === "boolean"
+      ? { credentialStored: config.credentialStored }
+      : {}),
+  };
+}
 
 export async function connectMcpServer(config: McpServerConfig): Promise<McpConnection> {
   const geraSessionKey = `${authSessionSnapshot()}:${getAccessToken() ?? "signed-out"}`;
@@ -469,11 +490,12 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
   const response = await authedFetch("/mcp/check", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ server: config }),
+    body: JSON.stringify({ server: mcpCheckServerPayload(config) }),
   });
   const data = (await response.json().catch(() => ({}))) as {
     tools?: unknown;
     identity?: unknown;
+    credentialStored?: unknown;
     error?: unknown;
   };
   if (!response.ok) {
@@ -501,6 +523,7 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
   return {
     tools: serverTools,
     identity: typeof data.identity === "string" && data.identity ? data.identity : "Server verified",
+    credentialStored: data.credentialStored === true,
   };
 }
 

@@ -483,7 +483,7 @@ function catalogStatusLabel(server: McpServerConfig, entry: McpCatalogEntry): st
   if (server.status === "error") {
     return "Failed — see Your tools";
   }
-  if (entry.auth === "token" && !(server.token ?? "").trim()) {
+  if (entry.auth === "token" && !server.credentialStored && !(server.token ?? "").trim()) {
     return entry.deviceFlow ? "Sign-in or key needed" : "Key needed";
   }
   if (entry.auth === "oauth") {
@@ -615,7 +615,10 @@ function ConnectedCard({
   const isOAuth = entry?.auth === "oauth" || (!entry && authMode === "oauth");
   const signedIn = (isOAuth || Boolean(entry?.deviceFlow)) && server.status === "connected";
   const showSignIn =
-    (isOAuth || Boolean(onDeviceSignIn)) && !signedIn && !(server.token ?? "").trim();
+    (isOAuth || Boolean(onDeviceSignIn)) &&
+    !signedIn &&
+    !server.credentialStored &&
+    !(server.token ?? "").trim();
   const needsKey = entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";
   const blockedReason = entry?.blocked;
   const statusLabel =
@@ -811,7 +814,11 @@ function ConnectedCard({
               autoComplete="off"
               value={server.token ?? ""}
               onChange={(event) => onUpdate({ token: event.target.value })}
-              placeholder={entry?.tokenPlaceholder ?? "Bearer token"}
+              placeholder={
+                server.credentialStored
+                  ? "Credential stored server-side · paste to replace"
+                  : entry?.tokenPlaceholder ?? "Bearer token"
+              }
               className="h-8 border-border bg-white text-xs"
             />
           ) : null}

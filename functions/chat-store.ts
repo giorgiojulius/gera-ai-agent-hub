@@ -1872,7 +1872,14 @@ export class ChatStore extends DurableObject {
       return json({ error: "invalid_body" }, 400);
     }
     if (body.mode === "replace") {
-      return json({ error: "server_owned_oauth_required" }, 410);
+      return json(
+        {
+          error: "server_owned_oauth_required",
+          error_description:
+            "Gera was updated — reload this page (Cmd/Ctrl+Shift+R) and start the sign-in again.",
+        },
+        410,
+      );
     }
     const entries: Array<[string, unknown]> = [];
     if (typeof body.serverId === "string") {

@@ -253,7 +253,15 @@ async function relayOAuth(request: Request, url: URL, env: Env): Promise<Respons
     // Registration, code exchange, device polling and refresh now run inside
     // the account shard. A browser-facing token relay would violate the
     // server-owned credential boundary, so old bundles fail closed here.
-    return corsJson({ error: "server_owned_oauth_required" }, 410);
+    // error_description surfaces verbatim in the old bundle's sign-in dialogs.
+    return corsJson(
+      {
+        error: "server_owned_oauth_required",
+        error_description:
+          "Gera was updated — reload this page (Cmd/Ctrl+Shift+R) and start the sign-in again.",
+      },
+      410,
+    );
   } else {
     return corsJson({ error: "method_not_allowed" }, 405);
   }

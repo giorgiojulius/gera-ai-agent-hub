@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { AgentContext, type AgentContextValue, type AgentDraftInput } from "@/hooks/agent-context";
+import { useAuth } from "@/hooks/use-auth";
 import { useCloudSync } from "@/hooks/use-cloud-sync";
 import { useMcpActions } from "@/hooks/use-mcp-actions";
 import {
@@ -57,6 +58,7 @@ function persistableRepoPreview(job: RepoPreviewJob): RepoPreviewJob {
 }
 
 export function AgentProvider({ children }: { children: ReactNode }) {
+  const { user, isLoading: isAuthLoading } = useAuth();
   const [state, setState] = useState<AgentState>(() => initialAgentState());
   /** One controller per conversation — threads run in parallel and stop independently. */
   const abortMapRef = useRef<Map<string, AbortController>>(new Map());
@@ -185,7 +187,12 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     removeMcp,
     connectMcp,
     toggleMcpTool,
-  } = useMcpActions({ stateRef, servers: state.settings.mcpServers, setSettings });
+  } = useMcpActions({
+    stateRef,
+    servers: state.settings.mcpServers,
+    canValidate: !isAuthLoading && user !== null && getAccessToken() !== null,
+    setSettings,
+  });
 
   const updateLife = useCallback((updater: (prev: LifeState) => LifeState) => {
     setState((prev) => ({ ...prev, life: updater(prev.life) }));

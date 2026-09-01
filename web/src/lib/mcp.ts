@@ -1,5 +1,6 @@
 import { AuthSessionChangedError, RelayAccessError, relayFetch } from "@/lib/backend";
 import { authedFetch } from "@/lib/backend";
+import { authSessionSnapshot, getAccessToken } from "@/lib/auth-tokens";
 import { newId } from "@/lib/env";
 import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
@@ -58,6 +59,7 @@ type McpSession = {
 
 const sessions = new Map<string, McpSession>();
 let sessionGeneration = 0;
+let rejectedGeraSessionKey: string | null = null;
 
 /** Drops every in-memory session/header copy when the signed-in Gera account leaves. */
 export function clearMcpSessionCache(): void {
@@ -92,8 +94,16 @@ function mcpConfigFingerprint(config: McpServerConfig): string {
   ].join("|");
 }
 
-/** Auth is truly dead — a key or a fresh sign-in is required; not a transient failure. */
+/** Auth is truly dead — a key or a fresh provider sign-in is required; not a transient failure. */
 export class McpAuthError extends Error {}
+
+/** The Gera account session is unavailable; this says nothing about provider credentials. */
+export class McpAccountAuthError extends Error {
+  constructor() {
+    super("Sign in to Gera again before checking external connectors.");
+    this.name = "McpAccountAuthError";
+  }
+}
 
 /** The server dropped our Mcp-Session-Id (idle expiry) — a reconnect plus one replay is safe. */
 export class McpSessionLostError extends Error {
@@ -452,6 +462,10 @@ export type McpConnection = {
 };
 
 export async function connectMcpServer(config: McpServerConfig): Promise<McpConnection> {
+  const geraSessionKey = `${authSessionSnapshot()}:${getAccessToken() ?? "signed-out"}`;
+  if (rejectedGeraSessionKey === geraSessionKey) {
+    throw new McpAccountAuthError();
+  }
   const response = await authedFetch("/mcp/check", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -464,11 +478,21 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
   };
   if (!response.ok) {
     const detail = typeof data.error === "string" ? data.error : `server check failed (${response.status})`;
+    // The outer account gate can reject this request before the selected MCP is
+    // touched. Never mislabel that as a revoked provider grant: background
+    // health checks must keep every connector armed and stay silent.
+    if (response.status === 401 && detail === "sign_in_required") {
+      // Pause every later health tick for this exact account-token generation.
+      // A successful refresh/sign-in changes the key and automatically resumes.
+      rejectedGeraSessionKey = geraSessionKey;
+      throw new McpAccountAuthError();
+    }
     if (/auth|credential|sign.?in|token/i.test(detail)) {
       throw new McpAuthError(detail);
     }
     throw new Error(detail);
   }
+  rejectedGeraSessionKey = null;
   const serverTools = Array.isArray(data.tools)
     ? data.tools.filter((tool): tool is McpToolInfo =>
         Boolean(tool && typeof tool === "object" && typeof (tool as McpToolInfo).name === "string"),

@@ -24,6 +24,7 @@ import type { AgentSettings, McpServerConfig } from "@/lib/types";
 type McpActionsArgs = {
   stateRef: { current: AgentState };
   servers: McpServerConfig[];
+  canValidate: boolean;
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void;
 };
 
@@ -48,13 +49,16 @@ function validationFingerprint(server: McpServerConfig): string {
   ].join("|");
 }
 
-export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs) {
+export function useMcpActions({ stateRef, servers, canValidate, setSettings }: McpActionsArgs) {
   const [healthTick, setHealthTick] = useState<number>(0);
   const validatedRef = useRef<Map<string, string>>(new Map<string, string>());
 
   // Long-open tabs need the same honesty as a reload. Wake the ten-minute
   // freshness check once a minute and immediately when a hidden tab returns.
   useEffect(() => {
+    if (!canValidate) {
+      return;
+    }
     const wake = () => setHealthTick((value) => value + 1);
     const onVisible = () => {
       if (!document.hidden) {
@@ -67,7 +71,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [canValidate]);
 
   // Re-run when cloud profile settings arrive too — the old mount-only pass
   // often ran before sync loaded its green cards, so they were never checked.
@@ -75,6 +79,12 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
   // again whenever its auth/config fingerprint changes); a successful update
   // changes tools/verifiedAt only, so it cannot create a verification loop.
   useEffect(() => {
+    if (!canValidate) {
+      // AgentProvider is mounted behind the auth provider, not the visual gate.
+      // Signed-out/loading renders must never probe every persisted connector.
+      validatedRef.current.clear();
+      return;
+    }
     const forceIds = new Set<string>();
     const liveIds = new Set(servers.map((server) => server.id));
     for (const id of validatedRef.current.keys()) {
@@ -97,7 +107,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
       }
     }
     revalidateMcpServers(servers, setSettings, forceIds);
-  }, [healthTick, servers, setSettings]);
+  }, [canValidate, healthTick, servers, setSettings]);
 
   const updateMcp = useCallback((id: string, patch: Partial<McpServerConfig>) => {
     const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);

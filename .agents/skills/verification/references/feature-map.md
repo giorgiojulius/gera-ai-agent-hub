@@ -857,9 +857,11 @@ rejection, is committed before use, and survives browser closure or deploys.
 The browser may still host the provider's authorization UI and a temporary PKCE
 verifier, but it is not an MCP state owner.
 
-Status checks also execute via the account shard. A network/provider outage stays
-retryable and does not erase a credential; only a definitive provider rejection
-marks that connector disconnected. Generic MCP parsing preserves text resources,
+Status checks also execute via the account shard. They do not start while Gera auth
+is loading or signed out; an account-level `sign_in_required` response stays silent
+and keeps every connector armed instead of masquerading as provider revocation. A
+network/provider outage is likewise retryable and does not erase a credential; only
+a definitive provider rejection marks that connector disconnected. Generic MCP parsing preserves text resources,
 `structuredContent`, resource links and request-id matching. Legacy direct-browser
 transport remains test-only for protocol parity; production calls use the Worker.
 Regression coverage: `mcp-server-ownership.test.ts`, `mcp-session.test.ts`,

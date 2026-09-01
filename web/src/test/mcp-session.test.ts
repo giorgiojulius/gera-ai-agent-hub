@@ -238,6 +238,60 @@ describe("honest MCP auth status", () => {
     await vi.waitFor(() => expect(settings.mcpServers[0]?.identity).toBe("Recovered MCP v1"));
   });
 
+  it("keeps every connector armed when the Gera account gate asks for sign-in", async () => {
+    let settings: AgentSettings = normalizeStoredSettings({
+      mcpServers: [
+        storedServer({
+          id: "account-gated-a",
+          name: "TesterArmy",
+          authMode: "none",
+          status: "connected",
+          verifiedAt: 1,
+          tools: [{ name: "search" }],
+        }),
+        storedServer({
+          id: "account-gated-b",
+          name: "Second server",
+          authMode: "none",
+          status: "connected",
+          verifiedAt: 1,
+          tools: [{ name: "read" }],
+        }),
+      ],
+    });
+    const fetchMock = vi.fn(async (): Promise<Response> =>
+      new Response(JSON.stringify({ error: "sign_in_required" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    revalidateMcpServers(
+      settings.mcpServers,
+      (updater) => {
+        settings = updater(settings);
+      },
+      new Set(["account-gated-a", "account-gated-b"]),
+    );
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(settings.mcpServers.map((server) => server.status)).toEqual(["connected", "connected"]);
+    expect(settings.mcpServers.map((server) => server.error)).toEqual([undefined, undefined]);
+
+    revalidateMcpServers(
+      settings.mcpServers,
+      (updater) => {
+        settings = updater(settings);
+      },
+      new Set(["account-gated-a", "account-gated-b"]),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(settings.mcpServers.map((server) => server.status)).toEqual(["connected", "connected"]);
+  });
+
   it("still disconnects only the provider whose credential is definitively rejected", async () => {
     let settings: AgentSettings = normalizeStoredSettings({
       mcpServers: [

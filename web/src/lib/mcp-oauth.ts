@@ -20,6 +20,7 @@ export const OAUTH_TOKENS_CHANGED_EVENT = "gera:mcp-oauth-changed";
 const CLIENTS_KEY = "gera.mcp.oauth.clients.v1";
 const TOKEN_ENTRY_PREFIX = "gera.mcp.oauth.token.v2.";
 const ACTIVE_FLOW_PREFIX = "gera.mcp.oauth.flow.v1.";
+const SERVER_FLOW_NONCE_PREFIX = "gera.mcp.oauth.server-flow.v1.";
 
 type StoredToken = {
   accessToken: string;
@@ -456,14 +457,14 @@ export function exportOAuthTokens(): Record<string, StoredToken> {
   return loadTokens();
 }
 
-export function clearOAuthToken(serverId: string): void {
+export function clearOAuthToken(serverId: string, catalogId?: string): void {
   if (loadTokens()[serverId]) {
     commitTokenChanges({ [serverId]: null });
   }
   void authedFetch("/mcp/oauth-clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ serverId }),
+    body: JSON.stringify({ serverId, ...(catalogId ? { catalogId } : {}) }),
   }).catch(() => undefined);
 }
 
@@ -795,7 +796,8 @@ export async function storeOAuthTokenOnServer(serverId: string, token: StoredTok
   const response = await authedFetch("/mcp/oauth-store", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ serverId, token }),
+    body: JSON.stringify({ serverId, token, mode: "replace" }),
+    keepalive: true,
   });
   if (!response.ok) {
     const data = (await response.json().catch(() => ({}))) as { error?: unknown };
@@ -812,16 +814,43 @@ export async function migrateLegacyOAuthTokensToServer(): Promise<number> {
   const response = await authedFetch("/mcp/oauth-store", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ grants }),
+    body: JSON.stringify({ grants, mode: "migrate" }),
+    keepalive: true,
   });
   if (!response.ok) return 0;
-  for (const serverId of Object.keys(grants)) {
+  const data = (await response.json().catch(() => ({}))) as { settledIds?: unknown };
+  const settledIds = Array.isArray(data.settledIds)
+    ? data.settledIds.filter((id): id is string => typeof id === "string" && id in grants)
+    : [];
+  for (const serverId of settledIds) {
     commitTokenChanges({ [serverId]: null }, false);
   }
-  return Object.keys(grants).length;
+  return settledIds.length;
 }
 
-/** Runs the full sign-in flow and stores the resulting token in the account shard. */
+function serverFlowNonceKey(state: string): string {
+  return `${SERVER_FLOW_NONCE_PREFIX}${state}`;
+}
+
+/** Completes the backend callback only in the same browser + Gera account that started it. */
+export async function completeServerOAuthSignIn(state: string, callbackChallenge: string): Promise<void> {
+  const browserNonce = window.localStorage.getItem(serverFlowNonceKey(state)) ?? "";
+  if (!browserNonce || !callbackChallenge) {
+    throw new Error("This OAuth link was opened outside the browser that started it.");
+  }
+  const response = await authedFetch("/mcp/oauth-complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state, browserNonce, callbackChallenge }),
+  });
+  const data = (await response.json().catch(() => ({}))) as { error?: unknown };
+  if (!response.ok) {
+    throw new Error(typeof data.error === "string" ? data.error : "OAuth confirmation failed.");
+  }
+  window.localStorage.removeItem(serverFlowNonceKey(state));
+}
+
+/** Runs OAuth without letting the browser receive a code exchange or provider token. */
 export async function runOAuthSignIn(
   server: { id: string; url: string; name: string },
   popup: Window | null,
@@ -835,66 +864,58 @@ export async function runOAuthSignIn(
       throw new Error("The Gera account changed while this sign-in was open. Start it again.");
     }
   };
-  let registrationKey: string | null = null;
-  let resultKey: string | null = null;
+  let flowState = "";
   try {
-    const redirectUri = `${window.location.origin}/oauth/callback`;
-    const mcpUrl = canonicalMcpUrl(server.url);
-    const { meta, resource, scopes } = await discover(mcpUrl);
-    ensureCurrentAccount();
-    registrationKey = meta.registrationEndpoint ?? "";
-    const clientId = await ensureClient(meta.registrationEndpoint, redirectUri);
-    ensureCurrentAccount();
-    const verifier = randomString();
-    const challenge = await sha256Base64Url(verifier);
-    ensureCurrentAccount();
-    const state = randomString();
-    resultKey = oauthResultStorageKey(state);
-
-    try {
-      window.localStorage.removeItem(resultKey);
-    } catch {
-      // ignore
-    }
-
-    const authorizeUrl = new URL(meta.authorizationEndpoint);
-    authorizeUrl.searchParams.set("response_type", "code");
-    authorizeUrl.searchParams.set("client_id", clientId);
-    authorizeUrl.searchParams.set("redirect_uri", redirectUri);
-    authorizeUrl.searchParams.set("state", state);
-    authorizeUrl.searchParams.set("code_challenge", challenge);
-    authorizeUrl.searchParams.set("code_challenge_method", "S256");
-    if (resource) {
-      authorizeUrl.searchParams.set("resource", resource);
-    }
-    const scope = composeAuthScope(scopes, meta.scopesSupported);
-    if (scope) {
-      authorizeUrl.searchParams.set("scope", scope);
-    }
-
-    popup.location.replace(authorizeUrl.toString());
-
-    const code = await waitForCallback(state, popup, meta.issuer, resultKey);
-    ensureCurrentAccount();
-    const token = await exchangeCode({
-      tokenEndpoint: meta.tokenEndpoint,
-      clientId,
-      code,
-      verifier,
-      redirectUri,
-      resource,
-      mcpUrl,
+    const response = await authedFetch("/mcp/oauth-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ server: { id: server.id, url: server.url, name: server.name } }),
     });
-
-    ensureCurrentAccount();
-    await storeOAuthTokenOnServer(server.id, token);
-    ensureCurrentAccount();
-  } catch (error) {
-    // A registration the provider expired or revoked would fail every future
-    // sign-in straight from cache — forget it so the next attempt re-registers.
-    if (registrationKey !== null && isClientRejection(error)) {
-      dropCachedClient(registrationKey);
+    const start = (await response.json().catch(() => ({}))) as {
+      authorizationUrl?: unknown;
+      state?: unknown;
+      browserNonce?: unknown;
+      expiresAt?: unknown;
+      error?: unknown;
+    };
+    if (
+      !response.ok ||
+      typeof start.authorizationUrl !== "string" ||
+      typeof start.state !== "string" ||
+      typeof start.browserNonce !== "string" ||
+      typeof start.expiresAt !== "number"
+    ) {
+      throw new Error(
+        typeof start.error === "string" ? start.error : "Could not start OAuth in the account store.",
+      );
     }
+    ensureCurrentAccount();
+    flowState = start.state;
+    window.localStorage.setItem(serverFlowNonceKey(start.state), start.browserNonce);
+    popup.location.replace(start.authorizationUrl);
+
+    while (Date.now() < start.expiresAt) {
+      ensureCurrentAccount();
+      const statusResponse = await authedFetch(
+        `/mcp/oauth-status?state=${encodeURIComponent(start.state)}`,
+      );
+      const status = (await statusResponse.json().catch(() => ({}))) as {
+        status?: unknown;
+        error?: unknown;
+      };
+      ensureCurrentAccount();
+      if (statusResponse.ok && status.status === "completed") {
+        return;
+      }
+      if (status.status === "failed" || status.status === "missing") {
+        throw new Error(
+          typeof status.error === "string" ? status.error : "OAuth sign-in did not complete.",
+        );
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 900));
+    }
+    throw new Error("OAuth sign-in expired before the provider completed it.");
+  } catch (error) {
     try {
       popup.close();
     } catch {
@@ -903,12 +924,14 @@ export async function runOAuthSignIn(
     throw error;
   } finally {
     finishOAuthGrantFlow(flow);
+    // Completed callbacks already removed this; failed/cancelled attempts must
+    // not leave a reusable browser proof behind.
     try {
-      if (resultKey) {
-        window.localStorage.removeItem(resultKey);
+      if (flowState) {
+        window.localStorage.removeItem(serverFlowNonceKey(flowState));
       }
     } catch {
-      // ignore
+      // restricted storage — pending server state still expires
     }
   }
 }

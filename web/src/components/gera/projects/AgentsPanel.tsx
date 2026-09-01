@@ -58,7 +58,6 @@ import {
   type GitHubViewer,
 } from "@/lib/github-device";
 import { findCatalogEntry, serverIconUrl } from "@/lib/mcp-catalog";
-import { exportOAuthTokens, hasOAuthToken } from "@/lib/mcp-oauth";
 import {
   MODE_MODEL_IDS,
   REASONING_EFFORTS,
@@ -106,6 +105,7 @@ type Draft = {
   /** Whose account the saved link resolves through ("" = none yet). */
   mcpOwner: string;
   githubToken: TokenDraft;
+  githubFromAccount: boolean;
   intercomToken: TokenDraft;
   slackToken: TokenDraft;
   slackSigningSecret: TokenDraft;
@@ -256,6 +256,7 @@ function draftFrom(agent: ProjectAgent | null): Draft {
     mcpSelection: (agent?.mcpServers ?? []).map((server) => ({ id: server.id, name: server.name })),
     mcpOwner: agent?.mcpOwner ?? "",
     githubToken: { ...EMPTY_TOKEN },
+    githubFromAccount: false,
     intercomToken: { ...EMPTY_TOKEN },
     slackToken: { ...EMPTY_TOKEN },
     slackSigningSecret: { ...EMPTY_TOKEN },
@@ -314,7 +315,6 @@ export function AgentsPanel({
   const [slackManagerBusy, setSlackManagerBusy] = useState<boolean>(false);
 
   const githubDeviceReady = githubDeviceClientId() !== null;
-  const hasLocalGithub = hasOAuthToken("github");
 
   /** Opens the editor with fresh per-dialog credential state. */
   const openEditor = (agent: ProjectAgent | null) => {
@@ -363,31 +363,45 @@ export function AgentsPanel({
 
   const adoptGithubToken = (token: string) => {
     const normalized = normalizeGithubToken(token);
-    setDraft((prev) => (prev ? { ...prev, githubToken: { value: normalized, clear: false } } : prev));
+    setDraft((prev) =>
+      prev
+        ? { ...prev, githubToken: { value: normalized, clear: false }, githubFromAccount: false }
+        : prev,
+    );
     setGithubPasteOpen(false);
     verifyGithub(normalized);
   };
 
-  /** Device-flow finished — pull the fresh token from the browser's sign-in store. */
+  /** Device-flow finished — link the project to the account shard, never copy a token. */
   const handleGithubSignedIn = () => {
     setGithubSignInOpen(false);
-    const token = exportOAuthTokens()["github"]?.accessToken ?? "";
-    if (!token) {
-      toast.error("GitHub sign-in finished but no token arrived — try again.");
-      return;
-    }
-    adoptGithubToken(token);
-    toast.success("GitHub connected — save the agent to store the token.");
+    setDraft((prev) =>
+      prev
+        ? {
+            ...prev,
+            githubFromAccount: true,
+            githubToken: { value: "", clear: false },
+          }
+        : prev,
+    );
+    setGithubCheck({ state: "checking", token: "gera-account:github" });
+    void fetchGitHubViewer("gera-account:github")
+      .then((viewer) => {
+        setGithubCheck({ state: "ok", token: "gera-account:github", viewer });
+        toast.success("GitHub connected through your account — no token was copied.");
+      })
+      .catch((error) => {
+        setGithubCheck({
+          state: "bad",
+          token: "gera-account:github",
+          error: error instanceof Error ? error.message : "Could not verify GitHub.",
+        });
+      });
   };
 
-  /** One tap: reuse the GitHub sign-in already living in this browser. */
+  /** One tap starts the account-owned device flow. */
   const fillFromMyGithub = () => {
-    const token = exportOAuthTokens()["github"]?.accessToken ?? "";
-    if (!token) {
-      setGithubSignInOpen(true);
-      return;
-    }
-    adoptGithubToken(token);
+    setGithubSignInOpen(true);
   };
 
   const copyEventsUrl = async (eventsUrl: string) => {
@@ -541,7 +555,8 @@ export function AgentsPanel({
       return;
     }
     const githubToken = normalizeGithubToken(draft.githubToken.value);
-    const willHaveGithub = !draft.githubToken.clear && (Boolean(githubToken) || draft.stored.github);
+    const willHaveGithub =
+      !draft.githubToken.clear && (Boolean(githubToken) || draft.githubFromAccount || draft.stored.github);
     if (draft.github !== "off" && !willHaveGithub) {
       toast.error("Connect a GitHub credential before enabling GitHub access");
       return;
@@ -572,6 +587,7 @@ export function AgentsPanel({
         },
         secrets: {
           githubToken: githubTokenPatch(draft.githubToken),
+          ...(draft.githubFromAccount ? { githubFromAccount: true } : {}),
           intercomToken: tokenPatch(draft.intercomToken),
           slackToken: tokenPatch(draft.slackToken),
           slackSigningSecret: tokenPatch(draft.slackSigningSecret),
@@ -927,38 +943,29 @@ export function AgentsPanel({
                                       type="button"
                                       className="font-medium text-destructive underline underline-offset-2"
                                       onClick={() =>
-                                        setDraft({ ...draft, githubToken: { value: "", clear: true } })
+                                        setDraft({
+                                          ...draft,
+                                          githubToken: { value: "", clear: true },
+                                          githubFromAccount: false,
+                                        })
                                       }
                                     >
                                       Remove
                                     </button>
                                   </p>
                                 ) : null}
-                                {!draft.githubToken.value && (githubDeviceReady || hasLocalGithub) ? (
+                                {!draft.githubToken.value && githubDeviceReady ? (
                                   <div className="flex flex-wrap items-center gap-2">
                                     <Button
                                       type="button"
-                                      onClick={() =>
-                                        hasLocalGithub ? fillFromMyGithub() : setGithubSignInOpen(true)
-                                      }
+                                      onClick={fillFromMyGithub}
                                       className="h-8 gap-1.5 rounded-full px-3 text-xs"
                                     >
                                       <Github className="h-3.5 w-3.5" />
-                                      {hasLocalGithub
-                                        ? draft.stored.github
-                                          ? "Replace with my GitHub"
-                                          : "Use my GitHub"
+                                      {draft.githubFromAccount
+                                        ? "Replace GitHub account"
                                         : "Sign in with GitHub"}
                                     </Button>
-                                    {hasLocalGithub && githubDeviceReady ? (
-                                      <button
-                                        type="button"
-                                        className="text-[11px] font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
-                                        onClick={() => setGithubSignInOpen(true)}
-                                      >
-                                        Sign in as another account
-                                      </button>
-                                    ) : null}
                                     {!githubPasteOpen ? (
                                       <button
                                         type="button"
@@ -972,7 +979,7 @@ export function AgentsPanel({
                                 ) : null}
                                 {githubPasteOpen ||
                                 draft.githubToken.value ||
-                                (!githubDeviceReady && !hasLocalGithub) ? (
+                                !githubDeviceReady ? (
                                   <Input
                                     type="password"
                                     autoComplete="off"
@@ -982,6 +989,7 @@ export function AgentsPanel({
                                       setDraft({
                                         ...draft,
                                         githubToken: { value: event.target.value, clear: false },
+                                        githubFromAccount: false,
                                       })
                                     }
                                     placeholder="ghp_… or github_pat_… (fine-grained, repo scope)"

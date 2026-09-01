@@ -567,7 +567,7 @@ async function runServerTurn(params: ServerTurnParams): Promise<ServerRunDone> {
       // discarded reply would arrive anyway via sync.
       throw new DOMException("Stopped.", "AbortError");
     }
-    await startServerRun({
+    const started = await startServerRun({
       runId: newId(),
       conversationId: seeded.id,
       assistantMessageId: assistantId,
@@ -580,6 +580,9 @@ async function runServerTurn(params: ServerTurnParams): Promise<ServerRunDone> {
       config: params.config,
     });
     ackStart();
+    if (started.status && started.status !== "running" && started.result) {
+      return { ...started.result, status: started.status } as ServerRunDone;
+    }
     if (params.signal.aborted) {
       // Stop landed while the start request was in flight — the run is live
       // on the server now; kill it there instead of just detaching the tab.
@@ -1970,6 +1973,7 @@ async function revalidateQuietly(
           item.status === "connected" &&
           item.error === undefined &&
           item.identity === connection.identity &&
+          item.credentialStored === (connection.credentialStored === true) &&
           sameMcpTools(item.tools, connection.tools)
         ) {
           return item;
@@ -1981,6 +1985,7 @@ async function revalidateQuietly(
           tools: connection.tools,
           identity: connection.identity,
           verifiedAt: Date.now(),
+          credentialStored: connection.credentialStored === true,
           error: undefined,
         };
       });

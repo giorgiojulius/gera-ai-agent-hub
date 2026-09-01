@@ -7,16 +7,12 @@
 // signs in with a one-time code. All requests go through the Gera relay
 // because github.com's OAuth endpoints send no CORS headers; the relay
 // forwards them verbatim and never stores tokens.
-import { relayFetch } from "@/lib/backend";
+import { authedFetch } from "@/lib/backend";
 import {
   beginOAuthGrantFlow,
   finishOAuthGrantFlow,
-  storeOAuthTokenOnServer,
   type OAuthGrantFlow,
 } from "@/lib/mcp-oauth";
-
-const DEVICE_CODE_URL = "https://github.com/login/device/code";
-const TOKEN_URL = "https://github.com/login/oauth/access_token";
 
 /** A credential is absent or definitively rejected; only a fresh sign-in/key can repair it. */
 export class GitHubAuthError extends Error {
@@ -26,13 +22,6 @@ export class GitHubAuthError extends Error {
   }
 }
 
-/**
- * Subset of the GitHub MCP server's published scopes_supported — enough for
- * repos, issues, PRs, Actions, gists, notifications and projects. Excludes
- * destructive/rare scopes (delete_repo, packages, codespace) on purpose.
- */
-const SCOPES = "repo read:org read:user user:email gist notifications workflow read:project";
-
 /** The workspace's GitHub OAuth app client ID, or null when not configured. */
 export function githubDeviceClientId(): string | null {
   const id = import.meta.env.EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID;
@@ -40,7 +29,7 @@ export function githubDeviceClientId(): string | null {
 }
 
 export type GitHubDeviceSession = {
-  deviceCode: string;
+  flowId: string;
   userCode: string;
   verificationUri: string;
   intervalMs: number;
@@ -105,12 +94,21 @@ export function githubOrgAccessUrl(): string | null {
  * in the browser and the token never leaves it.
  */
 export async function fetchGitHubViewer(authorization: string): Promise<GitHubViewer> {
-  const response = await fetch("https://api.github.com/user", {
-    headers: {
-      Authorization: authorization,
-      Accept: "application/vnd.github+json",
-    },
-  });
+  const accountPrefix = "gera-account:";
+  const serverId = authorization.startsWith(accountPrefix)
+    ? authorization.slice(accountPrefix.length) || "github"
+    : null;
+  const response = serverId
+    ? await authedFetch(
+        `/github-proxy?serverId=${encodeURIComponent(serverId)}&path=${encodeURIComponent("/user")}`,
+        { headers: { "X-Gera-GitHub-Accept": "application/vnd.github+json" } },
+      )
+    : await fetch("https://api.github.com/user", {
+        headers: {
+          Authorization: authorization,
+          Accept: "application/vnd.github+json",
+        },
+      });
   if (!response.ok) {
     if (response.status === 401) {
       throw new GitHubAuthError("GitHub rejected this credential — sign in again or paste a fresh PAT.");
@@ -127,24 +125,6 @@ export async function fetchGitHubViewer(authorization: string): Promise<GitHubVi
     name: typeof data.name === "string" ? data.name : null,
     scopes: parseOAuthScopes(response.headers.get("X-OAuth-Scopes")),
   };
-}
-
-async function postForm(url: string, params: Record<string, string>): Promise<Record<string, unknown>> {
-  let response: Response;
-  try {
-    response = await relayFetch("/oauth-proxy", url, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(params).toString(),
-    });
-  } catch {
-    throw new Error("Could not reach the Gera relay. Check your connection and try again.");
-  }
-  const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!data) {
-    throw new Error(`GitHub returned an unreadable response (${response.status}).`);
-  }
-  return data;
 }
 
 function deviceErrorMessage(data: Record<string, unknown>): string {
@@ -168,43 +148,41 @@ function deviceErrorMessage(data: Record<string, unknown>): string {
   return `GitHub sign-in failed: ${description}`;
 }
 
-/** Requests a device + user code pair from GitHub. */
+/** Requests a user code; the sensitive device_code stays in the account shard. */
 export async function startGitHubDeviceFlow(): Promise<GitHubDeviceSession> {
-  const clientId = githubDeviceClientId();
-  if (!clientId) {
+  if (!githubDeviceClientId()) {
     throw new Error("GitHub sign-in is not configured for this workspace yet.");
   }
   const operationFlow = beginOAuthGrantFlow("github");
-  let data: Record<string, unknown>;
   try {
-    data = await postForm(DEVICE_CODE_URL, { client_id: clientId, scope: SCOPES });
+    const response = await authedFetch("/mcp/github-device-start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    const flowId = typeof data.flowId === "string" ? data.flowId : "";
+    const userCode = typeof data.userCode === "string" ? data.userCode : "";
+    if (!response.ok || !flowId || !userCode) {
+      throw new Error(deviceErrorMessage(data));
+    }
+    return {
+      flowId,
+      userCode,
+      verificationUri:
+        typeof data.verificationUri === "string" && data.verificationUri
+          ? data.verificationUri
+          : "https://github.com/login/device",
+      intervalMs:
+        typeof data.intervalMs === "number" ? Math.max(data.intervalMs, 5_000) : 5_000,
+      expiresAt:
+        typeof data.expiresAt === "number" ? data.expiresAt : Date.now() + 15 * 60_000,
+      operationFlow,
+    };
   } catch (error) {
     finishOAuthGrantFlow(operationFlow);
     throw error;
   }
-  if (typeof data.error === "string" && data.error) {
-    finishOAuthGrantFlow(operationFlow);
-    throw new Error(deviceErrorMessage(data));
-  }
-  const deviceCode = typeof data.device_code === "string" ? data.device_code : "";
-  const userCode = typeof data.user_code === "string" ? data.user_code : "";
-  if (!deviceCode || !userCode) {
-    finishOAuthGrantFlow(operationFlow);
-    throw new Error("GitHub did not return a device code — double-check the OAuth app's client ID.");
-  }
-  const interval = typeof data.interval === "number" ? data.interval : 5;
-  const expiresIn = typeof data.expires_in === "number" ? data.expires_in : 900;
-  return {
-    deviceCode,
-    userCode,
-    verificationUri:
-      typeof data.verification_uri === "string" && data.verification_uri
-        ? data.verification_uri
-        : "https://github.com/login/device",
-    intervalMs: Math.max(interval, 5) * 1000,
-    expiresAt: Date.now() + expiresIn * 1000,
-    operationFlow,
-  };
 }
 
 /**
@@ -216,10 +194,6 @@ export async function pollGitHubDeviceToken(
   session: GitHubDeviceSession,
   isCancelled: () => boolean,
 ): Promise<boolean> {
-  const clientId = githubDeviceClientId();
-  if (!clientId) {
-    return false;
-  }
   let interval = session.intervalMs;
   try {
     while (!isCancelled()) {
@@ -230,34 +204,26 @@ export async function pollGitHubDeviceToken(
     if (isCancelled()) {
       return false;
     }
-      const data = await postForm(TOKEN_URL, {
-        client_id: clientId,
-        device_code: session.deviceCode,
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      });
+      const response = await authedFetch(
+        `/mcp/github-device-status?flowId=${encodeURIComponent(session.flowId)}`,
+      );
+      const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       if (isCancelled()) {
         return false;
       }
-      if (typeof data.access_token === "string" && data.access_token) {
-      const expiresIn = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in);
-      await storeOAuthTokenOnServer("github", {
-        accessToken: data.access_token,
-        refreshToken: typeof data.refresh_token === "string" ? data.refresh_token : undefined,
-        expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : undefined,
-        tokenEndpoint: TOKEN_URL,
-        clientId,
-        mcpUrl: "https://api.github.com",
-      });
+      if (data.status === "completed") {
         return true;
       }
-    const code = typeof data.error === "string" ? data.error : "";
-    if (code === "authorization_pending") {
-      continue;
-    }
-    if (code === "slow_down") {
-      interval += 5000;
-      continue;
-    }
+      if (data.status === "pending") {
+        if (typeof data.retryAfterMs === "number") {
+          interval = Math.max(1_000, data.retryAfterMs);
+        }
+        continue;
+      }
+      if (!response.ok && response.status >= 500) {
+        interval = Math.max(interval, 5_000);
+        continue;
+      }
       throw new Error(deviceErrorMessage(data));
     }
     return false;

@@ -118,7 +118,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
       patch.token !== undefined ||
       patch.headersJson !== undefined;
     if (urlChanged) {
-      clearOAuthToken(id);
+      clearOAuthToken(id, current?.catalogId);
     }
     if (connectionChanged) {
       clearMcpServerSession(id);
@@ -209,10 +209,11 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
   }, [setSettings]);
 
   const removeMcp = useCallback((id: string) => {
+    const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);
     clearMcpServerSession(id);
-    clearOAuthToken(id);
+    clearOAuthToken(id, current?.catalogId);
     setSettings((prev) => ({ ...prev, mcpServers: prev.mcpServers.filter((item) => item.id !== id) }));
-  }, [setSettings]);
+  }, [setSettings, stateRef]);
 
   const connectMcp = useCallback((id: string) => {
     const server = stateRef.current.settings.mcpServers.find((item) => item.id === id);

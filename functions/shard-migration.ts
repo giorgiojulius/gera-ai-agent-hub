@@ -76,12 +76,17 @@ async function reportNextDue(
  * the owner's shard, then mark the owner migrated in the global ledger.
  * Idempotent end to end — safe to run twice concurrently.
  */
-export async function migrateOwnerToShard(env: MigrationEnv, origin: string, email: string): Promise<void> {
+export async function migrateOwnerToShard(
+  env: MigrationEnv,
+  origin: string,
+  email: string,
+  destinationShard?: string,
+): Promise<void> {
   const owner = email.trim().toLowerCase();
   if (!owner) {
     throw new Error("empty owner");
   }
-  const shard = chatShardId(owner);
+  const shard = destinationShard?.trim() || chatShardId(owner);
   let cursor = "";
   let finished = false;
   for (let page = 0; page < MAX_EXPORT_PAGES; page += 1) {

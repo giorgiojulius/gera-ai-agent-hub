@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateA
 
 import { useAuth } from "@/hooks/use-auth";
 import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
-import { adoptActiveServerRuns, upsertConversation, type AgentState } from "@/lib/agent-store";
+import { upsertConversation, type AgentState } from "@/lib/agent-store";
 import {
   initProfileMeta,
   loadTombstones,
@@ -22,7 +22,6 @@ import {
 } from "@/lib/chat-sync";
 import { normalizeStoredSettings, saveActiveId, saveConversations } from "@/lib/history";
 import { normalizeLife } from "@/lib/life";
-import type { ExecutionOutcome } from "@/lib/types";
 import {
   OAUTH_TOKENS_CHANGED_EVENT,
   OAUTH_TOKENS_KEY,
@@ -35,10 +34,6 @@ type CloudSyncArgs = {
   state: AgentState;
   setState: Dispatch<SetStateAction<AgentState>>;
   stateRef: { current: AgentState };
-  /** Server runs are adopted once per session (boot or first sign-in). */
-  adoptedRef: { current: boolean };
-  notifyRef: { current: (conversationId: string, execution?: ExecutionOutcome) => void };
-  drainRef: { current: (conversationId: string) => void };
 };
 
 export function useCloudSync(args: CloudSyncArgs): {
@@ -46,8 +41,10 @@ export function useCloudSync(args: CloudSyncArgs): {
   scheduleSync: (delayMs: number) => void;
   /** Records a chat deletion so it reaches the account's other devices. */
   recordTombstone: (id: string) => void;
+  /** Durable profile/history baseline has been pulled for this auth session. */
+  isHydrated: boolean;
 } {
-  const { state, setState, stateRef, adoptedRef, notifyRef, drainRef } = args;
+  const { state, setState, stateRef } = args;
   const { user } = useAuth();
   const userRef = useRef(user);
   userRef.current = user;
@@ -65,6 +62,9 @@ export function useCloudSync(args: CloudSyncArgs): {
   const syncBusyRef = useRef<boolean>(false);
   const syncAgainRef = useRef<boolean>(false);
   const lastSyncAtRef = useRef<number>(0);
+  const syncFailureCountRef = useRef<number>(0);
+  const hydratedRef = useRef<boolean>(false);
+  const [isHydrated, setIsHydrated] = useState<boolean>(false);
   /** Armed on sign-in — the session's first pull gets a quiet toast. */
   const syncToastArmedRef = useRef<boolean>(false);
   const performSyncRef = useRef<() => void>(() => {});
@@ -94,6 +94,7 @@ export function useCloudSync(args: CloudSyncArgs): {
     try {
       const snapshot = stateRef.current;
       const meta = profileMetaRef.current;
+      const bootstrapOnly = !hydratedRef.current;
       const syncProfileRevision = meta.updatedAt;
       const syncOAuthSnapshot = JSON.stringify(exportOAuthTokens());
       const result = await runChatSync({
@@ -107,6 +108,7 @@ export function useCloudSync(args: CloudSyncArgs): {
           dirty: meta.updatedAt > meta.ackedAt,
         },
         authSessionNonce: syncSessionNonce,
+        bootstrapOnly,
       });
       if (
         disposedRef.current ||
@@ -116,6 +118,7 @@ export function useCloudSync(args: CloudSyncArgs): {
         return; // A late response from the previous account must change nothing.
       }
       lastSyncAtRef.current = Date.now();
+      syncFailureCountRef.current = 0;
       if (typeof result.profileAckedAt === "number") {
         meta.ackedAt = Math.max(meta.ackedAt, result.profileAckedAt);
         saveProfileMeta(meta);
@@ -219,13 +222,23 @@ export function useCloudSync(args: CloudSyncArgs): {
         toast.success("Synced from your account", { description: `Updated: ${parts.join(" · ")}` });
       }
       syncToastArmedRef.current = false;
+      if (bootstrapOnly && !result.incomplete) {
+        hydratedRef.current = true;
+        setIsHydrated(true);
+        // Only now may this device offer local mutations to the durable copy.
+        syncAgainRef.current = true;
+      }
       if (result.incomplete) {
         scheduleSync(2_500); // Caps were hit — keep draining soon.
       }
     } catch (error) {
-      // Quiet by design — sync retries on the next change or tab focus.
-      // 401/403 mean signed out / not invited; the AccessGate owns that UX.
+      // Bootstrap has its own bounded backoff: a deploy/network gap must not
+      // leave a tab permanently unhydrated until the user happens to edit it.
       console.warn("gera sync failed:", error instanceof Error ? error.message : error);
+      syncFailureCountRef.current += 1;
+      if (!disposedRef.current && userRef.current) {
+        scheduleSync(Math.min(30_000, 1_000 * 2 ** Math.min(syncFailureCountRef.current, 5)));
+      }
     } finally {
       syncBusyRef.current = false;
       if (!disposedRef.current && syncAgainRef.current) {
@@ -240,30 +253,26 @@ export function useCloudSync(args: CloudSyncArgs): {
 
   const userId = user?.id ?? null;
 
-  // Sign-in (or boot with a stored session): fetch the account history.
+  // Sign-in (or boot with a stored session): pull first, mutate only later.
   useEffect(() => {
+    hydratedRef.current = false;
+    setIsHydrated(false);
+    syncFailureCountRef.current = 0;
     if (!userId) {
       return;
     }
     syncToastArmedRef.current = true;
-    // Older bundles kept provider grants in localStorage. Move any surviving
-    // copy into the account shard before normal profile reconciliation.
-    void migrateLegacyOAuthTokensToServer().finally(() => scheduleSync(400));
-    // A fresh sign-in (no stored token at boot) still adopts server runs.
-    if (!adoptedRef.current) {
-      adoptedRef.current = true;
-      void adoptActiveServerRuns({
-        getState: () => stateRef.current,
-        setState,
-        onDone: (conversationId, stopped, execution) => {
-          if (stopped !== true) {
-            notifyRef.current(conversationId, execution);
-            window.setTimeout(() => drainRef.current(conversationId), 60);
-          }
-        },
-      }).catch(() => undefined);
+    scheduleSync(0);
+  }, [userId, scheduleSync]);
+
+  // Legacy browser grants are imported only after the account baseline won.
+  // The server endpoint itself is insert-if-absent + revocation-aware.
+  useEffect(() => {
+    if (!userId || !isHydrated) {
+      return;
     }
-  }, [userId, scheduleSync, adoptedRef, drainRef, notifyRef, setState, stateRef]);
+    void migrateLegacyOAuthTokensToServer().finally(() => scheduleSync(400));
+  }, [userId, isHydrated, scheduleSync]);
 
   // Every history change syncs after a quiet moment. Streaming keeps
   // resetting the timer, and running threads are excluded from the exchange
@@ -359,5 +368,5 @@ export function useCloudSync(args: CloudSyncArgs): {
     saveTombstones(tombstonesRef.current);
   }, []);
 
-  return { scheduleSync, recordTombstone };
+  return { scheduleSync, recordTombstone, isHydrated };
 }

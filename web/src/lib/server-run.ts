@@ -8,7 +8,8 @@
 // run snapshots and keeps reconnecting — the run itself never depends on
 // this tab being alive.
 
-import { authedFetch, parseOrThrow } from "@/lib/backend";
+import { authSessionSnapshot } from "@/lib/auth-tokens";
+import { authedFetch, authedFetchForSession, parseOrThrow } from "@/lib/backend";
 import { logDiagnostic } from "@/lib/diagnostics";
 import type {
   Attachment,
@@ -233,9 +234,18 @@ function abortError(): DOMException {
   return new DOMException("Stopped.", "AbortError");
 }
 
+export type StartServerRunResponse = {
+  ok: boolean;
+  runId: string;
+  historyOnServer: boolean;
+  replayed?: boolean;
+  status?: ServerRunStatus;
+  result?: Omit<ServerRunDone, "status">;
+};
+
 export async function startServerRun(
   body: StartServerRunRequest,
-): Promise<{ ok: boolean; runId: string; historyOnServer: boolean }> {
+): Promise<StartServerRunResponse> {
   // The backend resolves connector configuration and credentials from the
   // account shard. The browser sends only ids needed for per-run scoping.
   const serverOwnedBody: StartServerRunRequest = {
@@ -251,21 +261,39 @@ export async function startServerRun(
         : {}),
     },
   };
+  // Every retry is pinned to the account that created this payload. Switching
+  // accounts while a response is lost must never replay history into the new one.
+  const sessionNonce = authSessionSnapshot();
   // A just-stopped previous run may still be finalizing — retry run_active briefly.
   for (let attempt = 0; ; attempt += 1) {
-    const response = await authedFetch("/runs/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(serverOwnedBody),
-    });
-    if (response.status === 409 && attempt < 4) {
-      await sleep(900);
-      continue;
+    let response: Response;
+    try {
+      response = await authedFetchForSession("/runs/start", sessionNonce, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(serverOwnedBody),
+      });
+    } catch (error) {
+      if (attempt < 4) {
+        await sleep(900 * (attempt + 1));
+        continue;
+      }
+      throw error;
     }
     if (response.status === 409) {
-      throw new Error("Another reply is still running in this chat — stop it or wait for it to finish.");
+      const conflict = (await response.clone().json().catch(() => ({}))) as { error?: unknown };
+      if (conflict.error === "run_active" && attempt < 4) {
+        await sleep(900);
+        continue;
+      }
+      if (conflict.error === "run_active") {
+        throw new Error("Another reply is still running in this chat — stop it or wait for it to finish.");
+      }
+      if (conflict.error === "idempotency_conflict") {
+        throw new Error("This run id was already accepted with different input; nothing was executed twice.");
+      }
     }
-    return parseOrThrow(response, "Could not start the run on the server");
+    return parseOrThrow<StartServerRunResponse>(response, "Could not start the run on the server");
   }
 }
 

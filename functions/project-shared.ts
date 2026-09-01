@@ -40,6 +40,8 @@ export type AgentMcpSelection = { owner: string; servers: AgentMcpServerRef[] };
 /** Project-scoped credentials the agent acts with — stored server-side only. */
 export type AgentSecrets = {
   githubToken?: string;
+  /** Account-shard reference; OAuth grant itself never copies into the project. */
+  githubAccount?: { owner: string; serverId: string };
   intercomToken?: string;
   slackToken?: string;
   /** Slack app Signing Secret — turns the agent into a mentionable Slack bot. */

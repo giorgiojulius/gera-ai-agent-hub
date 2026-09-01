@@ -1,4 +1,4 @@
-import { relayFetch } from "@/lib/backend";
+import { authedFetch, relayFetch } from "@/lib/backend";
 import { GitHubAuthError, fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
 import { hasOAuthRefreshToken, hasOAuthToken, oauthAuthHeader } from "@/lib/mcp-oauth";
 import type { McpServerConfig, McpToolInfo } from "@/lib/types";
@@ -16,6 +16,30 @@ import type { McpServerConfig, McpToolInfo } from "@/lib/types";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
+const GERA_ACCOUNT_AUTH_PREFIX = "gera-account:";
+
+function accountAuthServerId(auth: string): string | null {
+  return auth.startsWith(GERA_ACCOUNT_AUTH_PREFIX)
+    ? auth.slice(GERA_ACCOUNT_AUTH_PREFIX.length) || "github"
+    : null;
+}
+
+async function githubTransportFetch(auth: string, url: URL, init: RequestInit): Promise<Response> {
+  const serverId = accountAuthServerId(auth);
+  if (!serverId) {
+    return fetch(url.toString(), init);
+  }
+  const path = `${url.pathname}${url.search}`;
+  const headers = new Headers(init.headers);
+  const accept = headers.get("Accept") ?? "application/vnd.github+json";
+  headers.delete("Authorization");
+  headers.delete("X-GitHub-Api-Version");
+  headers.set("X-Gera-GitHub-Accept", accept);
+  return authedFetch(
+    `/github-proxy?serverId=${encodeURIComponent(serverId)}&path=${encodeURIComponent(path)}`,
+    { ...init, headers },
+  );
+}
 
 /** Max characters of file content returned to the agent per read. */
 const MAX_FILE_CHARS = 12_000;
@@ -104,7 +128,8 @@ function stripAnsi(text: string): string {
  * user-actionable error when neither exists.
  */
 export async function resolveGitHubAuth(
-  config: Pick<McpServerConfig, "id" | "catalogId" | "token">,
+  config: Pick<McpServerConfig, "id" | "catalogId" | "token"> &
+    Partial<Pick<McpServerConfig, "credentialStored" | "status">>,
 ): Promise<string> {
   const pasted = config.token?.trim();
   if (pasted) {
@@ -125,6 +150,20 @@ export async function resolveGitHubAuth(
     if (hadRefreshableGrant && hasOAuthToken(oauthId)) {
       throw new Error("Could not refresh GitHub sign-in right now — retry shortly; your session was kept.");
     }
+  }
+  if (config.credentialStored === true || config.status === "connected") {
+    const serverId = config.id || config.catalogId || "github";
+    const sentinel = `${GERA_ACCOUNT_AUTH_PREFIX}${serverId}`;
+    const probe = await githubTransportFetch(sentinel, new URL(`${GITHUB_API}/user`), {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (probe.ok) {
+      return sentinel;
+    }
+    if (probe.status === 401) {
+      throw new GitHubAuthError('GitHub needs a fresh sign-in — press "Sign in with GitHub" again.');
+    }
+    throw new Error(`Could not verify the server-owned GitHub sign-in (HTTP ${probe.status}).`);
   }
   throw new GitHubAuthError('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');
 }
@@ -482,7 +521,7 @@ async function ghFetch(
   }
   let response: Response;
   try {
-    response = await fetch(url.toString(), {
+    response = await githubTransportFetch(auth, url, {
       method: options.method ?? "GET",
       headers: {
         Authorization: auth,
@@ -575,7 +614,7 @@ async function ghFetchRawText(
   }
   let response: Response;
   try {
-    response = await fetch(url.toString(), {
+    response = await githubTransportFetch(auth, url, {
       headers: {
         Authorization: auth,
         Accept: "application/vnd.github.raw+json",
@@ -1307,7 +1346,9 @@ async function fetchJobLogText(auth: string, owner: string, repo: string, jobId:
   };
   let response: Response;
   try {
-    response = await relayFetch("/mcp-proxy", target, { headers });
+    response = accountAuthServerId(auth)
+      ? await githubTransportFetch(auth, new URL(target), { headers })
+      : await relayFetch("/mcp-proxy", target, { headers });
   } catch {
     throw new Error("Could not reach GitHub logs through the relay.");
   }

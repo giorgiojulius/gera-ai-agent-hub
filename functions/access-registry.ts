@@ -41,6 +41,34 @@ type RequestRow = {
   created_at: number;
 };
 
+type PrincipalRow = {
+  user_id: string;
+  storage_owner: string;
+  shard_id: string;
+  current_email: string;
+  created_at: number;
+  last_seen_at: number;
+};
+
+type PrincipalAliasRow = {
+  email: string;
+  user_id: string;
+};
+
+type OAuthRouteRow = {
+  state: string;
+  shard_id: string;
+  storage_owner: string;
+  expires_at: number;
+};
+
+class PrincipalConflictError extends Error {
+  constructor() {
+    super("verified email is already bound to another account principal");
+    this.name = "PrincipalConflictError";
+  }
+}
+
 /**
  * Repairs UTF-8 text that was read as Latin-1 (mojibake like "ÐÐµÐ¾Ñ..."
  * instead of Cyrillic). Strict decoding leaves genuine Latin-1 text untouched.
@@ -97,6 +125,40 @@ export class AccessRegistry extends DurableObject {
       SEED_ADMIN_EMAIL,
       Date.now(),
     );
+    // Stable account principal registry. Existing accounts keep their original
+    // email-named ChatStore shard, but the verified immutable subject becomes
+    // the routing authority from the first request on. An alias is first-claim-
+    // wins, so a recycled email can never open another subject's old shard.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS principal_subjects (
+        user_id TEXT PRIMARY KEY,
+        storage_owner TEXT NOT NULL,
+        shard_id TEXT NOT NULL,
+        current_email TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS principal_aliases (
+        email TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_principal_alias_user ON principal_aliases (user_id)",
+    );
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS oauth_callback_routes (
+        state TEXT PRIMARY KEY,
+        shard_id TEXT NOT NULL,
+        storage_owner TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
   }
 
   private inviteFor(email: string): InviteRow | null {
@@ -113,13 +175,106 @@ export class AccessRegistry extends DurableObject {
     return rows[0] ?? null;
   }
 
+  /** Resolves or first-claims the immutable app subject without moving legacy data. */
+  private resolvePrincipal(userId: string, currentEmail: string): PrincipalRow {
+    if (!userId || userId.length > 512 || userId.includes("\0")) {
+      throw new Error("invalid principal subject");
+    }
+    const now = Date.now();
+    const existing = this.ctx.storage.sql
+      .exec<PrincipalRow>(
+        "SELECT user_id, storage_owner, shard_id, current_email, created_at, last_seen_at FROM principal_subjects WHERE user_id = ?",
+        userId,
+      )
+      .toArray()[0];
+    const alias = this.ctx.storage.sql
+      .exec<PrincipalAliasRow>("SELECT email, user_id FROM principal_aliases WHERE email = ?", currentEmail)
+      .toArray()[0];
+    if (alias && alias.user_id !== userId) {
+      throw new PrincipalConflictError();
+    }
+    if (existing) {
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO principal_aliases (email, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+        currentEmail,
+        userId,
+        now,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE principal_aliases SET last_seen_at = ? WHERE email = ? AND user_id = ?",
+        now,
+        currentEmail,
+        userId,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE principal_subjects SET current_email = ?, last_seen_at = ? WHERE user_id = ?",
+        currentEmail,
+        now,
+        userId,
+      );
+      return { ...existing, current_email: currentEmail, last_seen_at: now };
+    }
+    const storageOwner = currentEmail;
+    const principal: PrincipalRow = {
+      user_id: userId,
+      storage_owner: storageOwner,
+      shard_id: `acct:${encodeURIComponent(storageOwner)}`,
+      current_email: currentEmail,
+      created_at: now,
+      last_seen_at: now,
+    };
+    this.ctx.storage.sql.exec(
+      `INSERT INTO principal_subjects
+        (user_id, storage_owner, shard_id, current_email, created_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      principal.user_id,
+      principal.storage_owner,
+      principal.shard_id,
+      principal.current_email,
+      principal.created_at,
+      principal.last_seen_at,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO principal_aliases (email, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+      currentEmail,
+      userId,
+      now,
+      now,
+    );
+    return principal;
+  }
+
+  /** Access follows the stable account invite, with a newly invited current alias as recovery. */
+  private accessEmail(principal: PrincipalRow, currentEmail: string): string {
+    if (this.inviteFor(principal.storage_owner)) {
+      return principal.storage_owner;
+    }
+    return this.inviteFor(currentEmail) ? currentEmail : principal.storage_owner;
+  }
+
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (request.headers.get("X-Gera-Internal-Route") === "oauth") {
+      return this.handleOAuthRoute(request, url.pathname);
+    }
     const email = readIdentity(request, "X-Gera-Email").toLowerCase();
     if (!email) {
       return json({ error: "sign_in_required" }, 401);
     }
+    const userId = readIdentity(request, "X-Gera-User-Id");
     const name = readIdentity(request, "X-Gera-Name");
+    let principal: PrincipalRow | null = null;
+    if (userId) {
+      try {
+        principal = this.resolvePrincipal(userId, email);
+      } catch (error) {
+        if (error instanceof PrincipalConflictError) {
+          return json({ error: "principal_conflict" }, 409);
+        }
+        return json({ error: "invalid_principal" }, 400);
+      }
+    }
 
     // Domain rule runs before any route: @rork.com callers are provisioned
     // as members on first contact, and a pending request (if any) flips to
@@ -135,15 +290,31 @@ export class AccessRegistry extends DurableObject {
       this.ctx.storage.sql.exec("UPDATE requests SET status = 'approved' WHERE email = ?", email);
     }
 
+    const accountEmail = principal ? this.accessEmail(principal, email) : email;
+    if (request.method === "POST" && url.pathname === "/principal/resolve") {
+      if (!principal) {
+        return json({ error: "sign_in_required" }, 401);
+      }
+      const invite = this.inviteFor(accountEmail);
+      return json({
+        userId: principal.user_id,
+        currentEmail: email,
+        storageOwner: principal.storage_owner,
+        shardId: principal.shard_id,
+        accessEmail: accountEmail,
+        status: invite ? "invited" : "none",
+        role: invite?.role === "admin" ? "admin" : invite ? "member" : null,
+      });
+    }
     if (request.method === "GET" && url.pathname === "/status") {
-      return this.handleStatus(email);
+      return this.handleStatus(email, accountEmail);
     }
     if (request.method === "POST" && url.pathname === "/request") {
       return this.handleRequest(request, email, name);
     }
 
     // Everything below is admin-only.
-    const caller = this.inviteFor(email);
+    const caller = this.inviteFor(accountEmail);
     if (!caller || caller.role !== "admin") {
       return json({ error: "admin_only" }, 403);
     }
@@ -151,13 +322,13 @@ export class AccessRegistry extends DurableObject {
       return this.handleOverview();
     }
     if (request.method === "POST" && url.pathname === "/admin/invite") {
-      return this.handleInvite(request, email);
+      return this.handleInvite(request, accountEmail);
     }
     if (request.method === "POST" && url.pathname === "/admin/revoke") {
       return this.handleRevoke(request);
     }
     if (request.method === "POST" && url.pathname === "/admin/role") {
-      return this.handleRole(request, email);
+      return this.handleRole(request, accountEmail);
     }
     if (request.method === "POST" && url.pathname === "/admin/dismiss") {
       return this.handleDismiss(request);
@@ -165,21 +336,79 @@ export class AccessRegistry extends DurableObject {
     return json({ error: "not_found" }, 404);
   }
 
-  private handleStatus(email: string): Response {
-    const invite = this.inviteFor(email);
+  private async handleOAuthRoute(request: Request, pathname: string): Promise<Response> {
+    if (request.method !== "POST") {
+      return json({ error: "method_not_allowed" }, 405);
+    }
+    let body: { state?: unknown; shardId?: unknown; storageOwner?: unknown; expiresAt?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const state = typeof body.state === "string" ? body.state : "";
+    if (!/^[a-f0-9]{64}$/.test(state)) {
+      return json({ error: "invalid_state" }, 400);
+    }
+    this.ctx.storage.sql.exec("DELETE FROM oauth_callback_routes WHERE expires_at < ?", Date.now());
+    if (pathname === "/oauth-route/register") {
+      const shardId = typeof body.shardId === "string" ? body.shardId : "";
+      const storageOwner = typeof body.storageOwner === "string" ? body.storageOwner.trim().toLowerCase() : "";
+      const expiresAt = typeof body.expiresAt === "number" ? Math.floor(body.expiresAt) : 0;
+      if (
+        !shardId ||
+        shardId.length > 1_000 ||
+        !EMAIL_PATTERN.test(storageOwner) ||
+        shardId !== `acct:${encodeURIComponent(storageOwner)}` ||
+        expiresAt <= Date.now() ||
+        expiresAt > Date.now() + 15 * 60_000
+      ) {
+        return json({ error: "invalid_route" }, 400);
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO oauth_callback_routes (state, shard_id, storage_owner, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+        state,
+        shardId,
+        storageOwner,
+        expiresAt,
+        Date.now(),
+      );
+      return json({ ok: true });
+    }
+    const row = this.ctx.storage.sql
+      .exec<OAuthRouteRow>(
+        "SELECT state, shard_id, storage_owner, expires_at FROM oauth_callback_routes WHERE state = ?",
+        state,
+      )
+      .toArray()[0];
+    if (!row || row.expires_at < Date.now()) {
+      return json({ error: "oauth_state_unknown" }, 404);
+    }
+    if (pathname === "/oauth-route/resolve") {
+      return json({ shardId: row.shard_id, storageOwner: row.storage_owner, expiresAt: row.expires_at });
+    }
+    if (pathname === "/oauth-route/consume") {
+      this.ctx.storage.sql.exec("DELETE FROM oauth_callback_routes WHERE state = ?", state);
+      return json({ ok: true });
+    }
+    return json({ error: "not_found" }, 404);
+  }
+
+  private handleStatus(displayEmail: string, accessEmail: string): Response {
+    const invite = this.inviteFor(accessEmail);
     if (invite) {
       return json({
-        email,
+        email: displayEmail,
         status: "invited",
         role: invite.role === "admin" ? "admin" : "member",
         requestedAt: null,
       });
     }
-    const pending = this.requestFor(email);
+    const pending = this.requestFor(displayEmail);
     if (pending && pending.status === "pending") {
-      return json({ email, status: "pending", role: null, requestedAt: pending.created_at });
+      return json({ email: displayEmail, status: "pending", role: null, requestedAt: pending.created_at });
     }
-    return json({ email, status: "none", role: null, requestedAt: null });
+    return json({ email: displayEmail, status: "none", role: null, requestedAt: null });
   }
 
   private async handleRequest(request: Request, email: string, name: string): Promise<Response> {

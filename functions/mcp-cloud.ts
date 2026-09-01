@@ -592,6 +592,21 @@ function oauthRefreshFailure(status: number, data: Record<string, unknown> | nul
   return { ok: false, status, code, detail, transient };
 }
 
+async function refreshIdempotencyKey(grant: CloudOAuthToken): Promise<string> {
+  const material = new TextEncoder().encode(
+    [
+      grant.tokenEndpoint,
+      grant.clientId,
+      grant.refreshToken ?? "",
+      grant.accessToken,
+      grant.resource ?? "",
+      grant.mcpUrl ?? "",
+    ].join("\u0000"),
+  );
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
+  return `gera-oauth-${[...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
 /** One provider exchange shared by browser, interactive, and scheduled refreshes. */
 async function requestCloudOAuthRefresh(grant: CloudOAuthToken): Promise<CloudOAuthRefreshOutcome> {
   const params = new URLSearchParams({
@@ -604,9 +619,18 @@ async function requestCloudOAuthRefresh(grant: CloudOAuthToken): Promise<CloudOA
   }
   let response: Response;
   try {
+    const idempotencyKey = await refreshIdempotencyKey(grant);
     response = await fetchPublicHttps(grant.tokenEndpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+        // OAuth does not standardize refresh idempotency, but providers and our
+        // black-box staging broker that support it can replay the same rotated
+        // response after an isolate replacement instead of redeeming twice.
+        "Idempotency-Key": idempotencyKey,
+        "X-Gera-Refresh-Id": idempotencyKey,
+      },
       body: params.toString(),
       signal: AbortSignal.timeout(12_000),
     });
@@ -692,16 +716,16 @@ export async function ensureFreshCloudOAuth(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
-): Promise<void> {
+): Promise<CloudOAuthRefreshOutcome | null> {
   const grant = server.oauth;
   if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId) {
-    return;
+    return null;
   }
   const expiring = grant.expiresAt !== undefined && Date.now() > grant.expiresAt - OAUTH_EXPIRY_SKEW_MS;
   if (!expiring) {
-    return;
+    return null;
   }
-  await redeemCloudRefreshToken(server, refreshed, persist);
+  return redeemCloudRefreshToken(server, refreshed, persist);
 }
 
 /**
@@ -710,12 +734,20 @@ export async function ensureFreshCloudOAuth(
  * tokens early still repair without a new sign-in — mirrors the browser's
  * 401 replay.
  */
+export function forceRefreshCloudOAuthOutcome(
+  server: CloudMcpServer,
+  refreshed: RefreshedOAuth[],
+  persist?: PersistRefreshedOAuth,
+): Promise<CloudOAuthRefreshOutcome> {
+  return redeemCloudRefreshToken(server, refreshed, persist);
+}
+
 export async function forceRefreshCloudOAuth(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
 ): Promise<boolean> {
-  return (await redeemCloudRefreshToken(server, refreshed, persist)).ok;
+  return (await forceRefreshCloudOAuthOutcome(server, refreshed, persist)).ok;
 }
 
 type JsonRpcResponse = {

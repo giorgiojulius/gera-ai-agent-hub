@@ -57,7 +57,7 @@ import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute } from "./knowledge-storage";
 import { verifyRepoPreviewId } from "./repo-preview-shared";
 import { decodeSlackInstallState } from "./native-slack";
-import { isForbiddenHost } from "./network-safety";
+import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
 import { chatShardId, migrateOwnerToShard, sweepGlobalMigrations } from "./shard-migration";
 
@@ -106,9 +106,9 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Authorization, Content-Type, X-Intercom-Region, X-Gera-Upstream-Authorization, X-Gera-Upstream-Url",
+    "Authorization, Content-Type, X-Intercom-Region, X-Gera-Upstream-Authorization, X-Gera-Upstream-Url, X-Gera-GitHub-Accept",
   "Access-Control-Expose-Headers":
-    "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate, X-Gera-Relay-Auth",
+    "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate, X-Gera-Relay-Auth, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After, Link, Content-Disposition",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -148,16 +148,12 @@ function relayAuthRequired(): Response {
 
 /** Browser-facing generic relays are available only to invited Gera accounts. */
 async function relayAccessProblem(request: Request, env: Env): Promise<Response | null> {
-  const userId = request.headers.get("X-Rork-User-Id");
-  const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-  if (!userId || !email) {
-    return relayAuthRequired();
-  }
-  if (await isInvitedCached(env, request.url, email)) {
+  const account = await requireInvitedAccount(request, env);
+  if (!(account instanceof Response)) {
     return null;
   }
-  const response = corsJson({ error: "invite_required" }, 403);
-  response.headers.set("X-Gera-Relay-Auth", "forbidden");
+  const response = account.status === 401 ? relayAuthRequired() : account;
+  response.headers.set("X-Gera-Relay-Auth", account.status === 401 ? "required" : "forbidden");
   return response;
 }
 
@@ -251,22 +247,10 @@ async function relayOAuth(request: Request, url: URL, env: Env): Promise<Respons
     }
     init = { method: "GET", headers: { Accept: "application/json" }, redirect: "manual" };
   } else if (request.method === "POST") {
-    const contentType = request.headers.get("Content-Type") ?? "";
-    const allowedType =
-      contentType.includes("application/json") || contentType.includes("application/x-www-form-urlencoded");
-    if (!allowedType) {
-      return corsJson({ error: "content_type_not_allowed" }, 400);
-    }
-    const body = await request.text();
-    if (body.length > OAUTH_BODY_LIMIT) {
-      return corsJson({ error: "body_too_large" }, 413);
-    }
-    init = {
-      method: "POST",
-      headers: { "Content-Type": contentType, Accept: "application/json" },
-      body,
-      redirect: "manual",
-    };
+    // Registration, code exchange, device polling and refresh now run inside
+    // the account shard. A browser-facing token relay would violate the
+    // server-owned credential boundary, so old bundles fail closed here.
+    return corsJson({ error: "server_owned_oauth_required" }, 410);
   } else {
     return corsJson({ error: "method_not_allowed" }, 405);
   }
@@ -363,8 +347,11 @@ async function relayAccess(request: Request, url: URL, env: Env): Promise<Respon
   const target = new URL(request.url);
   target.pathname = subPath;
   const wrapped = new Request(target.toString(), request);
+  // Never forward caller-supplied internal routing markers into the DO.
+  wrapped.headers.delete("X-Gera-Internal-Route");
   wrapped.headers.set("X-Rork-DO-Class", "AccessRegistry");
   wrapped.headers.set("X-Rork-DO-Id", "global");
+  wrapped.headers.set("X-Gera-User-Id", encodeURIComponent(userId));
   wrapped.headers.set("X-Gera-Email", encodeURIComponent(decodeHeaderText(email)));
   wrapped.headers.set("X-Gera-Name", encodeURIComponent(decodeHeaderText(request.headers.get("X-Rork-User-Name") ?? "")));
 
@@ -381,6 +368,102 @@ async function relayAccess(request: Request, url: URL, env: Env): Promise<Respon
     status: upstream.status,
     headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
   });
+}
+
+type AccountPrincipal = {
+  userId: string;
+  currentEmail: string;
+  storageOwner: string;
+  shardId: string;
+  accessEmail: string;
+  status: "invited" | "none";
+  role: "admin" | "member" | null;
+};
+
+type PrincipalCacheEntry = { account: AccountPrincipal; expiresAt: number };
+const principalCache = new Map<string, PrincipalCacheEntry>();
+
+/**
+ * Resolves the immutable verified app subject to its permanent account shard.
+ * Existing users keep their email-named DO and row owner, so rollout performs
+ * no risky cross-object copy. A changed email only becomes an alias.
+ */
+async function resolveAccountPrincipal(request: Request, env: Env): Promise<AccountPrincipal | Response> {
+  const userId = request.headers.get("X-Rork-User-Id") ?? "";
+  const currentEmail = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
+  if (!userId || !currentEmail) {
+    return corsJson({ error: "sign_in_required" }, 401);
+  }
+  const cacheKey = `${userId}\u0000${currentEmail}`;
+  const cached = principalCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.account;
+  }
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-Rork-DO-Class": "AccessRegistry",
+    "X-Rork-DO-Id": "global",
+    "X-Gera-User-Id": encodeURIComponent(userId),
+    "X-Gera-Email": encodeURIComponent(currentEmail),
+  });
+  let response: Response;
+  try {
+    response = await env.DO.fetch(
+      new Request(new URL("/principal/resolve", request.url).toString(), {
+        method: "POST",
+        headers,
+        body: "{}",
+      }),
+    );
+  } catch (error) {
+    console.error("principal registry unreachable", error instanceof Error ? error.message : "error");
+    return corsJson({ error: "identity_unavailable" }, 503);
+  }
+  const raw = (await response.json().catch(() => ({}))) as Partial<AccountPrincipal> & { error?: unknown };
+  if (!response.ok) {
+    return corsJson(
+      { error: typeof raw.error === "string" ? raw.error : "identity_unavailable" },
+      response.status,
+    );
+  }
+  if (
+    raw.userId !== userId ||
+    raw.currentEmail !== currentEmail ||
+    typeof raw.storageOwner !== "string" ||
+    !raw.storageOwner ||
+    typeof raw.shardId !== "string" ||
+    !raw.shardId ||
+    typeof raw.accessEmail !== "string" ||
+    !raw.accessEmail ||
+    (raw.status !== "invited" && raw.status !== "none")
+  ) {
+    return corsJson({ error: "identity_unavailable" }, 503);
+  }
+  const account: AccountPrincipal = {
+    userId,
+    currentEmail,
+    storageOwner: raw.storageOwner,
+    shardId: raw.shardId,
+    accessEmail: raw.accessEmail,
+    status: raw.status,
+    role: raw.role === "admin" || raw.role === "member" ? raw.role : null,
+  };
+  if (principalCache.size > 5_000) {
+    principalCache.clear();
+  }
+  principalCache.set(cacheKey, {
+    account,
+    expiresAt: Date.now() + (account.status === "invited" ? INVITE_OK_TTL_MS : INVITE_MISS_TTL_MS),
+  });
+  return account;
+}
+
+async function requireInvitedAccount(request: Request, env: Env): Promise<AccountPrincipal | Response> {
+  const resolved = await resolveAccountPrincipal(request, env);
+  if (resolved instanceof Response) {
+    return resolved;
+  }
+  return resolved.status === "invited" ? resolved : corsJson({ error: "invite_required" }, 403);
 }
 
 /** Share snapshots above this are refused — links must stay light. */
@@ -459,16 +542,18 @@ async function isInvitedCached(env: Env, requestUrl: string, email: string): Pro
 async function shardCall(
   env: Env,
   requestUrl: string,
-  email: string,
+  principal: string | Pick<AccountPrincipal, "storageOwner" | "shardId">,
   path: string,
   options: { method: "GET" | "POST"; body?: string },
 ): Promise<Response> {
   const origin = new URL(requestUrl).origin;
+  const storageOwner = typeof principal === "string" ? principal : principal.storageOwner;
+  const shardId = typeof principal === "string" ? chatShardId(principal) : principal.shardId;
   const dispatch = (): Promise<Response> => {
     const headers = new Headers();
     headers.set("X-Rork-DO-Class", "ChatStore");
-    headers.set("X-Rork-DO-Id", chatShardId(email));
-    headers.set("X-Gera-Email", encodeURIComponent(email));
+    headers.set("X-Rork-DO-Id", shardId);
+    headers.set("X-Gera-Email", encodeURIComponent(storageOwner));
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");
     }
@@ -482,20 +567,20 @@ async function shardCall(
   };
   let upstream = await dispatch();
   if (upstream.status === 428) {
-    await migrateOwnerToShard(env, origin, email);
+    await migrateOwnerToShard(env, origin, storageOwner, shardId);
     upstream = await dispatch();
   }
   // Shards report their next automation due instant on profile-carrying
   // responses — mirror it into the global schedule index.
   const nextDueRaw = upstream.headers.get("X-Gera-Next-Due");
   if (nextDueRaw !== null) {
-    await scheduleSet(env, origin, email, Number(nextDueRaw));
+    await scheduleSet(env, origin, storageOwner, Number(nextDueRaw));
   }
   // Same trick for webhook triggers: shards report their token registry
   // rows so the public /hooks/<token> route can find the right shard.
   const hooksRaw = upstream.headers.get("X-Gera-Hooks");
   if (hooksRaw !== null) {
-    await hooksSet(env, origin, email, hooksRaw);
+    await hooksSet(env, origin, storageOwner, hooksRaw);
   }
   return upstream;
 }
@@ -618,18 +703,18 @@ async function relayShares(request: Request, url: URL, env: Env): Promise<Respon
       });
     }
 
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await resolveAccountPrincipal(request, env);
+    if (account instanceof Response) {
+      return account;
     }
+    const email = account.storageOwner;
 
     if (request.method === "POST" && url.pathname === "/share/create") {
       const body = await request.text();
       if (body.length > SHARE_BODY_LIMIT) {
         return corsJson({ error: "chat_too_large" }, 413);
       }
-      if (!(await isInvitedCached(env, request.url, email))) {
+      if (account.status !== "invited") {
         return corsJson({ error: "invite_required" }, 403);
       }
       const upstream = await shareStoreFetch(env, request.url, "/create", { method: "POST", body, email });
@@ -724,14 +809,11 @@ const USAGE_BODY_LIMIT = 64_000;
  */
 async function relayArena(request: Request, url: URL, env: Env): Promise<Response> {
   try {
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
+    const email = account.storageOwner;
 
     // Hot path first: automatic telemetry from every member's client.
     if (request.method === "POST" && url.pathname === "/arena/usage") {
@@ -1189,14 +1271,11 @@ async function relaySlackOAuthCallback(request: Request, url: URL, env: Env): Pr
  */
 async function relayProjects(request: Request, url: URL, env: Env, ctx: ExecutionCtx): Promise<Response> {
   try {
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
+    const email = account.storageOwner;
 
     if (request.method === "GET" && url.pathname === "/projects") {
       const upstream = await projectStoreFetch(
@@ -1269,6 +1348,31 @@ async function relayProjects(request: Request, url: URL, env: Env, ctx: Executio
       if (body.length > PROJECT_BODY_LIMIT) {
         return corsJson({ error: "body_too_large" }, 413);
       }
+      if (sub === "/agents/upsert") {
+        try {
+          const parsed = JSON.parse(body) as Record<string, unknown>;
+          const incomingSecrets =
+            parsed.secrets && typeof parsed.secrets === "object" && !Array.isArray(parsed.secrets)
+              ? { ...(parsed.secrets as Record<string, unknown>) }
+              : {};
+          const fromAccount = incomingSecrets.githubFromAccount === true;
+          delete incomingSecrets.githubFromAccount;
+          delete incomingSecrets.githubAccount;
+          if (fromAccount) {
+            const proof = await accountAuthorizationLease(env, request.url, account, "github", false);
+            if (!proof) {
+              return corsJson({ error: "github_sign_in_required" }, 409);
+            }
+            incomingSecrets.githubAccount = { owner: email, serverId: "github" };
+          } else if (incomingSecrets.githubToken === null) {
+            incomingSecrets.githubAccount = null;
+          }
+          parsed.secrets = incomingSecrets;
+          body = JSON.stringify(parsed);
+        } catch {
+          return corsJson({ error: "invalid_json" }, 400);
+        }
+      }
     }
     const upstream = await projectStoreFetch(env, request.url, `proj:${projectId}`, `${sub}${url.search}`, {
       method: expected,
@@ -1331,17 +1435,13 @@ async function relaySurf(request: Request, url: URL, env: Env): Promise<Response
   if (request.method !== "POST") {
     return corsJson({ error: "method_not_allowed" }, 405);
   }
-  const userId = request.headers.get("X-Rork-User-Id");
-  const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-  if (!userId || !email) {
-    return corsJson({ error: "sign_in_required" }, 401);
+  const account = await requireInvitedAccount(request, env);
+  if (account instanceof Response) {
+    return account;
   }
   const body = await request.text();
   if (body.length > SURF_BODY_LIMIT) {
     return corsJson({ error: "body_too_large" }, 413);
-  }
-  if (!(await isInvitedCached(env, request.url, email))) {
-    return corsJson({ error: "invite_required" }, 403);
   }
 
   let parsed: {
@@ -1416,10 +1516,9 @@ const RUNS_SMALL_BODY_LIMIT = 2_000_000;
  */
 async function relayRuns(request: Request, url: URL, env: Env): Promise<Response> {
   try {
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
     const sub = url.pathname;
     const isGet = request.method === "GET";
@@ -1441,10 +1540,7 @@ async function relayRuns(request: Request, url: URL, env: Env): Promise<Response
         return corsJson({ error: "body_too_large" }, 413);
       }
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
-    const upstream = await shardCall(env, request.url, email, `${sub}${url.search}`, {
+    const upstream = await shardCall(env, request.url, account, `${sub}${url.search}`, {
       method: isGet ? "GET" : "POST",
       body,
     });
@@ -1482,19 +1578,15 @@ async function relayChatSync(request: Request, url: URL, env: Env): Promise<Resp
     if (request.method !== "POST" || url.pathname !== "/chats/sync") {
       return corsJson({ error: "not_found" }, 404);
     }
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
     const body = await request.text();
     if (body.length > CHAT_SYNC_BODY_LIMIT) {
       return corsJson({ error: "body_too_large" }, 413);
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
-    const upstream = await shardCall(env, request.url, email, "/sync", { method: "POST", body });
+    const upstream = await shardCall(env, request.url, account, "/sync", { method: "POST", body });
     const text = await upstream.text();
     console.log("chats sync", upstream.status);
     return new Response(text, {
@@ -1518,15 +1610,11 @@ async function relayOAuthRotations(request: Request, url: URL, env: Env): Promis
     if (request.method !== "GET") {
       return corsJson({ error: "not_found" }, 404);
     }
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
-    const upstream = await shardCall(env, request.url, email, "/mcp/oauth-rotations", { method: "GET" });
+    const upstream = await shardCall(env, request.url, account, "/mcp/oauth-rotations", { method: "GET" });
     const text = await upstream.text();
     return new Response(text, {
       status: upstream.status,
@@ -1540,10 +1628,54 @@ async function relayOAuthRotations(request: Request, url: URL, env: Env): Promis
 
 const MCP_OAUTH_REFRESH_BODY_LIMIT = 64_000;
 
+function oauthAppOrigin(request: Request): string | null {
+  const raw = request.headers.get("Origin") ?? "";
+  try {
+    const origin = new URL(raw);
+    const host = origin.hostname.toLowerCase();
+    const allowedHost =
+      host.endsWith(".rork.live") ||
+      host.endsWith(".rork.app") ||
+      host.endsWith(".workers.dev") ||
+      host === "localhost" ||
+      host === "127.0.0.1";
+    return origin.protocol === "https:" && !origin.username && !origin.password && allowedHost
+      ? origin.origin
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function oauthRouteCall(
+  env: Env,
+  origin: string,
+  path: "/oauth-route/register" | "/oauth-route/resolve" | "/oauth-route/consume",
+  body: Record<string, unknown>,
+): Promise<Response> {
+  return env.DO.fetch(
+    new Request(new URL(path, origin).toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Rork-DO-Class": "AccessRegistry",
+        "X-Rork-DO-Id": "global",
+        "X-Gera-Internal-Route": "oauth",
+      },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
 /** Server-owned MCP state/control routes for one authenticated account shard. */
 async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Response> {
   try {
     const methods: Record<string, "GET" | "POST"> = {
+      "/mcp/oauth-start": "POST",
+      "/mcp/oauth-status": "GET",
+      "/mcp/oauth-complete": "POST",
+      "/mcp/github-device-start": "POST",
+      "/mcp/github-device-status": "GET",
       "/mcp/oauth-store": "POST",
       "/mcp/oauth-clear": "POST",
       "/mcp/check": "POST",
@@ -1552,20 +1684,52 @@ async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Re
     if (!method || request.method !== method) {
       return corsJson({ error: "not_found" }, 404);
     }
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
-    const body = await request.text();
-    if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
-      return corsJson({ error: "body_too_large" }, 413);
+    let body: string | undefined;
+    if (method === "POST") {
+      body = await request.text();
+      if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
+        return corsJson({ error: "body_too_large" }, 413);
+      }
+      if (url.pathname === "/mcp/oauth-start") {
+        const returnOrigin = oauthAppOrigin(request);
+        if (!returnOrigin) {
+          return corsJson({ error: "invalid_return_origin" }, 400);
+        }
+        let parsed: Record<string, unknown>;
+        try {
+          const value = JSON.parse(body) as unknown;
+          parsed = value && typeof value === "object" && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : {};
+        } catch {
+          return corsJson({ error: "invalid_body" }, 400);
+        }
+        body = JSON.stringify({ ...parsed, returnOrigin });
+      }
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
+    const targetPath = `${url.pathname}${method === "GET" ? url.search : ""}`;
+    const upstream = await shardCall(env, request.url, account, targetPath, { method, body });
+    const text = await upstream.text();
+    if (upstream.ok && url.pathname === "/mcp/oauth-start") {
+      const data = JSON.parse(text) as { state?: unknown; expiresAt?: unknown };
+      if (typeof data.state !== "string" || typeof data.expiresAt !== "number") {
+        return corsJson({ error: "oauth_start_invalid" }, 502);
+      }
+      const registered = await oauthRouteCall(env, new URL(request.url).origin, "/oauth-route/register", {
+        state: data.state,
+        shardId: account.shardId,
+        storageOwner: account.storageOwner,
+        expiresAt: data.expiresAt,
+      });
+      if (!registered.ok) {
+        return corsJson({ error: "oauth_callback_route_unavailable" }, 503);
+      }
     }
-    const upstream = await shardCall(env, request.url, email, url.pathname, { method, body });
-    return new Response(await upstream.text(), {
+    return new Response(text, {
       status: upstream.status,
       headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
@@ -1585,19 +1749,15 @@ async function relayBrowserOAuthRefresh(request: Request, env: Env): Promise<Res
     if (request.method !== "POST") {
       return corsJson({ error: "not_found" }, 404);
     }
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
     const body = await request.text();
     if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
       return corsJson({ error: "body_too_large" }, 413);
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
-    const upstream = await shardCall(env, request.url, email, "/mcp/oauth-refresh", { method: "POST", body });
+    const upstream = await shardCall(env, request.url, account, "/mcp/oauth-refresh", { method: "POST", body });
     const text = await upstream.text();
     return new Response(text, {
       status: upstream.status,
@@ -1607,6 +1767,152 @@ async function relayBrowserOAuthRefresh(request: Request, env: Env): Promise<Res
     console.error("browser oauth refresh relay failed", error instanceof Error ? error.message : "error");
     return corsJson({ error: "upstream_unreachable", transient: true }, 502);
   }
+}
+
+/** Public provider redirect; state routes to one account shard and is consumed once. */
+async function relayMcpOAuthCallback(request: Request, url: URL, env: Env): Promise<Response> {
+  if (request.method !== "GET") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+  const state = url.searchParams.get("state") ?? "";
+  if (!/^[a-f0-9]{64}$/.test(state)) {
+    return new Response("OAuth state is invalid or expired.", { status: 400 });
+  }
+  const origin = new URL(request.url).origin;
+  const route = await oauthRouteCall(env, origin, "/oauth-route/resolve", { state });
+  if (!route.ok) {
+    return new Response("OAuth state is invalid, expired, or already used.", { status: 400 });
+  }
+  const target = (await route.json()) as { shardId?: unknown; storageOwner?: unknown };
+  if (typeof target.shardId !== "string" || typeof target.storageOwner !== "string") {
+    return new Response("OAuth callback route is unavailable.", { status: 503 });
+  }
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-Rork-DO-Class": "ChatStore",
+    "X-Rork-DO-Id": target.shardId,
+    "X-Gera-Email": encodeURIComponent(target.storageOwner),
+  });
+  let upstream: Response;
+  try {
+    upstream = await env.DO.fetch(
+      new Request(new URL("/mcp/oauth-callback", origin).toString(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          state,
+          code: (url.searchParams.get("code") ?? "").slice(0, 8_000),
+          error: (url.searchParams.get("error_description") ?? url.searchParams.get("error") ?? "").slice(0, 300),
+          issuer: (url.searchParams.get("iss") ?? "").slice(0, 2_000),
+        }),
+      }),
+    );
+  } catch {
+    return new Response("OAuth callback could not reach the account store. Retry from Gera.", { status: 503 });
+  }
+  const data = (await upstream.json().catch(() => ({}))) as { redirectUrl?: unknown; error?: unknown };
+  if (upstream.status < 500) {
+    await oauthRouteCall(env, origin, "/oauth-route/consume", { state }).catch(() => undefined);
+  }
+  const redirectUrl = typeof data.redirectUrl === "string" ? safePublicHttpsUrl(data.redirectUrl) : null;
+  if (redirectUrl) {
+    return new Response(null, {
+      status: 302,
+      headers: { Location: redirectUrl.toString(), "Cache-Control": "no-store" },
+    });
+  }
+  return new Response(
+    upstream.ok ? "OAuth sign-in completed. You can close this window." : "OAuth sign-in failed. Return to Gera and retry.",
+    { status: upstream.ok ? 200 : 400, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } },
+  );
+}
+
+async function accountAuthorizationLease(
+  env: Env,
+  requestUrl: string,
+  account: AccountPrincipal,
+  serverId: string,
+  force: boolean,
+): Promise<string | null> {
+  const response = await shardCall(env, requestUrl, account, "/mcp/auth-lease", {
+    method: "POST",
+    body: JSON.stringify({ serverId, catalogId: "github", force }),
+  });
+  const data = (await response.json().catch(() => ({}))) as { authorization?: unknown };
+  return response.ok && typeof data.authorization === "string" ? data.authorization : null;
+}
+
+/** Account-owned GitHub relay. Provider tokens stay between Worker and account shard. */
+async function relayGitHubAccount(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
+    return corsJson({ error: "method_not_allowed" }, 405);
+  }
+  const account = await requireInvitedAccount(request, env);
+  if (account instanceof Response) {
+    return account;
+  }
+  const serverId = url.searchParams.get("serverId") ?? "github";
+  const rawPath = url.searchParams.get("path") ?? "";
+  if (!serverId || serverId.length > 80 || !rawPath.startsWith("/") || rawPath.length > 4_000) {
+    return corsJson({ error: "invalid_github_request" }, 400);
+  }
+  let target: URL;
+  try {
+    target = new URL(rawPath, "https://api.github.com");
+  } catch {
+    return corsJson({ error: "invalid_github_request" }, 400);
+  }
+  if (
+    target.origin !== "https://api.github.com" ||
+    target.pathname.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    return corsJson({ error: "invalid_github_request" }, 400);
+  }
+  const body = request.method === "GET" ? undefined : await readBoundedText(request, 2_000_000);
+  if (body === null) {
+    return corsJson({ error: "body_too_large" }, 413);
+  }
+  const execute = async (force: boolean): Promise<Response | null> => {
+    const authorization = await accountAuthorizationLease(env, request.url, account, serverId, force);
+    if (!authorization) {
+      return null;
+    }
+    return fetchPublicHttps(target.toString(), {
+      method: request.method,
+      headers: {
+        Authorization: authorization,
+        Accept: request.headers.get("X-Gera-GitHub-Accept") ?? "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body,
+      signal: AbortSignal.timeout(30_000),
+    }, { allowCrossOriginGet: request.method === "GET" });
+  };
+  let upstream = await execute(false);
+  if (!upstream) {
+    return corsJson({ error: "github_sign_in_required" }, 401);
+  }
+  if (upstream.status === 401) {
+    upstream = (await execute(true)) ?? upstream;
+  }
+  const headers = new Headers({ ...CORS_HEADERS });
+  for (const name of [
+    "Content-Type",
+    "Content-Disposition",
+    "X-OAuth-Scopes",
+    "X-Accepted-OAuth-Scopes",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+    "Retry-After",
+    "Link",
+  ]) {
+    const value = upstream.headers.get(name);
+    if (value) {
+      headers.set(name, value);
+    }
+  }
+  return new Response(upstream.body, { status: upstream.status, headers });
 }
 
 /** Error-journal bodies stay tiny; anything bigger is a bug or abuse. */
@@ -1619,10 +1925,9 @@ const DIAG_BODY_LIMIT = 131_072;
  */
 async function relayDiagnostics(request: Request, url: URL, env: Env): Promise<Response> {
   try {
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
     const sub = url.pathname.slice("/diag".length) || "/";
     const isList = request.method === "GET" && sub === "/list";
@@ -1638,10 +1943,7 @@ async function relayDiagnostics(request: Request, url: URL, env: Env): Promise<R
         return corsJson({ error: "body_too_large" }, 413);
       }
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
-    const upstream = await shardCall(env, request.url, email, `/diag${sub}`, {
+    const upstream = await shardCall(env, request.url, account, `/diag${sub}`, {
       method: request.method === "GET" ? "GET" : "POST",
       body,
     });
@@ -1850,22 +2152,18 @@ async function relayRunNow(request: Request, url: URL, env: Env, ctx: ExecutionC
     if (request.method !== "POST") {
       return corsJson({ error: "method_not_allowed" }, 405);
     }
-    const userId = request.headers.get("X-Rork-User-Id");
-    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-    if (!userId || !email) {
-      return corsJson({ error: "sign_in_required" }, 401);
+    const account = await requireInvitedAccount(request, env);
+    if (account instanceof Response) {
+      return account;
     }
     const body = await request.text();
     if (body.length > RUN_NOW_BODY_LIMIT) {
       return corsJson({ error: "body_too_large" }, 413);
     }
-    if (!(await isInvitedCached(env, request.url, email))) {
-      return corsJson({ error: "invite_required" }, 403);
-    }
-    const upstream = await shardCall(env, request.url, email, "/run-now", { method: "POST", body });
+    const upstream = await shardCall(env, request.url, account, "/run-now", { method: "POST", body });
     if (upstream.ok) {
       // Fire immediately — the cron tick is only the safety net.
-      ctx.waitUntil(fireShard(env, new URL(request.url).origin, email));
+      ctx.waitUntil(fireShard(env, new URL(request.url).origin, account.storageOwner));
     }
     const text = await upstream.text();
     console.log("automation run-now", upstream.status);
@@ -2117,20 +2415,17 @@ async function sweepRepoPreviewRegistry(env: Env, origin: string): Promise<void>
 
 /** Authenticated control plane: inspect, setup PR, launch, status, cancel. */
 async function relayRepoPreviews(request: Request, url: URL, env: Env): Promise<Response> {
-  const userId = request.headers.get("X-Rork-User-Id");
-  const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-  if (!userId || !email) {
-    return corsJson({ error: "sign_in_required" }, 401);
+  const account = await requireInvitedAccount(request, env);
+  if (account instanceof Response) {
+    return account;
   }
+  const email = account.storageOwner;
   const path = url.pathname.slice("/repo-previews".length) || "/";
   const allowed =
     (request.method === "GET" && path === "/status") ||
     (request.method === "POST" && ["/inspect", "/install", "/start", "/cancel"].includes(path));
   if (!allowed) {
     return corsJson({ error: "not_found" }, 404);
-  }
-  if (!(await isInvitedCached(env, request.url, email))) {
-    return corsJson({ error: "invite_required" }, 403);
   }
   let body: string | undefined;
   if (request.method === "POST") {
@@ -2152,7 +2447,11 @@ async function relayRepoPreviews(request: Request, url: URL, env: Env): Promise<
   if (body !== undefined) {
     headers.set("Content-Type", "application/json");
   }
-  const github = request.headers.get("X-Gera-Upstream-Authorization");
+  let github = request.headers.get("X-Gera-Upstream-Authorization") ?? "";
+  if (github.startsWith("gera-account:")) {
+    const serverId = github.slice("gera-account:".length) || "github";
+    github = (await accountAuthorizationLease(env, request.url, account, serverId, false)) ?? "";
+  }
   if (github) {
     headers.set("X-Gera-GitHub-Authorization", github);
   }
@@ -2220,15 +2519,11 @@ async function relayRepoPreviewPublic(request: Request, url: URL, env: Env): Pro
  * + invite gate as chat sync.
  */
 async function relayKnowledge(request: Request, url: URL, env: Env): Promise<Response> {
-  const userId = request.headers.get("X-Rork-User-Id");
-  const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
-  if (!userId || !email) {
-    return corsJson({ error: "sign_in_required" }, 401);
+  const account = await requireInvitedAccount(request, env);
+  if (account instanceof Response) {
+    return account;
   }
-  if (!(await isInvitedCached(env, request.url, email))) {
-    return corsJson({ error: "invite_required" }, 403);
-  }
-  const { status, body } = await handleKnowledgeRoute(request, url, env, email);
+  const { status, body } = await handleKnowledgeRoute(request, url, env, account.storageOwner);
   return corsJson(body, status);
 }
 
@@ -2297,6 +2592,12 @@ export default {
     if (url.pathname === "/diag" || url.pathname.startsWith("/diag/")) {
       return relayDiagnostics(request, url, env);
     }
+    if (url.pathname === "/mcp/oauth/callback") {
+      return relayMcpOAuthCallback(request, url, env);
+    }
+    if (url.pathname === "/github-proxy") {
+      return relayGitHubAccount(request, url, env);
+    }
     if (url.pathname === "/mcp/oauth-rotations") {
       return relayOAuthRotations(request, url, env);
     }
@@ -2304,6 +2605,11 @@ export default {
       return relayBrowserOAuthRefresh(request, env);
     }
     if (
+      url.pathname === "/mcp/oauth-start" ||
+      url.pathname === "/mcp/oauth-status" ||
+      url.pathname === "/mcp/oauth-complete" ||
+      url.pathname === "/mcp/github-device-start" ||
+      url.pathname === "/mcp/github-device-status" ||
       url.pathname === "/mcp/oauth-store" ||
       url.pathname === "/mcp/oauth-clear" ||
       url.pathname === "/mcp/check"

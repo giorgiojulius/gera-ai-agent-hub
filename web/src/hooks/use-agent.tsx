@@ -77,13 +77,10 @@ export function AgentProvider({ children }: { children: ReactNode }) {
 
   // --- Cloud history sync: one account, one history across devices (see
   // use-cloud-sync.ts — debounced loop, profile clock, tombstones, adoption). ---
-  const { scheduleSync, recordTombstone } = useCloudSync({
+  const { scheduleSync, recordTombstone, isHydrated } = useCloudSync({
     state,
     setState,
     stateRef,
-    adoptedRef,
-    notifyRef,
-    drainRef,
   });
 
   // One-time boot pass: legacy inline media (persisted by older versions as
@@ -190,7 +187,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   } = useMcpActions({
     stateRef,
     servers: state.settings.mcpServers,
-    canValidate: !isAuthLoading && user !== null && getAccessToken() !== null,
+    canValidate: isHydrated && !isAuthLoading && user !== null && getAccessToken() !== null,
     setSettings,
   });
 
@@ -1204,8 +1201,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
    * silently spending tokens.
    */
   const bootRecoveryRef = useRef<boolean>(false);
+  const [bootRecoveryTick, setBootRecoveryTick] = useState<number>(0);
   useEffect(() => {
-    if (bootRecoveryRef.current) {
+    if (bootRecoveryRef.current || isAuthLoading || (user !== null && !isHydrated)) {
       return;
     }
     bootRecoveryRef.current = true;
@@ -1230,7 +1228,11 @@ export function AgentProvider({ children }: { children: ReactNode }) {
             adopted.add(id);
           }
         } catch {
-          // Backend unreachable — local recovery still offers Continue/Retry.
+          // A deploy/network gap does not prove the durable run is absent.
+          // Retry adoption before local recovery; never start a duplicate.
+          bootRecoveryRef.current = false;
+          window.setTimeout(() => setBootRecoveryTick((value) => value + 1), 2_000);
+          return;
         }
       }
       const snapshot = stateRef.current;
@@ -1266,7 +1268,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         window.setTimeout(() => drainRef.current(conversationId), 400);
       }
     })();
-  }, [resumeInterrupted, retryInterrupted]);
+  }, [bootRecoveryTick, isAuthLoading, isHydrated, resumeInterrupted, retryInterrupted, user]);
 
   /**
    * Fires one automation run into its own background thread.

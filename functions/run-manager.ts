@@ -73,8 +73,6 @@ const ID_LIMIT = 80;
 const MAX_CHATS_PER_OWNER = 500;
 const OAUTH_REF_PREFIX = "oauthref:";
 
-/** A running row whose heartbeat is older than this is considered dead. */
-const STALE_AFTER_MS = 120_000;
 /** Finished, unacked results stay listable this long for reopened tabs. */
 const RESULT_RETENTION_MS = 30 * 60_000;
 /** Finished run rows are GC'd after this. */
@@ -121,6 +119,19 @@ type RunRow = {
   snapshot: string;
   result: string;
   error: string;
+};
+
+type RunReceiptRow = {
+  owner_email: string;
+  run_id: string;
+  conversation_id: string;
+  request_hash: string;
+  status: string;
+  history_on_server: number;
+  result: string;
+  error: string;
+  created_at: number;
+  updated_at: number;
 };
 
 type LiveRun = {
@@ -240,6 +251,27 @@ export class RunManager {
         PRIMARY KEY (owner_email, conversation_id)
       )
     `);
+    // Immutable idempotency receipts survive replacement of a conversation's
+    // current run row. Retrying the same accepted runId can therefore never
+    // execute tools twice, even when the first HTTP response vanished.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS agent_run_receipts (
+        owner_email TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        history_on_server INTEGER NOT NULL DEFAULT 0,
+        result TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, run_id)
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_run_receipts_owner_updated ON agent_run_receipts (owner_email, updated_at)",
+    );
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_run_media (
         owner_email TEXT NOT NULL,
@@ -326,6 +358,58 @@ export class RunManager {
     ) {
       return json({ error: "invalid_run" }, 400);
     }
+    const requestHash = await this.startRequestHash(body);
+    const receipt = this.receiptRow(owner, body.runId);
+    if (receipt) {
+      if (receipt.request_hash !== requestHash || receipt.conversation_id !== body.conversationId) {
+        return json({ error: "idempotency_conflict" }, 409);
+      }
+      let receiptStatus = receipt.status;
+      let result = receipt.result ? this.parseJson<Record<string, unknown>>(receipt.result) : null;
+      if (receiptStatus === "running" && !this.runRowById(owner, body.runId)) {
+        // Crash between the receipt and current-row writes: preserve exactly-
+        // once by settling the accepted id instead of starting its tools again.
+        receiptStatus = "interrupted";
+        result = {
+          message: { id: body.assistantMessageId, content: "", interrupted: true },
+          usageEvents: [],
+          steered: [],
+          chatUpdatedAt: 0,
+        };
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_run_receipts SET status = 'interrupted', result = ?, error = ?, updated_at = ?
+           WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
+          JSON.stringify(result),
+          "Run acceptance was interrupted before execution ownership was recorded.",
+          Date.now(),
+          owner,
+          body.runId,
+        );
+      }
+      return json({
+        ok: true,
+        runId: receipt.run_id,
+        replayed: true,
+        historyOnServer: receipt.history_on_server === 1,
+        status: receiptStatus,
+        ...(result ? { result } : {}),
+      });
+    }
+    // Rows created by the pre-receipt bundle still reserve their runId. We do
+    // not know their original request hash, so replay returns the durable row
+    // and never risks executing an old tool request a second time.
+    const legacyRow = this.runRowById(owner, body.runId);
+    if (legacyRow) {
+      const result = legacyRow.result ? this.parseJson<Record<string, unknown>>(legacyRow.result) : null;
+      return json({
+        ok: true,
+        runId: legacyRow.run_id,
+        replayed: true,
+        historyOnServer: legacyRow.ephemeral !== 1,
+        status: legacyRow.status,
+        ...(result ? { result } : {}),
+      });
+    }
     const existing = this.live.get(this.liveKey(owner, body.conversationId));
     if (existing && !existing.done) {
       return json({ error: "run_active", runId: existing.runId }, 409);
@@ -382,6 +466,18 @@ export class RunManager {
     };
     this.live.set(this.liveKey(owner, body.conversationId), run);
     this.ctx.storage.sql.exec(
+      `INSERT INTO agent_run_receipts
+        (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'running', ?, '', '', ?, ?)`,
+      owner,
+      body.runId,
+      body.conversationId,
+      requestHash,
+      chatWritable ? 1 : 0,
+      now,
+      now,
+    );
+    this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO agent_runs
         (owner_email, conversation_id, run_id, kind, status, started_at, heartbeat_at, finished_at,
          title, model_id, assistant_message_id, ephemeral, acked, snapshot, result, error)
@@ -407,7 +503,7 @@ export class RunManager {
         });
       }),
     );
-    return json({ ok: true, runId: body.runId, historyOnServer: chatWritable });
+    return json({ ok: true, runId: body.runId, historyOnServer: chatWritable, status: "running" });
   }
 
   private async handleSteer(request: Request, owner: string): Promise<Response> {
@@ -1136,6 +1232,32 @@ export class RunManager {
     }
   }
 
+  private async startRequestHash(body: StartRunBody): Promise<string> {
+    const bytes = new TextEncoder().encode(JSON.stringify(body));
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  private receiptRow(owner: string, runId: string): RunReceiptRow | undefined {
+    return this.ctx.storage.sql
+      .exec<RunReceiptRow>(
+        "SELECT * FROM agent_run_receipts WHERE owner_email = ? AND run_id = ?",
+        owner,
+        runId,
+      )
+      .toArray()[0];
+  }
+
+  private runRowById(owner: string, runId: string): RunRow | undefined {
+    return this.ctx.storage.sql
+      .exec<RunRow>(
+        "SELECT * FROM agent_runs WHERE owner_email = ? AND run_id = ?",
+        owner,
+        runId,
+      )
+      .toArray()[0];
+  }
+
   private runRow(owner: string, conversationId: string): RunRow | undefined {
     return this.ctx.storage.sql
       .exec<RunRow>(
@@ -1289,6 +1411,7 @@ export class RunManager {
       chatUpdatedAt,
     };
     const now = Date.now();
+    const resultPayload = JSON.stringify(result);
     try {
       this.ctx.storage.sql.exec(
         `UPDATE agent_runs SET status = ?, finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ?
@@ -1297,10 +1420,20 @@ export class RunManager {
         now,
         now,
         JSON.stringify({ ...this.snapshotOf(run), status }),
-        JSON.stringify(result),
+        resultPayload,
         outcome.error ?? "",
         run.owner,
         run.conversationId,
+        run.runId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_run_receipts SET status = ?, result = ?, error = ?, updated_at = ?
+          WHERE owner_email = ? AND run_id = ?`,
+        status,
+        resultPayload,
+        outcome.error ?? "",
+        now,
+        run.owner,
         run.runId,
       );
     } catch (error) {
@@ -1424,7 +1557,21 @@ export class RunManager {
       messages.splice(resumeIndex, 0, ...steerMessages);
       messages[messages.findIndex((entry) => entry.id === resumeId)] = merged;
     } else {
-      messages.push(...steerMessages, assistant);
+      const existingAssistantIndex = messages.findIndex(
+        (entry) => entry.id === message.id && entry.role === "assistant",
+      );
+      if (existingAssistantIndex >= 0) {
+        // A crash may happen after the chat write but before the terminal run
+        // row update. Recovery is idempotent by assistant message id: never
+        // duplicate or replace an already-settled answer with an interrupted
+        // snapshot from the stale row.
+        if (messages[existingAssistantIndex].pending !== true) {
+          return existing.updated_at;
+        }
+        messages.splice(existingAssistantIndex, 1, ...steerMessages, assistant);
+      } else {
+        messages.push(...steerMessages, assistant);
+      }
     }
 
     chat.messages = messages;
@@ -1550,9 +1697,8 @@ export class RunManager {
     try {
       const rows = this.ctx.storage.sql
         .exec<RunRow>(
-          "SELECT * FROM agent_runs WHERE owner_email = ? AND status = 'running' AND heartbeat_at < ?",
+          "SELECT * FROM agent_runs WHERE owner_email = ? AND status = 'running'",
           owner,
-          now - STALE_AFTER_MS,
         )
         .toArray();
       for (const row of rows) {
@@ -1565,6 +1711,11 @@ export class RunManager {
       // GC: acked/old finished rows and expired media.
       this.ctx.storage.sql.exec(
         "DELETE FROM agent_runs WHERE owner_email = ? AND status != 'running' AND (finished_at < ? OR (acked = 1 AND ephemeral = 1))",
+        owner,
+        now - ROW_TTL_MS,
+      );
+      this.ctx.storage.sql.exec(
+        "DELETE FROM agent_run_receipts WHERE owner_email = ? AND updated_at < ?",
         owner,
         now - ROW_TTL_MS,
       );
@@ -1604,8 +1755,9 @@ export class RunManager {
         }
       : undefined;
     let automationId: string | undefined;
+    let settledMessage: RunFinalMessage | undefined;
     const chatRow = this.ctx.storage.sql
-      .exec<{ payload: string }>(
+      .exec<{ payload: string; updated_at: number }>(
         "SELECT payload FROM chats WHERE owner_email = ? AND id = ?",
         row.owner_email,
         row.conversation_id,
@@ -1613,11 +1765,70 @@ export class RunManager {
       .toArray()[0];
     if (chatRow) {
       try {
-        const chat = JSON.parse(chatRow.payload) as { automationId?: unknown };
+        const chat = JSON.parse(chatRow.payload) as { automationId?: unknown; messages?: unknown };
         automationId = typeof chat.automationId === "string" && chat.automationId ? chat.automationId : undefined;
+        const messages = Array.isArray(chat.messages) ? chat.messages : [];
+        const existingAssistant = messages.find(
+          (item): item is Record<string, unknown> =>
+            Boolean(item) &&
+            typeof item === "object" &&
+            !Array.isArray(item) &&
+            (item as Record<string, unknown>).id === row.assistant_message_id &&
+            (item as Record<string, unknown>).role === "assistant" &&
+            (item as Record<string, unknown>).pending !== true,
+        );
+        if (existingAssistant && typeof existingAssistant.content === "string") {
+          settledMessage = {
+            ...(existingAssistant as unknown as RunFinalMessage),
+            id: row.assistant_message_id,
+            content: existingAssistant.content,
+          };
+        }
       } catch {
         automationId = undefined;
       }
+    }
+    if (settledMessage && chatRow) {
+      const now = Date.now();
+      const resultPayload = JSON.stringify({
+        message: settledMessage,
+        usageEvents: [],
+        steered: snapshot?.steered ?? [],
+        chatUpdatedAt: chatRow.updated_at,
+      });
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO agent_run_receipts
+          (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'done', 1, ?, '', ?, ?)`,
+        row.owner_email,
+        row.run_id,
+        row.conversation_id,
+        `legacy:${row.run_id}`,
+        resultPayload,
+        row.started_at,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_runs SET status = 'done', finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ''
+         WHERE owner_email = ? AND conversation_id = ? AND run_id = ? AND status = 'running'`,
+        now,
+        now,
+        JSON.stringify(snapshot ? { ...snapshot, status: "done" } : {}),
+        resultPayload,
+        row.owner_email,
+        row.conversation_id,
+        row.run_id,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_run_receipts SET status = 'done', result = ?, error = '', updated_at = ?
+         WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
+        resultPayload,
+        now,
+        row.owner_email,
+        row.run_id,
+      );
+      console.log("orphaned run recovered from settled chat:", row.conversation_id);
+      return;
     }
     const message: RunFinalMessage = {
       id: row.assistant_message_id,
@@ -1678,20 +1889,46 @@ export class RunManager {
       chatUpdatedAt = this.writeResultIntoChat(fake, message);
     }
     const now = Date.now();
+    const resultPayload = JSON.stringify({
+      message,
+      usageEvents: [],
+      steered: snapshot?.steered ?? [],
+      chatUpdatedAt,
+    });
+    const error = "The server node running this reply restarted — the collected draft is shown as-is.";
     this.ctx.storage.sql.exec(
-      `UPDATE agent_runs SET status = 'interrupted', finished_at = ?, snapshot = ?, result = ?, error = ?
-        WHERE owner_email = ? AND conversation_id = ? AND run_id = ?`,
+      `INSERT OR IGNORE INTO agent_run_receipts
+        (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'interrupted', ?, ?, ?, ?, ?)`,
+      row.owner_email,
+      row.run_id,
+      row.conversation_id,
+      `legacy:${row.run_id}`,
+      row.ephemeral === 1 ? 0 : 1,
+      resultPayload,
+      error,
+      row.started_at,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE agent_runs SET status = 'interrupted', finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ?
+        WHERE owner_email = ? AND conversation_id = ? AND run_id = ? AND status = 'running'`,
+      now,
       now,
       JSON.stringify(snapshot ? { ...snapshot, status: "interrupted" } : {}),
-      JSON.stringify({
-        message,
-        usageEvents: [],
-        steered: snapshot?.steered ?? [],
-        chatUpdatedAt,
-      }),
-      "The server node running this reply restarted — the collected draft is shown as-is.",
+      resultPayload,
+      error,
       row.owner_email,
       row.conversation_id,
+      row.run_id,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE agent_run_receipts SET status = 'interrupted', result = ?, error = ?, updated_at = ?
+        WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
+      resultPayload,
+      error,
+      now,
+      row.owner_email,
       row.run_id,
     );
     console.log("stale run finalized as interrupted:", row.conversation_id);
@@ -1780,6 +2017,15 @@ export class RunManager {
         // malformed vault rows authenticate nothing
       }
     }
+    const revoked = this.ctx.storage.sql
+      .exec<{ server_id: string }>(
+        "SELECT server_id FROM mcp_oauth_revocations WHERE owner_email = ?",
+        owner,
+      )
+      .toArray();
+    for (const row of revoked) {
+      delete tokens[row.server_id];
+    }
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const rows = await this.ctx.storage.list<unknown>({ prefix });
     const rotations: OAuthRotation[] = [];
@@ -1809,25 +2055,11 @@ export class RunManager {
     rotated: RefreshedOAuth,
     appliedChains: Map<string, string[]>,
   ): Promise<void> {
-    const profileRow = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
-    let parsed: unknown = null;
-    try {
-      parsed = profileRow ? JSON.parse(profileRow.payload) : null;
-    } catch {
-      parsed = null;
-    }
-    const raw =
-      parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>).mcpOAuth
-        : undefined;
-    const currentTokens = cloudOAuthTokens(raw);
-    const key = `${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`;
-    const existing = normalizeOAuthOverride(rotated.serverId, await this.ctx.storage.get<unknown>(key));
-    if (existing) {
-      overlayOAuthRotations(currentTokens, [existing]);
-    }
+    // SQL is the canonical grant source. Calling the same resolver used by
+    // run arming also overlays a still-live legacy rotation, so old accounts
+    // migrate safely without letting the deleted profile.mcpOAuth field make
+    // every new server-owned grant look stale.
+    const { tokens: currentTokens } = await this.oauthTokensFor(owner);
     const currentAccess = currentTokens[rotated.serverId]?.accessToken;
     if (currentAccess !== rotated.baseAccessToken && currentAccess !== rotated.token.accessToken) {
       throw new Error("stale OAuth refresh result");

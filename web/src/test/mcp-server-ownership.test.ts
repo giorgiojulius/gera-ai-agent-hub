@@ -4,7 +4,12 @@ const { authedFetchMock } = vi.hoisted(() => ({ authedFetchMock: vi.fn() }));
 
 vi.mock("@/lib/backend", async (importActual) => {
   const actual = await importActual<typeof import("@/lib/backend")>();
-  return { ...actual, authedFetch: authedFetchMock };
+  return {
+    ...actual,
+    authedFetch: authedFetchMock,
+    authedFetchForSession: (path: string, _session: string, init?: RequestInit) =>
+      authedFetchMock(path, init),
+  };
 });
 
 import { serializeProfile } from "@/lib/chat-sync";

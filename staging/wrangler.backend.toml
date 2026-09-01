@@ -1,0 +1,35 @@
+name = "gera-persistence-staging"
+main = "backend-entry.ts"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[vars]
+STAGING_VERSION = "A"
+
+[[durable_objects.bindings]]
+name = "ACCESS_REGISTRY"
+class_name = "AccessRegistry"
+
+[[durable_objects.bindings]]
+name = "ARENA_STORE"
+class_name = "ArenaStore"
+
+[[durable_objects.bindings]]
+name = "CHAT_STORE"
+class_name = "ChatStore"
+
+[[durable_objects.bindings]]
+name = "PROJECT_STORE"
+class_name = "ProjectStore"
+
+[[durable_objects.bindings]]
+name = "REPO_PREVIEW_STORE"
+class_name = "RepoPreviewStore"
+
+[[durable_objects.bindings]]
+name = "SHARE_STORE"
+class_name = "ShareStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AccessRegistry", "ArenaStore", "ChatStore", "ProjectStore", "RepoPreviewStore", "ShareStore"]

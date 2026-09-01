@@ -24,9 +24,10 @@ import {
   cloudMcpFunctionName,
   connectCloudMcp,
   ensureFreshCloudOAuth,
-  forceRefreshCloudOAuth,
+  forceRefreshCloudOAuthOutcome,
   type CloudMcpServer,
   type CloudMcpSession,
+  type CloudOAuthRefreshOutcome,
   type RefreshedOAuth,
 } from "./mcp-cloud";
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
@@ -312,12 +313,16 @@ function armNativeServer(runtime: McpRuntime, server: CloudMcpServer): void {
 export async function armCloudMcp(
   servers: CloudMcpServer[],
   persist?: (rotation: RefreshedOAuth) => Promise<void>,
+  reportFailure?: (serverId: string, outcome: Exclude<CloudOAuthRefreshOutcome, { ok: true }>) => Promise<void>,
 ): Promise<McpRuntime> {
   const runtime = emptyMcpRuntime();
   for (const server of servers) {
     if (server.oauth) {
       try {
-        await ensureFreshCloudOAuth(server, runtime.refreshed, persist);
+        const outcome = await ensureFreshCloudOAuth(server, runtime.refreshed, persist);
+        if (outcome && !outcome.ok) {
+          await reportFailure?.(server.id, outcome);
+        }
       } catch {
         // keep the synced token — a real auth failure surfaces honestly below
       }
@@ -339,8 +344,11 @@ export async function armCloudMcp(
           // the refresh token once and retry — mirrors the browser's 401
           // replay, so a sleeping sign-in repairs instead of failing.
           if (message.includes("auth rejected") && server.oauth?.refreshToken) {
-            const repaired = await forceRefreshCloudOAuth(server, runtime.refreshed, persist).catch(() => false);
-            if (repaired) {
+            const outcome = await forceRefreshCloudOAuthOutcome(server, runtime.refreshed, persist).catch(() => null);
+            if (outcome && !outcome.ok) {
+              await reportFailure?.(server.id, outcome);
+            }
+            if (outcome?.ok) {
               try {
                 return { server, connection: await connectCloudMcp(server) };
               } catch (retryError) {

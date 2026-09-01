@@ -409,7 +409,9 @@ function normalizeAccess(raw: unknown): AgentAccess {
 
 function secretFlags(secrets: AgentSecrets): AgentSecretFlags {
   return {
-    github: typeof secrets.githubToken === "string" && secrets.githubToken.length > 0,
+    github:
+      (typeof secrets.githubToken === "string" && secrets.githubToken.length > 0) ||
+      Boolean(secrets.githubAccount),
     intercom: typeof secrets.intercomToken === "string" && secrets.intercomToken.length > 0,
     slack: typeof secrets.slackToken === "string" && secrets.slackToken.length > 0,
     slackSigning: typeof secrets.slackSigningSecret === "string" && secrets.slackSigningSecret.length > 0,
@@ -425,6 +427,18 @@ function parseSecrets(raw: string): AgentSecrets {
     const out: AgentSecrets = {};
     if (typeof parsed.githubToken === "string" && parsed.githubToken.length > 0) {
       out.githubToken = parsed.githubToken;
+    }
+    if (
+      isRecord(parsed.githubAccount) &&
+      typeof parsed.githubAccount.owner === "string" &&
+      typeof parsed.githubAccount.serverId === "string" &&
+      parsed.githubAccount.owner.length > 0 &&
+      parsed.githubAccount.serverId.length > 0
+    ) {
+      out.githubAccount = {
+        owner: parsed.githubAccount.owner.trim().toLowerCase(),
+        serverId: parsed.githubAccount.serverId.slice(0, 80),
+      };
     }
     if (typeof parsed.intercomToken === "string" && parsed.intercomToken.length > 0) {
       out.intercomToken = parsed.intercomToken;
@@ -1650,6 +1664,18 @@ export class ProjectStore extends DurableObject {
     applySecret("githubToken", incoming.githubToken);
     if (secrets.githubToken) {
       secrets.githubToken = secrets.githubToken.replace(/^Bearer\s+/i, "");
+    }
+    if (incoming.githubAccount === null) {
+      delete secrets.githubAccount;
+    } else if (
+      isRecord(incoming.githubAccount) &&
+      incoming.githubAccount.owner === me.email &&
+      typeof incoming.githubAccount.serverId === "string" &&
+      incoming.githubAccount.serverId.length > 0 &&
+      incoming.githubAccount.serverId.length <= 80
+    ) {
+      secrets.githubAccount = { owner: me.email, serverId: incoming.githubAccount.serverId };
+      delete secrets.githubToken;
     }
     applySecret("intercomToken", incoming.intercomToken);
     applySecret("slackToken", incoming.slackToken);
@@ -3743,6 +3769,16 @@ export class ProjectStore extends DurableObject {
         : undefined;
     const selectionRefs = selection?.servers ?? [];
     const plan = planAgentTools(access, secretFlags(secrets), selectionRefs.length);
+    let accountGitHubAuth = "";
+    if (access.github !== "off" && !secrets.githubToken && secrets.githubAccount) {
+      const linkedMember = this.loadMember(secrets.githubAccount.owner);
+      if (linkedMember && canManageProject(this.memberRole(linkedMember))) {
+        accountGitHubAuth = await this.resolveOwnerAuth(
+          secrets.githubAccount.owner,
+          secrets.githubAccount.serverId,
+        );
+      }
+    }
     const tools: EngineToolDef[] = [
       ...builtinToolDefs({
         web_search: plan.webEnabled,
@@ -3757,7 +3793,7 @@ export class ProjectStore extends DurableObject {
     for (const planned of plan.native) {
       const token =
         planned.kind === "github"
-          ? secrets.githubToken ?? ""
+          ? secrets.githubToken ?? accountGitHubAuth
           : planned.kind === "intercom"
             ? secrets.intercomToken ?? ""
             : secrets.slackToken ?? "";
@@ -3875,6 +3911,36 @@ export class ProjectStore extends DurableObject {
       mcpNote = `\nExternal MCP servers (linked through ${selection.owner}'s account):\n${noteLines.join("\n")}`;
     }
     return { tools, routes, plan, access, mcpNote };
+  }
+
+  /** Resolves one native account credential without copying it into this project. */
+  private async resolveOwnerAuth(owner: string, serverId: string): Promise<string> {
+    const doBinding = this.workerEnv.DO;
+    if (!doBinding) {
+      return "";
+    }
+    try {
+      const headers = new Headers({
+        "Content-Type": "application/json",
+        "X-Rork-DO-Class": "ChatStore",
+        "X-Rork-DO-Id": chatShardId(owner),
+        "X-Gera-Email": encodeURIComponent(owner),
+      });
+      const response = await doBinding.fetch(
+        new Request("https://gera.internal/mcp/auth-lease", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ serverId, catalogId: "github" }),
+        }),
+      );
+      if (!response.ok) {
+        return "";
+      }
+      const data = (await response.json().catch(() => ({}))) as { authorization?: unknown };
+      return typeof data.authorization === "string" ? data.authorization : "";
+    } catch {
+      return "";
+    }
   }
 
   /**

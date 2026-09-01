@@ -154,6 +154,8 @@ type SyncResponse = {
   want?: string[];
   tombstones?: Array<{ id: string; deletedAt: number }>;
   skipped?: string[];
+  /** Tombstones the server actually applied or consciously overruled. */
+  deleteAck?: string[];
   /** Threads owned by a live server run this cycle — the protocol re-wants them later. */
   locked?: string[];
   more?: boolean;
@@ -264,6 +266,8 @@ export async function runChatSync(input: {
   profile?: { updatedAt: number; payload: string | null; dirty: boolean };
   /** Pins every round/retry to the account that produced this payload. */
   authSessionNonce?: string;
+  /** First authenticated cycle: read durable state before sending any mutation. */
+  bootstrapOnly?: boolean;
 }): Promise<ChatSyncResult> {
   const ensureCurrentSession = (): void => {
     if (input.authSessionNonce && !isAuthSessionCurrent(input.authSessionNonce)) {
@@ -282,12 +286,17 @@ export async function runChatSync(input: {
   const refused = new Set<string>();
   let pushedCount = 0;
   let moreLeft = false;
+  let unackedDeletes = false;
 
-  let deletesToSend = Object.entries(input.tombstones).map(([id, deletedAt]) => ({ id, deletedAt }));
+  let deletesToSend = input.bootstrapOnly
+    ? []
+    : Object.entries(input.tombstones).map(([id, deletedAt]) => ({ id, deletedAt }));
 
   const profileInput = input.profile;
   let profileSettled = !profileInput;
-  let sendProfilePayload = Boolean(profileInput?.dirty && profileInput.payload !== null);
+  let sendProfilePayload = Boolean(
+    !input.bootstrapOnly && profileInput?.dirty && profileInput.payload !== null,
+  );
   let profileApplied: { updatedAt: number; payload: string } | undefined;
   let profileAckedAt: number | undefined;
   let oauthAdopted = 0;
@@ -339,7 +348,9 @@ export async function runChatSync(input: {
     const profileBody =
       profileInput && !profileSettled
         ? {
-            updatedAt: profileInput.updatedAt,
+            // A bootstrap advertises no local authority. The server must either
+            // return its durable profile or confirm that no baseline exists.
+            updatedAt: input.bootstrapOnly ? 0 : profileInput.updatedAt,
             ...(sendProfilePayload && profileInput.payload !== null
               ? { payload: profileInput.payload }
               : {}),
@@ -370,10 +381,20 @@ export async function runChatSync(input: {
     const data = await parseOrThrow<SyncResponse>(response, "Sync failed");
     ensureCurrentSession();
 
-    // The server applied (or consciously overruled) everything we sent.
+    // Drop only explicit acknowledgements. Older servers and capped batches
+    // cannot make an unprocessed tombstone disappear from this device.
+    const deleteAck = new Set(
+      (data.deleteAck ?? []).filter((id): id is string => typeof id === "string"),
+    );
     for (const item of deletesToSend) {
-      acked.add(item.id);
+      if (deleteAck.has(item.id)) {
+        acked.add(item.id);
+      } else {
+        unackedDeletes = true;
+      }
     }
+    // Locked/unprocessed entries remain in local tombstone storage and retry
+    // on the next sync, rather than spinning all rounds in this one cycle.
     deletesToSend = [];
     for (const item of push) {
       pendingPush.delete(item.id);
@@ -388,6 +409,11 @@ export async function runChatSync(input: {
 
     for (const item of data.pull ?? []) {
       if (!item || typeof item.id !== "string" || typeof item.payload !== "string") {
+        continue;
+      }
+      // A pending local deletion is intentionally absent from bootstrap. Do
+      // not paint the server copy back into UI before its tombstone is sent.
+      if (input.tombstones[item.id] !== undefined) {
         continue;
       }
       if (running.has(item.id) || typeof item.updatedAt !== "number") {
@@ -421,6 +447,7 @@ export async function runChatSync(input: {
 
     for (const id of data.want ?? []) {
       if (
+        !input.bootstrapOnly &&
         typeof id === "string" &&
         !running.has(id) &&
         !refused.has(id) &&
@@ -455,7 +482,7 @@ export async function runChatSync(input: {
       ) {
         profileApplied = { updatedAt: data.profile.updatedAt, payload: data.profile.payload };
         profileSettled = true;
-      } else if (data.profileWant === true && profileInput.payload !== null) {
+      } else if (data.profileWant === true && profileInput.payload !== null && !input.bootstrapOnly) {
         sendProfilePayload = true; // the next round carries the blob
       } else {
         profileSettled = true; // clocks equal — nothing to exchange
@@ -476,6 +503,6 @@ export async function runChatSync(input: {
     profileApplied,
     profileAckedAt,
     oauthAdopted,
-    incomplete: moreLeft || pendingPush.size > 0 || !profileSettled,
+    incomplete: moreLeft || pendingPush.size > 0 || !profileSettled || unackedDeletes,
   };
 }

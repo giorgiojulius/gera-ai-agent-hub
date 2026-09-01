@@ -44,7 +44,7 @@ export function isTextLikeFile(file: File): boolean {
 
 /** Trims text at `cap` with an honest marker; strips NUL bytes. */
 export function capKnowledgeText(raw: string, cap: number = MAX_FILE_CHARS): string {
-  const clean = raw.replace(/\u0000/g, "");
+  const clean = raw.split("\u0000").join("");
   if (clean.length <= cap) {
     return clean;
   }
@@ -56,7 +56,7 @@ export function capKnowledgeText(raw: string, cap: number = MAX_FILE_CHARS): str
  * It is the honest offline fallback when the cloud copy is unreachable.
  */
 export function makeLocalExcerpt(full: string): string {
-  const clean = full.replace(/\u0000/g, "");
+  const clean = full.split("\u0000").join("");
   if (clean.length <= LOCAL_EXCERPT_CHARS) {
     return clean;
   }

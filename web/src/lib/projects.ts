@@ -277,6 +277,8 @@ export const PROJECT_MESSAGE_LIMIT = 8_000;
 /** Secrets patch semantics: non-empty string replaces, "" keeps, null clears. */
 export type AgentSecretsPatch = {
   githubToken?: string | null;
+  /** Link the saving admin's account-owned GitHub grant; no token crosses the browser. */
+  githubFromAccount?: boolean;
   intercomToken?: string | null;
   slackToken?: string | null;
   slackSigningSecret?: string | null;

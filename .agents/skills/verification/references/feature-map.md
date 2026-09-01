@@ -9,7 +9,8 @@ attachment image shrink, stop/steering hardening, GitHub run credential
 hand-off + pin/access fixes, truthful MCP health + OAuth/account-session/
 sleep/deploy-resume hardening, authenticated file reads, Intercom
 attachments, full 98-entry MCP audit, the four-model primary picker with
-More, and the live code Changes / Preview workbench)
+More, fixed-position screen assistant panels, and the live code Changes /
+Preview workbench)
 Drift check: `git log --oneline 32e3559..HEAD`, then compare against
 `web/src/App.tsx` (routes), `StudioPageShell.tsx` (tabs), `testids.ts`,
 `e2e/scenarios.ts`, `functions/index.ts` (worker routes).
@@ -766,12 +767,11 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   replies yet ("Other Intercom teammates", POST `/intercom/stats/link`). Admins
   see the whole team; members and summary metrics expose ONLY their own linked
   replies — grades are coaching, not a public scoreboard. **AI assistant** — a floating live-chat
-  launcher + panel (`screen-desk-assistant`, Intercom-messenger style,
-  bottom-right). On desktop the open panel (`screen-desk-assistant-panel`)
-  is drag & movable by its header (`screen-desk-assistant-handle`): offset
-  clamped to the viewport (`panel-position.ts`), seat persisted in
-  localStorage, double-click resets to the corner, window resize re-clamps;
-  on mobile the sheet stays fixed. PRIVATE chat per member (3.5s poll only while open,
+  launcher + fixed-position panel (`screen-desk-assistant`, Intercom-messenger
+  style, bottom-right). The open panel (`screen-desk-assistant-panel`) stays
+  anchored in its corner on desktop and mobile; it has no drag handle, move
+  gesture, position persistence, or movement tooltip. PRIVATE chat per member
+  (3.5s poll only while open,
   pending "thinking…" row), an "Attach conv #id" chip makes the SERVER
   fetch the live transcript into the run (client-supplied context is never
   trusted); **Post to channel** — a third composer target beside

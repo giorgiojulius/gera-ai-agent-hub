@@ -113,10 +113,8 @@ export const TID = {
   screenDeskDetails: "screen-desk-details",
   /** Floating live-chat launcher for the desk's AI assistant. */
   screenDeskAssistant: "screen-desk-assistant",
-  /** The assistant's floating panel (open state) — draggable on desktop. */
+  /** The assistant's fixed floating panel (open state). */
   screenDeskAssistantPanel: "screen-desk-assistant-panel",
-  /** Header of the assistant panel — the drag handle (double-click resets). */
-  screenDeskAssistantHandle: "screen-desk-assistant-handle",
   /** Gera's reply-suggestion strip above the desk composer. */
   screenDeskSuggest: "screen-desk-suggest",
   /** Header button opening the desk's team-performance panel. */

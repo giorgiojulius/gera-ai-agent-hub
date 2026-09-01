@@ -511,9 +511,16 @@ async function resolveAccountPrincipal(request: Request, env: Env): Promise<Acco
     response = await principalRegistryCall(env, request.url, userId, currentEmail, false);
     raw = (await response.json().catch(() => ({}))) as Partial<AccountPrincipal> & { error?: unknown };
     if (response.status === 404 && raw.error === "principal_unclaimed") {
-      const hasLegacyData = await ownerHasLegacyData(env, request.url, currentEmail);
-      if (hasLegacyData) {
-        return corsJson({ error: "legacy_owner_verification_required" }, 409);
+      // Invited members (the seed admin included) claim their own legacy shard
+      // on first contact — the invite registry is the operator-approved list of
+      // identities, so this cannot lock out existing users after rollout. The
+      // recycled-email fail-closed gate stays for everyone not on the list.
+      const invited = await isInvitedCached(env, request.url, currentEmail);
+      if (!invited) {
+        const hasLegacyData = await ownerHasLegacyData(env, request.url, currentEmail);
+        if (hasLegacyData) {
+          return corsJson({ error: "legacy_owner_verification_required" }, 409);
+        }
       }
       response = await principalRegistryCall(env, request.url, userId, currentEmail, true);
       raw = (await response.json().catch(() => ({}))) as Partial<AccountPrincipal> & { error?: unknown };

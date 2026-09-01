@@ -1274,6 +1274,40 @@ export class ChatStore extends DurableObject {
     }
   }
 
+  /**
+   * Non-secret snapshot of everything that decides whether one id can
+   * authenticate: usable grant, raw grant row (even when tombstoned), an
+   * active revocation tombstone, a stored manual secret, and the state
+   * marker. Powers `server_auth_missing` detail — never token material.
+   */
+  private oauthDiagnostic(
+    owner: string,
+    serverId: string,
+  ): { id: string; grantPresent: boolean; grantRow: boolean; revoked: boolean; secret: boolean; state: string } {
+    const grantRow = this.ctx.storage.sql
+      .exec<{ present: number }>(
+        "SELECT 1 AS present FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ? LIMIT 1",
+        owner,
+        serverId,
+      )
+      .toArray()[0];
+    const revoked = this.ctx.storage.sql
+      .exec<{ present: number }>(
+        "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
+        owner,
+        serverId,
+      )
+      .toArray()[0];
+    return {
+      id: serverId,
+      grantPresent: Boolean(grantRow && !revoked),
+      grantRow: Boolean(grantRow),
+      revoked: Boolean(revoked),
+      secret: Object.keys(this.mcpServerSecret(owner, serverId)).length > 0,
+      state: this.oauthGrantState(owner, serverId),
+    };
+  }
+
   private oauthGrantState(owner: string, serverId: string): string {
     return this.ctx.storage.sql
       .exec<{ state: string }>(
@@ -1542,21 +1576,25 @@ export class ChatStore extends DurableObject {
         JSON.stringify(token),
         Date.now(),
       );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = 'github'",
-        owner,
-      );
       // Latest credential wins: a fresh sign-in supersedes any pasted PAT or
       // legacy-migrated token, which the auth lease would otherwise prefer
       // forever (stale read-only/dead tokens made GitHub look read-only).
+      // Clear tombstones and blocked markers for EVERY id this account's
+      // GitHub connector can resolve through — an instance-id tombstone or a
+      // stale reauth marker must never outlive a successful re-sign-in.
       for (const staleId of this.githubConnectorIds(owner)) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
+          owner,
+          staleId,
+        );
         this.ctx.storage.sql.exec(
           "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
           owner,
           staleId,
         );
+        this.markOAuthReady(owner, staleId);
       }
-      this.markOAuthReady(owner, "github");
       this.ctx.storage.sql.exec(
         "UPDATE mcp_github_device_pending SET status = 'completed', error = '', updated_at = ? WHERE owner_email = ? AND flow_id = ?",
         Date.now(),
@@ -2250,11 +2288,7 @@ export class ChatStore extends DurableObject {
     if (servers.length === 0) {
       // Metadata only — which ids were consulted and why they cannot arm.
       // Never any token material.
-      const detail = grantIds.map((id) => ({
-        id,
-        grantPresent: storedGrants.has(id),
-        state: this.oauthGrantState(owner, id),
-      }));
+      const detail = grantIds.map((id) => this.oauthDiagnostic(owner, id));
       return json({ error: "server_auth_missing", detail }, 400);
     }
     const appliedChains = new Map<string, string[]>();
@@ -2534,11 +2568,7 @@ export class ChatStore extends DurableObject {
     if (!grantId) {
       // Metadata only — never token material. Tells the caller exactly which
       // ids were consulted and why each one cannot authenticate.
-      const detail = ids.map((id) => ({
-        id,
-        grantPresent: storedGrants.has(id),
-        state: this.oauthGrantState(owner, id),
-      }));
+      const detail = ids.map((id) => this.oauthDiagnostic(owner, id));
       return json({ error: "server_auth_missing", detail }, 404);
     }
     const grant = tokens[grantId];

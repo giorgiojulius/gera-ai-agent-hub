@@ -45,7 +45,7 @@ import { resolveMessagesForApi, vaultDataUrl } from "@/lib/media-vault";
 import { buildSkillsBlock, filterSkillsByIds, skillPinnedServerIds, skillsForSurface } from "@/lib/skills";
 import { applySkillOps, buildSkillsEditorContext, extractSkillOps } from "@/lib/skill-ops";
 import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerableRun, watchSteering } from "@/lib/steering";
-import { McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
+import { McpAccountAuthError, McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
 import { hasOAuthRefreshToken, hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
 import {
   IMAGE_EDIT_MODEL,
@@ -1079,6 +1079,7 @@ export async function sendPrompt(params: {
       reconcileServerClock(params.setState, seeded.id, done.chatUpdatedAt);
       if (done.status === "error") {
         turnFailed = true;
+        logServerRunFailure(done);
         toast.error("The run failed on the server", {
           description: done.error ?? "Unknown error — the collected draft is shown as-is.",
         });
@@ -1203,6 +1204,7 @@ export async function sendPrompt(params: {
     reconcileServerClock(params.setState, seeded.id, done.chatUpdatedAt);
     if (done.status === "error") {
       turnFailed = true;
+      logServerRunFailure(done);
       toast.error("The run failed on the server", {
         description: done.error ?? "Unknown error — the collected draft is shown as-is.",
       });
@@ -1478,6 +1480,7 @@ export async function resumePrompt(params: {
     reconcileServerClock(params.setState, conversationId, done.chatUpdatedAt);
     if (done.status === "error") {
       turnFailed = true;
+      logServerRunFailure(done);
       toast.error("Could not continue the reply", {
         description: done.error ?? "Unknown error — the collected draft is shown as-is.",
       });
@@ -1545,6 +1548,11 @@ export async function resumePrompt(params: {
     }
     params.onDone?.(conversationId, manualStop, executionOutcome);
   }
+}
+
+/** Cloud runs settle as status=error instead of throwing — still journal them. */
+function logServerRunFailure(done: ServerRunDone): void {
+  logDiagnostic("chat", done.error ?? "The run failed on the server");
 }
 
 // ---------------------------------------------------------------------------
@@ -1665,6 +1673,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
       reconcileServerClock(params.setState, conversationId, done.chatUpdatedAt);
       void ackServerRun(run.runId);
       if (done.status === "error") {
+        logServerRunFailure(done);
         toast.error("The run failed on the server", {
           description: done.error ?? "The collected draft is shown as-is.",
         });
@@ -1729,6 +1738,9 @@ async function applyFinishedServerRun(run: ActiveServerRun, params: AdoptParams)
   const patch = await settleDone(done);
   makePatcher(params.setState, run.conversationId, messageId)({ ...patch, pending: undefined });
   reconcileServerClock(params.setState, run.conversationId, done.chatUpdatedAt);
+  if (done.status === "error") {
+    logServerRunFailure(done);
+  }
   return true;
 }
 
@@ -1819,6 +1831,9 @@ export async function reconnectMcp(
       ),
     }));
     toast.error(`${server.name} did not connect`, { description: message });
+    if (!(error instanceof McpAccountAuthError)) {
+      logDiagnostic("mcp", error);
+    }
   }
 }
 
@@ -1834,7 +1849,7 @@ const mcpRevalidationInFlight = new Set<string>();
  */
 export function isRecoverableMcpHealthError(error: unknown): boolean {
   const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  return /(?:gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response|sign-in is missing|authorize this server again|needs a fresh API token|Bearer token is missing|needs an API key)/i.test(
+  return /(?:gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response|sign-in is missing)/i.test(
     message,
   );
 }
@@ -1974,6 +1989,9 @@ async function revalidateQuietly(
     // A failed Gera refresh, relay outage, sleeping network, provider 5xx, or
     // rate limit says nothing about the saved provider credential. Keep the
     // connector armed and retry on a later health tick.
+    if (error instanceof McpAccountAuthError) {
+      return;
+    }
     if (!(error instanceof McpAuthError) && isRecoverableMcpHealthError(error)) {
       return;
     }
@@ -1986,6 +2004,7 @@ async function revalidateQuietly(
           : item,
       ),
     }));
+    logDiagnostic("mcp", error);
     if (error instanceof McpAuthError) {
       toast.error(`${server.name} disconnected`, { description: message });
     }
@@ -2036,6 +2055,7 @@ export async function oauthConnectMcp(
       ),
     }));
     toast.error(`${server.name} sign-in failed`, { description: message });
+    logDiagnostic("mcp", error);
     return;
   }
   if (oauthAttempts.get(server.id) !== attempt) {

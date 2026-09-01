@@ -41,6 +41,20 @@ let flushTimer: number | null = null;
 let pulling = false;
 const listeners = new Set<() => void>();
 
+/** Test-only: empties the in-memory journal and cancels a pending upload. */
+export function resetDiagnosticsForTests(): void {
+  entries = [];
+  seenAt = 0;
+  pending = [];
+  pulling = false;
+  if (flushTimer !== null) {
+    if (typeof window !== "undefined") {
+      window.clearTimeout(flushTimer);
+    }
+    flushTimer = null;
+  }
+}
+
 function notify(): void {
   for (const listener of listeners) {
     listener();
@@ -102,7 +116,12 @@ export function clearDiagnostics(): void {
 }
 
 function scheduleFlush(): void {
-  if (typeof window === "undefined" || flushTimer !== null || pending.length === 0) {
+  if (
+    typeof window === "undefined" ||
+    typeof window.setTimeout !== "function" ||
+    flushTimer !== null ||
+    pending.length === 0
+  ) {
     return;
   }
   flushTimer = window.setTimeout(() => {
@@ -241,7 +260,11 @@ export function logDiagnostic(scope: string, error: unknown, detail?: string): v
   entries = [entry, ...entries].slice(0, MAX_ENTRIES);
   pending = [...pending, entry].slice(-PENDING_LIMIT);
   notify();
-  scheduleFlush();
+  try {
+    scheduleFlush();
+  } catch {
+    // A missing timer in tests or odd runtimes must never hide the journal row.
+  }
 }
 
 let installed = false;

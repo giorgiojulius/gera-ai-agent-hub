@@ -156,6 +156,12 @@ describe("honest MCP auth status", () => {
     expect(isRecoverableMcpHealthError("GitHub sign-in is missing — sign in again or paste a PAT.")).toBe(true);
   });
 
+  it("does not treat a real missing API key as a transient health blip", () => {
+    expect(isRecoverableMcpHealthError("This server needs an API key.")).toBe(false);
+    expect(isRecoverableMcpHealthError("Bearer token is missing.")).toBe(false);
+    expect(isRecoverableMcpHealthError("Authorize this server again.")).toBe(false);
+  });
+
   it("accepts the same card once the synced OAuth grant has been adopted", () => {
     const adopted = adoptProfileOAuthTokens({
       github: {

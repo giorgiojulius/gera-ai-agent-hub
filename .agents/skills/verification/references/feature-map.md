@@ -1,6 +1,7 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-01 · commit `cc440c7` (+ Gera-chat GitHub writes on by
+Last synced: 2026-09-01 · commit `4a0fa26` (+ Diagnostics journals cloud-run
+  failures and real MCP disconnects again, Gera-chat GitHub writes on by
   default, MCP no longer asks to reconnect when the browser has no local
   grant, Rork-hosted immutable web-
 repository launches, evidence-backed autonomous execution outcomes for
@@ -948,7 +949,10 @@ Requires `role === "admin"` from `/access/status`; others see an honest
 - **People** — members, roles, invites, the waitlist (approve/reject).
 - **Arena** — model standings, blind duels (ArenaStudio), usage stats with
   service-call split, usage clear.
-- **Diagnostics** — client/worker error journal (`/diag`), clearable.
+- **Diagnostics** — client/worker error journal (`/diag`), clearable. Cloud
+  runs that finish as `error` (they no longer throw in the tab) still land in
+  the journal, as do real MCP disconnects and failed sign-ins. Transient Gera
+  relay/account blips and a missing browser grant stay silent.
 
 ## Sharing (`/s/:shareId`)
 

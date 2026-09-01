@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-08-31 · commit `32e3559` (+ Rork-hosted immutable web-
+Last synced: 2026-09-01 · commit `32e3559` (+ Rork-hosted immutable web-
 repository launches, evidence-backed autonomous execution outcomes for
 Automations and project agents, quiet no-change checks, Luna suggestion
 model, fable back in chat, note @-mentions, explicit
@@ -860,6 +860,12 @@ the provider consumed its refresh token but before the response reached
 localStorage, the new bundle presents the old base and receives the durable tip
 without another provider redeem. The endpoint is identity/invite gated,
 no-store, URL-safe, CAS-protected against fresh sign-ins, and `keepalive`-eligible.
+A provider HTTP 400/409 classified by that endpoint as non-transient is treated
+as a dead grant even when its code is only `request_failed`: the browser checks
+the durable rotation chain once, then adopts its tip or clears the stale pair.
+If that check is temporarily unavailable, the same retained pair gets a
+one-minute retry cooldown, preventing background health/visibility wakes from
+flooding `/mcp/oauth-refresh`; a publish-lost fetch remains immediately replayable.
 Expired DCR registrations (client_secret_expires_at) re-register instead of
 failing from cache.
 
@@ -951,9 +957,9 @@ Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message t
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
-OAuth/session/file-content suites. Full verification on 2026-08-31: 739 unit
-checks, 23 browser checks, web build, Worker deploy, live preview/ping and
-unauthenticated relay-gate smoke probes all passed.
+OAuth/session/file-content suites. Full verification on 2026-09-01: 763 unit
+checks, 26 browser checks, web build/deploy and live preview smoke passed; the
+Worker was unchanged, and its public health/auth-gate smoke remained green.
 
 ## Settings (`/settings`)
 

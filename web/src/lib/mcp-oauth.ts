@@ -59,11 +59,13 @@ type CallbackPayload = {
 
 class OAuthTokenError extends Error {
   readonly code: string;
+  readonly isFatal: boolean;
 
-  constructor(message: string, code: string) {
+  constructor(message: string, code: string, isFatal: boolean = false) {
     super(message);
     this.name = "OAuthTokenError";
     this.code = code;
+    this.isFatal = isFatal;
   }
 }
 
@@ -91,6 +93,9 @@ const EXPIRY_SKEW_MS = 60_000;
 const CLOSED_POPUP_GRACE_MS = 10 * 60_000;
 
 const refreshInFlight = new Map<string, Promise<string | null>>();
+const REFRESH_FAILURE_COOLDOWN_MS = 60_000;
+type RefreshFailureCooldown = { grant: StoredToken; retryAfter: number };
+const refreshFailureCooldowns = new Map<string, RefreshFailureCooldown>();
 let oauthOperationGeneration = 0;
 
 /** Same-tab generation plus the persistent account boundary shared across tabs. */
@@ -103,6 +108,7 @@ export type OAuthOperationBoundary = {
 export function invalidateOAuthOperations(): void {
   oauthOperationGeneration += 1;
   refreshInFlight.clear();
+  refreshFailureCooldowns.clear();
 }
 
 /** Snapshot used by popup/device/refresh flows before their first await. */
@@ -335,6 +341,7 @@ function commitTokenChanges(
   }
   const tokens = loadTokens();
   for (const [serverId, token] of Object.entries(changes)) {
+    refreshFailureCooldowns.delete(serverId);
     if (token) {
       tokens[serverId] = token;
     } else {
@@ -682,6 +689,16 @@ function refreshServerToken(serverId: string): Promise<string | null> {
   if (!stored?.refreshToken) {
     return Promise.resolve(null);
   }
+  const cooldown = refreshFailureCooldowns.get(serverId);
+  if (cooldown) {
+    if (!sameStoredGrant(cooldown.grant, stored)) {
+      refreshFailureCooldowns.delete(serverId);
+    } else if (Date.now() < cooldown.retryAfter) {
+      return Promise.resolve(null);
+    } else {
+      refreshFailureCooldowns.delete(serverId);
+    }
+  }
   const task = withCrossTabOAuthLock(refreshLockName(stored), async (): Promise<string | null> => {
     if (!isOAuthOperationCurrent(boundary)) {
       return null;
@@ -711,7 +728,7 @@ function refreshServerToken(serverId: string): Promise<string | null> {
       if (!isOAuthOperationCurrent(boundary)) {
         return null;
       }
-      if (error instanceof OAuthTokenError && FATAL_REFRESH_CODES.has(error.code)) {
+      if (error instanceof OAuthTokenError && (error.isFatal || FATAL_REFRESH_CODES.has(error.code))) {
         const sibling = loadTokens()[serverId];
         if (sibling?.accessToken && !sameStoredGrant(sibling, stored)) {
           return sibling.accessToken;
@@ -733,7 +750,20 @@ function refreshServerToken(serverId: string): Promise<string | null> {
         // keeps the grant for the next deploy-safe retry.
         if (rescued.status === "missing" && sameStoredGrant(latest, stored)) {
           commitTokenChanges({ [serverId]: null });
+          return null;
         }
+      }
+      const latest = loadTokens()[serverId];
+      if (error instanceof OAuthTokenError && sameStoredGrant(latest, stored)) {
+        // A provider/relay HTTP rejection may be observed by several mounted
+        // cards or visibility wakes. Keep deploy-safe grants, but do not hammer
+        // the account shard with the same pair until a short cooldown. A fetch
+        // that vanished during publish is deliberately not cooled down: the
+        // next bundle must immediately replay and adopt the durable winner.
+        refreshFailureCooldowns.set(serverId, {
+          grant: stored,
+          retryAfter: Date.now() + REFRESH_FAILURE_COOLDOWN_MS,
+        });
       }
       return null;
     }
@@ -1247,6 +1277,7 @@ async function refreshAccessToken(serverId: string, stored: StoredToken): Promis
     token?: unknown;
     error?: unknown;
     error_description?: unknown;
+    transient?: unknown;
   };
   const token = parseStoredToken(data.token);
   if (!response.ok || !token) {
@@ -1255,7 +1286,14 @@ async function refreshAccessToken(serverId: string, stored: StoredToken): Promis
       (typeof data.error_description === "string" && data.error_description) ||
       code ||
       `token request failed (${response.status})`;
-    throw new OAuthTokenError(`Sign-in failed: ${detail}`, code);
+    // This authenticated endpoint already classifies provider failures. A
+    // non-transient 400/409 means the stored grant cannot be redeemed (even
+    // when the provider supplied only the generic `request_failed` code).
+    // Treat it like invalid_grant so the rotation rescue can reconcile it once
+    // instead of retrying the same pair on every background health check.
+    const isFatal =
+      data.transient !== true && (response.status === 400 || response.status === 409);
+    throw new OAuthTokenError(`Sign-in failed: ${detail}`, code, isFatal);
   }
   if (
     token.clientId !== stored.clientId ||

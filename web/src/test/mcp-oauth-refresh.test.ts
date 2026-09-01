@@ -30,6 +30,7 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
   let dispatchEvent: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    invalidateOAuthOperations();
     store = new Map<string, string>();
     dispatchEvent = vi.fn();
     const storage = {
@@ -335,6 +336,61 @@ describe("refresh survival (web/src/lib/mcp-oauth)", () => {
     const header = await forceRefreshOAuthHeader("dead");
     expect(header).toBeNull();
     expect(storedToken("dead")).toBeUndefined();
+  });
+
+  it("treats a backend-classified generic 400 as a dead grant", async () => {
+    seedToken("generic-dead", "A", "RA");
+    let refreshAttempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+        if (String(input).includes("/mcp/oauth-refresh")) {
+          refreshAttempts += 1;
+          return new Response(JSON.stringify({ error: "request_failed", transient: false }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ rotations: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    await expect(forceRefreshOAuthHeader("generic-dead")).resolves.toBeNull();
+    expect(refreshAttempts).toBe(1);
+    expect(storedToken("generic-dead")).toBeUndefined();
+  });
+
+  it("cooldowns a retained grant instead of repeating the same failed refresh", async () => {
+    seedToken("cooldown", "A", "RA");
+    let refreshAttempts = 0;
+    let rotationLookups = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+        if (String(input).includes("/mcp/oauth-refresh")) {
+          refreshAttempts += 1;
+          return new Response(JSON.stringify({ error: "invalid_grant", transient: false }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        rotationLookups += 1;
+        return new Response(JSON.stringify({ error: "upstream_unreachable" }), {
+          status: 502,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    await expect(forceRefreshOAuthHeader("cooldown")).resolves.toBeNull();
+    await expect(forceRefreshOAuthHeader("cooldown")).resolves.toBeNull();
+    await expect(forceRefreshOAuthHeader("cooldown")).resolves.toBeNull();
+    expect(refreshAttempts).toBe(1);
+    expect(rotationLookups).toBe(1);
+    expect(storedToken("cooldown")?.refreshToken).toBe("RA");
   });
 
   it("keeps the stored pair on transient refresh failures", async () => {

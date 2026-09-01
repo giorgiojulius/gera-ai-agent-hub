@@ -29,6 +29,7 @@ import {
   normalizeOAuthOverride,
   overlayOAuthRotations,
   unlockGithubChatWrites,
+  type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
@@ -171,6 +172,9 @@ type LiveRun = {
 type ManagerEnv = {
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
   RORK_TOOLKIT_SECRET_KEY?: string;
+  /** Test-only deterministic gateway; production leaves both unset. */
+  STAGING_GATEWAY_URL?: string;
+  STAGING_GATEWAY_SECRET?: string;
 };
 
 function json(data: unknown, status = 200): Response {
@@ -273,6 +277,17 @@ export class RunManager {
       "CREATE INDEX IF NOT EXISTS idx_run_receipts_owner_updated ON agent_run_receipts (owner_email, updated_at)",
     );
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mcp_oauth_states (
+        owner_email TEXT NOT NULL,
+        server_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        error_code TEXT NOT NULL DEFAULT '',
+        retry_after INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, server_id)
+      )
+    `);
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_run_media (
         owner_email TEXT NOT NULL,
         run_id TEXT NOT NULL,
@@ -366,25 +381,41 @@ export class RunManager {
       }
       let receiptStatus = receipt.status;
       let result = receipt.result ? this.parseJson<Record<string, unknown>>(receipt.result) : null;
-      if (receiptStatus === "running" && !this.runRowById(owner, body.runId)) {
-        // Crash between the receipt and current-row writes: preserve exactly-
-        // once by settling the accepted id instead of starting its tools again.
-        receiptStatus = "interrupted";
-        result = {
-          message: { id: body.assistantMessageId, content: "", interrupted: true },
-          usageEvents: [],
-          steered: [],
-          chatUpdatedAt: 0,
-        };
-        this.ctx.storage.sql.exec(
-          `UPDATE agent_run_receipts SET status = 'interrupted', result = ?, error = ?, updated_at = ?
-           WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
-          JSON.stringify(result),
-          "Run acceptance was interrupted before execution ownership was recorded.",
-          Date.now(),
-          owner,
-          body.runId,
-        );
+      const receiptRun = this.runRowById(owner, body.runId);
+      if (receiptStatus === "running" && receiptRun?.status !== "running") {
+        if (receiptRun) {
+          receiptStatus = receiptRun.status;
+          result = receiptRun.result ? this.parseJson<Record<string, unknown>>(receiptRun.result) : null;
+          this.ctx.storage.sql.exec(
+            `UPDATE agent_run_receipts SET status = ?, result = ?, error = ?, updated_at = ?
+             WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
+            receiptStatus,
+            receiptRun.result,
+            receiptRun.error,
+            Date.now(),
+            owner,
+            body.runId,
+          );
+        } else {
+          // Crash before execution ownership was recorded: the accepted id is
+          // terminally interrupted and can never execute tools on a retry.
+          receiptStatus = "interrupted";
+          result = {
+            message: { id: body.assistantMessageId, content: "", interrupted: true },
+            usageEvents: [],
+            steered: [],
+            chatUpdatedAt: 0,
+          };
+          this.ctx.storage.sql.exec(
+            `UPDATE agent_run_receipts SET status = 'interrupted', result = ?, error = ?, updated_at = ?
+             WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
+            JSON.stringify(result),
+            "Run acceptance was interrupted before execution ownership was recorded.",
+            Date.now(),
+            owner,
+            body.runId,
+          );
+        }
       }
       return json({
         ok: true,
@@ -427,18 +458,14 @@ export class RunManager {
     if (liveCount >= MAX_LIVE_RUNS_PER_OWNER) {
       return json({ error: "too_many_runs" }, 429);
     }
-    const authKey =
-      this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.env.RORK_TOOLKIT_SECRET_KEY ?? "";
+    const authKey = this.env.STAGING_GATEWAY_URL
+      ? this.env.STAGING_GATEWAY_SECRET ?? ""
+      : this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.env.RORK_TOOLKIT_SECRET_KEY ?? "";
     if (!authKey) {
       return json({ error: "toolkit_key_missing" }, 503);
     }
 
     const ephemeral = body.config.ephemeral === true;
-    // Seed the chat so the user message survives a closed tab. When the seed
-    // is missing or too large the run still executes, but history stays
-    // client-owned: the result is delivered via events + /runs/active only.
-    const chatWritable = !ephemeral && this.applyChatSeed(owner, body);
-
     const now = Date.now();
     const run: LiveRun = {
       owner,
@@ -447,7 +474,7 @@ export class RunManager {
       kind: body.kind,
       startedAt: now,
       body,
-      chatWritable,
+      chatWritable: false,
       content: body.config.resume?.partial ?? "",
       reasoningTail: "",
       toolCalls: [],
@@ -464,36 +491,42 @@ export class RunManager {
       toolsTimer: null,
       flushTimer: null,
     };
+    // Seed + idempotency receipt + execution ownership commit together. A
+    // deploy can observe all three or none; it can never accept a run id while
+    // leaving a second request free to execute its tools.
+    this.ctx.storage.transactionSync(() => {
+      run.chatWritable = !ephemeral && this.applyChatSeed(owner, body);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO agent_run_receipts
+          (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'running', ?, '', '', ?, ?)`,
+        owner,
+        body.runId,
+        body.conversationId,
+        requestHash,
+        run.chatWritable ? 1 : 0,
+        now,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO agent_runs
+          (owner_email, conversation_id, run_id, kind, status, started_at, heartbeat_at, finished_at,
+           title, model_id, assistant_message_id, ephemeral, acked, snapshot, result, error)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, 0, ?, ?, ?, ?, 0, ?, '', '')`,
+        owner,
+        body.conversationId,
+        body.runId,
+        body.kind,
+        now,
+        now,
+        capStr(body.title || "Chat", TITLE_LIMIT),
+        capStr(body.modelId || "", 120),
+        body.assistantMessageId,
+        ephemeral ? 1 : 0,
+        JSON.stringify(this.snapshotOf(run)),
+      );
+    });
     this.live.set(this.liveKey(owner, body.conversationId), run);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO agent_run_receipts
-        (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'running', ?, '', '', ?, ?)`,
-      owner,
-      body.runId,
-      body.conversationId,
-      requestHash,
-      chatWritable ? 1 : 0,
-      now,
-      now,
-    );
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO agent_runs
-        (owner_email, conversation_id, run_id, kind, status, started_at, heartbeat_at, finished_at,
-         title, model_id, assistant_message_id, ephemeral, acked, snapshot, result, error)
-       VALUES (?, ?, ?, ?, 'running', ?, ?, 0, ?, ?, ?, ?, 0, ?, '', '')`,
-      owner,
-      body.conversationId,
-      body.runId,
-      body.kind,
-      now,
-      now,
-      capStr(body.title || "Chat", TITLE_LIMIT),
-      capStr(body.modelId || "", 120),
-      body.assistantMessageId,
-      ephemeral ? 1 : 0,
-      JSON.stringify(this.snapshotOf(run)),
-    );
     this.ctx.waitUntil(
       this.executeRun(run, authKey).catch((error) => {
         console.error("run crashed:", error instanceof Error ? error.message : "unknown");
@@ -503,7 +536,7 @@ export class RunManager {
         });
       }),
     );
-    return json({ ok: true, runId: body.runId, historyOnServer: chatWritable, status: "running" });
+    return json({ ok: true, runId: body.runId, historyOnServer: run.chatWritable, status: "running" });
   }
 
   private async handleSteer(request: Request, owner: string): Promise<Response> {
@@ -768,6 +801,8 @@ export class RunManager {
             (server) => server.kind === "github",
           ),
           (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+          (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
+          (id) => this.markOAuthRefreshStarted(run.owner, id),
         );
         const githubRoute = [...githubRuntime.routes.values()].find(
           (route) => route.type === "native" && route.kind === "github",
@@ -840,8 +875,11 @@ export class RunManager {
             (server) => server.kind === "github",
           );
           juliusMcp = servers.length > 0
-            ? await armCloudMcp(servers, (rotated) =>
-                this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+            ? await armCloudMcp(
+                servers,
+                (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+                (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
+                (id) => this.markOAuthRefreshStarted(run.owner, id),
               )
             : emptyMcpRuntime();
         }
@@ -930,8 +968,11 @@ export class RunManager {
         const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
         const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens);
         mcp = servers.length > 0
-          ? await armCloudMcp(servers, (rotated) =>
-              this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+          ? await armCloudMcp(
+              servers,
+              (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+              (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
+              (id) => this.markOAuthRefreshStarted(run.owner, id),
             )
           : emptyMcpRuntime();
       } catch (error) {
@@ -1041,6 +1082,7 @@ export class RunManager {
       const result = await runEngineTurn({
         authKey,
         modelId: run.body.modelId,
+        gatewayUrl: this.env.STAGING_GATEWAY_URL,
         apiMessages,
         tools,
         executeTool: async (name, argsJson) => {
@@ -1387,7 +1429,6 @@ export class RunManager {
         error: outcome.error,
       });
     }
-    run.done = true;
     if (run.textTimer !== null) {
       clearTimeout(run.textTimer);
       run.textTimer = null;
@@ -1401,44 +1442,54 @@ export class RunManager {
       run.flushTimer = null;
     }
     let chatUpdatedAt = 0;
-    if (run.chatWritable) {
-      chatUpdatedAt = this.writeResultIntoChat(run, outcome.message);
-    }
-    const result = {
-      message: outcome.message,
-      usageEvents: run.usageEvents,
-      steered: run.steered,
-      chatUpdatedAt,
+    let result: {
+      message: RunFinalMessage;
+      usageEvents: RunUsageEvent[];
+      steered: RunSteerItem[];
+      chatUpdatedAt: number;
     };
     const now = Date.now();
-    const resultPayload = JSON.stringify(result);
     try {
-      this.ctx.storage.sql.exec(
-        `UPDATE agent_runs SET status = ?, finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ?
-          WHERE owner_email = ? AND conversation_id = ? AND run_id = ?`,
-        status,
-        now,
-        now,
-        JSON.stringify({ ...this.snapshotOf(run), status }),
-        resultPayload,
-        outcome.error ?? "",
-        run.owner,
-        run.conversationId,
-        run.runId,
-      );
-      this.ctx.storage.sql.exec(
-        `UPDATE agent_run_receipts SET status = ?, result = ?, error = ?, updated_at = ?
-          WHERE owner_email = ? AND run_id = ?`,
-        status,
-        resultPayload,
-        outcome.error ?? "",
-        now,
-        run.owner,
-        run.runId,
-      );
+      this.ctx.storage.transactionSync(() => {
+        if (run.chatWritable) {
+          chatUpdatedAt = this.writeResultIntoChat(run, outcome.message);
+        }
+        result = {
+          message: outcome.message,
+          usageEvents: run.usageEvents,
+          steered: run.steered,
+          chatUpdatedAt,
+        };
+        const resultPayload = JSON.stringify(result);
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_runs SET status = ?, finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ?
+            WHERE owner_email = ? AND conversation_id = ? AND run_id = ?`,
+          status,
+          now,
+          now,
+          JSON.stringify({ ...this.snapshotOf(run), status }),
+          resultPayload,
+          outcome.error ?? "",
+          run.owner,
+          run.conversationId,
+          run.runId,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_run_receipts SET status = ?, result = ?, error = ?, updated_at = ?
+            WHERE owner_email = ? AND run_id = ?`,
+          status,
+          resultPayload,
+          outcome.error ?? "",
+          now,
+          run.owner,
+          run.runId,
+        );
+      });
     } catch (error) {
       console.error("run result write failed:", error instanceof Error ? error.message : "unknown");
+      throw error;
     }
+    run.done = true;
     this.emit(run, {
       t: "done",
       seq: 0,
@@ -1796,8 +1847,9 @@ export class RunManager {
         steered: snapshot?.steered ?? [],
         chatUpdatedAt: chatRow.updated_at,
       });
-      this.ctx.storage.sql.exec(
-        `INSERT OR IGNORE INTO agent_run_receipts
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO agent_run_receipts
           (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'done', 1, ?, '', ?, ?)`,
         row.owner_email,
@@ -1805,11 +1857,11 @@ export class RunManager {
         row.conversation_id,
         `legacy:${row.run_id}`,
         resultPayload,
-        row.started_at,
-        now,
-      );
-      this.ctx.storage.sql.exec(
-        `UPDATE agent_runs SET status = 'done', finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ''
+          row.started_at,
+          now,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_runs SET status = 'done', finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ''
          WHERE owner_email = ? AND conversation_id = ? AND run_id = ? AND status = 'running'`,
         now,
         now,
@@ -1817,16 +1869,17 @@ export class RunManager {
         resultPayload,
         row.owner_email,
         row.conversation_id,
-        row.run_id,
-      );
-      this.ctx.storage.sql.exec(
-        `UPDATE agent_run_receipts SET status = 'done', result = ?, error = '', updated_at = ?
+          row.run_id,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_run_receipts SET status = 'done', result = ?, error = '', updated_at = ?
          WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
         resultPayload,
         now,
-        row.owner_email,
-        row.run_id,
-      );
+          row.owner_email,
+          row.run_id,
+        );
+      });
       console.log("orphaned run recovered from settled chat:", row.conversation_id);
       return;
     }
@@ -1852,8 +1905,7 @@ export class RunManager {
       interrupted: true,
     };
     let chatUpdatedAt = 0;
-    if (row.ephemeral !== 1) {
-      const fake: LiveRun = {
+    const fake: LiveRun = {
         owner: row.owner_email,
         runId: row.run_id,
         conversationId: row.conversation_id,
@@ -1884,20 +1936,22 @@ export class RunManager {
         done: false,
         textTimer: null,
         toolsTimer: null,
-        flushTimer: null,
-      };
-      chatUpdatedAt = this.writeResultIntoChat(fake, message);
-    }
+      flushTimer: null,
+    };
     const now = Date.now();
-    const resultPayload = JSON.stringify({
-      message,
-      usageEvents: [],
-      steered: snapshot?.steered ?? [],
-      chatUpdatedAt,
-    });
     const error = "The server node running this reply restarted — the collected draft is shown as-is.";
-    this.ctx.storage.sql.exec(
-      `INSERT OR IGNORE INTO agent_run_receipts
+    this.ctx.storage.transactionSync(() => {
+      if (row.ephemeral !== 1) {
+        chatUpdatedAt = this.writeResultIntoChat(fake, message);
+      }
+      const resultPayload = JSON.stringify({
+        message,
+        usageEvents: [],
+        steered: snapshot?.steered ?? [],
+        chatUpdatedAt,
+      });
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO agent_run_receipts
         (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'interrupted', ?, ?, ?, ?, ?)`,
       row.owner_email,
@@ -1907,11 +1961,11 @@ export class RunManager {
       row.ephemeral === 1 ? 0 : 1,
       resultPayload,
       error,
-      row.started_at,
-      now,
-    );
-    this.ctx.storage.sql.exec(
-      `UPDATE agent_runs SET status = 'interrupted', finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ?
+        row.started_at,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_runs SET status = 'interrupted', finished_at = ?, heartbeat_at = ?, snapshot = ?, result = ?, error = ?
         WHERE owner_email = ? AND conversation_id = ? AND run_id = ? AND status = 'running'`,
       now,
       now,
@@ -1919,18 +1973,19 @@ export class RunManager {
       resultPayload,
       error,
       row.owner_email,
-      row.conversation_id,
-      row.run_id,
-    );
-    this.ctx.storage.sql.exec(
-      `UPDATE agent_run_receipts SET status = 'interrupted', result = ?, error = ?, updated_at = ?
+        row.conversation_id,
+        row.run_id,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE agent_run_receipts SET status = 'interrupted', result = ?, error = ?, updated_at = ?
         WHERE owner_email = ? AND run_id = ? AND status = 'running'`,
       resultPayload,
       error,
       now,
-      row.owner_email,
-      row.run_id,
-    );
+        row.owner_email,
+        row.run_id,
+      );
+    });
     console.log("stale run finalized as interrupted:", row.conversation_id);
   }
 
@@ -1984,6 +2039,76 @@ export class RunManager {
     }
   }
 
+  private async markOAuthRefreshStarted(owner: string, serverId: string): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO mcp_oauth_states
+        (owner_email, server_id, state, error_code, retry_after, updated_at)
+       VALUES (?, ?, 'refreshing', '', 0, ?)
+       ON CONFLICT(owner_email, server_id) DO UPDATE SET
+         state = CASE
+           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN 'refresh_unknown'
+           ELSE 'refreshing'
+         END,
+         error_code = CASE
+           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN mcp_oauth_states.error_code
+           ELSE ''
+         END,
+         retry_after = 0,
+         updated_at = excluded.updated_at`,
+      owner,
+      serverId,
+      now,
+    );
+  }
+
+  private oauthGrantState(owner: string, serverId: string): string {
+    return this.ctx.storage.sql
+      .exec<{ state: string }>(
+        "SELECT state FROM mcp_oauth_states WHERE owner_email = ? AND server_id = ?",
+        owner,
+        serverId,
+      )
+      .toArray()[0]?.state ?? "ready";
+  }
+
+  private async recordOAuthFailure(
+    owner: string,
+    serverId: string,
+    outcome: CloudOAuthRefreshFailure,
+  ): Promise<void> {
+    const previousState = this.oauthGrantState(owner, serverId);
+    const stepUpCodes = new Set(["interaction_required", "consent_required", "insufficient_scope", "invalid_scope"]);
+    const followsUnknownRotation = previousState === "refresh_unknown" && outcome.code === "invalid_grant";
+    const state = outcome.transient
+      ? outcome.ambiguous ? "refresh_unknown" : "retryable_error"
+      : followsUnknownRotation || stepUpCodes.has(outcome.code)
+        ? "step_up_required"
+        : "reauth_required";
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO mcp_oauth_states
+        (owner_email, server_id, state, error_code, retry_after, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      owner,
+      serverId,
+      state,
+      capStr(outcome.code, 120),
+      outcome.transient ? Date.now() + 30_000 : 0,
+      Date.now(),
+    );
+  }
+
+  private markOAuthReady(owner: string, serverId: string): void {
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO mcp_oauth_states
+        (owner_email, server_id, state, error_code, retry_after, updated_at)
+       VALUES (?, ?, 'ready', '', 0, ?)`,
+      owner,
+      serverId,
+      Date.now(),
+    );
+  }
+
   private async oauthTokensFor(
     owner: string,
   ): Promise<{ tokens: Record<string, CloudOAuthToken>; appliedChains: Map<string, string[]> }> {
@@ -2024,6 +2149,15 @@ export class RunManager {
       )
       .toArray();
     for (const row of revoked) {
+      delete tokens[row.server_id];
+    }
+    const blocked = this.ctx.storage.sql
+      .exec<{ server_id: string }>(
+        "SELECT server_id FROM mcp_oauth_states WHERE owner_email = ? AND state IN ('reauth_required', 'step_up_required')",
+        owner,
+      )
+      .toArray();
+    for (const row of blocked) {
       delete tokens[row.server_id];
     }
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
@@ -2072,6 +2206,12 @@ export class RunManager {
       JSON.stringify(rotated.token),
       Date.now(),
     );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
+      owner,
+      rotated.serverId,
+    );
+    this.markOAuthReady(owner, rotated.serverId);
     await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`);
     appliedChains.set(rotated.serverId, bases);
   }

@@ -15,6 +15,22 @@ export type DynamicOAuthClient = {
   expiresAt?: number;
 };
 
+export class OAuthCodeExchangeError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly transient: boolean;
+  readonly ambiguous: boolean;
+
+  constructor(input: { code: string; status: number; transient: boolean; ambiguous: boolean }) {
+    super(`OAuth code exchange failed: ${input.code}`);
+    this.name = "OAuthCodeExchangeError";
+    this.code = input.code;
+    this.status = input.status;
+    this.transient = input.transient;
+    this.ambiguous = input.ambiguous;
+  }
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -239,16 +255,46 @@ export async function exchangeAuthorizationCode(input: {
   if (input.resource) {
     params.set("resource", input.resource);
   }
-  const response = await fetchPublicHttps(input.tokenEndpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-    body: params.toString(),
-    signal: AbortSignal.timeout(12_000),
-  });
+  let response: Response;
+  try {
+    response = await fetchPublicHttps(input.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: params.toString(),
+      signal: AbortSignal.timeout(12_000),
+    });
+  } catch {
+    throw new OAuthCodeExchangeError({
+      code: "temporarily_unavailable",
+      status: 502,
+      transient: true,
+      ambiguous: true,
+    });
+  }
   const data = record(await response.json().catch(() => null));
-  if (!response.ok || typeof data?.access_token !== "string" || !data.access_token) {
-    const code = typeof data?.error === "string" ? data.error : `HTTP ${response.status}`;
-    throw new Error(`OAuth code exchange failed: ${code}`);
+  if (!response.ok) {
+    const code = typeof data?.error === "string" && data.error ? data.error : `http_${response.status}`;
+    const transient =
+      response.status === 408 ||
+      response.status === 425 ||
+      response.status === 429 ||
+      response.status >= 500 ||
+      ["temporarily_unavailable", "server_error", "slow_down", "timeout"].includes(code);
+    const explicitRetryable = ["temporarily_unavailable", "server_error", "slow_down"].includes(code);
+    throw new OAuthCodeExchangeError({
+      code,
+      status: response.status,
+      transient,
+      ambiguous: transient && !explicitRetryable,
+    });
+  }
+  if (typeof data?.access_token !== "string" || !data.access_token) {
+    throw new OAuthCodeExchangeError({
+      code: "invalid_response",
+      status: 502,
+      transient: true,
+      ambiguous: true,
+    });
   }
   const expiresIn = Number(data.expires_in ?? 0);
   return {

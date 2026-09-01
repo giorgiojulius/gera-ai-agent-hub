@@ -3,12 +3,18 @@ import { DurableObject } from "cloudflare:workers";
 type ProviderEnv = {
   PROVIDER_STATE: DurableObjectNamespace;
   CONTROL_SECRET: string;
+  GATEWAY_SECRET: string;
 };
 
 type ProviderConfig = {
   accessTtlSeconds: number;
   mcpDelayMs: number;
   refreshDelayMs: number;
+  refreshResponseDelayMs: number;
+  idempotencyReplayDelayMs: number;
+  gatewayFinalDelayMs: number;
+  holdRefreshResponse: boolean;
+  holdGatewayFinal: boolean;
   mcp401Once: boolean;
   refresh503Once: boolean;
   invalidGrant: boolean;
@@ -22,6 +28,8 @@ type ProviderStats = {
   initialize: number;
   toolLists: number;
   toolCalls: number;
+  gatewayCalls: number;
+  violations: number;
   generation: number;
 };
 
@@ -29,6 +37,7 @@ type AuthorizationCode = {
   challenge: string;
   redirectUri: string;
   clientId: string;
+  resource: string;
   used: boolean;
 };
 
@@ -43,6 +52,11 @@ const DEFAULT_CONFIG: ProviderConfig = {
   accessTtlSeconds: 3,
   mcpDelayMs: 0,
   refreshDelayMs: 0,
+  refreshResponseDelayMs: 0,
+  idempotencyReplayDelayMs: 0,
+  gatewayFinalDelayMs: 0,
+  holdRefreshResponse: false,
+  holdGatewayFinal: false,
   mcp401Once: false,
   refresh503Once: false,
   invalidGrant: false,
@@ -56,6 +70,8 @@ const DEFAULT_STATS: ProviderStats = {
   initialize: 0,
   toolLists: 0,
   toolCalls: 0,
+  gatewayCalls: 0,
+  violations: 0,
   generation: 0,
 };
 
@@ -63,6 +79,31 @@ function json(data: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json", ...(headers ?? {}) },
+  });
+}
+
+function delayedJson(data: unknown, delayMs: number, status: number = 200): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      await sleep(delayMs);
+      controller.enqueue(encoder.encode(JSON.stringify(data)));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+function sse(events: unknown[]): Response {
+  const payload = `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`;
+  return new Response(payload, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store",
+    },
   });
 }
 
@@ -86,6 +127,22 @@ function sleep(ms: number): Promise<void> {
 }
 
 export class ProviderState extends DurableObject<ProviderEnv> {
+  private tokenQueue: Promise<void> = Promise.resolve();
+
+  private async withTokenLock<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = this.tokenQueue;
+    let release: () => void = () => undefined;
+    this.tokenQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prior;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   private async config(): Promise<ProviderConfig> {
     return { ...DEFAULT_CONFIG, ...((await this.ctx.storage.get<Partial<ProviderConfig>>("config")) ?? {}) };
   }
@@ -133,9 +190,15 @@ export class ProviderState extends DurableObject<ProviderEnv> {
     }
     if (url.pathname === "/register" && request.method === "POST") {
       await this.bump("registrations");
-      const body = (await request.json().catch(() => null)) as { redirect_uris?: unknown } | null;
+      const body = (await request.json().catch(() => null)) as {
+        redirect_uris?: unknown;
+        token_endpoint_auth_method?: unknown;
+      } | null;
       const redirectUri = Array.isArray(body?.redirect_uris) ? String(body?.redirect_uris[0] ?? "") : "";
-      if (!redirectUri.startsWith("https://")) return json({ error: "invalid_redirect_uri" }, 400);
+      if (!redirectUri.startsWith("https://") || body?.token_endpoint_auth_method !== "none") {
+        return json({ error: "invalid_redirect_uri" }, 400);
+      }
+      await this.ctx.storage.put("client:gera-blackbox-client", { redirectUri });
       return json({ client_id: "gera-blackbox-client", client_secret_expires_at: 0 });
     }
     if (url.pathname === "/authorize" && request.method === "GET") {
@@ -143,11 +206,22 @@ export class ProviderState extends DurableObject<ProviderEnv> {
       const state = url.searchParams.get("state") ?? "";
       const challenge = url.searchParams.get("code_challenge") ?? "";
       const clientId = url.searchParams.get("client_id") ?? "";
-      if (!redirectUri.startsWith("https://") || !state || !challenge || !clientId) {
+      const resource = url.searchParams.get("resource") ?? "";
+      const registration = await this.ctx.storage.get<{ redirectUri: string }>(`client:${clientId}`);
+      if (
+        !redirectUri.startsWith("https://") ||
+        !state ||
+        !challenge ||
+        url.searchParams.get("code_challenge_method") !== "S256" ||
+        url.searchParams.get("response_type") !== "code" ||
+        !registration ||
+        registration.redirectUri !== redirectUri ||
+        resource !== `${origin}/mcp`
+      ) {
         return json({ error: "invalid_request" }, 400);
       }
       const code = randomValue("code");
-      const item: AuthorizationCode = { challenge, redirectUri, clientId, used: false };
+      const item: AuthorizationCode = { challenge, redirectUri, clientId, resource, used: false };
       await this.ctx.storage.put(`code:${code}`, item);
       await this.bump("authorizations");
       const target = new URL(redirectUri);
@@ -158,10 +232,13 @@ export class ProviderState extends DurableObject<ProviderEnv> {
       return new Response(null, { status: 302, headers: { Location: target.toString(), "Cache-Control": "no-store" } });
     }
     if (url.pathname === "/token" && request.method === "POST") {
-      return this.handleToken(request);
+      return this.withTokenLock(() => this.handleToken(request));
     }
     if (url.pathname === "/mcp" && request.method === "POST") {
       return this.handleMcp(request);
+    }
+    if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
+      return this.handleGateway(request);
     }
     if (url.pathname === "/control" && request.method === "POST") {
       if (!this.authorized(request)) return json({ error: "unauthorized" }, 401);
@@ -182,6 +259,17 @@ export class ProviderState extends DurableObject<ProviderEnv> {
         refreshDelayMs: Number.isFinite(patch.refreshDelayMs)
           ? Math.max(0, Math.min(55_000, Math.floor(patch.refreshDelayMs ?? current.refreshDelayMs)))
           : current.refreshDelayMs,
+        refreshResponseDelayMs: Number.isFinite(patch.refreshResponseDelayMs)
+          ? Math.max(0, Math.min(55_000, Math.floor(patch.refreshResponseDelayMs ?? current.refreshResponseDelayMs)))
+          : current.refreshResponseDelayMs,
+        idempotencyReplayDelayMs: Number.isFinite(patch.idempotencyReplayDelayMs)
+          ? Math.max(0, Math.min(55_000, Math.floor(patch.idempotencyReplayDelayMs ?? current.idempotencyReplayDelayMs)))
+          : current.idempotencyReplayDelayMs,
+        gatewayFinalDelayMs: Number.isFinite(patch.gatewayFinalDelayMs)
+          ? Math.max(0, Math.min(55_000, Math.floor(patch.gatewayFinalDelayMs ?? current.gatewayFinalDelayMs)))
+          : current.gatewayFinalDelayMs,
+        holdRefreshResponse: patch.holdRefreshResponse ?? current.holdRefreshResponse,
+        holdGatewayFinal: patch.holdGatewayFinal ?? current.holdGatewayFinal,
         mcp401Once: patch.mcp401Once ?? current.mcp401Once,
         refresh503Once: patch.refresh503Once ?? current.refresh503Once,
         invalidGrant: patch.invalidGrant ?? current.invalidGrant,
@@ -201,19 +289,42 @@ export class ProviderState extends DurableObject<ProviderEnv> {
     return json({ error: "not_found" }, 404);
   }
 
+  private async waitUntilReleased(key: "holdRefreshResponse" | "holdGatewayFinal"): Promise<void> {
+    const deadline = Date.now() + 55_000;
+    while ((await this.config())[key] && Date.now() < deadline) {
+      await sleep(100);
+    }
+  }
+
   private async handleToken(request: Request): Promise<Response> {
     const params = new URLSearchParams(await request.text());
     const grantType = params.get("grant_type") ?? "";
     const idempotencyKey = request.headers.get("Idempotency-Key") ?? "";
     if (idempotencyKey) {
       const replay = await this.ctx.storage.get<{ status: number; body: unknown }>(`idem:${idempotencyKey}`);
-      if (replay) return json(replay.body, replay.status);
+      if (replay) {
+        const config = await this.config();
+        if (config.holdRefreshResponse) {
+          await this.waitUntilReleased("holdRefreshResponse");
+        }
+        return config.idempotencyReplayDelayMs > 0
+          ? delayedJson(replay.body, config.idempotencyReplayDelayMs, replay.status)
+          : json(replay.body, replay.status);
+      }
     }
     if (grantType === "authorization_code") {
       const code = params.get("code") ?? "";
       const verifier = params.get("code_verifier") ?? "";
       const stored = await this.ctx.storage.get<AuthorizationCode>(`code:${code}`);
-      if (!stored || stored.used || !verifier || (await s256(verifier)) !== stored.challenge) {
+      if (
+        !stored ||
+        stored.used ||
+        params.get("client_id") !== stored.clientId ||
+        params.get("redirect_uri") !== stored.redirectUri ||
+        params.get("resource") !== stored.resource ||
+        !verifier ||
+        (await s256(verifier)) !== stored.challenge
+      ) {
         return json({ error: "invalid_grant" }, 400);
       }
       stored.used = true;
@@ -272,7 +383,104 @@ export class ProviderState extends DurableObject<ProviderEnv> {
     };
     if (idempotencyKey) await this.ctx.storage.put(`idem:${idempotencyKey}`, { status: 200, body });
     console.log("provider refresh", nextGeneration);
-    return json(body);
+    if (config.holdRefreshResponse) {
+      await this.waitUntilReleased("holdRefreshResponse");
+    }
+    return config.refreshResponseDelayMs > 0 ? delayedJson(body, config.refreshResponseDelayMs) : json(body);
+  }
+
+  private async protocolViolation(message: string): Promise<Response> {
+    await this.bump("violations");
+    return json({ error: "protocol_violation", message }, 400);
+  }
+
+  private async handleGateway(request: Request): Promise<Response> {
+    if (!this.env.GATEWAY_SECRET || request.headers.get("Authorization") !== `Bearer ${this.env.GATEWAY_SECRET}`) {
+      return json({ error: "unauthorized" }, 401);
+    }
+    const body = (await request.json().catch(() => null)) as {
+      model?: unknown;
+      messages?: unknown;
+      tools?: unknown;
+    } | null;
+    if (!body || !Array.isArray(body.messages)) {
+      return json({ error: "invalid_request" }, 400);
+    }
+    const stats = await this.bump("gatewayCalls");
+    if (body.model !== "staging/deterministic") {
+      return this.protocolViolation("unexpected model");
+    }
+    const messages = body.messages.filter(
+      (item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item),
+    );
+    const hasToolResult = messages.some((message) => message.role === "tool");
+    const model = typeof body.model === "string" && body.model ? body.model : "staging/deterministic";
+    if (hasToolResult) {
+      const toolMessage = messages.findLast((message) => message.role === "tool");
+      const assistantCall = messages.findLast(
+        (message) => message.role === "assistant" && Array.isArray(message.tool_calls),
+      );
+      const firstCall = Array.isArray(assistantCall?.tool_calls)
+        ? assistantCall.tool_calls[0] as Record<string, unknown> | undefined
+        : undefined;
+      const expectedCallId = `blackbox-call-${stats.gatewayCalls - 1}`;
+      if (
+        !toolMessage ||
+        toolMessage.tool_call_id !== expectedCallId ||
+        firstCall?.id !== expectedCallId ||
+        typeof toolMessage.content !== "string" ||
+        !toolMessage.content.includes("durable-once")
+      ) {
+        return this.protocolViolation("tool result correlation failed");
+      }
+      const config = await this.config();
+      if (config.holdGatewayFinal) {
+        await this.waitUntilReleased("holdGatewayFinal");
+      }
+      if (config.gatewayFinalDelayMs > 0) {
+        await sleep(config.gatewayFinalDelayMs);
+      }
+      return sse([
+        {
+          id: `staging-final-${stats.gatewayCalls}`,
+          model,
+          choices: [{ index: 0, delta: { content: "BLACKBOX_RUN_COMPLETE" }, finish_reason: "stop" }],
+        },
+        { model, choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } },
+      ]);
+    }
+    const tools = Array.isArray(body.tools)
+      ? body.tools.filter(
+          (item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item),
+        )
+      : [];
+    const toolName = tools
+      .map((tool) => {
+        const fn = tool.function;
+        return fn && typeof fn === "object" && !Array.isArray(fn) && typeof (fn as Record<string, unknown>).name === "string"
+          ? String((fn as Record<string, unknown>).name)
+          : "";
+      })
+      .find((name) => name.endsWith("_blackbox_echo"));
+    if (!toolName || messages.at(-1)?.role !== "user") {
+      return this.protocolViolation("MCP tool or user turn missing");
+    }
+    return sse([{
+      id: `staging-tool-${stats.gatewayCalls}`,
+      model,
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: `blackbox-call-${stats.gatewayCalls}`,
+            type: "function",
+            function: { name: toolName, arguments: '{"text":"durable-once"}' },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    }]);
   }
 
   private async handleMcp(request: Request): Promise<Response> {
@@ -289,6 +497,10 @@ export class ProviderState extends DurableObject<ProviderEnv> {
     }
     const rpc = (await request.json().catch(() => null)) as { id?: unknown; method?: unknown; params?: unknown } | null;
     if (!rpc || typeof rpc.method !== "string") return json({ error: "invalid_rpc" }, 400);
+    const expectedSession = `session-${pair.generation}`;
+    if (rpc.method !== "initialize" && request.headers.get("Mcp-Session-Id") !== expectedSession) {
+      return json({ error: "session_not_found" }, 404);
+    }
     if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
     if (rpc.method === "initialize") {
       await this.bump("initialize");
@@ -300,7 +512,7 @@ export class ProviderState extends DurableObject<ProviderEnv> {
           capabilities: { tools: {} },
           serverInfo: { name: "Gera black-box provider", version: "1.0.0" },
         },
-      }, 200, { "Mcp-Session-Id": `session-${pair.generation}` });
+      }, 200, { "Mcp-Session-Id": expectedSession });
     }
     if (rpc.method === "tools/list") {
       await this.bump("toolLists");
@@ -322,6 +534,9 @@ export class ProviderState extends DurableObject<ProviderEnv> {
       const args = params.arguments && typeof params.arguments === "object"
         ? (params.arguments as Record<string, unknown>)
         : {};
+      if (params.name !== "blackbox_echo" || args.text !== "durable-once") {
+        return this.protocolViolation("unexpected tool invocation");
+      }
       return json({
         jsonrpc: "2.0",
         id: rpc.id,

@@ -63,6 +63,8 @@ import {
   handleImport,
   handleMarkMigrated,
   handleOwners,
+  handleOwnerCounts,
+  handleOwnerState,
   handleScheduleDue,
   handleScheduleSet,
   type ChatStoreRouteContext,
@@ -114,13 +116,11 @@ import {
   cloudOAuthToken,
   cloudOAuthTokens,
   ensureFreshCloudOAuth,
-  forceRefreshCloudOAuth,
   forceRefreshCloudOAuthOutcome,
   intersectMcpAllowIds,
   normalizeOAuthOverride,
   overlayOAuthRotations,
-  refreshCloudOAuthGrant,
-  type CloudOAuthRefreshOutcome,
+  type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
@@ -130,6 +130,7 @@ import {
   discoverMcpOAuth,
   exchangeAuthorizationCode,
   newOAuthState,
+  OAuthCodeExchangeError,
   newPkceVerifier,
   pkceChallenge,
   registerDynamicOAuthClient,
@@ -142,6 +143,7 @@ type ChatStoreEnv = {
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
   RORK_TOOLKIT_SECRET_KEY?: string;
   EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID?: string;
+  STAGING_VERSION?: string;
 };
 
 function sameOAuthEndpoint(left: string, right: string): boolean {
@@ -172,6 +174,21 @@ type GitHubDeviceRow = {
   updated_at: number;
 };
 
+type AutomationReceiptRow = {
+  owner_email: string;
+  id: string;
+  automation_id: string;
+  conversation_id: string;
+  name: string;
+  agent_id: string;
+  model_id: string;
+  user_text: string;
+  status: string;
+  started_at: number;
+  finished_at: number;
+  error: string;
+};
+
 type OAuthPendingRow = {
   owner_email: string;
   state: string;
@@ -198,6 +215,9 @@ export class ChatStore extends DurableObject {
   private readonly workerEnv: ChatStoreEnv;
   /** Interactive server-side agent runs (chat / research / Julius). */
   private readonly runs: RunManager;
+  /** Automation occurrences executing in this isolate; absent after a deploy. */
+  private readonly liveAutomationRuns = new Set<string>();
+  private readonly instanceId = crypto.randomUUID();
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
@@ -337,6 +357,26 @@ export class ChatStore extends DurableObject {
       )
     `);
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS automation_run_receipts (
+        owner_email TEXT NOT NULL,
+        id TEXT NOT NULL,
+        automation_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        agent_id TEXT NOT NULL DEFAULT '',
+        model_id TEXT NOT NULL DEFAULT '',
+        user_text TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER NOT NULL DEFAULT 0,
+        error TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (owner_email, id)
+      )
+    `);
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_automation_receipts_owner_status ON automation_run_receipts (owner_email, status)",
+    );
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS diagnostics (
         owner_email TEXT NOT NULL,
         id TEXT NOT NULL,
@@ -392,6 +432,12 @@ export class ChatStore extends DurableObject {
     // Internal plumbing, only reachable through the Worker entrypoint (it
     // never forwards arbitrary paths here): migration export/import between
     // the legacy global object and per-account shards.
+    if (request.method === "POST" && url.pathname === "/owner-state") {
+      return handleOwnerState(this.routeContext(), request);
+    }
+    if (request.method === "POST" && url.pathname === "/owner-counts") {
+      return handleOwnerCounts(this.routeContext(), request);
+    }
     if (request.method === "POST" && url.pathname === "/export") {
       return handleExport(this.routeContext(), request);
     }
@@ -430,6 +476,9 @@ export class ChatStore extends DurableObject {
     }
     if (shardOwner !== email) {
       return json({ error: "wrong_shard" }, 409);
+    }
+    if (request.method === "GET" && url.pathname === "/staging/version" && this.workerEnv.STAGING_VERSION) {
+      return json({ version: this.workerEnv.STAGING_VERSION, instanceId: this.instanceId });
     }
     // Interactive server-side runs: start / steer / stop / stream / media.
     const runResponse = await this.runs.handle(request, email, url.pathname);
@@ -621,6 +670,143 @@ export class ChatStore extends DurableObject {
     return json({ ok: true });
   }
 
+  private recoverInterruptedAutomationRuns(owner: string): void {
+    const rows = this.ctx.storage.sql
+      .exec<AutomationReceiptRow>(
+        "SELECT * FROM automation_run_receipts WHERE owner_email = ? AND status = 'running' ORDER BY started_at LIMIT 20",
+        owner,
+      )
+      .toArray();
+    for (const row of rows) {
+      if (this.liveAutomationRuns.has(row.id)) {
+        continue;
+      }
+      const content = "Cloud automation was interrupted by a server restart after its occurrence was claimed. It was not executed again; run it manually if you want to retry.";
+      const execution = buildExecutionOutcome({
+        content,
+        technicalStatus: "interrupted",
+        surface: "automation",
+        error: "The server restarted before the claimed automation occurrence reached a terminal commit.",
+      });
+      const now = Date.now();
+      this.ctx.storage.transactionSync(() => {
+        this.appendRun(owner, {
+          automationId: row.automation_id,
+          conversationId: row.conversation_id,
+          name: row.name,
+          agentId: row.agent_id || null,
+          modelId: row.model_id,
+          userText: row.user_text,
+          assistantText: content,
+          toolCalls: [],
+          sources: [],
+          execution,
+          startedAt: row.started_at,
+        });
+        this.ctx.storage.sql.exec(
+          `UPDATE automation_run_receipts
+           SET status = 'interrupted', finished_at = ?, error = ?
+           WHERE owner_email = ? AND id = ? AND status = 'running'`,
+          now,
+          "server_restart",
+          owner,
+          row.id,
+        );
+      });
+      console.log("automation occurrence recovered as interrupted", row.automation_id);
+    }
+    this.ctx.storage.sql.exec(
+      "DELETE FROM automation_run_receipts WHERE owner_email = ? AND status != 'running' AND finished_at < ?",
+      owner,
+      Date.now() - 7 * 24 * 60 * 60_000,
+    );
+  }
+
+  private async claimAutomationRun(
+    owner: string,
+    item: { auto: StoredAutomation; forced: boolean; hook?: HookQueue },
+    job: ClaimJob,
+    runPrompt: string,
+    receiptId: string,
+    startedAt: number,
+  ): Promise<boolean> {
+    let claimed = false;
+    this.liveAutomationRuns.add(receiptId);
+    try {
+      await this.ctx.storage.transaction(async () => {
+        claimed = false;
+        const active = this.ctx.storage.sql
+          .exec<{ id: string }>(
+            "SELECT id FROM automation_run_receipts WHERE owner_email = ? AND automation_id = ? AND status = 'running' LIMIT 1",
+            owner,
+            item.auto.id,
+          )
+          .toArray()[0];
+        if (active && active.id !== receiptId) {
+          return;
+        }
+        const forceKey = `${FORCE_RUN_PREFIX}${item.auto.id}`;
+        const hookKey = `${HOOK_QUEUE_PREFIX}${item.auto.id}`;
+        const forceValue = item.forced ? await this.ctx.storage.get<number>(forceKey) : undefined;
+        if (item.forced && forceValue === undefined) {
+          return;
+        }
+        const currentHook = item.hook ? await this.ctx.storage.get<HookQueue>(hookKey) : undefined;
+        const expectedEntries = item.hook?.entries ?? [];
+        const hookPrefixMatches =
+          !item.hook ||
+          (currentHook !== undefined &&
+            currentHook.entries.length >= expectedEntries.length &&
+            expectedEntries.every(
+              (entry, index) => JSON.stringify(currentHook.entries[index]) === JSON.stringify(entry),
+            ));
+        if (!hookPrefixMatches) {
+          return;
+        }
+        if (item.forced) {
+          await this.ctx.storage.delete(forceKey);
+        }
+        if (item.hook && currentHook) {
+          const remaining = currentHook.entries.slice(expectedEntries.length);
+          if (remaining.length === 0) {
+            await this.ctx.storage.delete(hookKey);
+          } else {
+            await this.ctx.storage.put(hookKey, { entries: remaining, dropped: currentHook.dropped });
+          }
+        }
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO automation_run_receipts
+            (owner_email, id, automation_id, conversation_id, name, agent_id, model_id, user_text,
+             status, started_at, finished_at, error)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, 0, '')`,
+          owner,
+          receiptId,
+          item.auto.id,
+          item.auto.conversationId,
+          capStr(item.auto.name, TITLE_LIMIT),
+          item.auto.agentId ?? "",
+          capStr(job.modelId, 120),
+          capStr(runPrompt, 8_000),
+          startedAt,
+        );
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO server_runs (owner_email, automation_id, last_run_at) VALUES (?, ?, ?)",
+          owner,
+          item.auto.id,
+          startedAt,
+        );
+        claimed = true;
+      });
+    } catch (error) {
+      this.liveAutomationRuns.delete(receiptId);
+      throw error;
+    }
+    if (!claimed) {
+      this.liveAutomationRuns.delete(receiptId);
+    }
+    return claimed;
+  }
+
   /**
    * Fires due cloud automations for this shard's account. Claims each run
    * first (at-most-once — a duplicate or racing fire can never double-run),
@@ -629,6 +815,7 @@ export class ChatStore extends DurableObject {
    * fresh. Called by the Worker: cron tick, exact-time sleeper, or run-now.
    */
   private async handleFire(owner: string): Promise<Response> {
+    this.recoverInterruptedAutomationRuns(owner);
     const forced = await this.ctx.storage.list<number>({ prefix: FORCE_RUN_PREFIX });
     const hookQueues = await this.ctx.storage.list<HookQueue>({ prefix: HOOK_QUEUE_PREFIX });
     const profileRow = this.ctx.storage.sql
@@ -658,7 +845,7 @@ export class ChatStore extends DurableObject {
     // Synced browser sign-ins, overlaid with grants this shard rotated
     // server-side. An override applies while the blob's token is anywhere on
     // its rotation chain; a caught-up blob or a fresh sign-in retires it.
-    const oauthTokens = cloudOAuthTokens(parsed.mcpOAuth);
+    const oauthTokens = this.profileOAuthTokens(owner);
     const oauthRefPrefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const overrideRows = await this.ctx.storage.list<unknown>({ prefix: oauthRefPrefix });
     const rotations: OAuthRotation[] = [];
@@ -771,27 +958,27 @@ export class ChatStore extends DurableObject {
 
     const batch = due.slice(0, FIRE_MAX_JOBS);
     const deadlineAt = Date.now() + FIRE_BUDGET_MS;
+    let ran = 0;
     for (const item of batch) {
       const startedAt = Date.now();
-      // Claim before running — an alarm retry must never double-run.
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO server_runs (owner_email, automation_id, last_run_at) VALUES (?, ?, ?)",
-        owner,
-        item.auto.id,
-        startedAt,
-      );
-      if (item.forced) {
-        await this.ctx.storage.delete(`${FORCE_RUN_PREFIX}${item.auto.id}`);
-      }
-      if (item.hook) {
-        // Claimed with the run — a racing fire finds no queue and no-ops.
-        await this.ctx.storage.delete(`${HOOK_QUEUE_PREFIX}${item.auto.id}`);
-      }
       const runPrompt = item.hook ? withHookContext(item.auto.prompt, item.hook) : item.auto.prompt;
       const job = this.buildClaimJob(owner, { ...item.auto, prompt: runPrompt }, settings, life, oauthTokens);
+      const receiptId = `automation:${item.auto.id}:${crypto.randomUUID()}`;
+      const claimed = await this.claimAutomationRun(owner, item, job, runPrompt, receiptId, startedAt);
+      if (!claimed) {
+        continue;
+      }
+      ran += 1;
       let result: AutomationRunResult;
       try {
-        result = await runAutomationJob(job, authKey, deadlineAt, persistOAuth);
+        result = await runAutomationJob(
+          job,
+          authKey,
+          deadlineAt,
+          persistOAuth,
+          (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
+          (id) => this.markOAuthRefreshStarted(owner, id),
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown error";
         console.error("automation run failed", item.auto.id, message);
@@ -809,26 +996,166 @@ export class ChatStore extends DurableObject {
           refreshedOAuth: [],
         };
       }
-      this.appendRun(owner, {
-        automationId: item.auto.id,
-        conversationId: item.auto.conversationId,
-        name: item.auto.name,
-        agentId: item.auto.agentId,
-        modelId: job.modelId,
-        userText: runPrompt,
-        assistantText: result.content,
-        toolCalls: result.toolCalls,
-        sources: result.sources,
-        execution: result.execution,
-        startedAt,
-      });
+      try {
+        const terminalStatus = result.execution.status === "error" ? "error" : "done";
+        this.ctx.storage.transactionSync(() => {
+          this.appendRun(owner, {
+            automationId: item.auto.id,
+            conversationId: item.auto.conversationId,
+            name: item.auto.name,
+            agentId: item.auto.agentId,
+            modelId: job.modelId,
+            userText: runPrompt,
+            assistantText: result.content,
+            toolCalls: result.toolCalls,
+            sources: result.sources,
+            execution: result.execution,
+            startedAt,
+          });
+          this.ctx.storage.sql.exec(
+            `UPDATE automation_run_receipts
+             SET status = ?, finished_at = ?, error = ?
+             WHERE owner_email = ? AND id = ? AND status = 'running'`,
+            terminalStatus,
+            Date.now(),
+            terminalStatus === "error" ? "automation_run_failed" : "",
+            owner,
+            receiptId,
+          );
+        });
+      } catch (error) {
+        // Keep the receipt running. A replacement isolate will settle it as
+        // interrupted instead of executing this occurrence a second time.
+        console.error("automation terminal commit failed", item.auto.id, error instanceof Error ? error.message : "error");
+      } finally {
+        this.liveAutomationRuns.delete(receiptId);
+      }
     }
     const finalNext =
       due.length > batch.length ? Date.now() + 1_000 : await this.nextDueForOwner(owner, profileRow.payload);
-    return json({ ran: batch.length, nextDueAt: finalNext }, 200, {
+    return json({ ran, nextDueAt: finalNext }, 200, {
       [NEXT_DUE_HEADER]: String(finalNext),
       [HOOKS_HEADER]: this.hooksIndexValue(profileRow.payload),
     });
+  }
+
+  /**
+   * Imports credentials from pre-vault profile blobs, then returns a payload
+   * that is safe to synchronize to browsers. Canonical rows and revocation
+   * tombstones always outrank stale legacy copies.
+   */
+  private async prepareProfilePayload(owner: string, payload: string): Promise<string | null> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+    if (!isRecord(parsed)) {
+      return null;
+    }
+    const profile: Record<string, unknown> = { ...parsed };
+    if (isRecord(profile.mcpOAuth)) {
+      for (const [serverId, rawToken] of Object.entries(profile.mcpOAuth).slice(0, 40)) {
+        const token = cloudOAuthToken(rawToken);
+        if (!isValidId(serverId) || !token) {
+          continue;
+        }
+        const revoked = this.ctx.storage.sql
+          .exec<{ present: number }>(
+            "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
+            owner,
+            serverId,
+          )
+          .toArray()[0];
+        const existing = this.ctx.storage.sql
+          .exec<{ present: number }>(
+            "SELECT 1 AS present FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ? LIMIT 1",
+            owner,
+            serverId,
+          )
+          .toArray()[0];
+        if (revoked || existing) {
+          continue;
+        }
+        let canonical = token;
+        const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
+        const rotation = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(rotationKey));
+        if (rotation?.bases.includes(token.accessToken)) {
+          canonical = rotation.token;
+        }
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+          owner,
+          serverId,
+          JSON.stringify(canonical),
+          Date.now(),
+        );
+        this.markOAuthReady(owner, serverId);
+        await this.ctx.storage.delete(rotationKey);
+      }
+      delete profile.mcpOAuth;
+    }
+    if (isRecord(profile.settings) && Array.isArray(profile.settings.mcpServers)) {
+      const settings = { ...profile.settings };
+      settings.mcpServers = profile.settings.mcpServers.map((item) => {
+        if (!isRecord(item)) {
+          return item;
+        }
+        const server = { ...item };
+        const serverId = typeof server.id === "string" && isValidId(server.id) ? server.id : "";
+        const catalogId = typeof server.catalogId === "string" && isValidId(server.catalogId)
+          ? server.catalogId
+          : "";
+        const token = typeof server.token === "string" && server.token ? server.token : "";
+        const headersJson = typeof server.headersJson === "string" && server.headersJson ? server.headersJson : "";
+        delete server.token;
+        delete server.headersJson;
+        if (serverId && (token || headersJson)) {
+          const revoked = this.ctx.storage.sql
+            .exec<{ present: number }>(
+              "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
+              owner,
+              serverId,
+            )
+            .toArray()[0];
+          if (!revoked) {
+            this.ctx.storage.sql.exec(
+              "INSERT OR IGNORE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+              owner,
+              serverId,
+              JSON.stringify({ ...(token ? { token } : {}), ...(headersJson ? { headersJson } : {}) }),
+              Date.now(),
+            );
+          }
+        }
+        const ids = [...new Set([serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])])]
+          .filter(Boolean);
+        const hasSecret = ids.some((id) => Object.keys(this.mcpServerSecret(owner, id)).length > 0);
+        const hasGrant = ids.some((id) => {
+          const grant = this.ctx.storage.sql
+            .exec<{ present: number }>(
+              "SELECT 1 AS present FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ? LIMIT 1",
+              owner,
+              id,
+            )
+            .toArray()[0];
+          const revoked = this.ctx.storage.sql
+            .exec<{ present: number }>(
+              "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
+              owner,
+              id,
+            )
+            .toArray()[0];
+          const state = this.oauthGrantState(owner, id);
+          return Boolean(grant && !revoked && state !== "reauth_required" && state !== "step_up_required");
+        });
+        server.credentialStored = hasSecret || hasGrant;
+        return server;
+      });
+      profile.settings = settings;
+    }
+    return JSON.stringify(profile);
   }
 
   /** Overlays server-only keys/headers onto redacted profile connector rows. */
@@ -881,15 +1208,40 @@ export class ChatStore extends DurableObject {
     );
   }
 
+  private async markOAuthRefreshStarted(owner: string, serverId: string): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO mcp_oauth_states
+        (owner_email, server_id, state, error_code, retry_after, updated_at)
+       VALUES (?, ?, 'refreshing', '', 0, ?)
+       ON CONFLICT(owner_email, server_id) DO UPDATE SET
+         state = CASE
+           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN 'refresh_unknown'
+           ELSE 'refreshing'
+         END,
+         error_code = CASE
+           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN mcp_oauth_states.error_code
+           ELSE ''
+         END,
+         retry_after = 0,
+         updated_at = excluded.updated_at`,
+      owner,
+      serverId,
+      now,
+    );
+  }
+
   private async recordOAuthFailure(
     owner: string,
     serverId: string,
-    outcome: Exclude<CloudOAuthRefreshOutcome, { ok: true }>,
+    outcome: CloudOAuthRefreshFailure,
   ): Promise<void> {
+    const previousState = this.oauthGrantState(owner, serverId);
     const stepUpCodes = new Set(["interaction_required", "consent_required", "insufficient_scope", "invalid_scope"]);
+    const followsUnknownRotation = previousState === "refresh_unknown" && outcome.code === "invalid_grant";
     const state = outcome.transient
-      ? "retryable_error"
-      : stepUpCodes.has(outcome.code)
+      ? outcome.ambiguous ? "refresh_unknown" : "retryable_error"
+      : followsUnknownRotation || stepUpCodes.has(outcome.code)
         ? "step_up_required"
         : "reauth_required";
     this.ctx.storage.sql.exec(
@@ -1277,17 +1629,14 @@ export class ChatStore extends DurableObject {
     if (!row) {
       return json({ status: "missing" }, 404);
     }
-    if (
-      row.status === "exchanging" &&
-      row.updated_at < Date.now() - 30_000
-    ) {
+    if (row.status === "exchanging" && row.updated_at < Date.now() - 30_000) {
       this.ctx.storage.sql.exec(
-        "UPDATE mcp_oauth_pending SET status = 'failed', error = 'step_up_required', updated_at = ? WHERE owner_email = ? AND state = ?",
+        "UPDATE mcp_oauth_pending SET status = 'exchange_unknown', error = 'oauth_exchange_interrupted', updated_at = ? WHERE owner_email = ? AND state = ? AND status = 'exchanging'",
         Date.now(),
         owner,
         state,
       );
-      return json({ status: "failed", error: "step_up_required" });
+      return json({ status: "pending", retryable: true, error: "oauth_exchange_interrupted" });
     }
     if (row.expires_at < Date.now() && row.status !== "completed" && row.status !== "failed") {
       this.ctx.storage.sql.exec(
@@ -1298,9 +1647,11 @@ export class ChatStore extends DurableObject {
       );
       return json({ status: "failed", error: "oauth_state_expired" });
     }
+    const retryable = row.status === "exchange_retryable" || row.status === "exchange_unknown";
     return json({
       status: row.status === "completed" ? "completed" : row.status === "failed" ? "failed" : "pending",
-      ...(row.status === "failed" && row.error ? { error: row.error } : {}),
+      ...(row.error && (row.status === "failed" || retryable) ? { error: row.error } : {}),
+      ...(retryable ? { retryable: true } : {}),
     });
   }
 
@@ -1313,12 +1664,18 @@ export class ChatStore extends DurableObject {
       return json({ error: "invalid_body" }, 400);
     }
     const state = typeof body.state === "string" ? body.state : "";
+    const providerError = typeof body.error === "string" ? capStr(body.error, 180) : "";
+    const issuer = typeof body.issuer === "string" ? body.issuer : "";
+    const code = typeof body.code === "string" ? body.code : "";
     const row = this.oauthPending(owner, state);
     if (!row) {
       return json({ error: "oauth_state_unknown" }, 404);
     }
-    if (row.status !== "pending") {
-      return json({ error: "oauth_callback_replayed", redirectUrl: this.oauthReturnUrl(row, "replayed") }, 409);
+    if (row.status === "completed") {
+      return json({ ok: true, replayed: true, redirectUrl: this.oauthReturnUrl(row, "complete") });
+    }
+    if (row.status === "failed") {
+      return json({ error: row.error || "oauth_failed", redirectUrl: this.oauthReturnUrl(row, "error") }, 409);
     }
     if (row.expires_at < Date.now()) {
       this.ctx.storage.sql.exec(
@@ -1330,8 +1687,22 @@ export class ChatStore extends DurableObject {
       const expired = this.oauthPending(owner, state) ?? row;
       return json({ error: "oauth_state_expired", redirectUrl: this.oauthReturnUrl(expired, "error") }, 400);
     }
-    const providerError = typeof body.error === "string" ? capStr(body.error, 180) : "";
-    const issuer = typeof body.issuer === "string" ? body.issuer : "";
+    const replayable = ["awaiting_confirmation", "exchanging", "exchange_retryable", "exchange_unknown"].includes(row.status);
+    if (replayable) {
+      if (
+        !providerError &&
+        code &&
+        code === row.authorization_code &&
+        (!issuer || sameOAuthEndpoint(issuer, row.issuer)) &&
+        row.callback_challenge
+      ) {
+        return json({ ok: true, replayed: true, redirectUrl: this.oauthReturnUrl(row, "confirm") });
+      }
+      return json({ error: "oauth_callback_replayed", redirectUrl: this.oauthReturnUrl(row, "replayed") }, 409);
+    }
+    if (row.status !== "pending") {
+      return json({ error: "oauth_callback_replayed", redirectUrl: this.oauthReturnUrl(row, "replayed") }, 409);
+    }
     if (issuer && !sameOAuthEndpoint(issuer, row.issuer)) {
       this.ctx.storage.sql.exec(
         "UPDATE mcp_oauth_pending SET status = 'failed', error = 'oauth_issuer_mismatch', updated_at = ? WHERE owner_email = ? AND state = ?",
@@ -1353,7 +1724,6 @@ export class ChatStore extends DurableObject {
       const failed = this.oauthPending(owner, state) ?? row;
       return json({ error: "oauth_denied", redirectUrl: this.oauthReturnUrl(failed, "error") }, 400);
     }
-    const code = typeof body.code === "string" ? body.code : "";
     if (!code || code.length > 8_000) {
       return json({ error: "oauth_code_missing" }, 400);
     }
@@ -1395,8 +1765,15 @@ export class ChatStore extends DurableObject {
     if (row.status === "completed") {
       return json({ ok: true, status: "completed", replayed: true });
     }
-    if (row.status !== "awaiting_confirmation") {
-      return json({ error: row.status === "failed" ? row.error || "oauth_failed" : "oauth_not_ready" }, 409);
+    if (row.status === "failed") {
+      return json({ error: row.error || "oauth_failed" }, 409);
+    }
+    const retryableStatus = row.status === "exchange_retryable" || row.status === "exchange_unknown";
+    if (row.status === "exchanging" && row.updated_at >= Date.now() - 30_000) {
+      return json({ error: "oauth_exchange_busy", retryable: true }, 409);
+    }
+    if (row.status !== "awaiting_confirmation" && row.status !== "exchanging" && !retryableStatus) {
+      return json({ error: "oauth_not_ready" }, 409);
     }
     if (
       row.expires_at < Date.now() ||
@@ -1407,10 +1784,10 @@ export class ChatStore extends DurableObject {
     ) {
       return json({ error: row.expires_at < Date.now() ? "oauth_state_expired" : "oauth_confirmation_mismatch" }, 403);
     }
-    // Claim before the outbound request. A second confirmation cannot redeem
-    // the same authorization code while this actor is awaiting the provider.
+    const priorWasUnknown = row.status === "exchange_unknown" || row.status === "exchanging";
     this.ctx.storage.sql.exec(
-      "UPDATE mcp_oauth_pending SET status = 'exchanging', updated_at = ? WHERE owner_email = ? AND state = ? AND status = 'awaiting_confirmation'",
+      `UPDATE mcp_oauth_pending SET status = 'exchanging', error = '', updated_at = ?
+       WHERE owner_email = ? AND state = ? AND status IN ('awaiting_confirmation', 'exchange_retryable', 'exchange_unknown', 'exchanging')`,
       Date.now(),
       owner,
       state,
@@ -1425,43 +1802,64 @@ export class ChatStore extends DurableObject {
         resource: row.resource || undefined,
         mcpUrl: row.mcp_url,
       });
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-        owner,
-        row.server_id,
-        JSON.stringify(token),
-        Date.now(),
-      );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-        owner,
-        row.server_id,
-      );
-      this.markOAuthReady(owner, row.server_id);
+      const committedAt = Date.now();
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+          owner,
+          row.server_id,
+          JSON.stringify({ ...token, authorizationState: state }),
+          committedAt,
+        );
+        this.ctx.storage.sql.exec(
+          "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
+          owner,
+          row.server_id,
+        );
+        this.markOAuthReady(owner, row.server_id);
+        this.ctx.storage.sql.exec(
+          `UPDATE mcp_oauth_pending
+           SET status = 'completed', error = '', verifier = '', browser_nonce = '',
+               callback_challenge = '', authorization_code = '', updated_at = ?
+           WHERE owner_email = ? AND state = ?`,
+          committedAt,
+          owner,
+          state,
+        );
+      });
       await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${row.server_id}`);
-      this.ctx.storage.sql.exec(
-        `UPDATE mcp_oauth_pending
-         SET status = 'completed', error = '', verifier = '', browser_nonce = '',
-             callback_challenge = '', authorization_code = '', updated_at = ?
-         WHERE owner_email = ? AND state = ?`,
-        Date.now(),
-        owner,
-        state,
-      );
       return json({ ok: true, status: "completed" });
     } catch (error) {
-      const message = capStr(error instanceof Error ? error.message : "oauth_exchange_failed", 180);
-      this.ctx.storage.sql.exec(
-        `UPDATE mcp_oauth_pending
-         SET status = 'failed', error = ?, verifier = '', browser_nonce = '',
-             callback_challenge = '', authorization_code = '', updated_at = ?
-         WHERE owner_email = ? AND state = ?`,
-        message,
-        Date.now(),
-        owner,
-        state,
-      );
-      return json({ error: "oauth_exchange_failed" }, 400);
+      const exchangeError = error instanceof OAuthCodeExchangeError ? error : null;
+      if (!exchangeError || exchangeError.transient) {
+        const status = exchangeError?.ambiguous === false ? "exchange_retryable" : "exchange_unknown";
+        const code = exchangeError?.code ?? "oauth_exchange_interrupted";
+        this.ctx.storage.sql.exec(
+          "UPDATE mcp_oauth_pending SET status = ?, error = ?, updated_at = ? WHERE owner_email = ? AND state = ? AND status = 'exchanging'",
+          status,
+          capStr(code, 180),
+          Date.now(),
+          owner,
+          state,
+        );
+        return json({ error: code, retryable: true }, 503);
+      }
+      const code = priorWasUnknown && exchangeError.code === "invalid_grant"
+        ? "step_up_required"
+        : exchangeError.code;
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `UPDATE mcp_oauth_pending
+           SET status = 'failed', error = ?, verifier = '', browser_nonce = '',
+               callback_challenge = '', authorization_code = '', updated_at = ?
+           WHERE owner_email = ? AND state = ?`,
+          capStr(code, 180),
+          Date.now(),
+          owner,
+          state,
+        );
+      });
+      return json({ error: code }, 400);
     }
   }
 
@@ -1473,6 +1871,9 @@ export class ChatStore extends DurableObject {
     } catch {
       return json({ error: "invalid_body" }, 400);
     }
+    if (body.mode === "replace") {
+      return json({ error: "server_owned_oauth_required" }, 410);
+    }
     const entries: Array<[string, unknown]> = [];
     if (typeof body.serverId === "string") {
       entries.push([body.serverId, body.token]);
@@ -1480,7 +1881,6 @@ export class ChatStore extends DurableObject {
     if (isRecord(body.grants)) {
       entries.push(...Object.entries(body.grants));
     }
-    const mode = body.mode === "replace" ? "replace" : "migrate";
     let stored = 0;
     const settledIds: string[] = [];
     for (const [serverId, raw] of entries.slice(0, 20)) {
@@ -1502,14 +1902,14 @@ export class ChatStore extends DurableObject {
           serverId,
         )
         .toArray()[0];
-      if (mode === "migrate" && (revoked || existing)) {
+      if (revoked || existing) {
         settledIds.push(serverId);
         continue;
       }
       let canonical = token;
       const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
       const rotation = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(rotationKey));
-      if (mode === "migrate" && rotation?.bases.includes(token.accessToken)) {
+      if (rotation?.bases.includes(token.accessToken)) {
         canonical = rotation.token;
       }
       this.ctx.storage.sql.exec(
@@ -1644,12 +2044,6 @@ export class ChatStore extends DurableObject {
       headersJson: typeof rawServer.headersJson === "string" ? rawServer.headersJson : "",
     };
     const catalogId = typeof rawServer.catalogId === "string" ? rawServer.catalogId : "";
-    const blockedState = [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])]
-      .map((id) => this.oauthGrantState(owner, id))
-      .find((state) => state === "reauth_required" || state === "step_up_required");
-    if (blockedState) {
-      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
-    }
     if (rawServer.credentialStored === false && !secret.token && !secret.headersJson) {
       this.ctx.storage.sql.exec(
         "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
@@ -1669,6 +2063,25 @@ export class ChatStore extends DurableObject {
     const storedSecret = this.mcpServerSecret(owner, serverId);
     const legacyCatalogSecret = catalogId && catalogId !== serverId ? this.mcpServerSecret(owner, catalogId) : {};
     const resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
+    const authMode =
+      rawServer.authMode === "none" ||
+      rawServer.authMode === "bearer" ||
+      rawServer.authMode === "headers" ||
+      rawServer.authMode === "oauth"
+        ? rawServer.authMode
+        : "auto";
+    const reliesOnOAuth =
+      (authMode === "oauth" || authMode === "auto") &&
+      !resolvedSecret.token &&
+      !resolvedSecret.headersJson;
+    const blockedState = reliesOnOAuth
+      ? [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])]
+          .map((id) => this.oauthGrantState(owner, id))
+          .find((state) => state === "reauth_required" || state === "step_up_required")
+      : undefined;
+    if (blockedState) {
+      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
+    }
     const oauthTokens = this.profileOAuthTokens(owner);
     if (!oauthTokens[serverId] && catalogId && oauthTokens[catalogId]) {
       oauthTokens[serverId] = oauthTokens[catalogId];
@@ -1697,7 +2110,14 @@ export class ChatStore extends DurableObject {
       servers,
       persist,
       (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
+      (id) => this.markOAuthRefreshStarted(owner, id),
     );
+    const authState = [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])]
+      .map((id) => this.oauthGrantState(owner, id))
+      .find((state) => state === "reauth_required" || state === "step_up_required");
+    if (authState) {
+      return json({ error: authState }, authState === "step_up_required" ? 403 : 401);
+    }
     if (runtime.failures.length > 0 || runtime.routes.size === 0) {
       const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
       return json({ error: failure }, 502);
@@ -1769,6 +2189,10 @@ export class ChatStore extends DurableObject {
     if (!isValidId(serverId) || !incoming?.refreshToken || !incoming.tokenEndpoint || !incoming.clientId) {
       return json({ error: "invalid_grant" }, 400);
     }
+    const blockedState = this.oauthGrantState(owner, serverId);
+    if (blockedState === "reauth_required" || blockedState === "step_up_required") {
+      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
+    }
 
     const key = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
     let existing = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
@@ -1782,6 +2206,7 @@ export class ChatStore extends DurableObject {
         // tab. Escrow repairs deploy loss, never resurrects a removed account grant.
         return json({ error: "stale_grant" }, 409);
       }
+      this.markOAuthReady(owner, serverId);
       return json({ ok: true, credentialStored: true, replayed: true });
     }
 
@@ -1843,15 +2268,16 @@ export class ChatStore extends DurableObject {
     };
 
     try {
-      const outcome = await refreshCloudOAuthGrant(server, persist);
-      if (!outcome.ok) {
+      const outcome = await refreshCloudOAuthGrant(
+        server,
+        persist,
+        (id) => this.markOAuthRefreshStarted(owner, id),
+      );
+      if (outcome.ok === false) {
+        await this.recordOAuthFailure(owner, serverId, outcome);
         const status = outcome.transient ? (outcome.status === 429 ? 429 : 503) : 400;
         return json(
-          {
-            error: outcome.code,
-            ...(outcome.detail ? { error_description: outcome.detail } : {}),
-            transient: outcome.transient,
-          },
+          { error: outcome.code, transient: outcome.transient },
           status,
         );
       }
@@ -1862,6 +2288,7 @@ export class ChatStore extends DurableObject {
       // grant untouched and let a later retry reconcile it.
       const winner = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
       if (winner?.bases.includes(incoming.accessToken)) {
+        this.markOAuthReady(owner, serverId);
         return json({ ok: true, credentialStored: true, replayed: true });
       }
       return json({ error: "refresh_commit_unavailable", transient: true }, 503);
@@ -1891,7 +2318,7 @@ export class ChatStore extends DurableObject {
     }
     const serverId = typeof body.serverId === "string" ? body.serverId : "";
     const catalogId = typeof body.catalogId === "string" ? body.catalogId : "";
-    if (!isValidId(serverId)) {
+    if (!isValidId(serverId) || (catalogId && !isValidId(catalogId))) {
       return json({ error: "invalid_server" }, 400);
     }
     const ids = [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])];
@@ -1901,6 +2328,12 @@ export class ChatStore extends DurableObject {
         const authorization = /^Bearer\s/i.test(secret.token) ? secret.token : `Bearer ${secret.token}`;
         return json({ authorization });
       }
+    }
+    const blockedState = ids
+      .map((id) => this.oauthGrantState(owner, id))
+      .find((state) => state === "reauth_required" || state === "step_up_required");
+    if (blockedState) {
+      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
     }
     const tokens = this.profileOAuthTokens(owner);
     const grantId = ids.find((id) => Boolean(tokens[id]));
@@ -1924,8 +2357,9 @@ export class ChatStore extends DurableObject {
         server,
         refreshed,
         (rotated) => this.persistCanonicalOAuthGrant(owner, rotated),
+        (id) => this.markOAuthRefreshStarted(owner, id),
       );
-      if (!outcome.ok) {
+      if (outcome.ok === false) {
         await this.recordOAuthFailure(owner, grantId, outcome);
         return json({ error: outcome.transient ? "retryable_error" : this.oauthGrantState(owner, grantId) }, outcome.transient ? 503 : 401);
       }
@@ -1934,8 +2368,9 @@ export class ChatStore extends DurableObject {
         server,
         refreshed,
         (rotated) => this.persistCanonicalOAuthGrant(owner, rotated),
+        (id) => this.markOAuthRefreshStarted(owner, id),
       );
-      if (outcome && !outcome.ok) {
+      if (outcome?.ok === false) {
         await this.recordOAuthFailure(owner, grantId, outcome);
         return json({ error: outcome.transient ? "retryable_error" : this.oauthGrantState(owner, grantId) }, outcome.transient ? 503 : 401);
       }
@@ -2003,6 +2438,7 @@ export class ChatStore extends DurableObject {
       (server) => server.kind === "mcp",
     );
     const refreshed: RefreshedOAuth[] = [];
+    const unavailable = new Set<string>();
     const persistOAuth = async (rotated: RefreshedOAuth): Promise<void> => {
       await this.persistCanonicalOAuthGrant(owner, rotated);
       const bases = chainRotationBases(appliedChains, rotated);
@@ -2013,13 +2449,26 @@ export class ChatStore extends DurableObject {
         continue;
       }
       const outcome = force.has(server.id)
-        ? await forceRefreshCloudOAuthOutcome(server, refreshed, persistOAuth)
-        : await ensureFreshCloudOAuth(server, refreshed, persistOAuth);
-      if (outcome && !outcome.ok) {
+        ? await forceRefreshCloudOAuthOutcome(
+            server,
+            refreshed,
+            persistOAuth,
+            (id) => this.markOAuthRefreshStarted(owner, id),
+          )
+        : await ensureFreshCloudOAuth(
+            server,
+            refreshed,
+            persistOAuth,
+            (id) => this.markOAuthRefreshStarted(owner, id),
+          );
+      if (outcome?.ok === false) {
         await this.recordOAuthFailure(owner, server.id, outcome);
+        if (!outcome.transient || force.has(server.id)) {
+          unavailable.add(server.id);
+        }
       }
     }
-    return json({ servers });
+    return json({ servers: servers.filter((server) => !unavailable.has(server.id)) });
   }
 
   /**
@@ -2313,6 +2762,30 @@ export class ChatStore extends DurableObject {
       hooksIndexValue: (payload: string | null | undefined) => this.hooksIndexValue(payload),
       markShardInitialized: async (owner: string) => {
         await this.ctx.storage.put("shardOwner", owner);
+      },
+      shardOwner: async () => (await this.ctx.storage.get<string>("shardOwner")) ?? "",
+      hasOwnerStorage: async (owner: string) => {
+        const rows = await this.ctx.storage.list({ prefix: `${OAUTH_REF_PREFIX}${owner}:`, limit: 1 });
+        return rows.size > 0;
+      },
+      prepareProfilePayload: (owner: string, payload: string) => this.prepareProfilePayload(owner, payload),
+      exportOwnerStorage: async (owner: string) => {
+        const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
+        const rows = await this.ctx.storage.list<unknown>({ prefix });
+        return [...rows.entries()]
+          .map(([key, value]) => ({ serverId: key.slice(prefix.length), value }))
+          .filter((item) => isValidId(item.serverId));
+      },
+      importOwnerStorage: async (owner: string, rows: Array<{ serverId: string; value: unknown }>) => {
+        for (const row of rows) {
+          if (!isValidId(row.serverId)) {
+            continue;
+          }
+          const key = `${OAUTH_REF_PREFIX}${owner}:${row.serverId}`;
+          if ((await this.ctx.storage.get(key)) === undefined) {
+            await this.ctx.storage.put(key, row.value);
+          }
+        }
       },
     };
   }
@@ -2762,21 +3235,40 @@ export class ChatStore extends DurableObject {
     if (body.profile && typeof body.profile === "object") {
       const raw = body.profile as { updatedAt?: unknown; payload?: unknown };
       const clientAt = typeof raw.updatedAt === "number" ? clampTime(raw.updatedAt) : 0;
-      const payload = typeof raw.payload === "string" ? raw.payload : null;
-      const row = this.ctx.storage.sql
+      const offeredPayload = typeof raw.payload === "string" ? raw.payload : null;
+      const payload = offeredPayload === null ? null : await this.prepareProfilePayload(email, offeredPayload);
+      let row = this.ctx.storage.sql
         .exec<{ payload: string; updated_at: number }>(
           "SELECT payload, updated_at FROM profiles WHERE owner_email = ?",
           email,
         )
         .toArray()[0];
+      if (row) {
+        const safeStored = await this.prepareProfilePayload(email, row.payload);
+        if (safeStored === null) {
+          // Never return an unparsable historical blob: keep it quarantined
+          // until a valid newer client profile replaces it.
+          row = undefined;
+          profileSkipped = true;
+        } else if (safeStored !== row.payload) {
+          this.ctx.storage.sql.exec(
+            "UPDATE profiles SET payload = ? WHERE owner_email = ? AND updated_at = ?",
+            safeStored,
+            email,
+            row.updated_at,
+          );
+          row = { ...row, payload: safeStored };
+        }
+      }
       const serverAt = row?.updated_at ?? 0;
-      if (
+      if (offeredPayload !== null && payload === null) {
+        profileSkipped = true;
+        profileSeen = row?.payload ?? null;
+      } else if (
         row &&
         (serverAt > clientAt || (serverAt === clientAt && payload !== null && row.payload !== payload))
       ) {
-        // Equal clocks are ACK-safe only for byte-identical blobs. A deploy can
-        // revive an older tab at the same millisecond; the durable copy wins
-        // rather than letting an uncommitted payload prune OAuth escrow.
+        // Equal clocks are ACK-safe only for byte-identical, redacted blobs.
         profileOut = { updatedAt: serverAt, payload: row.payload };
         profileSeen = row.payload;
       } else if (payload !== null) {
@@ -2791,8 +3283,11 @@ export class ChatStore extends DurableObject {
               clientAt,
             );
           }
-          profileAck = clientAt; // stored now, or already byte-identical
+          profileAck = clientAt;
           profileSeen = payload;
+          if (payload !== offeredPayload) {
+            profileOut = { updatedAt: clientAt, payload };
+          }
         }
       } else if (clientAt > serverAt) {
         profileWant = true;

@@ -71,6 +71,75 @@ async function reportNextDue(
   }
 }
 
+async function ownerCounts(
+  env: MigrationEnv,
+  origin: string,
+  doId: string,
+  owner: string,
+): Promise<Record<string, number>> {
+  const response = await chatStoreCall(env, origin, doId, "/owner-counts", { owner });
+  const data = (await response.json().catch(() => ({}))) as { counts?: unknown };
+  if (!response.ok || !data.counts || typeof data.counts !== "object" || Array.isArray(data.counts)) {
+    throw new Error(`owner counts failed (${response.status})`);
+  }
+  const counts: Record<string, number> = {};
+  for (const [table, value] of Object.entries(data.counts as Record<string, unknown>)) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new Error("owner counts invalid");
+    }
+    counts[table] = value;
+  }
+  return counts;
+}
+
+async function remapPendingOAuthRoutes(
+  env: MigrationEnv,
+  origin: string,
+  owner: string,
+  shardId: string,
+  page: Record<string, unknown>,
+): Promise<void> {
+  const migrationRows = page.migrationRows;
+  if (!migrationRows || typeof migrationRows !== "object" || Array.isArray(migrationRows)) {
+    return;
+  }
+  const batch = migrationRows as { table?: unknown; rows?: unknown };
+  if (batch.table !== "mcpOAuthPending" || !Array.isArray(batch.rows)) {
+    return;
+  }
+  for (const item of batch.rows) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const row = item as Record<string, unknown>;
+    const state = typeof row.state === "string" ? row.state : "";
+    const status = typeof row.status === "string" ? row.status : "";
+    const expiresAt = typeof row.expires_at === "number" ? row.expires_at : 0;
+    if (
+      !/^[a-f0-9]{64}$/.test(state) ||
+      expiresAt <= Date.now() ||
+      !["pending", "awaiting_confirmation", "exchanging", "exchange_retryable", "exchange_unknown"].includes(status)
+    ) {
+      continue;
+    }
+    const response = await env.DO.fetch(
+      new Request(new URL("/oauth-route/register", origin).toString(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Rork-DO-Class": "AccessRegistry",
+          "X-Rork-DO-Id": "global",
+          "X-Gera-Internal-Route": "oauth",
+        },
+        body: JSON.stringify({ state, shardId, storageOwner: owner, expiresAt }),
+      }),
+    );
+    if (!response.ok) {
+      throw new Error(`OAuth route migration failed (${response.status})`);
+    }
+  }
+}
+
 /**
  * Moves one owner: export pages from the global object, import them into
  * the owner's shard, then mark the owner migrated in the global ledger.
@@ -101,32 +170,40 @@ export async function migrateOwnerToShard(
     const imported = await chatStoreCall(env, origin, shard, "/import", {
       ...data,
       owner,
-      done: data.done === true,
+      // Ownership is unlocked only after source/destination verification.
+      done: false,
     });
     if (!imported.ok) {
       throw new Error(`import failed (${imported.status})`);
     }
+    await remapPendingOAuthRoutes(env, origin, owner, shard, data);
     if (data.done === true) {
-      await reportNextDue(env, origin, owner, imported);
       finished = true;
       break;
     }
     const nextCursor = typeof data.cursor === "string" ? data.cursor : "";
     if (!nextCursor || nextCursor === cursor) {
-      // No forward progress — finalize rather than loop forever.
-      const finalize = await chatStoreCall(env, origin, shard, "/import", { owner, done: true });
-      if (!finalize.ok) {
-        throw new Error(`import finalize failed (${finalize.status})`);
-      }
-      await reportNextDue(env, origin, owner, finalize);
-      finished = true;
-      break;
+      throw new Error("export cursor made no forward progress");
     }
     cursor = nextCursor;
   }
   if (!finished) {
     throw new Error("export paging never finished");
   }
+  const [sourceCounts, destinationCounts] = await Promise.all([
+    ownerCounts(env, origin, "global", owner),
+    ownerCounts(env, origin, shard, owner),
+  ]);
+  for (const [table, sourceCount] of Object.entries(sourceCounts)) {
+    if ((destinationCounts[table] ?? 0) < sourceCount) {
+      throw new Error(`migration verification failed (${table})`);
+    }
+  }
+  const finalized = await chatStoreCall(env, origin, shard, "/import", { owner, done: true });
+  if (!finalized.ok) {
+    throw new Error(`import finalize failed (${finalized.status})`);
+  }
+  await reportNextDue(env, origin, owner, finalized);
   const marked = await chatStoreCall(env, origin, "global", "/mark-migrated", { owner });
   if (!marked.ok) {
     throw new Error(`mark-migrated failed (${marked.status})`);

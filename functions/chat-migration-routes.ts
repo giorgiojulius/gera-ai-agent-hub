@@ -35,7 +35,160 @@ export type ChatStoreRouteContext = {
   hooksIndexValue(payload: string | null | undefined): string;
   /** `done: true` import — records the shard's owner and unlocks account routes. */
   markShardInitialized(owner: string): Promise<void>;
+  shardOwner(): Promise<string>;
+  hasOwnerStorage(owner: string): Promise<boolean>;
+  prepareProfilePayload(owner: string, payload: string): Promise<string | null>;
+  exportOwnerStorage(owner: string): Promise<Array<{ serverId: string; value: unknown }>>;
+  importOwnerStorage(owner: string, rows: Array<{ serverId: string; value: unknown }>): Promise<void>;
 };
+
+type MigrationTable = {
+  wireName: string;
+  tableName: string;
+  columns: readonly string[];
+};
+
+const MIGRATION_TABLES: readonly MigrationTable[] = [
+  { wireName: "mcpServerSecrets", tableName: "mcp_server_secrets", columns: ["server_id", "payload", "updated_at"] },
+  { wireName: "mcpOAuthGrants", tableName: "mcp_oauth_grants", columns: ["server_id", "payload", "updated_at"] },
+  { wireName: "mcpOAuthRevocations", tableName: "mcp_oauth_revocations", columns: ["server_id", "revoked_at"] },
+  { wireName: "mcpOAuthStates", tableName: "mcp_oauth_states", columns: ["server_id", "state", "error_code", "retry_after", "updated_at"] },
+  { wireName: "mcpOAuthClients", tableName: "mcp_oauth_clients", columns: ["registration_endpoint", "redirect_uri", "client_id", "expires_at", "updated_at"] },
+  {
+    wireName: "mcpOAuthPending",
+    tableName: "mcp_oauth_pending",
+    columns: ["state", "server_id", "mcp_url", "token_endpoint", "client_id", "verifier", "redirect_uri", "resource", "issuer", "return_origin", "browser_nonce", "callback_challenge", "authorization_code", "expires_at", "status", "error", "created_at", "updated_at"],
+  },
+  {
+    wireName: "mcpGithubPending",
+    tableName: "mcp_github_device_pending",
+    columns: ["flow_id", "server_id", "device_code", "user_code", "verification_uri", "client_id", "expires_at", "interval_ms", "next_poll_at", "status", "error", "created_at", "updated_at"],
+  },
+  {
+    wireName: "automationRunReceipts",
+    tableName: "automation_run_receipts",
+    columns: ["id", "automation_id", "conversation_id", "name", "agent_id", "model_id", "user_text", "status", "started_at", "finished_at", "error"],
+  },
+  {
+    wireName: "agentRuns",
+    tableName: "agent_runs",
+    columns: ["conversation_id", "run_id", "kind", "status", "started_at", "heartbeat_at", "finished_at", "title", "model_id", "assistant_message_id", "ephemeral", "acked", "snapshot", "result", "error"],
+  },
+  {
+    wireName: "agentRunReceipts",
+    tableName: "agent_run_receipts",
+    columns: ["run_id", "conversation_id", "request_hash", "status", "history_on_server", "result", "error", "created_at", "updated_at"],
+  },
+  { wireName: "agentRunMedia", tableName: "agent_run_media", columns: ["run_id", "idx", "chunk", "kind", "data", "created_at"] },
+] as const;
+
+const MIGRATION_PAGE_ROWS = 24;
+type ExportCursor = { phase: "chats"; key: string } | { phase: "table"; index: number; rowId: number };
+
+function decodeExportCursor(raw: string): ExportCursor {
+  if (!raw) return { phase: "chats", key: "" };
+  try {
+    const parsed = JSON.parse(raw) as Partial<ExportCursor>;
+    if (parsed.phase === "chats" && typeof parsed.key === "string") {
+      return { phase: "chats", key: parsed.key };
+    }
+    if (
+      parsed.phase === "table" &&
+      typeof parsed.index === "number" &&
+      Number.isInteger(parsed.index) &&
+      typeof parsed.rowId === "number" &&
+      Number.isFinite(parsed.rowId)
+    ) {
+      return { phase: "table", index: Math.max(0, parsed.index), rowId: Math.max(0, parsed.rowId) };
+    }
+  } catch {
+    // Pre-versioned migration cursors were raw chat ids.
+  }
+  return { phase: "chats", key: raw };
+}
+
+function encodeExportCursor(cursor: ExportCursor): string {
+  return JSON.stringify(cursor);
+}
+
+const OWNER_DATA_TABLES = [
+  "profiles",
+  "chats",
+  "tombstones",
+  "diagnostics",
+  "diag_meta",
+  "server_runs",
+  "mcp_server_secrets",
+  "mcp_oauth_grants",
+  "mcp_oauth_revocations",
+  "mcp_oauth_states",
+  "mcp_oauth_clients",
+  "mcp_oauth_pending",
+  "mcp_github_device_pending",
+  "automation_run_receipts",
+  "agent_runs",
+  "agent_run_receipts",
+  "agent_run_media",
+  "schedule",
+  "hooks",
+  "migrated_owners",
+] as const;
+
+/** Internal metadata-only probe used before an immutable subject may claim a legacy email. */
+export async function handleOwnerState(store: ChatStoreRouteContext, request: Request): Promise<Response> {
+  let body: { owner?: unknown };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: "invalid_body" }, 400);
+  }
+  const owner = asStr(body.owner).trim().toLowerCase();
+  if (!owner) {
+    return json({ error: "invalid_owner" }, 400);
+  }
+  if ((await store.shardOwner()) === owner || await store.hasOwnerStorage(owner)) {
+    return json({ hasData: true });
+  }
+  for (const table of OWNER_DATA_TABLES) {
+    const row = store.sql
+      .exec<{ present: number }>(`SELECT 1 AS present FROM ${table} WHERE owner_email = ? LIMIT 1`, owner)
+      .toArray()[0];
+    if (row) {
+      return json({ hasData: true });
+    }
+  }
+  return json({ hasData: false });
+}
+
+const VERIFIED_MIGRATION_TABLES = [
+  "profiles",
+  "chats",
+  "tombstones",
+  "server_runs",
+  ...MIGRATION_TABLES.map((item) => item.tableName),
+] as const;
+
+/** Internal row-count proof checked before the legacy source is marked migrated. */
+export async function handleOwnerCounts(store: ChatStoreRouteContext, request: Request): Promise<Response> {
+  let body: { owner?: unknown };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: "invalid_body" }, 400);
+  }
+  const owner = asStr(body.owner).trim().toLowerCase();
+  if (!owner) {
+    return json({ error: "invalid_owner" }, 400);
+  }
+  const counts: Record<string, number> = {};
+  for (const table of VERIFIED_MIGRATION_TABLES) {
+    counts[table] = store.sql
+      .exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE owner_email = ?`, owner)
+      .toArray()[0]?.count ?? 0;
+  }
+  counts.oauth_storage = (await store.exportOwnerStorage(owner)).length;
+  return json({ counts });
+}
 
 /**
  * Streams one owner's rows out of this (legacy global) object so the
@@ -54,16 +207,34 @@ export async function handleExport(store: ChatStoreRouteContext, request: Reques
   if (!owner) {
     return json({ error: "invalid_owner" }, 400);
   }
-  const cursor = asStr(body.cursor);
+  const rawCursor = asStr(body.cursor);
+  const cursor = decodeExportCursor(rawCursor);
   const out: Record<string, unknown> = {};
-  if (!cursor) {
+  if (!rawCursor) {
     const profile = store.sql
       .exec<{ payload: string; updated_at: number }>(
         "SELECT payload, updated_at FROM profiles WHERE owner_email = ?",
         owner,
       )
       .toArray()[0];
-    out.profile = profile ? { payload: profile.payload, updatedAt: profile.updated_at } : null;
+    if (profile) {
+      const safePayload = await store.prepareProfilePayload(owner, profile.payload);
+      if (safePayload !== null) {
+        if (safePayload !== profile.payload) {
+          store.sql.exec(
+            "UPDATE profiles SET payload = ? WHERE owner_email = ? AND updated_at = ?",
+            safePayload,
+            owner,
+            profile.updated_at,
+          );
+        }
+        out.profile = { payload: safePayload, updatedAt: profile.updated_at };
+      } else {
+        out.profile = null;
+      }
+    } else {
+      out.profile = null;
+    }
     out.serverRuns = store.sql
       .exec<{ automation_id: string; last_run_at: number }>(
         "SELECT automation_id, last_run_at FROM server_runs WHERE owner_email = ?",
@@ -88,27 +259,75 @@ export async function handleExport(store: ChatStoreRouteContext, request: Reques
       .exec<TombstoneRow>("SELECT id, deleted_at FROM tombstones WHERE owner_email = ?", owner)
       .toArray()
       .map((row) => ({ id: row.id, deletedAt: row.deleted_at }));
+    out.oauthStorage = await store.exportOwnerStorage(owner);
+  }
+
+  if (cursor.phase === "chats") {
+    const rows = store.sql
+      .exec<ChatRow>(
+        "SELECT id, title, updated_at, payload FROM chats WHERE owner_email = ? AND id > ? ORDER BY id LIMIT ?",
+        owner,
+        cursor.key,
+        EXPORT_PAGE_CHATS + 1,
+      )
+      .toArray();
+    const chats: Array<{ id: string; title: string; updatedAt: number; payload: string }> = [];
+    let bytes = 0;
+    for (const row of rows) {
+      if (chats.length > 0 && bytes + row.payload.length > EXPORT_PAGE_BYTES) {
+        break;
+      }
+      chats.push({ id: row.id, title: row.title, updatedAt: row.updated_at, payload: row.payload });
+      bytes += row.payload.length;
+      if (chats.length >= EXPORT_PAGE_CHATS) {
+        break;
+      }
+    }
+    const hasMoreChats = chats.length < rows.length;
+    out.chats = chats;
+    out.done = false;
+    out.cursor = hasMoreChats
+      ? encodeExportCursor({ phase: "chats", key: chats.at(-1)?.id ?? cursor.key })
+      : encodeExportCursor({ phase: "table", index: 0, rowId: 0 });
+    return json(out);
+  }
+
+  const definition = MIGRATION_TABLES[cursor.index];
+  if (!definition) {
+    return json({ ...out, done: true, cursor: rawCursor });
   }
   const rows = store.sql
-    .exec<ChatRow>(
-      "SELECT id, title, updated_at, payload FROM chats WHERE owner_email = ? AND id > ? ORDER BY id LIMIT ?",
+    .exec<Record<string, string | number | null>>(
+      `SELECT rowid AS migration_rowid, ${definition.columns.join(", ")} FROM ${definition.tableName}
+       WHERE owner_email = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
       owner,
-      cursor,
-      EXPORT_PAGE_CHATS,
+      cursor.rowId,
+      MIGRATION_PAGE_ROWS + 1,
     )
     .toArray();
-  const chats: Array<{ id: string; title: string; updatedAt: number; payload: string }> = [];
+  const selected: Array<Record<string, string | number | null>> = [];
   let bytes = 0;
   for (const row of rows) {
-    if (chats.length > 0 && bytes + row.payload.length > EXPORT_PAGE_BYTES) {
+    const size = JSON.stringify(row).length;
+    if (selected.length > 0 && bytes + size > EXPORT_PAGE_BYTES) {
       break;
     }
-    chats.push({ id: row.id, title: row.title, updatedAt: row.updated_at, payload: row.payload });
-    bytes += row.payload.length;
+    selected.push(row);
+    bytes += size;
+    if (selected.length >= MIGRATION_PAGE_ROWS) {
+      break;
+    }
   }
-  out.chats = chats;
-  out.done = rows.length < EXPORT_PAGE_CHATS && chats.length === rows.length;
-  out.cursor = chats.length > 0 ? chats[chats.length - 1].id : cursor;
+  const hasMoreRows = selected.length < rows.length;
+  const lastRowId = asNum(selected.at(-1)?.migration_rowid, cursor.rowId);
+  const nextIndex = hasMoreRows ? cursor.index : cursor.index + 1;
+  out.migrationRows = { table: definition.wireName, rows: selected };
+  out.done = !hasMoreRows && nextIndex >= MIGRATION_TABLES.length;
+  out.cursor = encodeExportCursor({
+    phase: "table",
+    index: nextIndex,
+    rowId: hasMoreRows ? lastRowId : 0,
+  });
   return json(out);
 }
 
@@ -130,6 +349,17 @@ export async function handleOwners(store: ChatStoreRouteContext, request: Reques
         UNION SELECT owner_email FROM diag_meta
         UNION SELECT owner_email FROM tombstones
         UNION SELECT owner_email FROM server_runs
+        UNION SELECT owner_email FROM mcp_server_secrets
+        UNION SELECT owner_email FROM mcp_oauth_grants
+        UNION SELECT owner_email FROM mcp_oauth_revocations
+        UNION SELECT owner_email FROM mcp_oauth_states
+        UNION SELECT owner_email FROM mcp_oauth_clients
+        UNION SELECT owner_email FROM mcp_oauth_pending
+        UNION SELECT owner_email FROM mcp_github_device_pending
+        UNION SELECT owner_email FROM automation_run_receipts
+        UNION SELECT owner_email FROM agent_runs
+        UNION SELECT owner_email FROM agent_run_receipts
+        UNION SELECT owner_email FROM agent_run_media
       ) WHERE owner_email NOT IN (SELECT owner_email FROM migrated_owners) LIMIT ?`,
       limit,
     )
@@ -156,6 +386,40 @@ export async function handleMarkMigrated(store: ChatStoreRouteContext, request: 
   return json({ ok: true });
 }
 
+function importMigrationRows(store: ChatStoreRouteContext, owner: string, raw: unknown): void {
+  if (!isRecord(raw) || typeof raw.table !== "string" || !Array.isArray(raw.rows)) {
+    return;
+  }
+  const definition = MIGRATION_TABLES.find((item) => item.wireName === raw.table);
+  if (!definition) {
+    return;
+  }
+  const placeholders = ["?", ...definition.columns.map(() => "?")].join(", ");
+  for (const item of raw.rows) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const values: Array<string | number | null> = [];
+    let valid = true;
+    for (const column of definition.columns) {
+      const value = item[column];
+      if (typeof value !== "string" && typeof value !== "number" && value !== null) {
+        valid = false;
+        break;
+      }
+      values.push(value);
+    }
+    if (!valid) {
+      continue;
+    }
+    store.sql.exec(
+      `INSERT OR IGNORE INTO ${definition.tableName} (owner_email, ${definition.columns.join(", ")}) VALUES (${placeholders})`,
+      owner,
+      ...values,
+    );
+  }
+}
+
 /**
  * Imports one export page into this shard. Every row is LWW-guarded, so a
  * duplicate concurrent migration — or a client that already synced fresher
@@ -171,6 +435,8 @@ export async function handleImport(store: ChatStoreRouteContext, request: Reques
     diagMeta?: unknown;
     tombstones?: unknown;
     chats?: unknown;
+    migrationRows?: unknown;
+    oauthStorage?: unknown;
     done?: unknown;
   };
   try {
@@ -183,20 +449,30 @@ export async function handleImport(store: ChatStoreRouteContext, request: Reques
     return json({ error: "invalid_owner" }, 400);
   }
 
+  if (Array.isArray(body.oauthStorage)) {
+    const rows = body.oauthStorage
+      .filter((item): item is { serverId: string; value: unknown } =>
+        isRecord(item) && typeof item.serverId === "string" && isValidId(item.serverId),
+      )
+      .map((item) => ({ serverId: item.serverId, value: item.value }));
+    await store.importOwnerStorage(owner, rows);
+  }
   if (isRecord(body.profile) && typeof body.profile.payload === "string") {
+    const safePayload = await store.prepareProfilePayload(owner, body.profile.payload);
     const incomingAt = asNum(body.profile.updatedAt, 0);
     const existing = store.sql
       .exec<{ updated_at: number }>("SELECT updated_at FROM profiles WHERE owner_email = ?", owner)
       .toArray()[0];
-    if (!existing || incomingAt > existing.updated_at) {
+    if (safePayload !== null && (!existing || incomingAt > existing.updated_at)) {
       store.sql.exec(
         "INSERT OR REPLACE INTO profiles (owner_email, payload, updated_at) VALUES (?, ?, ?)",
         owner,
-        body.profile.payload,
+        safePayload,
         incomingAt,
       );
     }
   }
+  importMigrationRows(store, owner, body.migrationRows);
   for (const item of Array.isArray(body.serverRuns) ? body.serverRuns : []) {
     if (!isRecord(item) || !isValidId(item.automationId)) {
       continue;

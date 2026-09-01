@@ -4,6 +4,7 @@ import {
   buildAuthorizationUrl,
   discoverMcpOAuth,
   exchangeAuthorizationCode,
+  OAuthCodeExchangeError,
   pkceChallenge,
   registerDynamicOAuthClient,
 } from "../../../functions/mcp-oauth-flow";
@@ -101,6 +102,31 @@ describe("server-owned MCP OAuth flow", () => {
       mcpUrl: "https://mcp.staging-provider.dev/mcp",
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies code-exchange failures without discarding retryable proof", async () => {
+    const exchange = (): ReturnType<typeof exchangeAuthorizationCode> => exchangeAuthorizationCode({
+      tokenEndpoint: "https://auth.staging-provider.dev/token",
+      clientId: "client-1",
+      code: "one-time-code",
+      verifier: "verifier-1",
+      redirectUri: "https://backend.staging.workers.dev/mcp/oauth/callback",
+      resource: "https://mcp.staging-provider.dev/mcp",
+      mcpUrl: "https://mcp.staging-provider.dev/mcp",
+    });
+
+    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => json({ error: "temporarily_unavailable" }, 503)));
+    const retryable = await exchange().catch((error: unknown) => error);
+    expect(retryable).toBeInstanceOf(OAuthCodeExchangeError);
+    expect(retryable).toMatchObject({ code: "temporarily_unavailable", transient: true, ambiguous: false });
+
+    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => { throw new TypeError("connection reset"); }));
+    const ambiguous = await exchange().catch((error: unknown) => error);
+    expect(ambiguous).toMatchObject({ code: "temporarily_unavailable", transient: true, ambiguous: true });
+
+    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => json({ error: "invalid_grant" }, 400)));
+    const permanent = await exchange().catch((error: unknown) => error);
+    expect(permanent).toMatchObject({ code: "invalid_grant", transient: false, ambiguous: false });
   });
 
   it("rejects cross-origin resource metadata before authorization", async () => {

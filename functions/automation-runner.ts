@@ -25,9 +25,11 @@ import {
   connectCloudMcp,
   ensureFreshCloudOAuth,
   forceRefreshCloudOAuthOutcome,
+  redactCloudMcpText,
+  type BeginCloudOAuthRefresh,
   type CloudMcpServer,
   type CloudMcpSession,
-  type CloudOAuthRefreshOutcome,
+  type CloudOAuthRefreshFailure,
   type RefreshedOAuth,
 } from "./mcp-cloud";
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
@@ -313,15 +315,25 @@ function armNativeServer(runtime: McpRuntime, server: CloudMcpServer): void {
 export async function armCloudMcp(
   servers: CloudMcpServer[],
   persist?: (rotation: RefreshedOAuth) => Promise<void>,
-  reportFailure?: (serverId: string, outcome: Exclude<CloudOAuthRefreshOutcome, { ok: true }>) => Promise<void>,
+  reportFailure?: (serverId: string, outcome: CloudOAuthRefreshFailure) => Promise<void>,
+  beginRefresh?: BeginCloudOAuthRefresh,
 ): Promise<McpRuntime> {
   const runtime = emptyMcpRuntime();
+  const unavailable = new Set<string>();
   for (const server of servers) {
     if (server.oauth) {
       try {
-        const outcome = await ensureFreshCloudOAuth(server, runtime.refreshed, persist);
-        if (outcome && !outcome.ok) {
+        const outcome = await ensureFreshCloudOAuth(server, runtime.refreshed, persist, beginRefresh);
+        if (outcome?.ok === false) {
           await reportFailure?.(server.id, outcome);
+          if (!outcome.transient) {
+            unavailable.add(server.id);
+            runtime.failures.push({
+              name: "mcp_auth",
+              arguments: server.name,
+              result: `Could not authenticate MCP server "${server.name}": sign-in must be renewed.`,
+            });
+          }
         }
       } catch {
         // keep the synced token — a real auth failure surfaces honestly below
@@ -329,11 +341,13 @@ export async function armCloudMcp(
     }
   }
   for (const server of servers) {
-    armNativeServer(runtime, server);
+    if (!unavailable.has(server.id)) {
+      armNativeServer(runtime, server);
+    }
   }
   const attempts = await Promise.all(
     servers
-      .filter((server) => server.kind === "mcp")
+      .filter((server) => server.kind === "mcp" && !unavailable.has(server.id))
       .map(async (server) => {
         try {
           return { server, connection: await connectCloudMcp(server) };
@@ -344,8 +358,13 @@ export async function armCloudMcp(
           // the refresh token once and retry — mirrors the browser's 401
           // replay, so a sleeping sign-in repairs instead of failing.
           if (message.includes("auth rejected") && server.oauth?.refreshToken) {
-            const outcome = await forceRefreshCloudOAuthOutcome(server, runtime.refreshed, persist).catch(() => null);
-            if (outcome && !outcome.ok) {
+            const outcome = await forceRefreshCloudOAuthOutcome(
+              server,
+              runtime.refreshed,
+              persist,
+              beginRefresh,
+            ).catch(() => null);
+            if (outcome?.ok === false) {
               await reportFailure?.(server.id, outcome);
             }
             if (outcome?.ok) {
@@ -407,13 +426,20 @@ export async function callNativeConnectorTool(
   route: Extract<McpRoute, { type: "native" }>,
   args: Record<string, unknown>,
 ): Promise<string> {
-  if (route.kind === "github") {
-    return callGitHubNativeTool(route.auth, route.toolName, args);
+  const credentials = [route.auth, /^Bearer\s+(.+)$/i.exec(route.auth)?.[1] ?? ""];
+  try {
+    const output = route.kind === "github"
+      ? await callGitHubNativeTool(route.auth, route.toolName, args)
+      : route.kind === "slack"
+        ? await callSlackNativeTool(route.auth, route.toolName, args)
+        : await callIntercomNativeTool(route.auth, route.toolName, args);
+    return redactCloudMcpText(output, credentials);
+  } catch (error) {
+    throw new Error(redactCloudMcpText(
+      error instanceof Error ? error.message : "native connector failed",
+      credentials,
+    ));
   }
-  if (route.kind === "slack") {
-    return callSlackNativeTool(route.auth, route.toolName, args);
-  }
-  return callIntercomNativeTool(route.auth, route.toolName, args);
 }
 
 function cap(text: string, limit: number): string {
@@ -459,10 +485,14 @@ export async function runAutomationJob(
   authKey: string,
   deadlineAt?: number,
   persistOAuth?: (rotation: RefreshedOAuth) => Promise<void>,
+  reportOAuthFailure?: (serverId: string, outcome: CloudOAuthRefreshFailure) => Promise<void>,
+  beginOAuthRefresh?: BeginCloudOAuthRefresh,
 ): Promise<AutomationRunResult> {
   // MCP first, so the system prompt lists what actually connected and the
   // thread shows honest records for servers that did not.
-  const mcp = job.mcpServers.length > 0 ? await armCloudMcp(job.mcpServers, persistOAuth) : emptyMcpRuntime();
+  const mcp = job.mcpServers.length > 0
+    ? await armCloudMcp(job.mcpServers, persistOAuth, reportOAuthFailure, beginOAuthRefresh)
+    : emptyMcpRuntime();
   const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs, executionOutcomeToolDefinition()];
   const messages: GatewayMessage[] = [{ role: "system", content: buildSystemPrompt(job, mcp.summary) }];
   for (const item of job.prior) {

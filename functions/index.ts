@@ -52,6 +52,7 @@
 // stop / ack + active / stream / media. The stream response passes through
 // as a live SSE stream. See run-manager.ts for the run lifecycle.
 
+import { AccessRegistry } from "./access-registry";
 import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute } from "./knowledge-storage";
@@ -61,7 +62,7 @@ import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
 import { chatShardId, migrateOwnerToShard, sweepGlobalMigrations } from "./shard-migration";
 
-export { AccessRegistry } from "./access-registry";
+export { AccessRegistry };
 export { ArenaStore } from "./arena-store";
 export { ChatStore } from "./chat-store";
 export { ProjectStore } from "./project-store";
@@ -79,6 +80,8 @@ type Env = {
   EXPO_PUBLIC_RORK_API_BASE_URL?: string;
   /** Stable private salt for opaque repository-preview account shards. */
   RORK_AUTH_SECRET_KEY?: string;
+  /** Present only on the isolated black-box acceptance Worker. */
+  STAGING_VERSION?: string;
 };
 
 type ExecutionCtx = { waitUntil(promise: Promise<unknown>): void };
@@ -327,6 +330,53 @@ function decodeHeaderText(value: string): string {
   }
 }
 
+async function sameBootstrapSecret(expected: string, presented: string): Promise<boolean> {
+  if (!expected || !presented) return false;
+  const [left, right] = await Promise.all([
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(expected)),
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(presented)),
+  ]);
+  const a = new Uint8Array(left);
+  const b = new Uint8Array(right);
+  let mismatch = a.length ^ b.length;
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    mismatch |= (a[index] ?? 0) ^ (b[index] ?? 0);
+  }
+  return mismatch === 0;
+}
+
+/** One operator-only escape hatch for pre-principal legacy owners. */
+async function relayPrincipalBootstrap(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST" || !env.RORK_AUTH_SECRET_KEY) {
+    return corsJson({ error: "not_found" }, 404);
+  }
+  const presented = request.headers.get("X-Gera-Bootstrap-Secret") ?? "";
+  if (!(await sameBootstrapSecret(env.RORK_AUTH_SECRET_KEY, presented))) {
+    return corsJson({ error: "unauthorized" }, 401);
+  }
+  const body = await request.text();
+  if (body.length > 4_096) {
+    return corsJson({ error: "body_too_large" }, 413);
+  }
+  const upstream = await env.DO.fetch(
+    new Request(new URL("/principal/bootstrap", request.url).toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Rork-DO-Class": "AccessRegistry",
+        "X-Rork-DO-Id": "global",
+        "X-Gera-Internal-Route": "principal-bootstrap",
+      },
+      body,
+    }),
+  );
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
 /**
  * Routes /access/* to the AccessRegistry DO. Identity comes exclusively from
  * the platform-verified X-Rork-User-* headers (the platform strips inbound
@@ -342,6 +392,10 @@ async function relayAccess(request: Request, url: URL, env: Env): Promise<Respon
   if (!userId || !email) {
     return corsJson({ error: "sign_in_required" }, 401);
   }
+  const principal = await resolveAccountPrincipal(request, env);
+  if (principal instanceof Response) {
+    return principal;
+  }
 
   const subPath = url.pathname.slice("/access".length) || "/";
   const target = new URL(request.url);
@@ -349,6 +403,7 @@ async function relayAccess(request: Request, url: URL, env: Env): Promise<Respon
   const wrapped = new Request(target.toString(), request);
   // Never forward caller-supplied internal routing markers into the DO.
   wrapped.headers.delete("X-Gera-Internal-Route");
+  wrapped.headers.delete("X-Gera-Principal-Create");
   wrapped.headers.set("X-Rork-DO-Class", "AccessRegistry");
   wrapped.headers.set("X-Rork-DO-Id", "global");
   wrapped.headers.set("X-Gera-User-Id", encodeURIComponent(userId));
@@ -383,6 +438,57 @@ type AccountPrincipal = {
 type PrincipalCacheEntry = { account: AccountPrincipal; expiresAt: number };
 const principalCache = new Map<string, PrincipalCacheEntry>();
 
+function principalRegistryCall(
+  env: Env,
+  requestUrl: string,
+  userId: string,
+  currentEmail: string,
+  allowCreate: boolean,
+): Promise<Response> {
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-Rork-DO-Class": "AccessRegistry",
+    "X-Rork-DO-Id": "global",
+    "X-Gera-User-Id": encodeURIComponent(userId),
+    "X-Gera-Email": encodeURIComponent(currentEmail),
+  });
+  if (allowCreate) {
+    headers.set("X-Gera-Principal-Create", "empty-owner");
+  }
+  return env.DO.fetch(
+    new Request(new URL("/principal/resolve", requestUrl).toString(), {
+      method: "POST",
+      headers,
+      body: "{}",
+    }),
+  );
+}
+
+/** Metadata-only probes; any ambiguity fails closed before a subject owns an old email shard. */
+async function ownerHasLegacyData(env: Env, requestUrl: string, owner: string): Promise<boolean> {
+  for (const doId of ["global", chatShardId(owner)]) {
+    const response = await env.DO.fetch(
+      new Request(new URL("/owner-state", requestUrl).toString(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Rork-DO-Class": "ChatStore",
+          "X-Rork-DO-Id": doId,
+        },
+        body: JSON.stringify({ owner }),
+      }),
+    );
+    const data = (await response.json().catch(() => ({}))) as { hasData?: unknown };
+    if (!response.ok || typeof data.hasData !== "boolean") {
+      throw new Error("owner state unavailable");
+    }
+    if (data.hasData) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Resolves the immutable verified app subject to its permanent account shard.
  * Existing users keep their email-named DO and row owner, so rollout performs
@@ -399,27 +505,23 @@ async function resolveAccountPrincipal(request: Request, env: Env): Promise<Acco
   if (cached && cached.expiresAt > Date.now()) {
     return cached.account;
   }
-  const headers = new Headers({
-    "Content-Type": "application/json",
-    "X-Rork-DO-Class": "AccessRegistry",
-    "X-Rork-DO-Id": "global",
-    "X-Gera-User-Id": encodeURIComponent(userId),
-    "X-Gera-Email": encodeURIComponent(currentEmail),
-  });
   let response: Response;
+  let raw: Partial<AccountPrincipal> & { error?: unknown };
   try {
-    response = await env.DO.fetch(
-      new Request(new URL("/principal/resolve", request.url).toString(), {
-        method: "POST",
-        headers,
-        body: "{}",
-      }),
-    );
+    response = await principalRegistryCall(env, request.url, userId, currentEmail, false);
+    raw = (await response.json().catch(() => ({}))) as Partial<AccountPrincipal> & { error?: unknown };
+    if (response.status === 404 && raw.error === "principal_unclaimed") {
+      const hasLegacyData = await ownerHasLegacyData(env, request.url, currentEmail);
+      if (hasLegacyData) {
+        return corsJson({ error: "legacy_owner_verification_required" }, 409);
+      }
+      response = await principalRegistryCall(env, request.url, userId, currentEmail, true);
+      raw = (await response.json().catch(() => ({}))) as Partial<AccountPrincipal> & { error?: unknown };
+    }
   } catch (error) {
     console.error("principal registry unreachable", error instanceof Error ? error.message : "error");
     return corsJson({ error: "identity_unavailable" }, 503);
   }
-  const raw = (await response.json().catch(() => ({}))) as Partial<AccountPrincipal> & { error?: unknown };
   if (!response.ok) {
     return corsJson(
       { error: typeof raw.error === "string" ? raw.error : "identity_unavailable" },
@@ -1729,13 +1831,28 @@ async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Re
         return corsJson({ error: "oauth_callback_route_unavailable" }, 503);
       }
     }
+    if (upstream.ok && url.pathname === "/mcp/oauth-complete" && body) {
+      try {
+        const parsed = JSON.parse(body) as { state?: unknown };
+        if (typeof parsed.state === "string") {
+          const consumed = await oauthRouteCall(env, new URL(request.url).origin, "/oauth-route/consume", {
+            state: parsed.state,
+          });
+          if (!consumed.ok && consumed.status !== 404) {
+            return corsJson({ error: "oauth_route_cleanup_unavailable", retryable: true }, 503);
+          }
+        }
+      } catch {
+        // The account shard already validated the body; route cleanup is best effort.
+      }
+    }
     return new Response(text, {
       status: upstream.status,
       headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
   } catch (error) {
     console.error("account MCP relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "upstream_unreachable", transient: true }, 502);
+    return corsJson({ error: "upstream_unreachable", transient: true, retryable: true }, 502);
   }
 }
 
@@ -1781,7 +1898,12 @@ async function relayMcpOAuthCallback(request: Request, url: URL, env: Env): Prom
   const origin = new URL(request.url).origin;
   const route = await oauthRouteCall(env, origin, "/oauth-route/resolve", { state });
   if (!route.ok) {
-    return new Response("OAuth state is invalid, expired, or already used.", { status: 400 });
+    return new Response(
+      route.status === 404
+        ? "OAuth state is invalid, expired, or already used."
+        : "OAuth callback routing is temporarily unavailable. Retry shortly.",
+      { status: route.status === 404 ? 400 : 503 },
+    );
   }
   const target = (await route.json()) as { shardId?: unknown; storageOwner?: unknown };
   if (typeof target.shardId !== "string" || typeof target.storageOwner !== "string") {
@@ -1811,9 +1933,6 @@ async function relayMcpOAuthCallback(request: Request, url: URL, env: Env): Prom
     return new Response("OAuth callback could not reach the account store. Retry from Gera.", { status: 503 });
   }
   const data = (await upstream.json().catch(() => ({}))) as { redirectUrl?: unknown; error?: unknown };
-  if (upstream.status < 500) {
-    await oauthRouteCall(env, origin, "/oauth-route/consume", { state }).catch(() => undefined);
-  }
   const redirectUrl = typeof data.redirectUrl === "string" ? safePublicHttpsUrl(data.redirectUrl) : null;
   if (redirectUrl) {
     return new Response(null, {
@@ -2568,11 +2687,29 @@ export default {
     if (url.pathname === "/ping") {
       return corsJson({ ok: true, now: new Date().toISOString() }, 200);
     }
+    if (url.pathname === "/__staging/account-version") {
+      if (!env.STAGING_VERSION || request.method !== "GET") {
+        return corsJson({ error: "not_found" }, 404);
+      }
+      const account = await requireInvitedAccount(request, env);
+      if (account instanceof Response) {
+        return account;
+      }
+      const upstream = await shardCall(env, request.url, account, "/staging/version", { method: "GET" });
+      const text = await upstream.text();
+      return new Response(text, {
+        status: upstream.status,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
+      });
+    }
     if (url.pathname.startsWith("/repo-preview/") || url.pathname.startsWith("/repo-preview-hook/")) {
       return relayRepoPreviewPublic(request, url, env);
     }
     if (url.pathname === "/repo-previews" || url.pathname.startsWith("/repo-previews/")) {
       return relayRepoPreviews(request, url, env);
+    }
+    if (url.pathname === "/access/bootstrap-principal") {
+      return relayPrincipalBootstrap(request, env);
     }
     if (url.pathname === "/access" || url.pathname.startsWith("/access/")) {
       return relayAccess(request, url, env);

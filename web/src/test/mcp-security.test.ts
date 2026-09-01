@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { armCloudMcp } from "../../../functions/automation-runner";
 import { INTERCOM_NATIVE_TOOLS as CLOUD_INTERCOM_TOOLS } from "../../../functions/native-intercom";
 import { SLACK_NATIVE_TOOLS as CLOUD_SLACK_TOOLS } from "../../../functions/native-slack";
 import {
@@ -8,6 +9,8 @@ import {
   cloudMcpServersForAutomation,
   connectCloudMcp,
   forceRefreshCloudOAuth,
+  redactCloudMcpText,
+  redactCloudMcpValue,
   type CloudMcpServer,
   type CloudMcpSession,
   type CloudOAuthToken,
@@ -414,13 +417,13 @@ describe("MCP protocol compatibility", () => {
         const body = requestBody(init);
         seen.push({ method: body.method ?? "", protocol: new Headers(init?.headers).get("MCP-Protocol-Version") });
         if (body.method === "initialize") {
-          return rpcJson(body.id, { protocolVersion: "2024-11-05" });
+          return rpcJson(body.id, { protocolVersion: "2024-11-05" }, { "Mcp-Session-Id": "session-sensitive" });
         }
         if (body.method === "notifications/initialized") {
           return new Response(null, { status: 202 });
         }
         if (body.method === "tools/list" && body.params?.cursor === "two") {
-          return rpcJson(body.id, { tools: [{ name: "two" }] });
+          return rpcJson(body.id, { tools: [{ name: "two", description: "echo session-sensitive" }] });
         }
         return rpcJson(body.id, { tools: [{ name: "one" }], nextCursor: "two" });
       }),
@@ -435,6 +438,8 @@ describe("MCP protocol compatibility", () => {
       disabledTools: [],
     });
     expect(connection.tools.map((tool) => tool.name)).toEqual(["one", "two"]);
+    expect(connection.tools[1]?.description).toBe("echo [REDACTED_CREDENTIAL]");
+    expect(connection.session.redactions).toContain("session-sensitive");
     expect(seen.find((item) => item.method === "tools/list")?.protocol).toBe("2024-11-05");
   });
 
@@ -515,6 +520,34 @@ describe("MCP protocol compatibility", () => {
       nextId: 0,
     };
     await expect(callCloudMcpTool(session, "write", {})).rejects.toThrow(/permission denied/);
+  });
+
+  it("redacts exact server credentials from provider text and structured values", async () => {
+    const secret = "credential-with-special+/characters";
+    expect(redactCloudMcpText(`echo ${secret} and ${encodeURIComponent(secret)}`, [secret]))
+      .toBe("echo [REDACTED_CREDENTIAL] and [REDACTED_CREDENTIAL]");
+    expect(redactCloudMcpValue({ nested: [secret, { key: `Bearer ${secret}` }] }, [`Bearer ${secret}`]))
+      .toEqual({ nested: ["[REDACTED_CREDENTIAL]", { key: "[REDACTED_CREDENTIAL]" }] });
+    let deep: unknown = secret;
+    for (let index = 0; index < 25; index += 1) deep = { child: deep };
+    const redactedDeep = JSON.stringify(redactCloudMcpValue(deep, [secret]));
+    expect(redactedDeep).not.toContain(secret);
+    expect(redactedDeep).toContain("REDACTED_DEEP_PROVIDER_VALUE");
+
+    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => rpcJson(1, {
+      content: [{ type: "text", text: `provider echoed Bearer ${secret}` }],
+      structuredContent: { leaked: secret },
+    })));
+    const result = await callCloudMcpTool({
+      url: "https://mcp.example.com/mcp",
+      headers: { Authorization: `Bearer ${secret}` },
+      omitMcpHeaders: false,
+      protocolVersion: "2025-06-18",
+      nextId: 0,
+      redactions: [`Bearer ${secret}`, secret],
+    }, "echo", {});
+    expect(result).toContain("[REDACTED_CREDENTIAL]");
+    expect(result).not.toContain(secret);
   });
 
   it("uses stable, valid, collision-resistant names in both clients", () => {
@@ -618,6 +651,45 @@ describe("cloud OAuth refresh concurrency", () => {
     expect(commits).toEqual(["durable-next", "durable-next"]);
     expect(first.oauth?.accessToken).toBe("durable-next");
     expect(secondStaleCopy.oauth?.accessToken).toBe("durable-next");
+  });
+
+  it("blocks a server after a permanent refresh failure and reports the durable state input", async () => {
+    const fetchMock = vi.fn(async (): Promise<Response> =>
+      new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const server: CloudMcpServer = {
+      id: "expired-permanent",
+      name: "Expired permanent",
+      kind: "mcp",
+      url: "https://permanent.example.com/mcp",
+      headers: {},
+      omitMcpHeaders: false,
+      disabledTools: [],
+      oauth: cloudGrant({
+        accessToken: "expired-access",
+        refreshToken: "expired-refresh",
+        expiresAt: 1,
+        tokenEndpoint: "https://permanent.example.com/token",
+        mcpUrl: "https://permanent.example.com/mcp",
+      }),
+    };
+    const reported: Array<{ serverId: string; code: string; transient: boolean }> = [];
+
+    const runtime = await armCloudMcp([server], undefined, async (serverId, outcome) => {
+      reported.push({ serverId, code: outcome.code, transient: outcome.transient });
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(reported).toEqual([{ serverId: "expired-permanent", code: "invalid_grant", transient: false }]);
+    expect(runtime.routes.size).toBe(0);
+    expect(runtime.failures).toEqual([
+      expect.objectContaining({ name: "mcp_auth", result: expect.stringContaining("sign-in must be renewed") }),
+    ]);
+    expect(server.oauth?.accessToken).toBe("expired-access");
   });
 
   it("never shares a refresh exchange across different resource boundaries", async () => {

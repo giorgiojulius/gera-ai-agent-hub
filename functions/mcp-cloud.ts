@@ -34,10 +34,24 @@ export type RefreshedOAuth = {
 /** Durable commit hook invoked before a rotated credential is used. */
 export type PersistRefreshedOAuth = (rotation: RefreshedOAuth) => Promise<void>;
 
-/** Provider refresh result, preserving whether retrying later is safe. */
+/** Durable hook written before a rotating provider request leaves the account actor. */
+export type BeginCloudOAuthRefresh = (serverId: string, baseAccessToken: string) => Promise<void>;
+
+/** A provider refresh failure, preserving whether retrying later is safe. */
+export type CloudOAuthRefreshFailure = {
+  ok: false;
+  status: number;
+  code: string;
+  detail?: string;
+  transient: boolean;
+  /** The provider may have consumed the rotating token before the response vanished. */
+  ambiguous: boolean;
+};
+
+/** Provider refresh result with a typed durable-failure branch. */
 export type CloudOAuthRefreshOutcome =
   | { ok: true; token: CloudOAuthToken }
-  | { ok: false; status: number; code: string; detail?: string; transient: boolean };
+  | CloudOAuthRefreshFailure;
 
 export type CloudMcpServer = {
   id: string;
@@ -69,7 +83,77 @@ export type CloudMcpSession = {
   protocolVersion?: string;
   sessionId?: string;
   nextId: number;
+  /** Exact server-owned values stripped from every provider-originated surface. */
+  redactions?: string[];
 };
+
+function credentialVariants(values: string[]): string[] {
+  const variants = new Set<string>();
+  for (const raw of values) {
+    const value = raw.trim();
+    if (!value) continue;
+    variants.add(value);
+    const bearer = /^Bearer\s+(.+)$/i.exec(value)?.[1]?.trim();
+    if (bearer) variants.add(bearer);
+    try {
+      variants.add(encodeURIComponent(value));
+      if (bearer) variants.add(encodeURIComponent(bearer));
+    } catch {
+      // Exact raw replacement still applies.
+    }
+  }
+  return [...variants].filter(Boolean).sort((left, right) => right.length - left.length);
+}
+
+/** Redacts exact server-owned credentials before output reaches an LLM, log, or row. */
+export function redactCloudMcpText(text: string, credentials: string[]): string {
+  let redacted = text;
+  for (const credential of credentialVariants(credentials)) {
+    redacted = redacted.split(credential).join("[REDACTED_CREDENTIAL]");
+  }
+  return redacted;
+}
+
+/** Deep string redaction for provider-controlled schemas and structured output. */
+export function redactCloudMcpValue(value: unknown, credentials: string[], depth: number = 0): unknown {
+  if (typeof value === "string") {
+    return redactCloudMcpText(value, credentials);
+  }
+  if (depth >= 20) {
+    return "[REDACTED_DEEP_PROVIDER_VALUE]";
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactCloudMcpValue(item, credentials, depth + 1));
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    output[redactCloudMcpText(key, credentials)] = redactCloudMcpValue(item, credentials, depth + 1);
+  }
+  return output;
+}
+
+function serverCredentialValues(server: CloudMcpServer): string[] {
+  const values = [
+    ...Object.values(server.headers),
+    server.token ?? "",
+    server.oauth?.accessToken ?? "",
+    server.oauth?.refreshToken ?? "",
+  ];
+  try {
+    const url = new URL(server.url);
+    for (const [key, value] of url.searchParams) {
+      if (/(?:token|key|secret|auth|credential)/i.test(key)) {
+        values.push(value);
+      }
+    }
+  } catch {
+    // URL validity is checked before connection.
+  }
+  return credentialVariants(values);
+}
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const CONNECT_TIMEOUT_MS = 12_000;
@@ -581,15 +665,19 @@ function refreshFlightKey(grant: CloudOAuthToken): string {
   ]);
 }
 
-function oauthRefreshFailure(status: number, data: Record<string, unknown> | null): CloudOAuthRefreshOutcome {
+function oauthRefreshFailure(status: number, data: Record<string, unknown> | null): CloudOAuthRefreshFailure {
   const code = typeof data?.error === "string" && data.error ? data.error : status >= 500 ? "server_error" : "request_failed";
   const rawDetail = typeof data?.error_description === "string" ? data.error_description : "";
   const detail = rawDetail ? rawDetail.slice(0, 300) : undefined;
   const transient =
+    status === 408 ||
+    status === 425 ||
     status === 429 ||
     status >= 500 ||
     ["temporarily_unavailable", "server_error", "slow_down", "timeout"].includes(code);
-  return { ok: false, status, code, detail, transient };
+  const explicitRetryable = ["temporarily_unavailable", "server_error", "slow_down"].includes(code);
+  const ambiguous = transient && !explicitRetryable && status !== 429;
+  return { ok: false, status, code, detail, transient, ambiguous };
 }
 
 async function refreshIdempotencyKey(grant: CloudOAuthToken): Promise<string> {
@@ -635,14 +723,14 @@ async function requestCloudOAuthRefresh(grant: CloudOAuthToken): Promise<CloudOA
       signal: AbortSignal.timeout(12_000),
     });
   } catch {
-    return { ok: false, status: 502, code: "temporarily_unavailable", transient: true };
+    return { ok: false, status: 502, code: "temporarily_unavailable", transient: true, ambiguous: true };
   }
   const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
   if (!response.ok) {
     return oauthRefreshFailure(response.status, data);
   }
   if (!data || typeof data.access_token !== "string" || !data.access_token) {
-    return { ok: false, status: 502, code: "invalid_response", transient: true };
+    return { ok: false, status: 502, code: "invalid_response", transient: true, ambiguous: true };
   }
   const expiresIn = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in);
   return {
@@ -665,11 +753,13 @@ async function redeemCloudRefreshToken(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
+  begin?: BeginCloudOAuthRefresh,
 ): Promise<CloudOAuthRefreshOutcome> {
   const grant = server.oauth;
   if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId || !safePublicHttpsUrl(grant.tokenEndpoint)) {
-    return { ok: false, status: 400, code: "invalid_grant", transient: false };
+    return { ok: false, status: 400, code: "invalid_grant", transient: false, ambiguous: false };
   }
+  await begin?.(server.id, grant.accessToken);
   const key = refreshFlightKey(grant);
   const now = Date.now();
   pruneCloudRefreshFlights(now);
@@ -707,8 +797,9 @@ async function redeemCloudRefreshToken(
 export function refreshCloudOAuthGrant(
   server: CloudMcpServer,
   persist: PersistRefreshedOAuth,
+  begin?: BeginCloudOAuthRefresh,
 ): Promise<CloudOAuthRefreshOutcome> {
-  return redeemCloudRefreshToken(server, [], persist);
+  return redeemCloudRefreshToken(server, [], persist, begin);
 }
 
 /** Refreshes an expiring synced grant in place; no-op while it still looks fresh. */
@@ -716,6 +807,7 @@ export async function ensureFreshCloudOAuth(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
+  begin?: BeginCloudOAuthRefresh,
 ): Promise<CloudOAuthRefreshOutcome | null> {
   const grant = server.oauth;
   if (!grant?.refreshToken || !grant.tokenEndpoint || !grant.clientId) {
@@ -725,7 +817,7 @@ export async function ensureFreshCloudOAuth(
   if (!expiring) {
     return null;
   }
-  return redeemCloudRefreshToken(server, refreshed, persist);
+  return redeemCloudRefreshToken(server, refreshed, persist, begin);
 }
 
 /**
@@ -738,16 +830,18 @@ export function forceRefreshCloudOAuthOutcome(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
+  begin?: BeginCloudOAuthRefresh,
 ): Promise<CloudOAuthRefreshOutcome> {
-  return redeemCloudRefreshToken(server, refreshed, persist);
+  return redeemCloudRefreshToken(server, refreshed, persist, begin);
 }
 
 export async function forceRefreshCloudOAuth(
   server: CloudMcpServer,
   refreshed: RefreshedOAuth[],
   persist?: PersistRefreshedOAuth,
+  begin?: BeginCloudOAuthRefresh,
 ): Promise<boolean> {
-  return (await forceRefreshCloudOAuthOutcome(server, refreshed, persist)).ok;
+  return (await forceRefreshCloudOAuthOutcome(server, refreshed, persist, begin)).ok;
 }
 
 type JsonRpcResponse = {
@@ -890,6 +984,7 @@ async function rpc(
   const sessionHeader = response.headers.get("mcp-session-id");
   if (sessionHeader) {
     session.sessionId = sessionHeader;
+    session.redactions = credentialVariants([...(session.redactions ?? []), sessionHeader]);
   }
   if (!response.ok) {
     await readLimitedResponseText(response);
@@ -910,7 +1005,7 @@ async function rpc(
     throw new Error("unexpected response shape");
   }
   if (parsed.error) {
-    throw new Error(parsed.error.message || "MCP request failed");
+    throw new Error(redactCloudMcpText(parsed.error.message || "MCP request failed", session.redactions ?? []));
   }
   return parsed.result;
 }
@@ -923,12 +1018,14 @@ export async function connectCloudMcp(
   if (server.oauth && !headers.Authorization) {
     headers.Authorization = `Bearer ${server.oauth.accessToken}`;
   }
+  const redactions = serverCredentialValues(server);
   const session: CloudMcpSession = {
     url: server.url,
     headers,
     omitMcpHeaders: server.omitMcpHeaders,
     protocolVersion: MCP_PROTOCOL_VERSION,
     nextId: 0,
+    redactions,
   };
   const initialized = (await rpc(
     session,
@@ -972,15 +1069,22 @@ export async function connectCloudMcp(
     }
   }
   const tools: CloudMcpTool[] = [];
+  const providerRedactions = session.redactions ?? redactions;
   for (const raw of rawTools) {
     const name = typeof raw.name === "string" ? raw.name : "";
-    if (!name || server.disabledTools.includes(name)) {
+    if (
+      !name ||
+      server.disabledTools.includes(name) ||
+      redactCloudMcpText(name, providerRedactions) !== name
+    ) {
       continue;
     }
+    const rawDescription = typeof raw.description === "string" && raw.description ? raw.description : name;
+    const inputSchema = isRecord(raw.inputSchema) ? raw.inputSchema : { type: "object", properties: {} };
     tools.push({
       name,
-      description: typeof raw.description === "string" && raw.description ? raw.description : name,
-      inputSchema: isRecord(raw.inputSchema) ? raw.inputSchema : { type: "object", properties: {} },
+      description: redactCloudMcpText(rawDescription, providerRedactions),
+      inputSchema: redactCloudMcpValue(inputSchema, providerRedactions) as Record<string, unknown>,
     });
   }
   return { session, tools };
@@ -1090,7 +1194,8 @@ export async function callCloudMcpTool(
   args: unknown,
 ): Promise<string> {
   const result = await rpc(session, "tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
-  const rendered = stringifyCloudMcpResult(result);
+  const redactions = session.redactions ?? [];
+  const rendered = redactCloudMcpText(stringifyCloudMcpResult(result), redactions);
   if (isRecord(result) && result.isError === true) {
     throw new Error(rendered || "MCP tool reported an error.");
   }
@@ -1098,15 +1203,18 @@ export async function callCloudMcpTool(
   for (const uri of resourceLinks(result)) {
     try {
       const resource = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
-      const text = stringifyResourceReadResult(resource);
+      const text = redactCloudMcpText(stringifyResourceReadResult(resource), redactions);
       if (text) {
         pieces.push(text);
       }
     } catch (error) {
-      pieces.push(`[Could not read resource ${uri}: ${error instanceof Error ? error.message : "unknown error"}]`);
+      pieces.push(redactCloudMcpText(
+        `[Could not read resource ${uri}: ${error instanceof Error ? error.message : "unknown error"}]`,
+        redactions,
+      ));
     }
   }
-  const output = pieces.filter((piece) => piece.length > 0).join("\n\n");
+  const output = redactCloudMcpText(pieces.filter((piece) => piece.length > 0).join("\n\n"), redactions);
   return output.length > MAX_MCP_RENDER_CHARS
     ? `${output.slice(0, MAX_MCP_RENDER_CHARS)}\n… [MCP result truncated]`
     : output;

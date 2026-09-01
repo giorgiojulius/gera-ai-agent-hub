@@ -464,6 +464,8 @@ async function* iterateSse(
 export type StreamCompletionParams = {
   authKey: string;
   modelId: string;
+  /** Optional server-controlled HTTPS endpoint used by black-box staging. */
+  gatewayUrl?: string;
   reasoningEffort?: ReasoningEffort;
   messages: EngineMessage[];
   tools: EngineToolDef[];
@@ -481,7 +483,24 @@ export async function streamGatewayCompletion(
 ): Promise<{ content: string; toolCalls: EngineToolCall[]; images: string[]; servedModelId?: string }> {
   const selection = parseSelection(params.modelId || DEFAULT_CHAT_MODEL);
   const effort = params.reasoningEffort ?? selection.effort;
-  const response = await fetch(`${TOOLKIT_URL}/v2/vercel/v1/chat/completions`, {
+  const gatewayUrl = params.gatewayUrl ?? `${TOOLKIT_URL}/v2/vercel/v1/chat/completions`;
+  let gateway: URL;
+  try {
+    gateway = new URL(gatewayUrl);
+  } catch {
+    throw new Error("gateway URL is invalid");
+  }
+  const isStagingOverride = params.gatewayUrl !== undefined;
+  if (
+    gateway.protocol !== "https:" ||
+    gateway.username ||
+    gateway.password ||
+    (isStagingOverride && !gateway.hostname.toLowerCase().endsWith(".workers.dev"))
+  ) {
+    throw new Error("gateway URL must be an allowlisted public HTTPS endpoint");
+  }
+  const response = await fetch(gateway.toString(), {
+    ...(isStagingOverride ? { redirect: "error" as const } : {}),
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -639,6 +658,8 @@ export const STEER_BOUNDARY_NOTE =
 export type EngineTurnParams = {
   authKey: string;
   modelId: string;
+  /** Optional server-controlled HTTPS endpoint used by black-box staging. */
+  gatewayUrl?: string;
   /** Prepared OpenAI-shaped context — mutated in place as the loop advances. */
   apiMessages: EngineMessage[];
   tools: EngineToolDef[];
@@ -739,6 +760,7 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
       const completion = await streamGatewayCompletion({
         authKey: params.authKey,
         modelId: params.modelId,
+        gatewayUrl: params.gatewayUrl,
         messages: apiMessages,
         tools: [],
         fallbacks: params.fallbacks,
@@ -801,6 +823,7 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
       completion = await streamGatewayCompletion({
         authKey: params.authKey,
         modelId: params.modelId,
+        gatewayUrl: params.gatewayUrl,
         messages: apiMessages,
         tools: params.tools,
         fallbacks: params.fallbacks,

@@ -23,6 +23,8 @@ type StagingEnv = {
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
   EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID?: string;
   RORK_AUTH_SECRET_KEY?: string;
+  STAGING_GATEWAY_URL?: string;
+  STAGING_GATEWAY_SECRET?: string;
 };
 
 type SessionPayload = {
@@ -126,7 +128,7 @@ export default {
         headers.set("X-Rork-User-Name", typeof session.name === "string" ? session.name : "Staging user");
       }
     }
-    const forwarded = new Request(request.url, { ...request, headers });
+    const forwarded = new Request(request, { headers });
     const runtimeEnv = { ...env, DO: dispatcher(env) };
     return app.fetch(forwarded, runtimeEnv, ctx);
   },

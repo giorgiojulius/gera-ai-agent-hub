@@ -2,7 +2,7 @@
 // its own Durable Object, page by page, then keeps its automations firing by
 // reporting the next due time into the global schedule index. A regression
 // here silently strands accounts mid-migration — pin the paging protocol,
-// the stall-finalize path, owner normalization, and the sweep's isolation
+// fail-closed stall handling, owner normalization, and the sweep's isolation
 // of per-owner failures.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -58,11 +58,16 @@ describe("shard migration (functions/shard-migration)", () => {
     expect(chatShardId("user@example.com")).toBe("acct:user%40example.com");
   });
 
-  it("pages export → import, reports next due from the header, marks migrated", async () => {
-    const { env, calls } = makeEnv((call, index) => {
-      if (index === 0) return { json: { done: false, cursor: "c1", rows: ["r1"] } };
-      if (index === 2) return { json: { done: true, rows: ["r2"] } };
-      if (index === 3) return { headers: { "X-Gera-Next-Due": "1234" } };
+  it("pages export → import, verifies counts, then unlocks and marks migrated", async () => {
+    const { env, calls } = makeEnv((call) => {
+      if (call.path === "/export" && call.body.cursor !== "c1") {
+        return { json: { done: false, cursor: "c1", rows: ["r1"] } };
+      }
+      if (call.path === "/export") return { json: { done: true, rows: ["r2"] } };
+      if (call.path === "/owner-counts") return { json: { counts: { chats: 2 } } };
+      if (call.path === "/import" && call.body.done === true) {
+        return { headers: { "X-Gera-Next-Due": "1234" } };
+      }
       return {};
     });
 
@@ -76,46 +81,43 @@ describe("shard migration (functions/shard-migration)", () => {
       `${shard} /import`,
       "global /export",
       `${shard} /import`,
+      "global /owner-counts",
+      `${shard} /owner-counts`,
+      `${shard} /import`,
       "global /schedule-set",
       "global /mark-migrated",
     ]);
     expect(calls[0].body).toEqual({ owner: "user@example.com" });
     expect(calls[1].body).toMatchObject({ owner: "user@example.com", done: false, rows: ["r1"] });
     expect(calls[2].body).toEqual({ owner: "user@example.com", cursor: "c1" });
-    expect(calls[3].body).toMatchObject({ done: true, rows: ["r2"] });
-    expect(calls[4].body).toEqual({ owner: "user@example.com", nextDueAt: 1234 });
-    expect(calls[5].body).toEqual({ owner: "user@example.com" });
+    expect(calls[3].body).toMatchObject({ done: false, rows: ["r2"] });
+    expect(calls[6].body).toEqual({ owner: "user@example.com", done: true });
+    expect(calls[7].body).toEqual({ owner: "user@example.com", nextDueAt: 1234 });
+    expect(calls[8].body).toEqual({ owner: "user@example.com" });
     // Logs never carry the full address.
     expect(console.log).toHaveBeenCalledWith("shard migration: moved", "us…@example.com");
   });
 
-  it("finalizes when the export cursor stops advancing, next due from the body", async () => {
-    const { env, calls } = makeEnv((call, index) => {
-      if (index === 0) return { json: { done: false, cursor: "", rows: ["r1"] } };
-      if (index === 2) {
-        // Malformed header forces the JSON-body fallback.
-        return { json: { nextDueAt: 42 }, headers: { "X-Gera-Next-Due": "soon" } };
-      }
-      return {};
-    });
+  it("fails closed when the export cursor stops advancing", async () => {
+    const { env, calls } = makeEnv((call) =>
+      call.path === "/export"
+        ? { json: { done: false, cursor: "", rows: ["r1"] } }
+        : {},
+    );
 
-    await migrateOwnerToShard(env, ORIGIN, "user@example.com");
-
-    expect(calls.map((c) => c.path)).toEqual([
-      "/export",
-      "/import",
-      "/import",
-      "/schedule-set",
-      "/mark-migrated",
-    ]);
-    expect(calls[2].body).toEqual({ owner: "user@example.com", done: true });
-    expect(calls[3].body).toEqual({ owner: "user@example.com", nextDueAt: 42 });
+    await expect(migrateOwnerToShard(env, ORIGIN, "user@example.com")).rejects.toThrow(
+      "export cursor made no forward progress",
+    );
+    expect(calls.map((c) => c.path)).toEqual(["/export", "/import"]);
+    expect(calls.some((call) => call.body.done === true)).toBe(false);
+    expect(calls.some((call) => call.path === "/mark-migrated")).toBe(false);
   });
 
   it("treats a missing next-due header as 0 without reading the body", async () => {
-    const { env, calls } = makeEnv((call, index) => {
-      if (index === 0) return { json: { done: true } };
-      if (index === 1) return { json: { nextDueAt: 42 } };
+    const { env, calls } = makeEnv((call) => {
+      if (call.path === "/export") return { json: { done: true } };
+      if (call.path === "/owner-counts") return { json: { counts: {} } };
+      if (call.path === "/import" && call.body.done === true) return { json: { nextDueAt: 42 } };
       return {};
     });
 
@@ -123,6 +125,22 @@ describe("shard migration (functions/shard-migration)", () => {
 
     const schedule = calls.find((c) => c.path === "/schedule-set");
     expect(schedule?.body).toEqual({ owner: "user@example.com", nextDueAt: 0 });
+  });
+
+  it("never unlocks or marks a count-mismatched migration", async () => {
+    const { env, calls } = makeEnv((call) => {
+      if (call.path === "/export") return { json: { done: true } };
+      if (call.path === "/owner-counts" && call.doId === "global") {
+        return { json: { counts: { mcp_oauth_grants: 1 } } };
+      }
+      if (call.path === "/owner-counts") return { json: { counts: { mcp_oauth_grants: 0 } } };
+      return {};
+    });
+    await expect(migrateOwnerToShard(env, ORIGIN, "user@example.com")).rejects.toThrow(
+      "migration verification failed (mcp_oauth_grants)",
+    );
+    expect(calls.some((call) => call.body.done === true)).toBe(false);
+    expect(calls.some((call) => call.path === "/mark-migrated")).toBe(false);
   });
 
   it("propagates export failures and rejects empty owners", async () => {
@@ -157,7 +175,10 @@ describe("shard migration (functions/shard-migration)", () => {
       }
       if (call.body.owner === "bad@x.com") return { status: 500 };
       if (call.path === "/export") return { json: { done: true } };
-      if (call.path === "/import") return { headers: { "X-Gera-Next-Due": "0" } };
+      if (call.path === "/owner-counts") return { json: { counts: {} } };
+      if (call.path === "/import" && call.body.done === true) {
+        return { headers: { "X-Gera-Next-Due": "0" } };
+      }
       return {};
     });
 

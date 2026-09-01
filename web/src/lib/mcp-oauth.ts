@@ -7,7 +7,7 @@
  */
 
 import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
-import { authedFetch, relayFetch } from "@/lib/backend";
+import { authedFetch, authedFetchForSession, relayFetch } from "@/lib/backend";
 
 export const OAUTH_RESULT_KEY = "gera.mcp.oauth.result.v1";
 
@@ -838,16 +838,24 @@ export async function completeServerOAuthSignIn(state: string, callbackChallenge
   if (!browserNonce || !callbackChallenge) {
     throw new Error("This OAuth link was opened outside the browser that started it.");
   }
-  const response = await authedFetch("/mcp/oauth-complete", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ state, browserNonce, callbackChallenge }),
-  });
-  const data = (await response.json().catch(() => ({}))) as { error?: unknown };
-  if (!response.ok) {
+  const session = authSessionSnapshot();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const response = await authedFetchForSession("/mcp/oauth-complete", session, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, browserNonce, callbackChallenge }),
+    });
+    const data = (await response.json().catch(() => ({}))) as { error?: unknown; retryable?: unknown };
+    if (response.ok) {
+      window.localStorage.removeItem(serverFlowNonceKey(state));
+      return;
+    }
+    if (data.retryable === true && attempt < 3 && isAuthSessionCurrent(session)) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 700 * (attempt + 1)));
+      continue;
+    }
     throw new Error(typeof data.error === "string" ? data.error : "OAuth confirmation failed.");
   }
-  window.localStorage.removeItem(serverFlowNonceKey(state));
 }
 
 /** Runs OAuth without letting the browser receive a code exchange or provider token. */

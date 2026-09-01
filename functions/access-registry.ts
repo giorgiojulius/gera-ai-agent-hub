@@ -5,7 +5,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 /** The first invite — seeded as admin so invites can be granted from day one. */
-const SEED_ADMIN_EMAIL = "georgekvirkvelia@gmail.com";
+export const SEED_ADMIN_EMAIL = "georgekvirkvelia@gmail.com";
 
 /**
  * Domain allowlist: anyone signing in with an email on these domains becomes
@@ -61,6 +61,13 @@ type OAuthRouteRow = {
   storage_owner: string;
   expires_at: number;
 };
+
+class PrincipalUnclaimedError extends Error {
+  constructor() {
+    super("principal has not been safely claimed");
+    this.name = "PrincipalUnclaimedError";
+  }
+}
 
 class PrincipalConflictError extends Error {
   constructor() {
@@ -176,7 +183,7 @@ export class AccessRegistry extends DurableObject {
   }
 
   /** Resolves or first-claims the immutable app subject without moving legacy data. */
-  private resolvePrincipal(userId: string, currentEmail: string): PrincipalRow {
+  private resolvePrincipal(userId: string, currentEmail: string, allowCreate: boolean): PrincipalRow {
     if (!userId || userId.length > 512 || userId.includes("\0")) {
       throw new Error("invalid principal subject");
     }
@@ -214,6 +221,12 @@ export class AccessRegistry extends DurableObject {
         userId,
       );
       return { ...existing, current_email: currentEmail, last_seen_at: now };
+    }
+    // A legacy email shard may predate immutable-subject metadata. The Worker
+    // probes both legacy and destination stores before granting this marker;
+    // without it, first-touch is fail-closed against recycled-email takeover.
+    if (!allowCreate && alias?.user_id !== userId) {
+      throw new PrincipalUnclaimedError();
     }
     const storageOwner = currentEmail;
     const principal: PrincipalRow = {
@@ -258,6 +271,13 @@ export class AccessRegistry extends DurableObject {
     if (request.headers.get("X-Gera-Internal-Route") === "oauth") {
       return this.handleOAuthRoute(request, url.pathname);
     }
+    if (
+      request.headers.get("X-Gera-Internal-Route") === "principal-bootstrap" &&
+      request.method === "POST" &&
+      url.pathname === "/principal/bootstrap"
+    ) {
+      return this.handlePrincipalBind(request);
+    }
     const email = readIdentity(request, "X-Gera-Email").toLowerCase();
     if (!email) {
       return json({ error: "sign_in_required" }, 401);
@@ -267,10 +287,14 @@ export class AccessRegistry extends DurableObject {
     let principal: PrincipalRow | null = null;
     if (userId) {
       try {
-        principal = this.resolvePrincipal(userId, email);
+        const allowCreate = request.headers.get("X-Gera-Principal-Create") === "empty-owner";
+        principal = this.resolvePrincipal(userId, email, allowCreate);
       } catch (error) {
         if (error instanceof PrincipalConflictError) {
           return json({ error: "principal_conflict" }, 409);
+        }
+        if (error instanceof PrincipalUnclaimedError) {
+          return json({ error: "principal_unclaimed" }, 404);
         }
         return json({ error: "invalid_principal" }, 400);
       }
@@ -326,6 +350,9 @@ export class AccessRegistry extends DurableObject {
     }
     if (request.method === "POST" && url.pathname === "/admin/revoke") {
       return this.handleRevoke(request);
+    }
+    if (request.method === "POST" && url.pathname === "/admin/principal-bind") {
+      return this.handlePrincipalBind(request);
     }
     if (request.method === "POST" && url.pathname === "/admin/role") {
       return this.handleRole(request, accountEmail);
@@ -482,6 +509,59 @@ export class AccessRegistry extends DurableObject {
       Date.now(),
     );
     this.ctx.storage.sql.exec("UPDATE requests SET status = 'approved' WHERE email = ?", target);
+    return json({ ok: true });
+  }
+
+  private async handlePrincipalBind(request: Request): Promise<Response> {
+    let targetEmail = "";
+    let targetUserId = "";
+    try {
+      const body = (await request.json()) as { email?: unknown; userId?: unknown };
+      targetEmail = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+      targetUserId = typeof body.userId === "string" ? body.userId.trim() : "";
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    if (!EMAIL_PATTERN.test(targetEmail) || !targetUserId || targetUserId.length > 512 || targetUserId.includes("\0")) {
+      return json({ error: "invalid_principal" }, 400);
+    }
+    if (!this.inviteFor(targetEmail)) {
+      return json({ error: "invite_required" }, 409);
+    }
+    const existingSubject = this.ctx.storage.sql
+      .exec<PrincipalRow>(
+        "SELECT user_id, storage_owner, shard_id, current_email, created_at, last_seen_at FROM principal_subjects WHERE user_id = ?",
+        targetUserId,
+      )
+      .toArray()[0];
+    const existingAlias = this.ctx.storage.sql
+      .exec<PrincipalAliasRow>("SELECT email, user_id FROM principal_aliases WHERE email = ?", targetEmail)
+      .toArray()[0];
+    if (
+      (existingSubject && existingSubject.storage_owner !== targetEmail) ||
+      (existingAlias && existingAlias.user_id !== targetUserId)
+    ) {
+      return json({ error: "principal_conflict" }, 409);
+    }
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO principal_subjects
+        (user_id, storage_owner, shard_id, current_email, created_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      targetUserId,
+      targetEmail,
+      `acct:${encodeURIComponent(targetEmail)}`,
+      targetEmail,
+      now,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO principal_aliases (email, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+      targetEmail,
+      targetUserId,
+      now,
+      now,
+    );
     return json({ ok: true });
   }
 

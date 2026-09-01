@@ -134,6 +134,43 @@
   @apply border-b-0;
 }
 
+/* "Gera is thinking" — a soft shimmer sweeping across the label while the
+   typing dots bounce next to it. Falls back to plain muted text if the
+   browser can't clip background to text. */
+.gera-thinking-label {
+  color: hsl(var(--muted-foreground));
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted-foreground)) 0%,
+    hsl(var(--muted-foreground)) 35%,
+    hsl(var(--ember)) 50%,
+    hsl(var(--muted-foreground)) 65%,
+    hsl(var(--muted-foreground)) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: gera-thinking-shimmer 1.8s linear infinite;
+}
+
+@keyframes gera-thinking-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gera-thinking-label {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
 * {
   scrollbar-width: thin;
   scrollbar-color: hsl(336 8% 72% / 0.8) transparent;

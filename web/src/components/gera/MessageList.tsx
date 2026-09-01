@@ -786,12 +786,15 @@ function ResearchCard({ research }: { research: ResearchState }) {
 }
 
 function TypingDots() {
-  // mt-1 + h-8 mirrors the avatar circle so the dots sit on its vertical center.
+  // mt-1 + h-8 mirrors the avatar circle so the label + dots sit on its vertical center.
   return (
-    <div className="mt-1 flex h-8 items-center gap-1">
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ember [animation-delay:-0.2s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ember [animation-delay:-0.1s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ember" />
+    <div className="mt-1 flex h-8 items-center gap-2">
+      <span className="gera-thinking-label text-[13px] font-medium">Gera is thinking</span>
+      <span className="flex items-center gap-1">
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ember [animation-delay:-0.2s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ember [animation-delay:-0.1s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ember" />
+      </span>
     </div>
   );
 }

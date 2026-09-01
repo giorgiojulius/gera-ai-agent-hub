@@ -102,3 +102,14 @@ export function json(data: unknown, status = 200, headers?: Record<string, strin
 export function isValidId(id: unknown): id is string {
   return typeof id === "string" && id.length > 0 && id.length <= ID_LIMIT;
 }
+
+/**
+ * True for the browser's internal "credential lives on the server" marker
+ * (`gera-account:<serverId>`, optionally Bearer-prefixed). It is NOT a real
+ * credential: if it is ever persisted as a manual token it shadows the actual
+ * OAuth grant and every provider call fails — GitHub even escalates repeated
+ * bad-credential attempts to HTTP 403. Fail closed: never store, never serve.
+ */
+export function isPlaceholderCredential(token: string): boolean {
+  return /^(bearer\s+)?gera-account:/i.test(token.trim());
+}

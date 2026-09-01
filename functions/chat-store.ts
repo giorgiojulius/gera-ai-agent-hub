@@ -87,6 +87,7 @@ import {
   FUTURE_SLACK_MS,
   HAVE_LIMIT,
   HOOKS_HEADER,
+  isPlaceholderCredential,
   isRecord,
   isValidId,
   json,
@@ -1107,7 +1108,10 @@ export class ChatStore extends DurableObject {
         const catalogId = typeof server.catalogId === "string" && isValidId(server.catalogId)
           ? server.catalogId
           : "";
-        const token = typeof server.token === "string" && server.token ? server.token : "";
+        const token =
+          typeof server.token === "string" && server.token && !isPlaceholderCredential(server.token)
+            ? server.token
+            : "";
         const headersJson = typeof server.headersJson === "string" && server.headersJson ? server.headersJson : "";
         delete server.token;
         delete server.headersJson;
@@ -1178,9 +1182,24 @@ export class ChatStore extends DurableObject {
       .toArray()[0];
     try {
       const value = row ? JSON.parse(row.payload) as Record<string, unknown> : {};
+      const token =
+        typeof value.token === "string" && value.token && !isPlaceholderCredential(value.token)
+          ? value.token
+          : "";
+      const headersJson = typeof value.headersJson === "string" && value.headersJson ? value.headersJson : "";
+      if (row && !token && typeof value.token === "string" && value.token && !headersJson) {
+        // Poisoned legacy row: the browser's `gera-account:` marker was stored
+        // as a manual token and shadowed the real OAuth grant on every call.
+        // Deleting it here heals the account without requiring a re-sign-in.
+        this.ctx.storage.sql.exec(
+          "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
+          owner,
+          serverId,
+        );
+      }
       return {
-        ...(typeof value.token === "string" && value.token ? { token: value.token } : {}),
-        ...(typeof value.headersJson === "string" && value.headersJson ? { headersJson: value.headersJson } : {}),
+        ...(token ? { token } : {}),
+        ...(headersJson ? { headersJson } : {}),
       };
     } catch {
       return {};
@@ -2090,7 +2109,10 @@ export class ChatStore extends DurableObject {
       return json({ error: "invalid_server" }, 400);
     }
     const secret = {
-      token: typeof rawServer.token === "string" ? rawServer.token : "",
+      token:
+        typeof rawServer.token === "string" && !isPlaceholderCredential(rawServer.token)
+          ? rawServer.token
+          : "",
       headersJson: typeof rawServer.headersJson === "string" ? rawServer.headersJson : "",
     };
     const catalogId = typeof rawServer.catalogId === "string" ? rawServer.catalogId : "";

@@ -133,7 +133,7 @@ describe("honest MCP auth status", () => {
     vi.unstubAllGlobals();
   });
 
-  it("rejects a fresh-looking green GitHub card when its credential is absent", () => {
+  it("keeps a green GitHub card armed when the browser has no local grant", () => {
     const github = storedServer({
       id: "github",
       catalogId: "github",
@@ -142,15 +142,18 @@ describe("honest MCP auth status", () => {
       verifiedAt: Date.now(),
       tools: [{ name: "get_contents" }],
     });
-    expect(mcpCredentialProblem(github)).toContain("sign-in is missing");
+    expect(mcpCredentialProblem(github)).toBeNull();
 
     let settings: AgentSettings = normalizeStoredSettings({ mcpServers: [github] });
     revalidateMcpServers(settings.mcpServers, (updater) => {
       settings = updater(settings);
     });
-    expect(settings.mcpServers[0]?.status).toBe("error");
-    expect(settings.mcpServers[0]?.verifiedAt).toBeUndefined();
-    expect(settings.mcpServers[0]?.error).toContain("sign in again");
+    expect(settings.mcpServers[0]?.status).toBe("connected");
+    expect(settings.mcpServers[0]?.error).toBeUndefined();
+  });
+
+  it("treats a poisoned local-credential error as recoverable", () => {
+    expect(isRecoverableMcpHealthError("GitHub sign-in is missing — sign in again or paste a PAT.")).toBe(true);
   });
 
   it("accepts the same card once the synced OAuth grant has been adopted", () => {

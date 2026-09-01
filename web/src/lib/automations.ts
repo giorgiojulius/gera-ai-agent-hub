@@ -189,6 +189,11 @@ export type CloudMcpReadiness = "ready" | "needs-auth";
  * "needs-auth" = nothing is connected yet — sign in or paste a key first.
  */
 export function cloudMcpReadiness(server: McpServerConfig): CloudMcpReadiness {
+  // A verified-green card already proved the account shard has a credential.
+  // Browser tokens are stripped after migration, so local emptiness is normal.
+  if (server.status === "connected") {
+    return "ready";
+  }
   const entry = findCatalogEntry(server.catalogId ?? server.id);
   const catalogKey = server.catalogId ?? server.id;
   const hasKey = (server.token ?? "").trim().length > 0;

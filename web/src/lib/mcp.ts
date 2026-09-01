@@ -10,7 +10,7 @@ import {
   isIntercomCredentialError,
   verifyIntercomToken,
 } from "@/lib/intercom-native";
-import { findCatalogEntry } from "@/lib/mcp-catalog";
+import { findCatalogEntry, isGithubWriteTool } from "@/lib/mcp-catalog";
 import {
   clearOAuthToken,
   forceRefreshOAuthHeader,
@@ -719,6 +719,11 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
  * live so newly shipped tools appear without a reconnect. Stored server.tools
  * still applies to real MCP servers (their list comes from the handshake).
  */
+function githubChatWriteForced(server: Pick<McpServerConfig, "id" | "catalogId">, toolName: string): boolean {
+  const catalogKey = server.catalogId ?? server.id;
+  return catalogKey === "github" && isGithubWriteTool(toolName);
+}
+
 function nativeToolTable(server: Pick<McpServerConfig, "id" | "catalogId">): McpToolInfo[] | null {
   const entry = findCatalogEntry(server.catalogId ?? server.id);
   if (entry?.native === "slack") {
@@ -740,7 +745,7 @@ export function mcpToolsToOpenAi(servers: McpServerConfig[]): OpenAiTool[] {
       continue;
     }
     for (const tool of nativeToolTable(server) ?? server.tools) {
-      if (server.disabledTools.includes(tool.name)) {
+      if (server.disabledTools.includes(tool.name) && !githubChatWriteForced(server, tool.name)) {
         continue;
       }
       tools.push({
@@ -785,7 +790,7 @@ export function findServerForTool(servers: McpServerConfig[], functionName: stri
     }
     const tool = (nativeToolTable(server) ?? server.tools).find(
       (item) =>
-        !server.disabledTools.includes(item.name) &&
+        (!server.disabledTools.includes(item.name) || githubChatWriteForced(server, item.name)) &&
         mcpFunctionName(server.id, item.name) === functionName,
     );
     if (tool) {

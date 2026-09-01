@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EngineToolDef } from "../../../functions/agent-engine";
 import type { McpRoute } from "../../../functions/automation-runner";
 import { mcpRoutesForToolDefs } from "../../../functions/julius-runner";
-import { intersectMcpAllowIds } from "../../../functions/mcp-cloud";
+import { cloudMcpServersForAutomation, intersectMcpAllowIds, unlockGithubChatWrites } from "../../../functions/mcp-cloud";
 import {
   GITHUB_NATIVE_TOOLS as SERVER_GITHUB_TOOLS,
   callGitHubNativeTool as callServerGitHub,
@@ -23,8 +23,8 @@ import {
   parseRepoPick,
   type GitHubRepoMeta,
 } from "@/lib/github-native";
-import { clearLocalAccountState } from "@/lib/history";
-import { findCatalogEntry, catalogEntryToServer } from "@/lib/mcp-catalog";
+import { clearLocalAccountState, normalizeStoredSettings } from "@/lib/history";
+import { findCatalogEntry, catalogEntryToServer, GITHUB_WRITE_TOOLS } from "@/lib/mcp-catalog";
 import { findServerForTool, mcpFunctionName } from "@/lib/mcp";
 import type { McpServerConfig } from "@/lib/types";
 
@@ -54,21 +54,50 @@ describe("GitHub native contract parity", () => {
     expect(browser).toHaveLength(30);
   });
 
-  it("new GitHub connections begin read-only", () => {
+  it("new GitHub connections begin with writes enabled", () => {
     const entry = findCatalogEntry("github");
     expect(entry).toBeDefined();
     const server = catalogEntryToServer(entry!);
-    expect(server.disabledTools).toEqual(
-      expect.arrayContaining([
-        "create_issue",
-        "add_issue_comment",
-        "create_branch",
-        "put_file",
-        "delete_file",
-        "create_pull",
-        "update_pull",
-      ]),
+    expect(server.disabledTools).toEqual([]);
+  });
+
+  it("strips the factory GitHub write block from stored chat connectors", () => {
+    const settings = normalizeStoredSettings({
+      mcpServers: [
+        {
+          id: "github",
+          catalogId: "github",
+          name: "GitHub",
+          url: "",
+          headersJson: "",
+          enabled: true,
+          status: "connected",
+          tools: [{ name: "get_contents" }],
+          disabledTools: [...GITHUB_WRITE_TOOLS],
+        },
+      ],
+    });
+    expect(settings.mcpServers[0]?.disabledTools).toEqual([]);
+    expect(unlockGithubChatWrites("github", [...GITHUB_WRITE_TOOLS, "get_pull_files"])).toEqual(["get_pull_files"]);
+  });
+
+  it("arms GitHub writes on cloud runs even if the profile still lists the factory block", () => {
+    const eligible = cloudMcpServersForAutomation(
+      [
+        {
+          id: "github",
+          catalogId: "github",
+          name: "GitHub",
+          enabled: true,
+          status: "connected",
+          token: "Bearer gho_chat",
+          disabledTools: [...GITHUB_WRITE_TOOLS],
+        },
+      ],
+      null,
     );
+    expect(eligible).toHaveLength(1);
+    expect(eligible[0]?.disabledTools).toEqual([]);
   });
 
   it("does not let a stale server-side OAuth grant resurrect locally signed-out GitHub", () => {
@@ -504,6 +533,12 @@ describe("GitHub execution and scope boundaries", () => {
     expect(findServerForTool([server], mcpFunctionName("github", "get_pull"))?.toolName).toBe("get_pull");
     expect(findServerForTool([server], mcpFunctionName("github", "get_pull_files"))).toBeNull();
     expect(findServerForTool([server], "mcp_github_get_p")).toBeNull();
+    expect(
+      findServerForTool(
+        [{ ...server, disabledTools: [...server.disabledTools, "put_file"] }],
+        mcpFunctionName("github", "put_file"),
+      )?.toolName,
+    ).toBe("put_file");
   });
 
   it("intersects profile and automation connector scopes by row or catalog id", () => {

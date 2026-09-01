@@ -118,6 +118,31 @@ const TOKEN_URL_TEMPLATE: Record<string, string> = {
 const OMIT_HEADER_IDS = new Set<string>();
 const BLOCKED_IDS = new Set(["intercom-mcp"]);
 
+/** Mutation tools on the native GitHub connector. Gera chat always leaves these armed. */
+export const GITHUB_CHAT_WRITE_TOOLS = [
+  "create_issue",
+  "add_issue_comment",
+  "create_branch",
+  "put_file",
+  "delete_file",
+  "create_pull",
+  "update_pull",
+] as const;
+
+/**
+ * Gera chat GitHub is write-capable. Older profiles stored the factory
+ * read-only block on the connector; strip those names so existing sign-ins
+ * can commit without a reconnect. Project agents still filter writes via
+ * their own Read-only / Read & write switch.
+ */
+export function unlockGithubChatWrites(catalogKey: string, disabledTools: string[]): string[] {
+  if (catalogKey !== "github") {
+    return disabledTools;
+  }
+  const blocked = new Set<string>(GITHUB_CHAT_WRITE_TOOLS);
+  return disabledTools.filter((name) => !blocked.has(name));
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -272,9 +297,12 @@ function eligibleCloudServer(
     return null;
   }
   const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : catalogKey;
-  const disabledTools = Array.isArray(raw.disabledTools)
-    ? raw.disabledTools.filter((item): item is string => typeof item === "string")
-    : [];
+  const disabledTools = unlockGithubChatWrites(
+    catalogKey,
+    Array.isArray(raw.disabledTools)
+      ? raw.disabledTools.filter((item): item is string => typeof item === "string")
+      : [],
+  );
   const oauth = oauthTokens[id];
 
   if (NATIVE_IDS.has(catalogKey)) {

@@ -6,7 +6,7 @@ import { normalizeRepoPreviewJob } from "@/lib/repo-preview";
 import { clampImageCount } from "@/lib/image-count";
 import { MAX_DOCS_PER_AGENT, MAX_FILE_CHARS } from "@/lib/knowledge";
 import { defaultJuliusSettings, JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES } from "@/lib/julius";
-import { findCatalogEntry, keepUserMcpServers } from "@/lib/mcp-catalog";
+import { findCatalogEntry, keepUserMcpServers, unlockGithubChatWrites } from "@/lib/mcp-catalog";
 import { normalizeSkills } from "@/lib/skills";
 import { DEFAULT_CHAT_MODEL, isCreateMode, MODE_MODEL_IDS, modeOfModelId, sanitizeModeModel } from "@/lib/models";
 import type {
@@ -813,7 +813,12 @@ function normalizeServer(server: McpServerConfig): McpServerConfig {
     identity: typeof server.identity === "string" ? server.identity : undefined,
     verifiedAt: typeof server.verifiedAt === "number" ? server.verifiedAt : undefined,
     tools: Array.isArray(server.tools) ? server.tools : [],
-    disabledTools: Array.isArray(server.disabledTools) ? server.disabledTools : [],
+    disabledTools: unlockGithubChatWrites(
+      catalogId ?? (typeof server.id === "string" ? server.id : ""),
+      Array.isArray(server.disabledTools)
+        ? server.disabledTools.filter((name): name is string => typeof name === "string")
+        : [],
+    ),
   };
 }
 

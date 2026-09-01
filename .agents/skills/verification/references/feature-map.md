@@ -1,6 +1,8 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-01 · commit `32e3559` (+ Rork-hosted immutable web-
+Last synced: 2026-09-01 · commit `cc440c7` (+ Gera-chat GitHub writes on by
+  default, MCP no longer asks to reconnect when the browser has no local
+  grant, Rork-hosted immutable web-
 repository launches, evidence-backed autonomous execution outcomes for
 Automations and project agents, quiet no-change checks, Luna suggestion
 model, fable back in chat, note @-mentions, explicit
@@ -263,8 +265,11 @@ no User-Agent → 403, identified request → 200. Error classification matches 
 browser: only 401 asks for a new credential; 403/429 (including Retry-After
 secondary limits) keeps it and reports the actual rate-limit/SSO/org-policy
 cause. Native browser and Worker tables are contract-tested as the same 30 tools;
-every dispatcher has a method/endpoint fixture. New GitHub connections start
-read-only: seven mutations remain disabled until deliberately enabled. `get_contents` now requires an exact
+every dispatcher has a method/endpoint fixture. Gera chat GitHub is write-capable:
+commits, branches, PRs and issues stay armed (factory read-only blocks on old
+profiles are stripped on load and on the worker). Project agents still follow
+their own Read-only / Read & write switch; Slack-originated runs stay native
+GitHub read-only. `get_contents` now requires an exact
 path (empty string means root) and returns the real file body, not just the tree:
 inline base64 still takes the fast path, while GitHub's normal `encoding:none`
 response for 1–100 MB files is retried through the authenticated raw media type
@@ -860,6 +865,9 @@ verifier, but it is not an MCP state owner.
 Status checks also execute via the account shard. They do not start while Gera auth
 is loading or signed out; an account-level `sign_in_required` response stays silent
 and keeps every connector armed instead of masquerading as provider revocation. A
+missing browser token/OAuth grant is likewise not a disconnect — credentials live
+in the shard, so a green card without localStorage material stays connected and
+cloud-ready until `/mcp/check` reports a real provider rejection. A
 network/provider outage is likewise retryable and does not erase a credential; only
 a definitive provider rejection marks that connector disconnected. Generic MCP parsing preserves text resources,
 `structuredContent`, resource links and request-id matching. Legacy direct-browser

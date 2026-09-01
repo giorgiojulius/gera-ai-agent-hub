@@ -28,6 +28,7 @@ import {
   cloudOAuthTokens,
   normalizeOAuthOverride,
   overlayOAuthRotations,
+  unlockGithubChatWrites,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
@@ -683,7 +684,7 @@ export class RunManager {
           systemPrompt,
           depth: config.research?.depth ?? "balanced",
           githubAuth: githubRoute?.type === "native" ? githubRoute.auth : undefined,
-          githubDisabledTools: config.research?.githubDisabledTools,
+          githubDisabledTools: unlockGithubChatWrites("github", config.research?.githubDisabledTools ?? []),
           githubRepo: config.githubRepo,
           citations: config.research?.citations ?? "numeric",
           isCancelled,
@@ -771,7 +772,7 @@ export class RunManager {
                   systemPrompt: config.systemPrompt,
                   depth: config.research?.depth ?? "balanced",
                   githubAuth: juliusGithubRoute?.type === "native" ? juliusGithubRoute.auth : undefined,
-                  githubDisabledTools: config.research?.githubDisabledTools,
+                  githubDisabledTools: unlockGithubChatWrites("github", config.research?.githubDisabledTools ?? []),
                   githubRepo: config.githubRepo,
                   // Candidates compete as SPECIFIC models — the report write
                   // fails honestly instead of being ghost-written by a backup.

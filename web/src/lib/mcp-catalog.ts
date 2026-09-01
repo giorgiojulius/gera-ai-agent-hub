@@ -241,7 +241,7 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   { id: "serpapi", name: "SerpAPI", url: "https://mcp.serpapi.com/mcp", category: "search", auth: "token", icon: "serpapi.com", hint: "Google, Bing, Maps and more SERP data", tokenPlaceholder: "SerpAPI key", docsUrl: "https://serpapi.com/manage-api-key" },
   { id: "mapbox", name: "Mapbox", url: "https://mcp.mapbox.com/mcp", category: "search", auth: "oauth", icon: "mapbox.com", hint: "Geocoding, directions, isochrones, POI search" },
 
-  { id: "github", name: "GitHub", url: "https://api.github.com", native: "github", category: "code", auth: "token", tokenOptional: true, deviceFlow: true, icon: "github.com", hint: "Native GitHub connector: your repos (incl. private), files, issues, PRs, code search — sign in with GitHub or paste a PAT", tokenPlaceholder: "ghp_… or github_pat_… (optional after sign-in)", docsUrl: "https://docs.github.com/rest" },
+  { id: "github", name: "GitHub", url: "https://api.github.com", native: "github", category: "code", auth: "token", tokenOptional: true, deviceFlow: true, icon: "github.com", hint: "Native GitHub connector: Gera chat can read and write your repos (incl. private) — files, commits, PRs, issues. Project agents still follow their own Read-only / Read & write switch. Sign in with GitHub or paste a PAT", tokenPlaceholder: "ghp_… or github_pat_… (optional after sign-in)", docsUrl: "https://docs.github.com/rest" },
   { id: "postman", name: "Postman", url: "https://mcp.postman.com/mcp", category: "code", auth: "token", icon: "postman.com", hint: "Collections, environments, and your API workspace", tokenPlaceholder: "PMAK-… Postman API key" },
   { id: "lovable", name: "Lovable", url: "https://mcp.lovable.dev", category: "code", auth: "oauth", icon: "lovable.dev", hint: "Your Lovable apps and projects" },
   { id: "sonatype", name: "Sonatype", url: "https://mcp.guide.sonatype.com/mcp", category: "code", auth: "none", icon: "sonatype.com", hint: "Maven Central versions and upgrade recommendations" },
@@ -332,7 +332,8 @@ export function findCatalogEntry(id: string): McpCatalogEntry | undefined {
   return CATALOG_BY_ID.get(id);
 }
 
-const GITHUB_WRITE_TOOLS = [
+/** Mutation tools on the native GitHub connector. Gera chat always leaves these armed. */
+export const GITHUB_WRITE_TOOLS = [
   "create_issue",
   "add_issue_comment",
   "create_branch",
@@ -341,6 +342,24 @@ const GITHUB_WRITE_TOOLS = [
   "create_pull",
   "update_pull",
 ] as const;
+
+/** True when `name` is a GitHub mutation tool that chat must keep enabled. */
+export function isGithubWriteTool(name: string): boolean {
+  return (GITHUB_WRITE_TOOLS as readonly string[]).includes(name);
+}
+
+/**
+ * Gera chat GitHub is write-capable. Older profiles stored the factory
+ * read-only block on the connector card; strip those names so existing
+ * sign-ins start committing without a reconnect. Project agents still filter
+ * writes via their own Read-only / Read & write switch.
+ */
+export function unlockGithubChatWrites(catalogKey: string, disabledTools: string[]): string[] {
+  if (catalogKey !== "github") {
+    return disabledTools;
+  }
+  return disabledTools.filter((name) => !isGithubWriteTool(name));
+}
 
 export function catalogEntryToServer(entry: McpCatalogEntry): McpServerConfig {
   return {
@@ -353,9 +372,7 @@ export function catalogEntryToServer(entry: McpCatalogEntry): McpServerConfig {
     enabled: true,
     status: "idle",
     tools: [],
-    // New GitHub connections begin read-only. The user can deliberately enable
-    // individual mutation tools on the card; unattended writes are never opt-out.
-    disabledTools: entry.id === "github" ? [...GITHUB_WRITE_TOOLS] : [],
+    disabledTools: [],
   };
 }
 

@@ -80,13 +80,19 @@ describe("cloudMcpReadiness", () => {
     expect(cloudMcpReadiness(server({ id: "intercom", catalogId: "intercom", token: "ic_x" }))).toBe("ready");
   });
 
+  it("a verified-green card is cloud-ready even without a browser token", () => {
+    expect(cloudMcpReadiness(server({ id: "github", catalogId: "github" }))).toBe("ready");
+    expect(cloudMcpReadiness(server({ id: "slack", catalogId: "slack", status: "connected" }))).toBe("ready");
+    expect(cloudMcpReadiness(server({ id: "notion", catalogId: "notion", status: "connected" }))).toBe("ready");
+  });
+
   it("native connectors without any credential need auth first", () => {
-    expect(cloudMcpReadiness(server({ id: "github", catalogId: "github" }))).toBe("needs-auth");
-    expect(cloudMcpReadiness(server({ id: "slack", catalogId: "slack" }))).toBe("needs-auth");
+    expect(cloudMcpReadiness(server({ id: "github", catalogId: "github", status: "idle" }))).toBe("needs-auth");
+    expect(cloudMcpReadiness(server({ id: "slack", catalogId: "slack", status: "idle" }))).toBe("needs-auth");
   });
 
   it("OAuth catalog servers without a sign-in or key need auth", () => {
-    expect(cloudMcpReadiness(server({ id: "notion", catalogId: "notion" }))).toBe("needs-auth");
+    expect(cloudMcpReadiness(server({ id: "notion", catalogId: "notion", status: "idle" }))).toBe("needs-auth");
   });
 
   it("a pasted key makes a key-required catalog server cloud-ready", () => {
@@ -94,7 +100,7 @@ describe("cloudMcpReadiness", () => {
   });
 
   it("key-required catalog servers without credentials stay needs-auth", () => {
-    expect(cloudMcpReadiness(server({ id: "datadog", catalogId: "datadog" }))).toBe("needs-auth");
+    expect(cloudMcpReadiness(server({ id: "datadog", catalogId: "datadog", status: "idle" }))).toBe("needs-auth");
   });
 
   it("open catalog servers are cloud-ready without keys", () => {
@@ -103,12 +109,12 @@ describe("cloudMcpReadiness", () => {
   });
 
   it("explicit sign-in mode needs a stored sign-in (none in tests)", () => {
-    expect(cloudMcpReadiness(server({ id: "c1", authMode: "oauth", token: "tok" }))).toBe("needs-auth");
+    expect(cloudMcpReadiness(server({ id: "c1", authMode: "oauth", token: "tok", status: "idle" }))).toBe("needs-auth");
   });
 
   it("custom servers attempt openly unless locked to bearer auth", () => {
     expect(cloudMcpReadiness(server({ id: "c1" }))).toBe("ready");
-    expect(cloudMcpReadiness(server({ id: "c1", authMode: "bearer" }))).toBe("needs-auth");
+    expect(cloudMcpReadiness(server({ id: "c1", authMode: "bearer", status: "idle" }))).toBe("needs-auth");
     expect(cloudMcpReadiness(server({ id: "c1", headersJson: '{"X-Key":"v"}' }))).toBe("ready");
   });
 });

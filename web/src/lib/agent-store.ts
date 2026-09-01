@@ -1834,36 +1834,17 @@ const mcpRevalidationInFlight = new Set<string>();
  */
 export function isRecoverableMcpHealthError(error: unknown): boolean {
   const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  return /(?:gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response)/i.test(
+  return /(?:gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response|sign-in is missing|authorize this server again|needs a fresh API token|Bearer token is missing|needs an API key)/i.test(
     message,
   );
 }
 
-/** Returns the exact local credential gap that makes a green card impossible. */
-export function mcpCredentialProblem(server: McpServerConfig): string | null {
-  const entry = findCatalogEntry(server.catalogId ?? server.id);
-  const catalogId = server.catalogId ?? server.id;
-  const hasKey = Boolean(server.token?.trim());
-  const hasHeaders = Boolean(server.headersJson?.trim());
-  const hasOAuth =
-    hasOAuthToken(server.id, server.url) ||
-    (catalogId !== server.id && hasOAuthToken(catalogId, server.url));
-
-  if (entry?.native === "github") {
-    return hasKey || hasOAuth ? null : "GitHub sign-in is missing — sign in again or paste a PAT.";
-  }
-  if (entry?.native === "slack" || entry?.native === "intercom") {
-    return hasKey ? null : `${entry.name} needs a fresh API token.`;
-  }
-  if (server.authMode === "oauth" || entry?.auth === "oauth") {
-    return hasOAuth ? null : "Sign-in is missing or expired — authorize this server again.";
-  }
-  if (server.authMode === "bearer") {
-    return hasKey ? null : "Bearer token is missing.";
-  }
-  if (entry?.auth === "token" && entry.tokenOptional !== true) {
-    return hasKey || hasHeaders ? null : `${entry.name} needs an API key.`;
-  }
+/**
+ * Local credential gaps are not disconnects. After server-owned MCP, tokens
+ * live in the account shard — a green card without a browser grant is normal.
+ * `/mcp/check` is the only honest source of truth.
+ */
+export function mcpCredentialProblem(_server: McpServerConfig): string | null {
   return null;
 }
 

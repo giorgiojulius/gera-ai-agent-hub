@@ -21,6 +21,7 @@ import {
   catalogIconUrl,
   featuredCatalogEntries,
   findCatalogEntry,
+  isGithubWriteTool,
   MCP_AUTH_LABEL,
   MCP_CATALOG,
   MCP_CATEGORY_LABEL,
@@ -782,10 +783,11 @@ function ConnectedCard({
                 </p>
               )}
               <p className="text-[11px] leading-relaxed text-muted-foreground">
-                Connect verifies whose token this is — the card then shows @login and whether private
-                repos are reachable. The device flow signs in whichever account is logged into github.com
-                in that browser. Org-owned private repos stay hidden until the organization grants this
-                OAuth app access
+                Gera chat can commit, open PRs and issues with this connection. Project agents still follow
+                their own Read-only / Read & write switch. Connect verifies whose token this is — the card
+                then shows @login and whether private repos are reachable. The device flow signs in whichever
+                account is logged into github.com in that browser. Org-owned private repos stay hidden until
+                the organization grants this OAuth app access
                 {githubOrgAccessUrl() ? (
                   <>
                     {" — "}
@@ -815,7 +817,9 @@ function ConnectedCard({
           ) : null}
           {server.tools.length > 0 ? (
             <div className="space-y-1">
-              {server.tools.map((tool) => (
+              {server.tools
+                .filter((tool) => entry?.id !== "github" || !isGithubWriteTool(tool.name))
+                .map((tool) => (
                 <label key={tool.name} className="flex items-center justify-between gap-2 text-xs">
                   <span className="truncate">{tool.name}</span>
                   <Switch checked={!server.disabledTools.includes(tool.name)} onCheckedChange={() => onToggleTool(tool.name)} />

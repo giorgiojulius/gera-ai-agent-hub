@@ -8,8 +8,8 @@ import {
   Hash,
   Loader2,
   MonitorDot,
-  MoreHorizontal,
   Plus,
+  Settings2,
   Users,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -20,6 +20,7 @@ import { AgentsPanel } from "@/components/gera/projects/AgentsPanel";
 import { ChannelChat } from "@/components/gera/projects/ChannelChat";
 import { MembersPanel } from "@/components/gera/projects/MembersPanel";
 import { ScreensPanel } from "@/components/gera/projects/ScreensPanel";
+import { SettingsPanel } from "@/components/gera/projects/SettingsPanel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -28,24 +29,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import {
-  createProjectChannel,
-  deleteProject,
-  fetchProjectOverview,
-  renameProject,
-} from "@/lib/projects";
+import { createProjectChannel, fetchProjectOverview } from "@/lib/projects";
 import { TID } from "@/lib/testids";
 import { cn } from "@/lib/utils";
 
-type SpaceTab = "channels" | "screens" | "agents" | "members";
+type SpaceTab = "channels" | "screens" | "agents" | "members" | "settings";
 
 export default function ProjectSpacePage() {
   const {
@@ -60,7 +49,10 @@ export default function ProjectSpacePage() {
   const tab: SpaceTab =
     channelParam !== undefined
       ? "channels"
-      : tabParam === "screens" || tabParam === "agents" || tabParam === "members"
+      : tabParam === "screens" ||
+          tabParam === "agents" ||
+          tabParam === "members" ||
+          tabParam === "settings"
         ? tabParam
         : "channels";
   const channelId = channelParam ?? null;
@@ -96,8 +88,6 @@ export default function ProjectSpacePage() {
   const [channelDialog, setChannelDialog] = useState<boolean>(false);
   const [channelName, setChannelName] = useState<string>("");
   const [channelTopic, setChannelTopic] = useState<string>("");
-  const [renameDialog, setRenameDialog] = useState<boolean>(false);
-  const [renameDraft, setRenameDraft] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
 
   const overviewQuery = useQuery({
@@ -160,37 +150,6 @@ export default function ProjectSpacePage() {
       toast.error(error instanceof Error ? error.message : "Could not create the channel");
     } finally {
       setBusy(false);
-    }
-  };
-
-  const submitRename = async () => {
-    const name = renameDraft.trim();
-    if (!name || busy) {
-      return;
-    }
-    setBusy(true);
-    try {
-      await renameProject(projectId, name);
-      await queryClient.invalidateQueries({ queryKey: ["project", projectId] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      setRenameDialog(false);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not rename the project");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const removeProject = async () => {
-    if (!window.confirm("Delete this project for everyone? Channels, messages and agents are erased.")) {
-      return;
-    }
-    try {
-      await deleteProject(projectId);
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      navigate("/projects");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not delete the project");
     }
   };
 
@@ -268,47 +227,13 @@ export default function ProjectSpacePage() {
             active={tab === "members"}
             onClick={() => openTab("members")}
           />
+          <SpaceTabButton
+            icon={Settings2}
+            label="Settings"
+            active={tab === "settings"}
+            onClick={() => openTab("settings")}
+          />
         </nav>
-
-        {canManage ? (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Project settings"
-                className="h-8 w-8 shrink-0 rounded-lg text-muted-foreground hover:text-foreground"
-              >
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-52 rounded-2xl border-border/70 p-1.5">
-              <DropdownMenuItem
-                className="gap-2 rounded-xl"
-                onSelect={() => {
-                  setRenameDraft(overview.project.name);
-                  setRenameDialog(true);
-                }}
-              >
-                Rename project
-              </DropdownMenuItem>
-              <DropdownMenuItem className="gap-2 rounded-xl" onSelect={() => setChannelDialog(true)}>
-                New channel
-              </DropdownMenuItem>
-              {overview.me.role === "owner" ? (
-                <>
-                  <DropdownMenuSeparator className="bg-border/60" />
-                  <DropdownMenuItem
-                    className="gap-2 rounded-xl text-destructive focus:bg-destructive/10 focus:text-destructive"
-                    onSelect={() => void removeProject()}
-                  >
-                    Delete project
-                  </DropdownMenuItem>
-                </>
-              ) : null}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ) : null}
       </header>
 
       {tab === "channels" ? (
@@ -410,13 +335,25 @@ export default function ProjectSpacePage() {
             />
           </div>
         </div>
-      ) : (
+      ) : tab === "members" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6">
             <MembersPanel
               projectId={projectId}
               members={overview.members}
               meEmail={overview.me.email}
+              myRole={overview.me.role}
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6">
+            <SettingsPanel
+              projectId={projectId}
+              projectName={overview.project.name}
+              channels={overview.channels}
+              slackConfig={overview.slackConfig ?? null}
               myRole={overview.me.role}
             />
           </div>
@@ -472,45 +409,6 @@ export default function ProjectSpacePage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={renameDialog} onOpenChange={setRenameDialog}>
-        <DialogContent className="rounded-3xl sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Rename project</DialogTitle>
-          </DialogHeader>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              void submitRename();
-            }}
-            className="space-y-3"
-          >
-            <Input
-              autoFocus
-              value={renameDraft}
-              onChange={(event) => setRenameDraft(event.target.value)}
-              maxLength={60}
-              className="h-10 rounded-xl"
-            />
-            <div className="flex justify-end gap-2">
-              <Button
-                type="button"
-                variant="ghost"
-                className="h-9 rounded-full px-4"
-                onClick={() => setRenameDialog(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                disabled={renameDraft.trim().length === 0 || busy}
-                className="h-9 rounded-full bg-ember px-5 text-ember-foreground hover:bg-ember/90"
-              >
-                Save
-              </Button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

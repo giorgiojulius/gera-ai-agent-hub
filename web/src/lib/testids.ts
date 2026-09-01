@@ -103,6 +103,8 @@ export const TID = {
   projectSpace: "project-space",
   /** Message composer input inside a project channel. */
   projectComposer: "project-composer",
+  /** Root of the project's Settings tab (rename, channels, Slack, delete). */
+  projectSettings: "project-settings",
   /** "New screen" action on the project's Screens tab (admins). */
   projectScreenCreate: "project-screen-create",
   /** One screen card on the project's Screens tab (repeats). */

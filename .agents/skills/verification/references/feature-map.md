@@ -1,6 +1,7 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-01 · commit `4a0fa26` (+ Diagnostics journals cloud-run
+Last synced: 2026-09-01 · commit `4a0fa26` (+ project Settings tab replaces
+  the ··· menu, Diagnostics journals cloud-run
   failures and real MCP disconnects again, Gera-chat GitHub writes on by
   default, MCP no longer asks to reconnect when the browser has no local
   grant, Rork-hosted immutable web-
@@ -455,7 +456,7 @@ Team spaces: scoped agents + Slack-style channels with threads + screens
 `project-create`); each project opens a full-bleed workspace at
 `/projects/:id` (`project-space`, normalizes to the first channel's address
 `/projects/:id/channels/:cid`; tabs live at
-`/projects/:id/{screens|agents|members}`, an open thread rides
+`/projects/:id/{screens|agents|members|settings}`, an open thread rides
 `?thread=<root id>` — Back closes it on mobile); a screen opens its own desk
 at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
 `?conversation=<id>`, the performance panel `?panel=performance`).
@@ -479,8 +480,14 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   rename) > member (talk, summon agents, leave). Enforced inside the
   project's ProjectStore shard (`proj:<id>`), never client-side.
 - **Channels & threads**: `#general` auto-created; admins add channels
-  (name + topic, ··· menu or rail +). Replies live in threads; root rows
+  (name + topic, rail + or Settings tab). Replies live in threads; root rows
   show reply-count chips; thread pane is a side column (overlay on mobile).
+- **Settings tab** (`project-settings`, replaces the old ··· header menu):
+  a real screen with General (rename), Channels (chip list + create form),
+  the project-level Slack app manager (connect via pasted `xoxe-1-…` refresh
+  token / disconnect — the same `/slack-config` connection the agent editor's
+  bot wizard uses), and an owner-only Danger zone (delete project). Members
+  see a read-only view; admins manage; only the owner sees delete.
 - **Agent profiles (the point)**: admin-owned, general-purpose — code,
   support, research, writing. The Agents tab is the project's admin
   panel: owner/admins configure name/emoji/handle, instructions, model

@@ -861,6 +861,7 @@ const PROJECT_SUB_ROUTES: Record<string, "GET" | "POST"> = {
   "/intercom/ask-gera": "POST",
   "/intercom/stats": "POST",
   "/intercom/stats/refresh": "POST",
+  "/intercom/stats/clear": "POST",
   "/intercom/stats/link": "POST",
   "/intercom/slack-related": "POST",
   "/intercom/ask-status": "POST",

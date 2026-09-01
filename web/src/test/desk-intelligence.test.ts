@@ -216,7 +216,7 @@ describe("prompt builders", () => {
   });
 
   it("grade prompt trims oldest unmarked lines but never the replies being graded", () => {
-    const filler = Array.from({ length: 60 }, (_, i) => `Customer (Anna): filler message ${i}`);
+    const filler = Array.from({ length: 100 }, (_, i) => `Customer (Anna): filler message ${i}`);
     const transcript = [
       "[p1] Maria (teammate): Early reply",
       ...filler,
@@ -240,6 +240,6 @@ describe("prompt builders", () => {
     expect(user).toContain("[p1] Maria (teammate): Early reply");
     expect(user).toContain("[p2] Maria (teammate): Late reply");
     expect(user).not.toContain("filler message 0");
-    expect(user).toContain("filler message 59");
+    expect(user).toContain("filler message 99");
   });
 });

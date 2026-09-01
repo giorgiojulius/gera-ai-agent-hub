@@ -203,8 +203,9 @@ const AGENT_TOOL_CAP = 90;
 // Desk intelligence: suggestion cache window, memory caps, grading batch size.
 const DESK_SUGGEST_TTL_MS = 15 * 60 * 1000;
 const DESK_SUGGESTIONS_KEEP = 300;
-const DESK_REPLIES_KEEP = 500;
-const DESK_GRADE_BATCH = 12;
+const DESK_REPLIES_KEEP = 2_000;
+const DESK_GRADE_BATCH = 24;
+const DESK_CONVERSATIONS_SCAN = 300;
 /** Reply drafts ride Luna — a fixed fast writer; grading keeps the inbox agent's model. */
 const DESK_SUGGEST_MODEL = "openai/gpt-5.6-luna";
 const DESK_QUESTION_LIMIT = 600;
@@ -321,6 +322,16 @@ type DeskLinkRow = {
   linked_at: number;
 };
 type DeskCoachRow = { admin_id: string; text: string; updated_at: number };
+type DeskStatsMetaRow = {
+  screen_id: string;
+  scanned_conversations: number;
+  analyzed_conversations: number;
+  range_from: number;
+  range_to: number;
+  collected_at: number;
+  limit_reached: number;
+};
+type DeskStatsRange = { from: number; to: number };
 /** Synced Slack pool for one screen — watched channels + recent messages. */
 type DeskSlackPoolData = {
   team: string;
@@ -372,6 +383,16 @@ type SlackJobRow = {
 
 function newId(prefix: string): string {
   return `${prefix}${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+}
+
+/** Validated inclusive millisecond range; zero means that side is unbounded. */
+function deskStatsRange(body: unknown): DeskStatsRange {
+  const record = isRecord(body) ? body : {};
+  const rawFrom = typeof record.from === "number" ? record.from : Number(record.from ?? 0);
+  const rawTo = typeof record.to === "number" ? record.to : Number(record.to ?? 0);
+  const from = Number.isFinite(rawFrom) ? Math.max(0, Math.trunc(rawFrom)) : 0;
+  const to = Number.isFinite(rawTo) ? Math.max(0, Math.trunc(rawTo)) : 0;
+  return from > 0 && to > 0 && from > to ? { from: to, to: from } : { from, to };
 }
 
 function normalizeAccess(raw: unknown): AgentAccess {
@@ -775,6 +796,29 @@ export class ProjectStore extends DurableObject {
         updated_at INTEGER NOT NULL
       )
     `);
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS desk_stats_meta (
+        screen_id TEXT PRIMARY KEY,
+        scanned_conversations INTEGER NOT NULL,
+        analyzed_conversations INTEGER NOT NULL,
+        range_from INTEGER NOT NULL,
+        range_to INTEGER NOT NULL,
+        collected_at INTEGER NOT NULL,
+        limit_reached INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    // One-time v2 reset requested for the old shallow (20-conversation) result
+    // set. Identity links remain; only harvested analysis is rebuilt.
+    const performanceReset = sql
+      .exec<{ value: string }>("SELECT value FROM meta WHERE key = 'desk_performance_v2_reset'")
+      .toArray()[0];
+    if (!performanceReset) {
+      sql.exec("DELETE FROM desk_replies");
+      sql.exec("DELETE FROM desk_transcripts");
+      sql.exec("DELETE FROM desk_coach");
+      sql.exec("DELETE FROM desk_stats_meta");
+      sql.exec("INSERT INTO meta (key, value) VALUES ('desk_performance_v2_reset', '1')");
+    }
     // Desk ↔ Slack: per-screen pool of synced channel messages (short TTL).
     sql.exec(`
       CREATE TABLE IF NOT EXISTS desk_slack_pool (
@@ -953,6 +997,9 @@ export class ProjectStore extends DurableObject {
       }
       if (request.method === "POST" && path === "/intercom/stats/refresh") {
         return this.handleDeskStatsRefresh(me, await request.json());
+      }
+      if (request.method === "POST" && path === "/intercom/stats/clear") {
+        return this.handleDeskStatsClear(me, await request.json());
       }
       if (request.method === "POST" && path === "/intercom/stats/link") {
         return this.handleDeskLink(me, await request.json());
@@ -2061,6 +2108,7 @@ export class ProjectStore extends DurableObject {
       "desk_transcripts",
       "desk_links",
       "desk_coach",
+      "desk_stats_meta",
       "desk_slack_pool",
       "desk_pageviews",
     ]) {
@@ -2223,6 +2271,7 @@ export class ProjectStore extends DurableObject {
     sql.exec("DELETE FROM desk_suggest_cache WHERE screen_id = ?", id);
     sql.exec("DELETE FROM desk_replies WHERE screen_id = ?", id);
     sql.exec("DELETE FROM desk_transcripts WHERE screen_id = ?", id);
+    sql.exec("DELETE FROM desk_stats_meta WHERE screen_id = ?", id);
     sql.exec("DELETE FROM desk_slack_pool WHERE screen_id = ?", id);
     return json({ ok: true });
   }
@@ -3036,14 +3085,29 @@ export class ProjectStore extends DurableObject {
     });
   }
 
-  /** Aggregates the harvested reply log into per-teammate performance cards. */
-  private deskStatsPayload(me: MemberRow, screen: ScreenRow): Record<string, unknown> {
+  /** Aggregates the harvested reply log into date-filtered teammate cards. */
+  private deskStatsPayload(
+    me: MemberRow,
+    screen: ScreenRow,
+    range: DeskStatsRange = { from: 0, to: 0 },
+  ): Record<string, unknown> {
     const sql = this.ctx.storage.sql;
     const isAdmin = canManageProject(this.memberRole(me));
+    const conditions = ["screen_id = ?"];
+    const bindings: Array<string | number> = [screen.id];
+    if (range.from > 0) {
+      conditions.push("at >= ?");
+      bindings.push(range.from);
+    }
+    if (range.to > 0) {
+      conditions.push("at <= ?");
+      bindings.push(range.to);
+    }
     const replies = sql
       .exec<DeskReplyRow>(
-        "SELECT screen_id, id, conversation_id, admin_id, admin_name, customer_text, reply_text, response_ms, at, grade, grade_reason FROM desk_replies WHERE screen_id = ? ORDER BY at DESC LIMIT ?",
-        screen.id,
+        `SELECT screen_id, id, conversation_id, admin_id, admin_name, customer_text, reply_text, response_ms, at, grade, grade_reason
+         FROM desk_replies WHERE ${conditions.join(" AND ")} ORDER BY at DESC LIMIT ?`,
+        ...bindings,
         DESK_REPLIES_KEEP,
       )
       .toArray();
@@ -3073,21 +3137,27 @@ export class ProjectStore extends DurableObject {
           .sort((a, b) => a - b);
         const good = rows.filter((row) => row.grade === "good").length;
         const bad = rows.filter((row) => row.grade === "bad").length;
+        const withinOneHour = times.filter((ms) => ms <= 60 * 60 * 1000).length;
         const link = links.get(adminId);
         return {
           adminId,
           name: rows[0]?.admin_name || link?.admin_name || `Admin #${adminId}`,
           linkedEmail: link?.email ?? "",
           replies: rows.length,
+          conversations: new Set(rows.map((row) => row.conversation_id)).size,
+          responseSamples: times.length,
           medianResponseMs: times.length > 0 ? times[Math.floor(times.length / 2)] : 0,
+          p90ResponseMs: times.length > 0 ? times[Math.min(times.length - 1, Math.ceil(times.length * 0.9) - 1)] : 0,
+          withinOneHour,
           good,
           bad,
           ungraded: rows.length - good - bad,
+          firstAt: rows[rows.length - 1]?.at ?? 0,
           lastAt: rows[0]?.at ?? 0,
           coaching: coach.get(adminId) ?? "",
           examples: rows
             .filter((row) => row.grade !== "")
-            .slice(0, 6)
+            .slice(0, 10)
             .map((row) => ({
               customer: row.customer_text,
               reply: row.reply_text,
@@ -3099,14 +3169,44 @@ export class ProjectStore extends DurableObject {
         };
       })
       .sort((a, b) => b.replies - a.replies);
-    // Members see only their own linked card — grades are a coaching tool,
-    // not a public scoreboard; admins see the whole team.
     const visible = isAdmin ? teammates : teammates.filter((teammate) => teammate.linkedEmail === me.email);
+    const visibleAdminIds = new Set(visible.map((teammate) => teammate.adminId));
+    const summaryReplies = isAdmin ? replies : replies.filter((row) => visibleAdminIds.has(row.admin_id));
+    const meta = sql
+      .exec<DeskStatsMetaRow>(
+        "SELECT screen_id, scanned_conversations, analyzed_conversations, range_from, range_to, collected_at, limit_reached FROM desk_stats_meta WHERE screen_id = ?",
+        screen.id,
+      )
+      .toArray()[0];
+    const responseTimes = summaryReplies
+      .map((row) => row.response_ms)
+      .filter((ms) => ms > 0)
+      .sort((a, b) => a - b);
     const payload: Record<string, unknown> = {
       isAdmin,
       teammates: visible,
-      totalReplies: replies.length,
-      ungraded: replies.filter((row) => row.grade === "").length,
+      totalReplies: summaryReplies.length,
+      conversations: new Set(summaryReplies.map((row) => row.conversation_id)).size,
+      gradedReplies: summaryReplies.filter((row) => row.grade !== "").length,
+      badReplies: summaryReplies.filter((row) => row.grade === "bad").length,
+      responseSamples: responseTimes.length,
+      withinOneHour: responseTimes.filter((ms) => ms <= 60 * 60 * 1000).length,
+      p90ResponseMs:
+        responseTimes.length > 0
+          ? responseTimes[Math.min(responseTimes.length - 1, Math.ceil(responseTimes.length * 0.9) - 1)]
+          : 0,
+      ungraded: summaryReplies.filter((row) => row.grade === "").length,
+      range,
+      coverage: meta
+        ? {
+            scannedConversations: meta.scanned_conversations,
+            analyzedConversations: meta.analyzed_conversations,
+            from: meta.range_from,
+            to: meta.range_to,
+            collectedAt: meta.collected_at,
+            limitReached: meta.limit_reached === 1,
+          }
+        : null,
       now: Date.now(),
     };
     if (isAdmin) {
@@ -3125,7 +3225,7 @@ export class ProjectStore extends DurableObject {
     if (!screen) {
       return json({ error: "screen_not_found" }, 404);
     }
-    const payload = this.deskStatsPayload(me, screen);
+    const payload = this.deskStatsPayload(me, screen, deskStatsRange(body));
     if (payload.isAdmin === true) {
       // Admins also get the Intercom teammate directory for manual linking.
       const resolved = this.screenIntercomToken(screen);
@@ -3164,8 +3264,13 @@ export class ProjectStore extends DurableObject {
       return json({ error: resolved.error }, 400);
     }
     const sql = this.ctx.storage.sql;
+    const range = deskStatsRange(body);
     try {
-      const harvest = await harvestIntercomReplyPairs(resolved.token, 20);
+      const harvest = await harvestIntercomReplyPairs(resolved.token, {
+        from: range.from,
+        to: range.to,
+        maxConversations: DESK_CONVERSATIONS_SCAN,
+      });
       const pairs = harvest.replies;
       const countRows = (): number =>
         sql
@@ -3188,6 +3293,18 @@ export class ProjectStore extends DurableObject {
         );
       }
       const added = countRows() - before;
+      sql.exec(
+        `INSERT OR REPLACE INTO desk_stats_meta
+         (screen_id, scanned_conversations, analyzed_conversations, range_from, range_to, collected_at, limit_reached)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        screen.id,
+        harvest.scannedConversations,
+        harvest.analyzedConversations,
+        range.from,
+        range.to,
+        Date.now(),
+        harvest.limitReached ? 1 : 0,
+      );
       // Refresh the grading context: one full transcript per harvested conversation.
       for (const item of harvest.transcripts) {
         sql.exec(
@@ -3256,10 +3373,21 @@ export class ProjectStore extends DurableObject {
       // Grade the newest ungraded replies + refresh coaching — one model call.
       let graded = 0;
       let gradeError = "";
+      const gradeConditions = ["screen_id = ?", "grade = ''"];
+      const gradeBindings: Array<string | number> = [screen.id];
+      if (range.from > 0) {
+        gradeConditions.push("at >= ?");
+        gradeBindings.push(range.from);
+      }
+      if (range.to > 0) {
+        gradeConditions.push("at <= ?");
+        gradeBindings.push(range.to);
+      }
       const ungraded = sql
         .exec<DeskReplyRow>(
-          "SELECT screen_id, id, conversation_id, admin_id, admin_name, customer_text, reply_text, response_ms, at, grade, grade_reason FROM desk_replies WHERE screen_id = ? AND grade = '' ORDER BY at DESC LIMIT ?",
-          screen.id,
+          `SELECT screen_id, id, conversation_id, admin_id, admin_name, customer_text, reply_text, response_ms, at, grade, grade_reason
+           FROM desk_replies WHERE ${gradeConditions.join(" AND ")} ORDER BY at DESC LIMIT ?`,
+          ...gradeBindings,
           DESK_GRADE_BATCH,
         )
         .toArray();
@@ -3349,9 +3477,12 @@ export class ProjectStore extends DurableObject {
           gradeError = error instanceof Error ? error.message : "Grading run failed.";
         }
       }
-      const payload = this.deskStatsPayload(me, screen);
+      const payload = this.deskStatsPayload(me, screen, range);
       payload.intercomAdmins = intercomAdmins;
       payload.collected = pairs.length;
+      payload.scannedConversations = harvest.scannedConversations;
+      payload.analyzedConversations = harvest.analyzedConversations;
+      payload.limitReached = harvest.limitReached;
       payload.added = added;
       payload.graded = graded;
       if (gradeError) {
@@ -3361,6 +3492,48 @@ export class ProjectStore extends DurableObject {
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : "Intercom request failed." }, 502);
     }
+  }
+
+  /** Clears harvested performance results for one screen while preserving identity links. */
+  private async handleDeskStatsClear(me: MemberRow, body: unknown): Promise<Response> {
+    if (!canManageProject(this.memberRole(me))) {
+      return json({ error: "admin_required" }, 403);
+    }
+    const record = isRecord(body) ? body : {};
+    const screenId = asStr(record.screenId);
+    const screen = screenId ? this.loadScreen(screenId) : undefined;
+    if (!screen) {
+      return json({ error: "screen_not_found" }, 404);
+    }
+    const sql = this.ctx.storage.sql;
+    const adminIds = sql
+      .exec<{ admin_id: string }>("SELECT DISTINCT admin_id FROM desk_replies WHERE screen_id = ?", screen.id)
+      .toArray()
+      .map((row) => row.admin_id);
+    sql.exec("DELETE FROM desk_replies WHERE screen_id = ?", screen.id);
+    sql.exec("DELETE FROM desk_transcripts WHERE screen_id = ?", screen.id);
+    sql.exec("DELETE FROM desk_stats_meta WHERE screen_id = ?", screen.id);
+    for (const adminId of adminIds) {
+      const usedElsewhere = sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM desk_replies WHERE admin_id = ?", adminId)
+        .toArray()[0]?.n ?? 0;
+      if (usedElsewhere === 0) {
+        sql.exec("DELETE FROM desk_coach WHERE admin_id = ?", adminId);
+      }
+    }
+    const payload = this.deskStatsPayload(me, screen, deskStatsRange(body));
+    const resolved = this.screenIntercomToken(screen);
+    if ("token" in resolved) {
+      try {
+        payload.intercomAdmins = await listIntercomAdmins(resolved.token);
+      } catch {
+        payload.intercomAdmins = [];
+      }
+    } else {
+      payload.intercomAdmins = [];
+    }
+    payload.cleared = true;
+    return json(payload);
   }
 
   /** Manual Intercom-admin ↔ Gera-member link; empty email unlinks. */

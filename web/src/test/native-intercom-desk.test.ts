@@ -16,6 +16,7 @@ import {
   deriveReplyPairs,
   deriveThreadParts,
   extractSpendValue,
+  intercomNextCursor,
   moneyValue,
   rankInboxRows,
   readAttachments,
@@ -485,6 +486,14 @@ describe("readAttachments", () => {
 
   it("returns empty for payloads without attachments", () => {
     expect(readAttachments({})).toEqual([]);
+  });
+});
+
+describe("intercomNextCursor", () => {
+  it("reads the next conversation-search cursor and fails closed on malformed pages", () => {
+    expect(intercomNextCursor({ pages: { next: { starting_after: "cursor-2" } } })).toBe("cursor-2");
+    expect(intercomNextCursor({ pages: { next: null } })).toBe("");
+    expect(intercomNextCursor({ pages: "invalid" })).toBe("");
   });
 });
 

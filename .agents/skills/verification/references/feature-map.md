@@ -737,27 +737,35 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   Slack API failures → amber "Slack check failed" line, drafts still
   generate without Slack context. **Team performance** — header ChartColumn button
   (`screen-desk-performance`) opens a full-screen panel
-  (`screen-desk-performance-panel`, POST `/intercom/stats`): per-teammate
-  cards from REAL transcripts — reply counts, median response time,
-  good/bad grades with reasons on examples, coaching paragraphs. Data
-  flows only on demand: admin "Collect & grade" (POST
-  `/intercom/stats/refresh`) harvests the latest ~20 conversations via
-  `harvestIntercomReplyPairs`/`deriveReplyPairs` (human admin comments
-  paired with the customer message they answered; bots and notes
-  skipped; dedup by part id into `desk_replies`, cap 500) plus one full
-  transcript per conversation (`deriveConversationTranscript` →
-  `desk_transcripts`, pruned with the replies), then grades ≤12
-  ungraded replies in ONE model call grouped BY CONVERSATION — the
-  model sees each whole transcript with `[partId]` markers on human
-  replies and judges every listed reply in context (medium reasoning
-  effort; pair-only fallback when a transcript is gone;
-  `buildGradeMessages`/`parseGradePayload`) — and refreshes per-teammate
-  coaching (`desk_coach`, addressed as "you"). Intercom admins auto-link
-  to Gera members by email match (`desk_links`); admins re-link manually
-  per card and pre-link teammates with no replies yet ("Other Intercom
-  teammates", POST `/intercom/stats/link`). Admins see the whole team;
-  members see ONLY their own linked card — grades are coaching, not a
-  public scoreboard. **AI assistant** — a floating live-chat
+  (`screen-desk-performance-panel`, POST `/intercom/stats`): custom From/To
+  dates plus 7/30/90-day and All-time presets (`screen-desk-performance-dates`)
+  filter every metric by reply timestamp. Per-teammate cards use REAL transcripts
+  and show conversations/replies, median speed, slow-tail p90, share answered
+  within one hour, good/bad grades, ungraded work, exact first/last dates,
+  coaching and up to 10 explained examples. The compact "What to act on" block
+  reports only operational signals: ungraded backlog, bad replies, >1h slow tail,
+  and incomplete scan coverage — no decorative charts. Data flows only on demand:
+  admin "Analyze conversations" (`screen-desk-performance-analyze`, POST
+  `/intercom/stats/refresh`) uses Intercom Search date filters and cursor pages to
+  scan/read up to 300 matching conversations via `harvestIntercomReplyPairs` /
+  `deriveReplyPairs` (human admin comments paired with the customer message they
+  answered; bots and notes skipped; exact reply-date filter; dedup by part id into
+  `desk_replies`, cap 2,000). It stores one deeper transcript per conversation
+  (`deriveConversationTranscript`, up to 100 lines / 12k chars), then grades ≤24
+  new replies in ONE model call grouped BY CONVERSATION; each grading block keeps
+  up to 70 lines / 7.5k chars and protects target `[partId]` lines. Coaching is
+  3–5 specific sentences based on recurring patterns across the sample (medium
+  reasoning; pair-only fallback when a transcript is gone;
+  `buildGradeMessages`/`parseGradePayload`). Coverage count/range/timestamp and
+  scan-limit truth persist in `desk_stats_meta`. "Clear current results"
+  (`screen-desk-performance-clear`, POST `/intercom/stats/clear`) permanently
+  removes replies, transcripts, grades and coaching after confirmation while
+  preserving teammate links; the former shallow result set is cleared once on
+  the v2 migration. Intercom admins auto-link to Gera members by email match
+  (`desk_links`); admins re-link manually per card and pre-link teammates with no
+  replies yet ("Other Intercom teammates", POST `/intercom/stats/link`). Admins
+  see the whole team; members and summary metrics expose ONLY their own linked
+  replies — grades are coaching, not a public scoreboard. **AI assistant** — a floating live-chat
   launcher + panel (`screen-desk-assistant`, Intercom-messenger style,
   bottom-right). On desktop the open panel (`screen-desk-assistant-panel`)
   is drag & movable by its header (`screen-desk-assistant-handle`): offset
@@ -957,9 +965,9 @@ Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message t
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
-OAuth/session/file-content suites. Full verification on 2026-09-01: 763 unit
-checks, 26 browser checks, web build/deploy and live preview smoke passed; the
-Worker was unchanged, and its public health/auth-gate smoke remained green.
+OAuth/session/file-content suites. Full verification on 2026-09-01: 766 unit
+checks, 26 browser checks, web build/deploy, Worker deploy and live preview smoke
+passed; public backend health and the new stats-clear auth gate remained green.
 
 ## Settings (`/settings`)
 

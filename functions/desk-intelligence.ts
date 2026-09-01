@@ -230,7 +230,7 @@ export type GradePromptInput = {
 };
 
 const GRADE_SYSTEM = [
-  "You audit a support team's REAL replies to customers, then coach each teammate.",
+  "You audit a support team's REAL replies to customers, then coach each teammate from recurring patterns across the whole supplied sample.",
   "",
   'You get full conversation transcripts, oldest first. Human team replies are marked with ids like [123]. Grade ONLY the ids listed in each "Grade:" list — customer messages, bot replies, internal notes and unlisted team replies are context, never grade those.',
   "",
@@ -239,7 +239,7 @@ const GRADE_SYSTEM = [
   '- "bad" — ignored the conversation context, missed the question, canned or robotic, wrong or invented facts, needlessly slow, or left the customer stuck.',
   "reason: ONE short sentence naming the decisive factor.",
   "",
-  'Then coach every teammate that appears (keyed by admin_id): 2–4 sentences addressed as "you" — what you do well, where you slipped (name the pattern, not reply ids), and the one change that would make you faster or better.',
+  'Then coach every teammate that appears (keyed by admin_id): 3–5 specific sentences addressed as "you" — recurring strengths, recurring gaps, speed/context awareness, and one concrete behavior to practice next. Weigh the full sample, not one isolated reply; name patterns, never reply ids.',
   "",
   "Answer with STRICT JSON only:",
   '{"grades":[{"id":"…","verdict":"good|bad","reason":"…"}],"coaching":[{"admin_id":"…","text":"…"}]}',
@@ -265,8 +265,8 @@ function humanDuration(ms: number): string {
   return `${Math.round(hours / 24)}d`;
 }
 
-const GRADE_TRANSCRIPT_MAX_LINES = 40;
-const GRADE_TRANSCRIPT_MAX_CHARS = 4200;
+const GRADE_TRANSCRIPT_MAX_LINES = 70;
+const GRADE_TRANSCRIPT_MAX_CHARS = 7500;
 
 /** Drops the OLDEST unmarked lines when over budget; replies being graded always survive. */
 function trimTranscript(transcript: string, protectedIds: string[]): string {

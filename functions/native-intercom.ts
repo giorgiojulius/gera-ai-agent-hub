@@ -1138,9 +1138,10 @@ export function deriveConversationTranscript(detail: Record<string, unknown>): s
     const partId = idStr(part.id);
     push(`${partId ? `[${partId}] ` : ""}${name || "Teammate"} (teammate): ${body}`);
   }
-  // Newest context wins the budget — grading targets sit near the tail.
-  const kept = lines.slice(-60);
-  while (kept.length > 1 && kept.join("\n").length > 8000) {
+  // Keep a deep transcript while bounding one conversation's model footprint.
+  // Newest context wins only when a very long support thread exceeds the cap.
+  const kept = lines.slice(-100);
+  while (kept.length > 1 && kept.join("\n").length > 12_000) {
     kept.shift();
   }
   return kept.join("\n");
@@ -1150,17 +1151,78 @@ export type IntercomHarvest = {
   replies: IntercomHarvestedReply[];
   /** One full transcript per conversation — the grading context store. */
   transcripts: Array<{ conversationId: string; transcript: string }>;
+  /** Conversations returned by Intercom before detail reads. */
+  scannedConversations: number;
+  /** Conversations whose detail could be read and contained a reply in range. */
+  analyzedConversations: number;
+  /** True when more matching conversations existed beyond the bounded scan. */
+  limitReached: boolean;
 };
 
-/** Teammate replies + full transcripts across the latest conversations — the desk stats feed. */
+export type IntercomHarvestOptions = {
+  /** Inclusive reply timestamps in epoch milliseconds; 0 means unbounded. */
+  from?: number;
+  to?: number;
+  /** Hard cap on conversation detail calls, 1–300. */
+  maxConversations?: number;
+};
+
+/** Reads Intercom's cursor without trusting the rest of the paging payload. */
+export function intercomNextCursor(data: Record<string, unknown>): string {
+  return str(asRecord(asRecord(data.pages).next).starting_after);
+}
+
+/**
+ * Teammate replies + full transcripts across a bounded, paginated Intercom
+ * search. Search narrows by conversation activity; reply timestamps enforce
+ * the exact range after each full transcript is fetched.
+ */
 export async function harvestIntercomReplyPairs(
   token: string,
-  limit = 20,
+  options: IntercomHarvestOptions = {},
 ): Promise<IntercomHarvest> {
   const { region } = await ensureContext(token);
-  const perPage = clampNumber(limit, 20, 1, 50);
-  const data = await relay(token, region, "GET", `/conversations?per_page=${perPage}`);
-  const nested = await mapLimit(asRecordArray(data.conversations), 5, async (item) => {
+  const from = Number.isFinite(options.from) ? Math.max(0, Math.trunc(options.from ?? 0)) : 0;
+  const to = Number.isFinite(options.to) ? Math.max(0, Math.trunc(options.to ?? 0)) : 0;
+  const maxConversations = clampNumber(options.maxConversations, 150, 1, 300);
+  const conversations: Array<Record<string, unknown>> = [];
+  let startingAfter = "";
+  let hasMore = false;
+
+  while (conversations.length < maxConversations) {
+    const remaining = maxConversations - conversations.length;
+    const filters: Array<Record<string, unknown>> = [];
+    if (from > 0) {
+      filters.push({ field: "updated_at", operator: ">", value: Math.max(0, Math.floor(from / 1000) - 1) });
+    }
+    if (to > 0) {
+      filters.push({ field: "updated_at", operator: "<", value: Math.ceil(to / 1000) + 1 });
+    }
+    const query =
+      filters.length === 0
+        ? { field: "updated_at", operator: ">", value: 0 }
+        : filters.length === 1
+          ? filters[0]
+          : { operator: "AND", value: filters };
+    const data = await relay(token, region, "POST", "/conversations/search", {
+      query,
+      pagination: {
+        per_page: Math.min(150, remaining),
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      },
+      sort: { field: "updated_at", order: "descending" },
+    });
+    const page = asRecordArray(data.conversations);
+    conversations.push(...page.slice(0, remaining));
+    const next = intercomNextCursor(data);
+    hasMore = Boolean(next);
+    if (!next || page.length === 0 || conversations.length >= maxConversations) {
+      break;
+    }
+    startingAfter = next;
+  }
+
+  const nested = await mapLimit(conversations, 8, async (item) => {
     const id = idStr(item.id);
     if (!id) {
       return null;
@@ -1172,20 +1234,33 @@ export async function harvestIntercomReplyPairs(
         "GET",
         `/conversations/${encodeURIComponent(id)}?display_as=plaintext`,
       );
+      const replies = deriveReplyPairs(detail)
+        .filter((pair) => (from === 0 || pair.at >= from) && (to === 0 || pair.at <= to))
+        .map((pair) => ({ ...pair, conversationId: id }));
+      if (replies.length === 0) {
+        return null;
+      }
       return {
         conversationId: id,
-        replies: deriveReplyPairs(detail).map((pair) => ({ ...pair, conversationId: id })),
+        replies,
         transcript: deriveConversationTranscript(detail),
       };
     } catch {
       return null; // One bad conversation must not sink the harvest.
     }
   });
-  const harvest: IntercomHarvest = { replies: [], transcripts: [] };
+  const harvest: IntercomHarvest = {
+    replies: [],
+    transcripts: [],
+    scannedConversations: conversations.length,
+    analyzedConversations: 0,
+    limitReached: conversations.length >= maxConversations && hasMore,
+  };
   for (const entry of nested) {
     if (!entry) {
       continue;
     }
+    harvest.analyzedConversations += 1;
     harvest.replies.push(...entry.replies);
     if (entry.transcript) {
       harvest.transcripts.push({ conversationId: entry.conversationId, transcript: entry.transcript });

@@ -13,6 +13,7 @@ import {
   AlarmClock,
   ArrowLeft,
   Bot,
+  CalendarDays,
   ChartColumn,
   CheckCheck,
   ChevronDown,
@@ -35,6 +36,7 @@ import {
   Sparkles,
   ThumbsDown,
   ThumbsUp,
+  Trash2,
   UserRound,
   X,
 } from "lucide-react";
@@ -57,6 +59,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import {
   actOnScreenConversation,
   askGeraFromScreen,
+  clearDeskStats,
   deskTrackerSnippet,
   fetchDeskAskStatus,
   fetchDeskSlackRelated,
@@ -80,6 +83,7 @@ import {
   type DeskConversationDetails,
   type DeskMentionAdmin,
   type DeskStats,
+  type DeskStatsRange,
   type DeskTeammate,
   type IntercomAttr,
   type IntercomContactProfile,
@@ -135,6 +139,34 @@ function ago(at: number): string {
     return `${hours}h`;
   }
   return `${Math.floor(hours / 24)}d`;
+}
+
+function deskDateRange(fromDate: string, toDate: string): DeskStatsRange {
+  const from = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : 0;
+  const to = toDate ? new Date(`${toDate}T23:59:59.999`).getTime() : 0;
+  return {
+    from: Number.isFinite(from) ? from : 0,
+    to: Number.isFinite(to) ? to : 0,
+  };
+}
+
+function dateInputValue(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function performanceRangeLabel(range: DeskStatsRange): string {
+  if (range.from === 0 && range.to === 0) {
+    return "All collected time";
+  }
+  const format = (at: number): string =>
+    new Date(at).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  if (range.from > 0 && range.to > 0) {
+    return `${format(range.from)} – ${format(range.to)}`;
+  }
+  return range.from > 0 ? `Since ${format(range.from)}` : `Through ${format(range.to)}`;
 }
 
 export default function ScreenDeskPage() {
@@ -1695,14 +1727,18 @@ function PerformancePanel({
 }) {
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  const [clearing, setClearing] = useState<boolean>(false);
+  const [fromDate, setFromDate] = useState<string>("");
+  const [toDate, setToDate] = useState<string>("");
+  const range = useMemo(() => deskDateRange(fromDate, toDate), [fromDate, toDate]);
   const statsKey = useMemo(
-    () => ["desk-stats", projectId, screenId] as const,
-    [projectId, screenId],
+    () => ["desk-stats", projectId, screenId, range.from, range.to] as const,
+    [projectId, range.from, range.to, screenId],
   );
   const statsQuery = useQuery({
     queryKey: statsKey,
     retry: false,
-    queryFn: () => fetchDeskStats(projectId, screenId),
+    queryFn: () => fetchDeskStats(projectId, screenId, range),
   });
   const stats: DeskStats | null = statsQuery.data ?? null;
   const members = stats?.members ?? [];
@@ -1710,10 +1746,10 @@ function PerformancePanel({
   const refresh = async () => {
     setRefreshing(true);
     try {
-      const next = await refreshDeskStats(projectId, screenId);
+      const next = await refreshDeskStats(projectId, screenId, range);
       queryClient.setQueryData(statsKey, next);
       toast.success(
-        `Collected ${next.collected ?? 0} replies (${next.added ?? 0} new) · graded ${next.graded ?? 0}`,
+        `Read ${next.analyzedConversations ?? 0} conversations · collected ${next.collected ?? 0} replies · graded ${next.graded ?? 0}`,
       );
       if (next.gradeError) {
         toast.error(next.gradeError);
@@ -1723,6 +1759,36 @@ function PerformancePanel({
     } finally {
       setRefreshing(false);
     }
+  };
+
+  const clearResults = async (): Promise<void> => {
+    if (!window.confirm("Clear all collected replies, grades and coaching for this desk? Team links will stay.")) {
+      return;
+    }
+    setClearing(true);
+    try {
+      const next = await clearDeskStats(projectId, screenId, range);
+      queryClient.setQueryData(statsKey, next);
+      await queryClient.invalidateQueries({ queryKey: ["desk-stats", projectId, screenId] });
+      toast.success("Team performance results cleared");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not clear team performance");
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const setPreset = (days: number | null): void => {
+    if (days === null) {
+      setFromDate("");
+      setToDate("");
+      return;
+    }
+    const to = new Date();
+    const from = new Date();
+    from.setDate(from.getDate() - days + 1);
+    setFromDate(dateInputValue(from));
+    setToDate(dateInputValue(to));
   };
 
   const link = async (teammate: { adminId: string; name: string }, email: string) => {
@@ -1740,6 +1806,25 @@ function PerformancePanel({
 
   const knownAdminIds = new Set((stats?.teammates ?? []).map((teammate) => teammate.adminId));
   const unseenAdmins = (stats?.intercomAdmins ?? []).filter((admin) => !knownAdminIds.has(admin.id));
+  const slowReplies = stats ? Math.max(0, stats.responseSamples - stats.withinOneHour) : 0;
+  const withinHourShare =
+    stats && stats.responseSamples > 0 ? Math.round((stats.withinOneHour / stats.responseSamples) * 100) : null;
+  const attentionItems = stats
+    ? [
+        ...(stats.ungraded > 0
+          ? [`Grade ${stats.ungraded} waiting ${stats.ungraded === 1 ? "reply" : "replies"} to make coaching current.`]
+          : []),
+        ...(stats.badReplies > 0
+          ? [`Review ${stats.badReplies} ${stats.badReplies === 1 ? "reply" : "replies"} that left the customer stuck or missed context.`]
+          : []),
+        ...(stats.responseSamples >= 5 && slowReplies > 0
+          ? [`Reduce the slow tail: ${slowReplies} measured replies took over one hour; p90 is ${formatDuration(stats.p90ResponseMs)}.`]
+          : []),
+        ...(stats.coverage?.limitReached
+          ? ["Narrow the date range for complete coverage; this pass reached the 300-conversation scan limit."]
+          : []),
+      ]
+    : [];
 
   return (
     <div
@@ -1769,30 +1854,153 @@ function PerformancePanel({
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-2xl px-4 py-4">
-          {stats?.isAdmin ? (
-            <div className="mb-3 flex flex-wrap items-center gap-3 rounded-2xl border border-border/60 bg-card p-3.5">
+          <section
+            className="mb-3 rounded-2xl border border-border/60 bg-card p-3.5"
+            data-testid={TID.screenDeskPerformanceDates}
+          >
+            <div className="flex items-start gap-2">
+              <CalendarDays className="mt-0.5 h-4 w-4 shrink-0 text-ember" />
               <div className="min-w-0 flex-1">
-                <p className="text-xs font-semibold">Collect & grade</p>
-                <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-                  Pulls the latest teammate replies from Intercom, grades up to 12 ungraded ones
-                  with the model and refreshes coaching. Runs only when you press it.
-                  {stats.ungraded > 0 ? ` ${stats.ungraded} replies await grading.` : ""}
+                <p className="text-xs font-semibold">Performance period</p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  {performanceRangeLabel(range)} · results update as dates change
                 </p>
               </div>
-              <button
-                type="button"
-                disabled={refreshing}
-                onClick={() => void refresh()}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-ember px-3.5 py-1.5 text-xs font-semibold text-ember-foreground transition-colors hover:bg-ember/90 disabled:opacity-60"
-              >
-                {refreshing ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" />
-                )}
-                {refreshing ? "Working…" : "Collect & grade"}
-              </button>
+              {(fromDate || toDate) && (
+                <button
+                  type="button"
+                  onClick={() => setPreset(null)}
+                  className="text-[11px] font-medium text-muted-foreground hover:text-foreground"
+                >
+                  Clear dates
+                </button>
+              )}
             </div>
+            <div className="mt-2.5 flex flex-wrap gap-1.5">
+              {[
+                { label: "7 days", days: 7 },
+                { label: "30 days", days: 30 },
+                { label: "90 days", days: 90 },
+                { label: "All time", days: null },
+              ].map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => setPreset(preset.days)}
+                  className="rounded-full border border-border/70 px-2.5 py-1 text-[10px] font-medium text-muted-foreground transition-colors hover:border-ember/40 hover:text-foreground"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+            <div className="mt-2.5 grid grid-cols-2 gap-2">
+              <label className="text-[10px] font-medium text-muted-foreground">
+                From
+                <input
+                  type="date"
+                  value={fromDate}
+                  max={toDate || dateInputValue(new Date())}
+                  onChange={(event) => setFromDate(event.target.value)}
+                  className="mt-1 h-8 w-full rounded-lg border border-border/70 bg-background px-2 text-[11px] text-foreground"
+                />
+              </label>
+              <label className="text-[10px] font-medium text-muted-foreground">
+                To
+                <input
+                  type="date"
+                  value={toDate}
+                  min={fromDate || undefined}
+                  max={dateInputValue(new Date())}
+                  onChange={(event) => setToDate(event.target.value)}
+                  className="mt-1 h-8 w-full rounded-lg border border-border/70 bg-background px-2 text-[11px] text-foreground"
+                />
+              </label>
+            </div>
+          </section>
+
+          {stats?.isAdmin ? (
+            <div className="mb-3 rounded-2xl border border-border/60 bg-card p-3.5">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold">Deep analysis</p>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+                    Reads up to 300 matching Intercom conversations and their deeper transcripts,
+                    grades up to 24 new replies, then rebuilds pattern-based coaching.
+                    {stats.ungraded > 0 ? ` ${stats.ungraded} replies in this period await grading.` : ""}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={refreshing || clearing}
+                  onClick={() => void refresh()}
+                  data-testid={TID.screenDeskPerformanceAnalyze}
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-ember px-3.5 py-1.5 text-xs font-semibold text-ember-foreground transition-colors hover:bg-ember/90 disabled:opacity-60"
+                >
+                  {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                  {refreshing ? "Reading conversations…" : "Analyze conversations"}
+                </button>
+              </div>
+              {stats.totalReplies > 0 ? (
+                <button
+                  type="button"
+                  disabled={refreshing || clearing}
+                  onClick={() => void clearResults()}
+                  data-testid={TID.screenDeskPerformanceClear}
+                  className="mt-2.5 inline-flex items-center gap-1.5 text-[11px] font-medium text-red-600 transition-colors hover:text-red-700 disabled:opacity-50"
+                >
+                  {clearing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                  {clearing ? "Clearing…" : "Clear current results"}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          {stats && stats.totalReplies > 0 ? (
+            <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {[
+                { label: "Conversations", value: stats.conversations },
+                { label: "Replies", value: stats.totalReplies },
+                { label: "Graded", value: stats.gradedReplies },
+                { label: "Teammates", value: stats.teammates.length },
+              ].map((metric) => (
+                <div key={metric.label} className="rounded-xl border border-border/60 bg-card px-3 py-2.5">
+                  <p className="text-[10px] text-muted-foreground">{metric.label}</p>
+                  <p className="mt-0.5 text-lg font-bold tracking-tight">{metric.value}</p>
+                </div>
+              ))}
+              {stats.coverage ? (
+                <p className="col-span-2 px-1 text-[10px] leading-relaxed text-muted-foreground sm:col-span-4">
+                  Last analysis read {stats.coverage.analyzedConversations} of {stats.coverage.scannedConversations} scanned conversations
+                  {stats.coverage.limitReached ? " · scan limit reached" : ""} · updated {ago(stats.coverage.collectedAt)} ago
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {stats && stats.totalReplies > 0 ? (
+            <section className="mb-3 rounded-2xl border border-border/60 bg-card p-3.5">
+              <div className="flex items-center gap-2">
+                <Activity className="h-4 w-4 text-ember" />
+                <p className="text-xs font-semibold">What to act on</p>
+                {withinHourShare !== null ? (
+                  <span className="ml-auto text-[10px] text-muted-foreground">{withinHourShare}% answered within 1h</span>
+                ) : null}
+              </div>
+              {attentionItems.length > 0 ? (
+                <ul className="mt-2 space-y-1.5">
+                  {attentionItems.map((item) => (
+                    <li key={item} className="flex gap-2 text-[11px] leading-relaxed text-foreground/85">
+                      <span aria-hidden className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-ember" />
+                      {item}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                  No actionable warning in this sample. Keep the period consistent and rerun analysis to spot a real change.
+                </p>
+              )}
+            </section>
           ) : null}
 
           {statsQuery.isLoading ? (
@@ -1816,7 +2024,7 @@ function PerformancePanel({
               </p>
               <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-muted-foreground">
                 {stats.isAdmin
-                  ? "Press Collect & grade — Gera reads the latest Intercom threads and builds per-teammate stats."
+                  ? "Choose a date range and press Analyze conversations — Gera will rebuild performance from real Intercom threads."
                   : "Your Intercom identity isn't linked yet, or no stats were collected. Ask a project admin to open this panel, collect stats and link you."}
               </p>
             </div>
@@ -1877,9 +2085,10 @@ function PerformancePanel({
           ) : null}
 
           <p className="mt-4 px-1 pb-4 text-[10px] leading-relaxed text-muted-foreground/70">
-            Stats come from real Intercom threads — replies, response times and pairs are read
-            from transcripts. Grades and coaching are written by the model from actual replies;
-            admins collect &amp; grade on demand, nothing runs in the background.
+            Stats come from real Intercom threads in the selected reply-date range. Collection is
+            paginated and bounded at 300 conversations per pass; every grade sees the surrounding
+            transcript, while coaching looks for broader patterns. Admins run analysis on demand;
+            nothing spends model credits in the background.
           </p>
         </div>
       </div>
@@ -1935,14 +2144,28 @@ function TeammateCard({
         ) : null}
       </div>
 
-      <div className="mt-2.5 grid grid-cols-4 gap-2">
+      <div className="mt-2.5 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <div>
           <p className="text-[10px] text-muted-foreground">Replies</p>
           <p className="text-sm font-bold">{teammate.replies}</p>
         </div>
         <div>
+          <p className="text-[10px] text-muted-foreground">Conversations</p>
+          <p className="text-sm font-bold">{teammate.conversations}</p>
+        </div>
+        <div>
           <p className="text-[10px] text-muted-foreground">Median reply</p>
           <p className="text-sm font-bold">{formatDuration(teammate.medianResponseMs)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-muted-foreground">Slow tail (p90)</p>
+          <p className="text-sm font-bold">{formatDuration(teammate.p90ResponseMs)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-muted-foreground">Within 1 hour</p>
+          <p className="text-sm font-bold">
+            {teammate.responseSamples > 0 ? `${Math.round((teammate.withinOneHour / teammate.responseSamples) * 100)}%` : "—"}
+          </p>
         </div>
         <div>
           <p className="text-[10px] text-muted-foreground">Good / Bad</p>
@@ -1966,7 +2189,7 @@ function TeammateCard({
             <div className="h-full rounded-full bg-emerald-500" style={{ width: `${goodShare}%` }} />
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">
-            {goodShare}% of graded replies rated good · last reply {ago(teammate.lastAt)} ago
+            {goodShare}% of graded replies rated good · {new Date(teammate.firstAt).toLocaleDateString()} – {new Date(teammate.lastAt).toLocaleDateString()} · last reply {ago(teammate.lastAt)} ago
           </p>
         </div>
       ) : (
@@ -2014,7 +2237,7 @@ function TeammateCard({
                       {example.grade}
                     </span>
                     <span className="text-muted-foreground">
-                      reply in {formatDuration(example.responseMs)}
+                      {new Date(example.at).toLocaleDateString()} · reply in {formatDuration(example.responseMs)}
                     </span>
                     {example.reason ? (
                       <span className="min-w-0 flex-1 text-muted-foreground">{example.reason}</span>

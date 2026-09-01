@@ -123,6 +123,12 @@ export const TID = {
   screenDeskPerformance: "screen-desk-performance",
   /** Full-screen team-performance panel (stats, grades, coaching, links). */
   screenDeskPerformancePanel: "screen-desk-performance-panel",
+  /** Date-range controls for filtering and collecting team performance. */
+  screenDeskPerformanceDates: "screen-desk-performance-dates",
+  /** Starts a deep Intercom collection and grading pass. */
+  screenDeskPerformanceAnalyze: "screen-desk-performance-analyze",
+  /** Clears harvested team-performance results while preserving links. */
+  screenDeskPerformanceClear: "screen-desk-performance-clear",
   /** "Already in Slack" awareness section inside the desk suggest strip. */
   screenDeskSlack: "screen-desk-slack",
   /** Inline "Ask Gera" investigation card (running / answer) in the strip. */

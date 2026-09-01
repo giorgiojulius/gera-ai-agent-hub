@@ -755,25 +755,51 @@ export type DeskTeammate = {
   /** Gera member email this Intercom admin is linked to ("" = not linked). */
   linkedEmail: string;
   replies: number;
+  conversations: number;
+  responseSamples: number;
   medianResponseMs: number;
+  p90ResponseMs: number;
+  withinOneHour: number;
   good: number;
   bad: number;
   ungraded: number;
+  firstAt: number;
   lastAt: number;
   coaching: string;
   examples: DeskGradedExample[];
 };
 
+export type DeskStatsRange = { from: number; to: number };
+
 export type DeskStats = {
   isAdmin: boolean;
   teammates: DeskTeammate[];
   totalReplies: number;
+  conversations: number;
+  gradedReplies: number;
+  badReplies: number;
+  responseSamples: number;
+  withinOneHour: number;
+  p90ResponseMs: number;
   ungraded: number;
+  range: DeskStatsRange;
+  coverage: {
+    scannedConversations: number;
+    analyzedConversations: number;
+    from: number;
+    to: number;
+    collectedAt: number;
+    limitReached: boolean;
+  } | null;
   members?: Array<{ email: string; name: string }>;
   intercomAdmins?: Array<{ id: string; name: string; email: string }>;
   collected?: number;
   added?: number;
+  /** Replies graded during the latest explicit analysis pass. */
   graded?: number;
+  scannedConversations?: number;
+  analyzedConversations?: number;
+  limitReached?: boolean;
   gradeError?: string;
   now: number;
 };
@@ -855,22 +881,44 @@ export async function fetchDeskAskStatus(
     : status;
 }
 
-export async function fetchDeskStats(projectId: string, screenId: string): Promise<DeskStats> {
+export async function fetchDeskStats(
+  projectId: string,
+  screenId: string,
+  range: DeskStatsRange = { from: 0, to: 0 },
+): Promise<DeskStats> {
   const response = await authedFetch(`/projects/${projectId}/intercom/stats`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ screenId }),
+    body: JSON.stringify({ screenId, ...range }),
   });
   return parseOrThrow(response, "Could not load team performance");
 }
 
-export async function refreshDeskStats(projectId: string, screenId: string): Promise<DeskStats> {
+export async function refreshDeskStats(
+  projectId: string,
+  screenId: string,
+  range: DeskStatsRange = { from: 0, to: 0 },
+): Promise<DeskStats> {
   const response = await authedFetch(`/projects/${projectId}/intercom/stats/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ screenId }),
+    body: JSON.stringify({ screenId, ...range }),
   });
   return parseOrThrow(response, "Could not collect team stats");
+}
+
+/** Permanently clears harvested replies, grades and coaching for one desk. */
+export async function clearDeskStats(
+  projectId: string,
+  screenId: string,
+  range: DeskStatsRange = { from: 0, to: 0 },
+): Promise<DeskStats> {
+  const response = await authedFetch(`/projects/${projectId}/intercom/stats/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ screenId, ...range }),
+  });
+  return parseOrThrow(response, "Could not clear team performance");
 }
 
 export async function linkDeskTeammate(

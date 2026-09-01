@@ -1538,7 +1538,42 @@ async function relayOAuthRotations(request: Request, url: URL, env: Env): Promis
   }
 }
 
-const MCP_OAUTH_REFRESH_BODY_LIMIT = 16_384;
+const MCP_OAUTH_REFRESH_BODY_LIMIT = 64_000;
+
+/** Server-owned MCP state/control routes for one authenticated account shard. */
+async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Response> {
+  try {
+    const methods: Record<string, "GET" | "POST"> = {
+      "/mcp/oauth-store": "POST",
+      "/mcp/oauth-clear": "POST",
+      "/mcp/check": "POST",
+    };
+    const method = methods[url.pathname];
+    if (!method || request.method !== method) {
+      return corsJson({ error: "not_found" }, 404);
+    }
+    const userId = request.headers.get("X-Rork-User-Id");
+    const email = (request.headers.get("X-Rork-User-Email") ?? "").trim().toLowerCase();
+    if (!userId || !email) {
+      return corsJson({ error: "sign_in_required" }, 401);
+    }
+    const body = await request.text();
+    if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
+      return corsJson({ error: "body_too_large" }, 413);
+    }
+    if (!(await isInvitedCached(env, request.url, email))) {
+      return corsJson({ error: "invite_required" }, 403);
+    }
+    const upstream = await shardCall(env, request.url, email, url.pathname, { method, body });
+    return new Response(await upstream.text(), {
+      status: upstream.status,
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  } catch (error) {
+    console.error("account MCP relay failed", error instanceof Error ? error.message : "error");
+    return corsJson({ error: "upstream_unreachable", transient: true }, 502);
+  }
+}
 
 /**
  * POST /mcp/oauth-refresh — refreshes a browser MCP grant inside its account
@@ -2267,6 +2302,13 @@ export default {
     }
     if (url.pathname === "/mcp/oauth-refresh") {
       return relayBrowserOAuthRefresh(request, env);
+    }
+    if (
+      url.pathname === "/mcp/oauth-store" ||
+      url.pathname === "/mcp/oauth-clear" ||
+      url.pathname === "/mcp/check"
+    ) {
+      return relayAccountMcp(request, url, env);
     }
     if (url.pathname === "/automations/run-now") {
       return relayRunNow(request, url, env, ctx);

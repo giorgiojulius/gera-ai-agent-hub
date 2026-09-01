@@ -460,6 +460,11 @@ export function clearOAuthToken(serverId: string): void {
   if (loadTokens()[serverId]) {
     commitTokenChanges({ [serverId]: null });
   }
+  void authedFetch("/mcp/oauth-clear", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ serverId }),
+  }).catch(() => undefined);
 }
 
 /** One server-rotated grant from the account backend: chain + freshest pair. */
@@ -785,7 +790,38 @@ export function openOAuthPopup(): Window | null {
   return window.open("about:blank", "gera-mcp-oauth", "popup,width=560,height=720");
 }
 
-/** Runs the full sign-in flow and stores the resulting token for the server id. */
+/** Persists a provider grant in the authenticated account shard; no token is returned to app state. */
+export async function storeOAuthTokenOnServer(serverId: string, token: StoredToken): Promise<void> {
+  const response = await authedFetch("/mcp/oauth-store", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ serverId, token }),
+  });
+  if (!response.ok) {
+    const data = (await response.json().catch(() => ({}))) as { error?: unknown };
+    throw new Error(typeof data.error === "string" ? data.error : "Could not save MCP sign-in on the server.");
+  }
+  // Remove any legacy browser copy only after the server confirms durability.
+  commitTokenChanges({ [serverId]: null });
+}
+
+/** One-time migration for grants created by older bundles. */
+export async function migrateLegacyOAuthTokensToServer(): Promise<number> {
+  const grants = exportOAuthTokens();
+  if (Object.keys(grants).length === 0) return 0;
+  const response = await authedFetch("/mcp/oauth-store", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grants }),
+  });
+  if (!response.ok) return 0;
+  for (const serverId of Object.keys(grants)) {
+    commitTokenChanges({ [serverId]: null }, false);
+  }
+  return Object.keys(grants).length;
+}
+
+/** Runs the full sign-in flow and stores the resulting token in the account shard. */
 export async function runOAuthSignIn(
   server: { id: string; url: string; name: string },
   popup: Window | null,
@@ -851,9 +887,8 @@ export async function runOAuthSignIn(
     });
 
     ensureCurrentAccount();
-    if (!storeExternalOAuthToken(server.id, token, flow)) {
-      throw new Error("The Gera account changed while this sign-in was open. Start it again.");
-    }
+    await storeOAuthTokenOnServer(server.id, token);
+    ensureCurrentAccount();
   } catch (error) {
     // A registration the provider expired or revoked would fail every future
     // sign-in straight from cache — forget it so the next attempt re-registers.

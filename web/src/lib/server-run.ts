@@ -236,12 +236,27 @@ function abortError(): DOMException {
 export async function startServerRun(
   body: StartServerRunRequest,
 ): Promise<{ ok: boolean; runId: string; historyOnServer: boolean }> {
+  // The backend resolves connector configuration and credentials from the
+  // account shard. The browser sends only ids needed for per-run scoping.
+  const serverOwnedBody: StartServerRunRequest = {
+    ...body,
+    config: {
+      ...body.config,
+      mcpServers: body.config.mcpServers.map((server) => ({
+        id: server.id,
+        ...(server.catalogId ? { catalogId: server.catalogId } : {}),
+      })) as McpServerConfig[],
+      ...(body.config.research
+        ? { research: { ...body.config.research, githubAuth: undefined } }
+        : {}),
+    },
+  };
   // A just-stopped previous run may still be finalizing — retry run_active briefly.
   for (let attempt = 0; ; attempt += 1) {
     const response = await authedFetch("/runs/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(serverOwnedBody),
     });
     if (response.status === 409 && attempt < 4) {
       await sleep(900);

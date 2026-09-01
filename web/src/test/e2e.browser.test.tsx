@@ -314,6 +314,23 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
     if (url.includes("/access/status")) {
       return jsonResponse({ email: "e2e@gera.app", status: "invited", role: "member", requestedAt: null });
     }
+    if (url.includes("/mcp/check")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { server?: { id?: string; token?: string } };
+      if (body.server?.id === "github") {
+        return jsonResponse({
+          tools: [{ name: "get_contents", inputSchema: { type: "object", properties: {} } }],
+          identity: "GitHub · server verified",
+        });
+      }
+      return jsonResponse({
+        tools: [{
+          name: "ask_question",
+          description: "Ask about a public repository",
+          inputSchema: { type: "object", properties: { question: { type: "string" } } },
+        }],
+        identity: "DeepWiki · server verified",
+      });
+    }
     if (url.includes("/mcp-proxy")) {
       const headers = new Headers(init?.headers);
       expect(headers.get("Authorization")).toMatch(/^Bearer /);
@@ -615,7 +632,7 @@ for (const scenario of E2E_SCENARIOS) {
       const github = lastStubRunBody?.config?.mcpServers?.find(
         (server) => (server.catalogId ?? server.id) === "github",
       );
-      expect(github?.token).toBe("ghp_e2e_fixture");
+      expect(github?.token).toBeUndefined();
     }
     if (scenario.id === "github-launch-web-preview") {
       const readPersisted = (): Record<string, unknown> | undefined => {

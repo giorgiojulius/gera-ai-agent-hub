@@ -67,6 +67,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   /** Server runs are adopted once per session (boot or first sign-in). */
   const adoptedRef = useRef<boolean>(false);
   const stateRef = useRef(state);
+  const firstSettingsSaveRef = useRef<boolean>(true);
   stateRef.current = state;
 
   /** Drain runs through a ref to break the cycle: drain → sendPrompt → onDone → drain. */
@@ -140,6 +141,12 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   const models = useMemo(() => withStaticModels(modelsQuery.data ?? []), [modelsQuery.data]);
 
   useEffect(() => {
+    // Keep a legacy credential-bearing settings record intact on first boot
+    // until the account-shard migration has had a chance to ingest it.
+    if (firstSettingsSaveRef.current) {
+      firstSettingsSaveRef.current = false;
+      return;
+    }
     saveSettings(state.settings);
   }, [state.settings]);
 

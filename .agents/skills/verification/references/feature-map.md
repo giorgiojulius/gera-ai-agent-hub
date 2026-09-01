@@ -834,97 +834,37 @@ HubStudio (view, edit, delete entries).
 
 ## MCP (`/mcp`)
 
-Connector studio: add MCP servers from a catalog or by URL, OAuth sign-in
-flows relayed through the worker (`/oauth-proxy`, `/mcp-proxy`,
-`/mcp/oauth-refresh`, `/mcp/oauth-rotations`), per-server tool listing and health, native
-GitHub / Slack / Intercom connectors. Connected servers appear in the
-composer Studio popover, in Profiles, and can bind to Skills.
+Connector studio: add MCP servers from a catalog or by URL, OAuth/device
+sign-in, per-server tool listing and health, and native GitHub / Slack / Intercom
+connectors. Connected servers appear in the composer Studio popover, Profiles,
+and Skills.
 
-OAuth popup sign-in has NO overall deadline — it waits as long as the user
-needs (SSO, 2FA). `popup.closed` is treated as unreliable: COOP-protected
-provider pages sever the opener link and report closed=true while the
-window is still open, so results keep arriving via localStorage for a
-10-minute grace after a "close". While waiting, the card button stays live
-as "Sign in again" (restart supersedes the old attempt — a stale failure
-never clobbers the newer attempt's state).
+Server ownership (2026-09-01): OAuth access/refresh grants, pasted API keys,
+custom headers, refresh single-flight, connection checks, protocol sessions and
+tool calls are owned by the signed-in account's ChatStore shard. `/mcp/oauth-store`
+persists a newly authorized grant before the popup/device flow reports success;
+`/mcp/check` stores submitted key/header material in the server vault and returns
+only redacted tool/status metadata. Browser profile and local settings serializers
+strip `token`, `headersJson`, and `mcpOAuth`; old local OAuth grants migrate once
+to the shard and are deleted only after its durable acknowledgement.
 
-Token lifecycle (defenses against "works a day, then re-login"): access
-tokens refresh 60s before expiry and once more reactively on 401; no
-client-side TTL is invented when a server omits expires_in; refresh always
-uses the stored token endpoint (no re-discovery); offline_access is
-requested whenever the AS advertises it (otherwise many providers issue no
-refresh token). Every sign-in/refresh/sign-out now bumps the profile clock,
-so a browser-rotated pair reaches cloud runs before the old refresh token is
-reused there. A newer account profile applies BOTH its MCP settings and its
-validated `mcpOAuth` grants (the old loader discarded the grants but kept the
-green flags); local-only grants remain. A transient relay/provider refresh
-failure keeps the recoverable grant and says retry — it never deletes it or
-asks for re-login; a fatal refresh (invalid_grant) still adopts the freshest
-sibling/server rotation first, and only a genuinely dead or expired
-non-refreshable grant drops to Sign in. Browser refresh now runs through the
-account shard (`POST /mcp/oauth-refresh`): a rotating provider response is
-persisted before the tab receives it. If a deploy replaces the old bundle after
-the provider consumed its refresh token but before the response reached
-localStorage, the new bundle presents the old base and receives the durable tip
-without another provider redeem. The endpoint is identity/invite gated,
-no-store, URL-safe, CAS-protected against fresh sign-ins, and `keepalive`-eligible.
-A provider HTTP 400/409 classified by that endpoint as non-transient is treated
-as a dead grant even when its code is only `request_failed`: the browser checks
-the durable rotation chain once, then adopts its tip or clears the stale pair.
-If that check is temporarily unavailable, the same retained pair gets a
-one-minute retry cooldown, preventing background health/visibility wakes from
-flooding `/mcp/oauth-refresh`; a publish-lost fetch remains immediately replayable.
-Expired DCR registrations (client_secret_expires_at) re-register instead of
-failing from cache.
+Every interactive, scheduled, project and Slack run resolves its connector
+configuration and credential again from durable server state. Run-start requests
+carry only selected connector ids; any client-supplied credential or GitHub auth
+is removed, and the backend ignores client connector config beyond that scope.
+Refresh occurs 60 seconds before recorded expiry and reactively after auth
+rejection, is committed before use, and survives browser closure or deploys.
+The browser may still host the provider's authorization UI and a temporary PKCE
+verifier, but it is not an MCP state owner.
 
-Account/race boundary (2026-08-31): every Gera session has a persistent nonce
-shared by tabs; logout or account replacement invalidates pending auth, MCP
-popup, device-flow, refresh, relay and multi-round sync work before it can write
-or retry. PKCE verifiers live per tab, popup callback slots are per OAuth state,
-and only the newest per-server sign-in attempt may commit. Browser refreshes use
-Web Locks across tabs, then compare-and-swap the full grant; independent
-per-server token entries prevent simultaneous connectors from erasing each
-other. After a sleeping tab's Gera JWT expires, every relay/sync/access retry is
-now pinned to the rejected access-token generation: the first 401 refreshes,
-while later 401s that belonged to the same old token reuse that winner instead
-of rotating the Gera session once per MCP. This closes the shared ~12-hour cliff
-where a burst of health checks could invalidate one another. A profile pull
-applies only if neither its profile clock nor OAuth snapshot changed while it
-was in flight. Cloud refresh holds its single-flight through durable persistence,
-keeps a short completed-flight reuse window for stale callers, and rejects a
-rotation whose source grant was replaced meanwhile. A deploy-time network/5xx
-failure while renewing Gera itself is also tri-stated as unavailable rather than
-rejected: stored tokens and expired identity context remain, boot retries in the
-background/on reconnect, and only an explicit revoked/invalid refresh grant
-shows signed-out. Equal profile clocks are ACKed only for byte-identical blobs,
-so a revived stale bundle cannot use an uncommitted profile to prune OAuth escrow.
-
-File-result truth (2026-08-30): generic MCP calls preserve plain text,
-embedded text resources and `structuredContent`; opaque image/audio/blob base64
-is replaced by a short descriptor instead of crowding file text out of context.
-A returned `resource_link` is resolved with `resources/read` on the same signed
-session (up to four links). Streamable HTTP parsing scans notifications and
-selects the final JSON-RPC response by request id, so progress events no longer
-turn a file read into an empty result. The browser and Worker implementations
-share regression fixtures in `mcp-file-content.test.ts`.
-
-Status truth (2026-08-31): every persisted green card is live-checked once
-per browser session, again when synced settings/auth arrive, every 10 minutes
-in a long-open tab, and when the tab returns (the old mount-only pass often ran
-too early). A `connected` card with missing OAuth/key bypasses the freshness
-window and flips straight to a specific error. Background checks no longer move
-healthy servers through a persisted Connecting state or turn a shared Gera
-refresh/relay outage, sleeping network, 5xx, timeout, or rate limit into a
-permanent synced disconnect; the connector stays armed and retries later.
-Profiles poisoned by the former relay-error behavior self-heal on boot when the
-credential/refresh grant still exists. Only a definitive provider auth rejection
-turns that one card red; native Slack/Intercom classify credential failures
-separately, and GitHub retries an early 401 with its refresh grant. GitHub's
-`bad_refresh_token` spelling also uses the existing rotation rescue. Unit suites:
-`auth-boundary.test.ts`, `mcp-oauth-refresh.test.ts`, `mcp-rotation.test.ts`,
-`mcp-session.test.ts`; real-browser Web Lock/localStorage regression:
-`auth-resume.browser.test.ts` (sleeping-tab single-flight, transient Gera boot,
-and lost-old-bundle-response → durable MCP replay).
+Status checks also execute via the account shard. A network/provider outage stays
+retryable and does not erase a credential; only a definitive provider rejection
+marks that connector disconnected. Generic MCP parsing preserves text resources,
+`structuredContent`, resource links and request-id matching. Legacy direct-browser
+transport remains test-only for protocol parity; production calls use the Worker.
+Regression coverage: `mcp-server-ownership.test.ts`, `mcp-session.test.ts`,
+`mcp-oauth-refresh.test.ts`, `mcp-rotation.test.ts`, `mcp-security.test.ts`, and
+`mcp-file-content.test.ts`.
 
 Full catalog + transport audit (2026-08-30): all 98 catalog rows were probed
 read-only. Of 94 generic connectable endpoints, 26 completed initialize +

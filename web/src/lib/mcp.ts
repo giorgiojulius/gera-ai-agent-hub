@@ -1,4 +1,5 @@
 import { AuthSessionChangedError, RelayAccessError, relayFetch } from "@/lib/backend";
+import { authedFetch } from "@/lib/backend";
 import { newId } from "@/lib/env";
 import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
@@ -451,6 +452,36 @@ export type McpConnection = {
 };
 
 export async function connectMcpServer(config: McpServerConfig): Promise<McpConnection> {
+  const response = await authedFetch("/mcp/check", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ server: config }),
+  });
+  const data = (await response.json().catch(() => ({}))) as {
+    tools?: unknown;
+    identity?: unknown;
+    error?: unknown;
+  };
+  if (!response.ok) {
+    const detail = typeof data.error === "string" ? data.error : `server check failed (${response.status})`;
+    if (/auth|credential|sign.?in|token/i.test(detail)) {
+      throw new McpAuthError(detail);
+    }
+    throw new Error(detail);
+  }
+  const serverTools = Array.isArray(data.tools)
+    ? data.tools.filter((tool): tool is McpToolInfo =>
+        Boolean(tool && typeof tool === "object" && typeof (tool as McpToolInfo).name === "string"),
+      )
+    : [];
+  return {
+    tools: serverTools,
+    identity: typeof data.identity === "string" && data.identity ? data.identity : "Server verified",
+  };
+}
+
+/** @deprecated Browser MCP transport remains only for old direct-call tests. */
+export async function connectMcpServerLegacy(config: McpServerConfig): Promise<McpConnection> {
   const entry = findCatalogEntry(config.catalogId ?? config.id);
   if (entry?.native === "slack") {
     const token = config.token?.trim();
@@ -632,7 +663,7 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
     session = undefined;
   }
   if (!session) {
-    await connectMcpServer(config);
+    await connectMcpServerLegacy(config);
     session = sessions.get(config.id);
   }
   if (!session) {
@@ -649,7 +680,7 @@ export async function callMcpTool(config: McpServerConfig, name: string, args: u
     // Idle servers expire sessions; "connect once and forget" means the user
     // never notices. Re-handshake with the stored auth and replay the call
     // exactly once — the failed call never executed, so nothing double-fires.
-    await connectMcpServer(config);
+    await connectMcpServerLegacy(config);
     const fresh = sessions.get(config.id);
     if (!fresh) {
       throw new Error("MCP server is not connected.");

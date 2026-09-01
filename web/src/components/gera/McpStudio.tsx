@@ -29,7 +29,6 @@ import {
   type McpCategory,
 } from "@/lib/mcp-catalog";
 import { githubDeviceClientId, githubOrgAccessUrl } from "@/lib/github-device";
-import { hasOAuthToken } from "@/lib/mcp-oauth";
 import { mcpCatalogConnectTid, mcpServerCardTid } from "@/lib/testids";
 import type { McpAuthMode, McpServerConfig } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -224,10 +223,10 @@ export function McpStudio() {
   return (
     <section>
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Every connectable server passed a live MCP handshake through the Gera relay — including the GitHub
-        MCP Registry batch. Open servers connect instantly, Sign-in servers authorize through a popup,
-        API-key servers take a pasted key. Servers that can't be reached this way are listed with the
-        probed reason.
+        Every connector is verified and executed by Gera's server. OAuth grants, API keys, refreshes and
+        MCP sessions stay in your account shard; this browser receives only connection status and tool metadata.
+        Open servers connect instantly, Sign-in servers authorize through a popup, and API-key servers take a
+        pasted key that is sent directly to the server vault.
       </p>
 
       <div className="mt-4">
@@ -484,12 +483,9 @@ function catalogStatusLabel(server: McpServerConfig, entry: McpCatalogEntry): st
     return "Failed — see Your tools";
   }
   if (entry.auth === "token" && !(server.token ?? "").trim()) {
-    if (entry.deviceFlow && hasOAuthToken(server.id, server.url)) {
-      return "Signed in — press Connect";
-    }
     return entry.deviceFlow ? "Sign-in or key needed" : "Key needed";
   }
-  if (entry.auth === "oauth" && !hasOAuthToken(server.id, server.url)) {
+  if (entry.auth === "oauth") {
     return "Sign-in needed";
   }
   return "Added — not verified";
@@ -616,7 +612,7 @@ function ConnectedCard({
   const entry = findCatalogEntry(server.catalogId ?? server.id);
   const authMode: McpAuthMode = server.authMode ?? "auto";
   const isOAuth = entry?.auth === "oauth" || (!entry && authMode === "oauth");
-  const signedIn = (isOAuth || Boolean(entry?.deviceFlow)) && hasOAuthToken(server.id, server.url);
+  const signedIn = (isOAuth || Boolean(entry?.deviceFlow)) && server.status === "connected";
   const showSignIn =
     (isOAuth || Boolean(onDeviceSignIn)) && !signedIn && !(server.token ?? "").trim();
   const needsKey = entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";

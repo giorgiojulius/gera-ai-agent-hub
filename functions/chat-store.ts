@@ -107,6 +107,7 @@ import {
   type PushEntry,
   type TombstoneRow,
 } from "./chat-shared";
+import { armCloudMcp } from "./automation-runner";
 import {
   chainRotationBases,
   cloudMcpServersForAutomation,
@@ -165,6 +166,24 @@ export class ChatStore extends DurableObject {
         owner_email TEXT PRIMARY KEY,
         payload TEXT NOT NULL,
         updated_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mcp_server_secrets (
+        owner_email TEXT NOT NULL,
+        server_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, server_id)
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mcp_oauth_grants (
+        owner_email TEXT NOT NULL,
+        server_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, server_id)
       )
     `);
     this.ctx.storage.sql.exec(`
@@ -280,6 +299,15 @@ export class ChatStore extends DurableObject {
     }
     if (request.method === "GET" && url.pathname === "/mcp/oauth-rotations") {
       return this.handleOAuthRotations(email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/oauth-store") {
+      return this.handleOAuthStore(request, email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/oauth-clear") {
+      return this.handleOAuthClear(request, email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/check") {
+      return this.handleMcpCheck(request, email);
     }
     if (request.method === "POST" && url.pathname === "/mcp/oauth-refresh") {
       return this.handleBrowserOAuthRefresh(request, email);
@@ -644,20 +672,230 @@ export class ChatStore extends DurableObject {
     });
   }
 
-  /** Reads the account's durable OAuth map without ever trusting a caller copy. */
-  private profileOAuthTokens(owner: string): Record<string, CloudOAuthToken> {
-    const profileRow = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+  /** Overlays server-only keys/headers onto redacted profile connector rows. */
+  private mcpConfigsWithSecrets(owner: string, raw: unknown): unknown[] {
+    if (!Array.isArray(raw)) return [];
+    return raw.map((item) => {
+      if (!isRecord(item) || typeof item.id !== "string") return item;
+      return { ...item, ...this.mcpServerSecret(owner, item.id) };
+    });
+  }
+
+  /** Reads one saved API-key/header pair; it never leaves the account shard. */
+  private mcpServerSecret(owner: string, serverId: string): { token?: string; headersJson?: string } {
+    const row = this.ctx.storage.sql
+      .exec<{ payload: string }>(
+        "SELECT payload FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
+        owner,
+        serverId,
+      )
       .toArray()[0];
-    if (!profileRow) {
-      return {};
-    }
     try {
-      const parsed = JSON.parse(profileRow.payload) as unknown;
-      return cloudOAuthTokens(isRecord(parsed) ? parsed.mcpOAuth : undefined);
+      const value = row ? JSON.parse(row.payload) as Record<string, unknown> : {};
+      return {
+        ...(typeof value.token === "string" && value.token ? { token: value.token } : {}),
+        ...(typeof value.headersJson === "string" && value.headersJson ? { headersJson: value.headersJson } : {}),
+      };
     } catch {
       return {};
     }
+  }
+
+  /** Reads OAuth grants from the account shard; legacy profile grants migrate once. */
+  private profileOAuthTokens(owner: string): Record<string, CloudOAuthToken> {
+    const tokens: Record<string, CloudOAuthToken> = {};
+    const profileRow = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    if (profileRow) {
+      try {
+        const parsed = JSON.parse(profileRow.payload) as unknown;
+        Object.assign(tokens, cloudOAuthTokens(isRecord(parsed) ? parsed.mcpOAuth : undefined));
+      } catch {
+        // A malformed legacy profile cannot authenticate any connector.
+      }
+    }
+    const rows = this.ctx.storage.sql
+      .exec<{ server_id: string; payload: string }>(
+        "SELECT server_id, payload FROM mcp_oauth_grants WHERE owner_email = ?",
+        owner,
+      )
+      .toArray();
+    for (const row of rows) {
+      try {
+        const token = cloudOAuthToken(JSON.parse(row.payload));
+        if (token) {
+          tokens[row.server_id] = token;
+        }
+      } catch {
+        // Ignore malformed rows; they never leave the shard.
+      }
+    }
+    return tokens;
+  }
+
+  /** Stores a newly authorized or legacy-migrated grant only in the account shard. */
+  private async handleOAuthStore(request: Request, owner: string): Promise<Response> {
+    let body: { serverId?: unknown; token?: unknown; grants?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const entries: Array<[string, unknown]> = [];
+    if (typeof body.serverId === "string") {
+      entries.push([body.serverId, body.token]);
+    }
+    if (isRecord(body.grants)) {
+      entries.push(...Object.entries(body.grants));
+    }
+    let stored = 0;
+    for (const [serverId, raw] of entries.slice(0, 20)) {
+      const token = cloudOAuthToken(raw);
+      if (!isValidId(serverId) || !token) {
+        continue;
+      }
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+        owner,
+        serverId,
+        JSON.stringify(token),
+        Date.now(),
+      );
+      await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${serverId}`);
+      stored += 1;
+    }
+    if (stored > 0) {
+      const row = this.ctx.storage.sql
+        .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+        .toArray()[0];
+      if (row) {
+        try {
+          const profile = JSON.parse(row.payload) as Record<string, unknown>;
+          if (isRecord(profile) && "mcpOAuth" in profile) {
+            delete profile.mcpOAuth;
+            this.ctx.storage.sql.exec(
+              "UPDATE profiles SET payload = ?, updated_at = ? WHERE owner_email = ?",
+              JSON.stringify(profile),
+              Date.now(),
+              owner,
+            );
+          }
+        } catch {
+          // Keep a malformed profile untouched; the grant is already safe.
+        }
+      }
+      return json({ ok: true, stored });
+    }
+    return json({ error: "invalid_grant" }, 400);
+  }
+
+  /** Removes a grant from the server; no browser credential can resurrect it. */
+  private async handleOAuthClear(request: Request, owner: string): Promise<Response> {
+    let body: { serverId?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const serverId = typeof body.serverId === "string" ? body.serverId : "";
+    if (!isValidId(serverId)) {
+      return json({ error: "invalid_server" }, 400);
+    }
+    this.ctx.storage.sql.exec(
+      "DELETE FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ?",
+      owner,
+      serverId,
+    );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
+      owner,
+      serverId,
+    );
+    await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${serverId}`);
+    const row = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    if (row) {
+      try {
+        const profile = JSON.parse(row.payload) as Record<string, unknown>;
+        if (isRecord(profile.mcpOAuth) && serverId in profile.mcpOAuth) {
+          const oauth = { ...profile.mcpOAuth };
+          delete oauth[serverId];
+          profile.mcpOAuth = oauth;
+          this.ctx.storage.sql.exec(
+            "UPDATE profiles SET payload = ?, updated_at = ? WHERE owner_email = ?",
+            JSON.stringify(profile),
+            Date.now(),
+            owner,
+          );
+        }
+      } catch {
+        // Malformed legacy profile remains unusable.
+      }
+    }
+    return json({ ok: true });
+  }
+
+  /** Server-side connection check; credentials, refresh and MCP session stay in this shard. */
+  private async handleMcpCheck(request: Request, owner: string): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const rawServer = isRecord(body) && isRecord(body.server) ? body.server : null;
+    const serverId = rawServer && typeof rawServer.id === "string" ? rawServer.id : "";
+    if (!rawServer || !isValidId(serverId)) {
+      return json({ error: "invalid_server" }, 400);
+    }
+    const secret = {
+      token: typeof rawServer.token === "string" ? rawServer.token : "",
+      headersJson: typeof rawServer.headersJson === "string" ? rawServer.headersJson : "",
+    };
+    if (secret.token || secret.headersJson) {
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+        owner,
+        serverId,
+        JSON.stringify(secret),
+        Date.now(),
+      );
+    }
+    const storedSecret = this.mcpServerSecret(owner, serverId);
+    const oauthTokens = this.profileOAuthTokens(owner);
+    const candidate = { ...rawServer, ...storedSecret, enabled: true, status: "connected" };
+    const servers = cloudMcpServersForAutomation([candidate], [serverId], oauthTokens);
+    if (servers.length === 0) {
+      return json({ error: "server_auth_missing" }, 400);
+    }
+    const appliedChains = new Map<string, string[]>();
+    const persist = async (rotated: RefreshedOAuth): Promise<void> => {
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+        owner,
+        rotated.serverId,
+        JSON.stringify(rotated.token),
+        Date.now(),
+      );
+      const bases = chainRotationBases(appliedChains, rotated);
+      appliedChains.set(rotated.serverId, bases);
+    };
+    const runtime = await armCloudMcp(servers, persist);
+    if (runtime.failures.length > 0 || runtime.routes.size === 0) {
+      const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
+      return json({ error: failure }, 502);
+    }
+    const tools = [...runtime.routes.entries()].map(([functionName, route]) => {
+      const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
+      return {
+        name: route.toolName,
+        description: definition?.function.description ?? route.toolName,
+        inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
+      };
+    });
+    return json({ tools, identity: `${servers[0].name} · server verified` });
   }
 
   /** Rejects a late refresh when the synced/overlaid grant changed while the provider request awaited. */
@@ -852,7 +1090,7 @@ export class ChatStore extends DurableObject {
     if (!isRecord(parsed) || !isRecord(parsed.settings)) {
       return json({ servers: [] });
     }
-    const oauthTokens = cloudOAuthTokens(parsed.mcpOAuth);
+    const oauthTokens = this.profileOAuthTokens(owner);
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const overrideRows = await this.ctx.storage.list<unknown>({ prefix });
     const rotations: OAuthRotation[] = [];
@@ -863,7 +1101,11 @@ export class ChatStore extends DurableObject {
       }
     }
     const { appliedChains } = overlayOAuthRotations(oauthTokens, rotations);
-    const servers = cloudMcpServersForAutomation(parsed.settings.mcpServers, ids, oauthTokens).filter(
+    const servers = cloudMcpServersForAutomation(
+      this.mcpConfigsWithSecrets(owner, parsed.settings.mcpServers),
+      ids,
+      oauthTokens,
+    ).filter(
       (server) => server.kind === "mcp",
     );
     const refreshed: RefreshedOAuth[] = [];
@@ -1292,7 +1534,7 @@ export class ChatStore extends DurableObject {
       // Profile and automation allow-lists intersect exactly like browser
       // runs; a cloud schedule can never resurrect GitHub excluded by its profile.
       mcpServers: cloudMcpServersForAutomation(
-        settings.mcpServers,
+        this.mcpConfigsWithSecrets(owner, settings.mcpServers),
         intersectMcpAllowIds(settings.mcpServers, agent?.mcpServerIds, auto.mcpServerIds),
         oauthTokens,
       ),

@@ -649,6 +649,9 @@ export class RunManager {
 
   private async executeRun(run: LiveRun, authKey: string): Promise<void> {
     const config = run.body.config;
+    // The tab chooses connector ids only. Runtime config and every credential
+    // are re-read from this account's durable profile on the server.
+    const durableMcpConfigs = this.profileMcpConfigsForRun(run.owner, config.mcpServers);
     const isAutomation = Boolean(run.body.automationId);
     const contractPrompt = isAutomation
       ? executionOutcomeSystemPrompt(run.kind === "research" ? "marker" : "tool", "automation")
@@ -662,6 +665,16 @@ export class RunManager {
 
     if (run.kind === "research") {
       try {
+        const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
+        const githubRuntime = await armCloudMcp(
+          cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens).filter(
+            (server) => server.kind === "github",
+          ),
+          (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+        );
+        const githubRoute = [...githubRuntime.routes.values()].find(
+          (route) => route.type === "native" && route.kind === "github",
+        );
         const outcome = await runServerDeepResearch({
           authKey,
           prompt: config.prompt,
@@ -669,7 +682,7 @@ export class RunManager {
           modelId: run.body.modelId,
           systemPrompt,
           depth: config.research?.depth ?? "balanced",
-          githubAuth: config.research?.githubAuth,
+          githubAuth: githubRoute?.type === "native" ? githubRoute.auth : undefined,
           githubDisabledTools: config.research?.githubDisabledTools,
           githubRepo: config.githubRepo,
           citations: config.research?.citations ?? "numeric",
@@ -724,9 +737,9 @@ export class RunManager {
         // their deterministic preload, while the council Verifier still needs
         // the same route to independently check their repository claims.
         let juliusMcp: McpRuntime = emptyMcpRuntime();
-        if (config.mcpServers.length > 0) {
+        if (durableMcpConfigs.length > 0) {
           const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
-          const servers = cloudMcpServersForAutomation(config.mcpServers, null, oauthTokens).filter(
+          const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens).filter(
             (server) => server.kind === "github",
           );
           juliusMcp = servers.length > 0
@@ -735,6 +748,9 @@ export class RunManager {
               )
             : emptyMcpRuntime();
         }
+        const juliusGithubRoute = [...juliusMcp.routes.values()].find(
+          (route) => route.type === "native" && route.kind === "github",
+        );
         const result = await runServerJulius({
           authKey,
           history: config.history,
@@ -754,7 +770,7 @@ export class RunManager {
                   modelId,
                   systemPrompt: config.systemPrompt,
                   depth: config.research?.depth ?? "balanced",
-                  githubAuth: config.research?.githubAuth,
+                  githubAuth: juliusGithubRoute?.type === "native" ? juliusGithubRoute.auth : undefined,
                   githubDisabledTools: config.research?.githubDisabledTools,
                   githubRepo: config.githubRepo,
                   // Candidates compete as SPECIFIC models — the report write
@@ -812,10 +828,10 @@ export class RunManager {
     }
     // MCP first, so honest failure records are visible from the start.
     let mcp: McpRuntime = emptyMcpRuntime();
-    if (config.mcpServers.length > 0) {
+    if (durableMcpConfigs.length > 0) {
       try {
         const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
-        const servers = cloudMcpServersForAutomation(config.mcpServers, null, oauthTokens);
+        const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens);
         mcp = servers.length > 0
           ? await armCloudMcp(servers, (rotated) =>
               this.persistRefreshedGrant(run.owner, rotated, appliedChains),
@@ -1681,7 +1697,54 @@ export class RunManager {
   }
 
   // -------------------------------------------------------------------------
-  // OAuth grants for MCP (same override chain as cloud automations).
+  // MCP config + OAuth grants. Browser requests carry ids/scopes, never the
+  // authoritative connector configuration used by a run.
+
+  private profileMcpConfigsForRun(owner: string, requested: Array<Record<string, unknown>>): unknown[] {
+    const ids = new Set<string>();
+    for (const item of requested) {
+      if (typeof item.id === "string" && item.id) ids.add(item.id);
+      if (typeof item.catalogId === "string" && item.catalogId) ids.add(item.catalogId);
+    }
+    if (ids.size === 0) return [];
+    const row = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    try {
+      const parsed = row ? JSON.parse(row.payload) as unknown : null;
+      const settings = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).settings
+        : null;
+      const servers = settings && typeof settings === "object" && !Array.isArray(settings)
+        ? (settings as Record<string, unknown>).mcpServers
+        : null;
+      if (!Array.isArray(servers)) return [];
+      const secretRows = this.ctx.storage.sql
+        .exec<{ server_id: string; payload: string }>(
+          "SELECT server_id, payload FROM mcp_server_secrets WHERE owner_email = ?",
+          owner,
+        )
+        .toArray();
+      const secrets = new Map<string, Record<string, unknown>>();
+      for (const secret of secretRows) {
+        try {
+          secrets.set(secret.server_id, JSON.parse(secret.payload) as Record<string, unknown>);
+        } catch {
+          // malformed secret rows authenticate nothing
+        }
+      }
+      return servers.flatMap((item): unknown[] => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const server = item as Record<string, unknown>;
+        const id = typeof server.id === "string" ? server.id : "";
+        const catalogId = typeof server.catalogId === "string" ? server.catalogId : "";
+        if (!ids.has(id) && !ids.has(catalogId)) return [];
+        return [{ ...server, ...(secrets.get(id) ?? {}) }];
+      });
+    } catch {
+      return [];
+    }
+  }
 
   private async oauthTokensFor(
     owner: string,
@@ -1702,6 +1765,20 @@ export class RunManager {
         ? (parsed as Record<string, unknown>).mcpOAuth
         : undefined;
     const tokens = cloudOAuthTokens(raw);
+    const durableRows = this.ctx.storage.sql
+      .exec<{ server_id: string; payload: string }>(
+        "SELECT server_id, payload FROM mcp_oauth_grants WHERE owner_email = ?",
+        owner,
+      )
+      .toArray();
+    for (const row of durableRows) {
+      try {
+        const token = cloudOAuthTokens({ [row.server_id]: JSON.parse(row.payload) })[row.server_id];
+        if (token) tokens[row.server_id] = token;
+      } catch {
+        // malformed vault rows authenticate nothing
+      }
+    }
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const rows = await this.ctx.storage.list<unknown>({ prefix });
     const rotations: OAuthRotation[] = [];
@@ -1755,10 +1832,14 @@ export class RunManager {
       throw new Error("stale OAuth refresh result");
     }
     const bases = chainRotationBases(appliedChains, rotated);
-    await this.ctx.storage.put(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`, {
-      bases,
-      token: rotated.token,
-    });
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+      owner,
+      rotated.serverId,
+      JSON.stringify(rotated.token),
+      Date.now(),
+    );
+    await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`);
     appliedChains.set(rotated.serverId, bases);
   }
 }

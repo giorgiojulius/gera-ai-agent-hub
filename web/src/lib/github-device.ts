@@ -11,7 +11,7 @@ import { relayFetch } from "@/lib/backend";
 import {
   beginOAuthGrantFlow,
   finishOAuthGrantFlow,
-  storeExternalOAuthToken,
+  storeOAuthTokenOnServer,
   type OAuthGrantFlow,
 } from "@/lib/mcp-oauth";
 
@@ -240,15 +240,15 @@ export async function pollGitHubDeviceToken(
       }
       if (typeof data.access_token === "string" && data.access_token) {
       const expiresIn = typeof data.expires_in === "number" ? data.expires_in : Number(data.expires_in);
-      const stored = storeExternalOAuthToken("github", {
+      await storeOAuthTokenOnServer("github", {
         accessToken: data.access_token,
         refreshToken: typeof data.refresh_token === "string" ? data.refresh_token : undefined,
         expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : undefined,
         tokenEndpoint: TOKEN_URL,
         clientId,
         mcpUrl: "https://api.github.com",
-      }, session.operationFlow);
-        return stored;
+      });
+        return true;
       }
     const code = typeof data.error === "string" ? data.error : "";
     if (code === "authorization_pending") {

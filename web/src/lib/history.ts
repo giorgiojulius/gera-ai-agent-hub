@@ -722,7 +722,12 @@ function normalizeJulius(stored: unknown): JuliusSettings {
 }
 
 export function saveSettings(settings: AgentSettings): void {
-  writeJson(SETTINGS_KEY, settings);
+  writeJson(SETTINGS_KEY, {
+    ...settings,
+    // Keys and custom headers are submitted to the account shard by the
+    // connection check and are never persisted in browser storage.
+    mcpServers: settings.mcpServers.map(({ token: _token, headersJson: _headers, ...server }) => server),
+  });
 }
 
 const BUILTIN_IDS: BuiltinToolId[] = [

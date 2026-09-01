@@ -221,26 +221,12 @@ describe("honest MCP auth status", () => {
     });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const request = JSON.parse(String(init?.body ?? "{}")) as {
-          id?: number;
-          method?: string;
-        };
-        if (request.method === "notifications/initialized") {
-          return new Response(null, { status: 202 });
-        }
-        const result =
-          request.method === "initialize"
-            ? {
-                protocolVersion: "2025-06-18",
-                serverInfo: { name: "Recovered MCP", version: "1" },
-              }
-            : { tools: [{ name: "search" }] };
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }),
+      vi.fn(async (): Promise<Response> =>
+        new Response(
+          JSON.stringify({ tools: [{ name: "search" }], identity: "Recovered MCP v1" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
     );
 
     expect(isRecoverableMcpHealthError(settings.mcpServers[0]?.error)).toBe(true);
@@ -266,7 +252,12 @@ describe("honest MCP auth status", () => {
     });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (): Promise<Response> => new Response("unauthorized", { status: 401 })),
+      vi.fn(async (): Promise<Response> =>
+        new Response(JSON.stringify({ error: "This server needs a key or sign-in." }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
     );
 
     revalidateMcpServers(

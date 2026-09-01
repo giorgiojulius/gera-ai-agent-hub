@@ -11,7 +11,6 @@ import { AuthSessionChangedError, authedFetch, authedFetchForSession, parseOrThr
 import { reviveMessage, slimMessage } from "@/lib/history";
 import {
   applyServerOAuthRotations,
-  exportOAuthTokens,
   parseServerOAuthRotations,
 } from "@/lib/mcp-oauth";
 import { inlineMessageMedia, vaultConversationMedia } from "@/lib/media-vault";
@@ -115,20 +114,22 @@ export function initProfileMeta(settings: AgentSettings, life: LifeState): Profi
  * device-local rather than being silently truncated.
  */
 export function serializeProfile(settings: AgentSettings, life: LifeState): string | null {
-  // MCP sign-ins ride along so the account's cloud automations can use every
-  // connected server; the blob is per-account server state, never shared.
-  const mcpOAuth = exportOAuthTokens();
-  const full = JSON.stringify({ settings, life, mcpOAuth });
+  // Connector credentials live in the account shard, never in this client
+  // profile payload. Only redacted UI configuration is synchronized here.
+  const redactedSettings = {
+    ...settings,
+    mcpServers: settings.mcpServers.map(({ token: _token, headersJson: _headers, ...server }) => server),
+  };
+  const full = JSON.stringify({ settings: redactedSettings, life });
   if (full.length <= PROFILE_PAYLOAD_LIMIT) {
     return full;
   }
   const slim = JSON.stringify({
     settings: {
-      ...settings,
-      mcpServers: settings.mcpServers.map((server) => ({ ...server, tools: [] })),
+      ...redactedSettings,
+      mcpServers: redactedSettings.mcpServers.map((server) => ({ ...server, tools: [] })),
     },
     life,
-    mcpOAuth,
   });
   return slim.length <= PROFILE_PAYLOAD_LIMIT ? slim : null;
 }

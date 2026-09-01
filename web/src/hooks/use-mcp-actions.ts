@@ -16,10 +16,7 @@ import {
 import { catalogEntryToServer, findCatalogEntry } from "@/lib/mcp-catalog";
 import { clearMcpServerSession } from "@/lib/mcp";
 import {
-  OAUTH_TOKENS_CHANGED_EVENT,
   clearOAuthToken,
-  hasOAuthToken,
-  oauthTokenFingerprint,
   openOAuthPopup,
 } from "@/lib/mcp-oauth";
 import type { AgentSettings, McpServerConfig } from "@/lib/types";
@@ -42,32 +39,18 @@ function shortFingerprint(value: string): string {
 /** Auth/config revision only — tools, identity, and verifiedAt must not loop validation. */
 function validationFingerprint(server: McpServerConfig): string {
   const catalogId = server.catalogId ?? server.id;
-  const oauth = [oauthTokenFingerprint(server.id)];
-  if (catalogId !== server.id) {
-    oauth.push(oauthTokenFingerprint(catalogId));
-  }
   return [
     server.url,
     server.authMode ?? "auto",
     catalogId,
     shortFingerprint(server.token ?? ""),
     shortFingerprint(server.headersJson ?? ""),
-    ...oauth,
   ].join("|");
 }
 
 export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs) {
-  const [oauthRevision, setOAuthRevision] = useState<number>(0);
   const [healthTick, setHealthTick] = useState<number>(0);
   const validatedRef = useRef<Map<string, string>>(new Map<string, string>());
-
-  // OAuth tokens live outside React state. Wake the status validator whenever
-  // sign-in/refresh/sign-out changes them in this document.
-  useEffect(() => {
-    const onOAuthChanged = () => setOAuthRevision((value) => value + 1);
-    window.addEventListener(OAUTH_TOKENS_CHANGED_EVENT, onOAuthChanged);
-    return () => window.removeEventListener(OAUTH_TOKENS_CHANGED_EVENT, onOAuthChanged);
-  }, []);
 
   // Long-open tabs need the same honesty as a reload. Wake the ten-minute
   // freshness check once a minute and immediately when a hidden tab returns.
@@ -114,7 +97,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
       }
     }
     revalidateMcpServers(servers, setSettings, forceIds);
-  }, [healthTick, oauthRevision, servers, setSettings]);
+  }, [healthTick, servers, setSettings]);
 
   const updateMcp = useCallback((id: string, patch: Partial<McpServerConfig>) => {
     const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);
@@ -154,7 +137,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
     );
     const server = existing ?? catalogEntryToServer(entry);
     const hasToken = Boolean(server.token?.trim());
-    if (entry.auth === "none" || entry.tokenOptional || hasToken || hasOAuthToken(server.id, server.url)) {
+    if (entry.auth === "none" || entry.tokenOptional || hasToken || server.status === "connected") {
       void reconnectMcp(server, setSettings);
       return;
     }
@@ -216,7 +199,7 @@ export function useMcpActions({ stateRef, servers, setSettings }: McpActionsArgs
     const needsOAuth =
       (entry?.auth === "oauth" || server.authMode === "oauth") &&
       !server.token?.trim() &&
-      !hasOAuthToken(server.id, server.url);
+      server.status !== "connected";
     if (needsOAuth) {
       const popup = openOAuthPopup();
       void oauthConnectMcp(server, popup, setSettings);

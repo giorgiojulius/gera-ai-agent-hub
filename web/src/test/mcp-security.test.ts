@@ -20,7 +20,7 @@ import { FEATURED_MCP_IDS, MCP_CATALOG, findCatalogEntry } from "@/lib/mcp-catal
 import {
   callMcpTool,
   clearMcpSessionCache,
-  connectMcpServer,
+  connectMcpServerLegacy,
   mcpFunctionName,
 } from "@/lib/mcp";
 import {
@@ -398,7 +398,7 @@ describe("MCP protocol compatibility", () => {
         throw new Error(`unexpected ${body.method}`);
       }),
     );
-    const connection = await connectMcpServer(config({ id: "paged-browser", authMode: "none" }));
+    const connection = await connectMcpServerLegacy(config({ id: "paged-browser", authMode: "none" }));
     expect(connection.tools.map((tool) => tool.name)).toEqual(["first", "second"]);
     expect(seen.find((item) => item.method === "tools/list")).toMatchObject({
       protocol: "2025-03-26",
@@ -492,7 +492,7 @@ describe("MCP protocol compatibility", () => {
       }),
     );
     const server = config({ id: "no-rpc-replay", authMode: "none" });
-    await connectMcpServer(server);
+    await connectMcpServerLegacy(server);
     await expect(callMcpTool(server, "mutate", {})).rejects.toThrow(/Session expired/);
     expect({ initializeCalls, toolCalls }).toEqual({ initializeCalls: 1, toolCalls: 1 });
   });

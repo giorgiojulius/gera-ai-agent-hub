@@ -28,6 +28,7 @@ import {
   OAUTH_TOKENS_KEY,
   adoptProfileOAuthTokens,
   exportOAuthTokens,
+  migrateLegacyOAuthTokensToServer,
 } from "@/lib/mcp-oauth";
 
 type CloudSyncArgs = {
@@ -129,7 +130,10 @@ export function useCloudSync(args: CloudSyncArgs): {
           // Settings and their OAuth grants are one account profile. Applying
           // only the green `connected` flag while discarding `mcpOAuth` left
           // this browser unable to authenticate and caused repeated re-login.
-          adoptProfileOAuthTokens(parsed.mcpOAuth);
+          const adoptedLegacyGrants = adoptProfileOAuthTokens(parsed.mcpOAuth);
+          if (adoptedLegacyGrants > 0) {
+            void migrateLegacyOAuthTokensToServer().finally(() => scheduleSync(500));
+          }
           const nextSettings = normalizeStoredSettings(parsed.settings);
           const nextLife = normalizeLife(parsed.life);
           applyingProfileRef.current = true;
@@ -242,7 +246,9 @@ export function useCloudSync(args: CloudSyncArgs): {
       return;
     }
     syncToastArmedRef.current = true;
-    scheduleSync(400);
+    // Older bundles kept provider grants in localStorage. Move any surviving
+    // copy into the account shard before normal profile reconciliation.
+    void migrateLegacyOAuthTokensToServer().finally(() => scheduleSync(400));
     // A fresh sign-in (no stored token at boot) still adopts server runs.
     if (!adoptedRef.current) {
       adoptedRef.current = true;

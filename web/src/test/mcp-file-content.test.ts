@@ -16,7 +16,7 @@ import { callGitHubNativeTool as callServerGitHubNativeTool } from "../../../fun
 import { callGitHubNativeTool as callBrowserGitHubNativeTool } from "@/lib/github-native";
 import {
   callMcpTool,
-  connectMcpServer,
+  connectMcpServerLegacy,
   parseMcpRpcResponse,
   stringifyMcpResult,
 } from "@/lib/mcp";
@@ -294,7 +294,7 @@ describe("generic MCP file-content transport", () => {
       disabledTools: [],
     };
 
-    await connectMcpServer(server);
+    await connectMcpServerLegacy(server);
     await expect(callMcpTool(server, "read_file", { path: "README.md" })).resolves.toContain(
       "BROWSER_RESOURCE_BODY",
     );

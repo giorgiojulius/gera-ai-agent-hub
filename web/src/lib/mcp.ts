@@ -12,7 +12,7 @@ import {
 } from "@/lib/intercom-native";
 import { findCatalogEntry, isGithubWriteTool } from "@/lib/mcp-catalog";
 import {
-  clearOAuthToken,
+  dropLocalOAuthToken,
   forceRefreshOAuthHeader,
   hasOAuthRefreshToken,
   hasOAuthToken,
@@ -424,7 +424,9 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
             // the next attempt; deleting it here caused needless re-logins.
             throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
           }
-          clearOAuthToken(session.configId);
+          // Only the browser copy is provably dead here; the account shard
+          // may already hold a rotated/fresh grant that server runs still use.
+          dropLocalOAuthToken(session.configId);
           throw new McpAuthError("Sign-in expired. Press Sign in to authorize again.");
         }
         throw new McpAuthError("This server needs a key or sign-in before it will talk.");
@@ -499,7 +501,21 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
     error?: unknown;
   };
   if (!response.ok) {
-    const detail = typeof data.error === "string" ? data.error : `server check failed (${response.status})`;
+    let detail = typeof data.error === "string" ? data.error : `server check failed (${response.status})`;
+    if (detail === "server_auth_missing") {
+      const perId = Array.isArray((data as { detail?: unknown }).detail)
+        ? ((data as { detail: unknown[] }).detail
+            .map((item) => {
+              const entry = item as { id?: unknown; grantPresent?: unknown; state?: unknown };
+              return typeof entry.id === "string"
+                ? `${entry.id}: ${entry.grantPresent === true ? "grant present" : "no grant"}${typeof entry.state === "string" && entry.state !== "ready" ? `, ${entry.state}` : ""}`
+                : "";
+            })
+            .filter(Boolean)
+            .join("; "))
+        : "";
+      detail = `The server has no usable sign-in for this connector — press "Sign in" to authorize again.${perId ? ` (${perId})` : ""}`;
+    }
     // The outer account gate can reject this request before the selected MCP is
     // touched. Never mislabel that as a revoked provider grant: background
     // health checks must keep every connector armed and stay silent.

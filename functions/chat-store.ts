@@ -2068,7 +2068,7 @@ export class ChatStore extends DurableObject {
 
   /** Removes a grant from the server; no browser credential can resurrect it. */
   private async handleOAuthClear(request: Request, owner: string): Promise<Response> {
-    let body: { serverId?: unknown; catalogId?: unknown };
+    let body: { serverId?: unknown; catalogId?: unknown; reason?: unknown };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -2078,6 +2078,14 @@ export class ChatStore extends DurableObject {
     const catalogId = typeof body.catalogId === "string" ? body.catalogId : "";
     if (!isValidId(serverId) || (catalogId && !isValidId(catalogId))) {
       return json({ error: "invalid_server" }, 400);
+    }
+    if (body.reason !== "disconnect") {
+      // Only an explicit user disconnect may create a durable revocation.
+      // Older bundles auto-cleared on a stale/expired BROWSER copy, which
+      // tombstoned and destroyed a perfectly fresh server-owned grant — every
+      // new GitHub sign-in was poisoned minutes later (server_auth_missing).
+      // Automatic housekeeping is a browser-local concern; ack without damage.
+      return json({ ok: true, ignored: true });
     }
     const ids = [...new Set([serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])])];
     for (const id of ids) {
@@ -2481,7 +2489,16 @@ export class ChatStore extends DurableObject {
     if (!isValidId(serverId) || (catalogId && !isValidId(catalogId))) {
       return json({ error: "invalid_server" }, 400);
     }
-    const ids = [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])];
+    const nativeGithub = (catalogId || serverId) === "github";
+    const ids = [
+      ...new Set([
+        serverId,
+        ...(catalogId && catalogId !== serverId ? [catalogId] : []),
+        // Device-flow GitHub commits its grant under the canonical "github"
+        // id; instance cards must resolve it regardless of their own id.
+        ...(nativeGithub ? ["github"] : []),
+      ]),
+    ];
     for (const id of ids) {
       const secret = this.mcpServerSecret(owner, id);
       if (secret.token) {
@@ -2489,16 +2506,40 @@ export class ChatStore extends DurableObject {
         return json({ authorization });
       }
     }
-    const blockedState = ids
-      .map((id) => this.oauthGrantState(owner, id))
-      .find((state) => state === "reauth_required" || state === "step_up_required");
+    const storedGrants = new Map<string, CloudOAuthToken>();
+    for (const id of ids) {
+      const stored = this.rawOAuthGrant(owner, id);
+      if (stored) {
+        storedGrants.set(id, stored);
+      }
+    }
+    // A stale blocked marker must never hide a physically present grant: a
+    // fresh sign-in is the recovery path and has to be tried. Fail closed on
+    // the marker only when no grant exists at all.
+    const blockedState = storedGrants.size === 0
+      ? ids
+          .map((id) => this.oauthGrantState(owner, id))
+          .find((state) => state === "reauth_required" || state === "step_up_required")
+      : undefined;
     if (blockedState) {
       return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
     }
     const tokens = this.profileOAuthTokens(owner);
+    for (const [id, stored] of storedGrants) {
+      if (!tokens[id]) {
+        tokens[id] = stored;
+      }
+    }
     const grantId = ids.find((id) => Boolean(tokens[id]));
     if (!grantId) {
-      return json({ error: "server_auth_missing" }, 404);
+      // Metadata only — never token material. Tells the caller exactly which
+      // ids were consulted and why each one cannot authenticate.
+      const detail = ids.map((id) => ({
+        id,
+        grantPresent: storedGrants.has(id),
+        state: this.oauthGrantState(owner, id),
+      }));
+      return json({ error: "server_auth_missing", detail }, 404);
     }
     const grant = tokens[grantId];
     const server = {
@@ -2534,6 +2575,11 @@ export class ChatStore extends DurableObject {
         await this.recordOAuthFailure(owner, grantId, outcome);
         return json({ error: outcome.transient ? "retryable_error" : this.oauthGrantState(owner, grantId) }, outcome.transient ? 503 : 401);
       }
+    }
+    if (storedGrants.has(grantId)) {
+      // The grant is durable and just leased successfully — clear any stale
+      // reauth/step-up marker so later leases stop tripping over it.
+      this.markOAuthReady(owner, grantId);
     }
     return json({ authorization: `Bearer ${server.oauth?.accessToken ?? grant.accessToken}` });
   }

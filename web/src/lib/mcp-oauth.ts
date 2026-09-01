@@ -457,14 +457,25 @@ export function exportOAuthTokens(): Record<string, StoredToken> {
   return loadTokens();
 }
 
-export function clearOAuthToken(serverId: string, catalogId?: string): void {
+/**
+ * Drops only this browser's copy of a grant. Automatic housekeeping (an
+ * expired local token, a dead session) must use this — never `clearOAuthToken`
+ * — because the server-owned grant may be newer than what this tab knows:
+ * revoking it server-side destroyed every fresh GitHub sign-in.
+ */
+export function dropLocalOAuthToken(serverId: string): void {
   if (loadTokens()[serverId]) {
     commitTokenChanges({ [serverId]: null });
   }
+}
+
+/** Explicit user disconnect: removes the browser copy AND revokes the server-owned grant. */
+export function clearOAuthToken(serverId: string, catalogId?: string): void {
+  dropLocalOAuthToken(serverId);
   void authedFetch("/mcp/oauth-clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ serverId, ...(catalogId ? { catalogId } : {}) }),
+    body: JSON.stringify({ serverId, reason: "disconnect", ...(catalogId ? { catalogId } : {}) }),
   }).catch(() => undefined);
 }
 
@@ -646,7 +657,9 @@ export async function oauthAuthHeader(serverId: string, mcpUrl?: string): Promis
     return after?.accessToken && stillLive ? `Bearer ${after.accessToken}` : null;
   }
   if (stored.expiresAt !== undefined && now >= stored.expiresAt) {
-    clearOAuthToken(serverId);
+    // Local copy is dead — but the account shard may hold a fresh grant this
+    // tab never saw. Drop only the browser copy; server relays keep working.
+    dropLocalOAuthToken(serverId);
     return null;
   }
   return `Bearer ${stored.accessToken}`;

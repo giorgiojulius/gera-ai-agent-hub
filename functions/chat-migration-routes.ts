@@ -287,7 +287,7 @@ export async function handleExport(store: ChatStoreRouteContext, request: Reques
     out.chats = chats;
     out.done = false;
     out.cursor = hasMoreChats
-      ? encodeExportCursor({ phase: "chats", key: chats.at(-1)?.id ?? cursor.key })
+      ? encodeExportCursor({ phase: "chats", key: chats[chats.length - 1]?.id ?? cursor.key })
       : encodeExportCursor({ phase: "table", index: 0, rowId: 0 });
     return json(out);
   }
@@ -319,7 +319,7 @@ export async function handleExport(store: ChatStoreRouteContext, request: Reques
     }
   }
   const hasMoreRows = selected.length < rows.length;
-  const lastRowId = asNum(selected.at(-1)?.migration_rowid, cursor.rowId);
+  const lastRowId = asNum(selected[selected.length - 1]?.migration_rowid, cursor.rowId);
   const nextIndex = hasMoreRows ? cursor.index : cursor.index + 1;
   out.migrationRows = { table: definition.wireName, rows: selected };
   out.done = !hasMoreRows && nextIndex >= MIGRATION_TABLES.length;
@@ -331,7 +331,7 @@ export async function handleExport(store: ChatStoreRouteContext, request: Reques
   return json(out);
 }
 
-/** Legacy-global-only: owners that still need a shard, oldest first. */
+/** Legacy-global-only: a deterministic batch of owners that still need a shard. */
 export async function handleOwners(store: ChatStoreRouteContext, request: Request): Promise<Response> {
   let body: { limit?: unknown };
   try {
@@ -342,25 +342,42 @@ export async function handleOwners(store: ChatStoreRouteContext, request: Reques
   const limit = Math.min(20, Math.max(1, Math.round(asNum(body.limit, 5))));
   const rows = store.sql
     .exec<{ owner_email: string }>(
-      `SELECT DISTINCT owner_email FROM (
-        SELECT owner_email FROM profiles
-        UNION SELECT owner_email FROM chats
-        UNION SELECT owner_email FROM diagnostics
-        UNION SELECT owner_email FROM diag_meta
-        UNION SELECT owner_email FROM tombstones
-        UNION SELECT owner_email FROM server_runs
-        UNION SELECT owner_email FROM mcp_server_secrets
-        UNION SELECT owner_email FROM mcp_oauth_grants
-        UNION SELECT owner_email FROM mcp_oauth_revocations
-        UNION SELECT owner_email FROM mcp_oauth_states
-        UNION SELECT owner_email FROM mcp_oauth_clients
-        UNION SELECT owner_email FROM mcp_oauth_pending
-        UNION SELECT owner_email FROM mcp_github_device_pending
-        UNION SELECT owner_email FROM automation_run_receipts
-        UNION SELECT owner_email FROM agent_runs
-        UNION SELECT owner_email FROM agent_run_receipts
-        UNION SELECT owner_email FROM agent_run_media
-      ) WHERE owner_email NOT IN (SELECT owner_email FROM migrated_owners) LIMIT ?`,
+      `WITH
+        owner_group_1 AS (
+          SELECT owner_email FROM profiles
+          UNION SELECT owner_email FROM chats
+          UNION SELECT owner_email FROM diagnostics
+          UNION SELECT owner_email FROM diag_meta
+          UNION SELECT owner_email FROM tombstones
+        ),
+        owner_group_2 AS (
+          SELECT owner_email FROM server_runs
+          UNION SELECT owner_email FROM mcp_server_secrets
+          UNION SELECT owner_email FROM mcp_oauth_grants
+          UNION SELECT owner_email FROM mcp_oauth_revocations
+          UNION SELECT owner_email FROM mcp_oauth_states
+        ),
+        owner_group_3 AS (
+          SELECT owner_email FROM mcp_oauth_clients
+          UNION SELECT owner_email FROM mcp_oauth_pending
+          UNION SELECT owner_email FROM mcp_github_device_pending
+          UNION SELECT owner_email FROM automation_run_receipts
+          UNION SELECT owner_email FROM agent_runs
+        ),
+        owner_group_4 AS (
+          SELECT owner_email FROM agent_run_receipts
+          UNION SELECT owner_email FROM agent_run_media
+        ),
+        all_owners AS (
+          SELECT owner_email FROM owner_group_1
+          UNION SELECT owner_email FROM owner_group_2
+          UNION SELECT owner_email FROM owner_group_3
+          UNION SELECT owner_email FROM owner_group_4
+        )
+       SELECT owner_email FROM all_owners
+       WHERE owner_email NOT IN (SELECT owner_email FROM migrated_owners)
+       ORDER BY owner_email
+       LIMIT ?`,
       limit,
     )
     .toArray();
@@ -403,11 +420,12 @@ function importMigrationRows(store: ChatStoreRouteContext, owner: string, raw: u
     let valid = true;
     for (const column of definition.columns) {
       const value = item[column];
-      if (typeof value !== "string" && typeof value !== "number" && value !== null) {
+      if (value === null || typeof value === "string" || typeof value === "number") {
+        values.push(value as string | number | null);
+      } else {
         valid = false;
         break;
       }
-      values.push(value);
     }
     if (!valid) {
       continue;

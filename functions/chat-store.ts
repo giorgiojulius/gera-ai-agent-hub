@@ -1239,6 +1239,41 @@ export class ChatStore extends DurableObject {
     return [...ids];
   }
 
+  /**
+   * Reads the physically stored OAuth grant for one connector id, honoring
+   * revocation tombstones but IGNORING blocked `mcp_oauth_states` rows. A
+   * user-initiated health check must be able to try a freshly committed grant
+   * even when an older failure left a stale reauth/step-up marker behind —
+   * otherwise a successful re-sign-in stays invisible forever.
+   */
+  private rawOAuthGrant(owner: string, serverId: string): CloudOAuthToken | null {
+    const revoked = this.ctx.storage.sql
+      .exec<{ present: number }>(
+        "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
+        owner,
+        serverId,
+      )
+      .toArray()[0];
+    if (revoked) {
+      return null;
+    }
+    const row = this.ctx.storage.sql
+      .exec<{ payload: string }>(
+        "SELECT payload FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ?",
+        owner,
+        serverId,
+      )
+      .toArray()[0];
+    if (!row) {
+      return null;
+    }
+    try {
+      return cloudOAuthToken(JSON.parse(row.payload));
+    } catch {
+      return null;
+    }
+  }
+
   private oauthGrantState(owner: string, serverId: string): string {
     return this.ctx.storage.sql
       .exec<{ state: string }>(
@@ -2134,7 +2169,14 @@ export class ChatStore extends DurableObject {
     }
     const storedSecret = this.mcpServerSecret(owner, serverId);
     const legacyCatalogSecret = catalogId && catalogId !== serverId ? this.mcpServerSecret(owner, catalogId) : {};
-    const resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
+    let resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
+    const nativeGithub = (catalogId || serverId) === "github";
+    if (nativeGithub && !resolvedSecret.token) {
+      // Native GitHub talks REST with a bearer token only. A leftover
+      // headers-style secret can neither authenticate it nor should it mask
+      // the OAuth grant path.
+      resolvedSecret = {};
+    }
     const authMode =
       rawServer.authMode === "none" ||
       rawServer.authMode === "bearer" ||
@@ -2146,8 +2188,28 @@ export class ChatStore extends DurableObject {
       (authMode === "oauth" || authMode === "auto") &&
       !resolvedSecret.token &&
       !resolvedSecret.headersJson;
-    const blockedState = reliesOnOAuth
-      ? [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])]
+    // Every id whose grant row can authenticate this card. Device-flow GitHub
+    // always commits under the canonical "github" id, so github-native cards
+    // resolve it even when their own instance id differs.
+    const grantIds = [
+      ...new Set([
+        serverId,
+        ...(catalogId ? [catalogId] : []),
+        ...(nativeGithub ? ["github"] : []),
+      ]),
+    ];
+    const storedGrants = new Map<string, CloudOAuthToken>();
+    for (const id of grantIds) {
+      const grant = this.rawOAuthGrant(owner, id);
+      if (grant) {
+        storedGrants.set(id, grant);
+      }
+    }
+    // Fail closed on blocked states only when no grant physically exists. A
+    // user-initiated check with a fresh grant must try it: success below
+    // clears the stale marker, failure re-records an accurate one.
+    const blockedState = reliesOnOAuth && storedGrants.size === 0
+      ? grantIds
           .map((id) => this.oauthGrantState(owner, id))
           .find((state) => state === "reauth_required" || state === "step_up_required")
       : undefined;
@@ -2155,8 +2217,16 @@ export class ChatStore extends DurableObject {
       return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
     }
     const oauthTokens = this.profileOAuthTokens(owner);
-    if (!oauthTokens[serverId] && catalogId && oauthTokens[catalogId]) {
-      oauthTokens[serverId] = oauthTokens[catalogId];
+    for (const [id, grant] of storedGrants) {
+      if (!oauthTokens[id]) {
+        oauthTokens[id] = grant;
+      }
+    }
+    if (!oauthTokens[serverId]) {
+      const donor = grantIds.find((id) => Boolean(oauthTokens[id]));
+      if (donor) {
+        oauthTokens[serverId] = oauthTokens[donor];
+      }
     }
     // A health check must always return the complete remote tool table. The
     // account's disabled-tool preferences stay in the profile and are applied
@@ -2170,7 +2240,14 @@ export class ChatStore extends DurableObject {
     };
     const servers = cloudMcpServersForAutomation([candidate], [serverId], oauthTokens);
     if (servers.length === 0) {
-      return json({ error: "server_auth_missing" }, 400);
+      // Metadata only — which ids were consulted and why they cannot arm.
+      // Never any token material.
+      const detail = grantIds.map((id) => ({
+        id,
+        grantPresent: storedGrants.has(id),
+        state: this.oauthGrantState(owner, id),
+      }));
+      return json({ error: "server_auth_missing", detail }, 400);
     }
     const appliedChains = new Map<string, string[]>();
     const persist = async (rotated: RefreshedOAuth): Promise<void> => {
@@ -2184,15 +2261,26 @@ export class ChatStore extends DurableObject {
       (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
       (id) => this.markOAuthRefreshStarted(owner, id),
     );
-    const authState = [serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])]
-      .map((id) => this.oauthGrantState(owner, id))
-      .find((state) => state === "reauth_required" || state === "step_up_required");
-    if (authState) {
-      return json({ error: authState }, authState === "step_up_required" ? 403 : 401);
-    }
     if (runtime.failures.length > 0 || runtime.routes.size === 0) {
+      // Only a failed arm may surface an auth state — a stale pre-existing
+      // marker must never veto a verification that just succeeded.
+      const authState = grantIds
+        .map((id) => this.oauthGrantState(owner, id))
+        .find((state) => state === "reauth_required" || state === "step_up_required");
+      if (authState) {
+        return json({ error: authState }, authState === "step_up_required" ? 403 : 401);
+      }
       const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
       return json({ error: failure }, 502);
+    }
+    if (servers[0]?.oauth) {
+      // The grant just proved itself against the live provider: clear any
+      // stuck reauth/step-up markers so leases and relays use it again.
+      for (const id of grantIds) {
+        if (storedGrants.has(id)) {
+          this.markOAuthReady(owner, id);
+        }
+      }
     }
     const tools = [...runtime.routes.entries()].map(([functionName, route]) => {
       const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);

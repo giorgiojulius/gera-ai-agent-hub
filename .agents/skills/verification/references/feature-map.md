@@ -55,8 +55,12 @@ Every app route is wrapped in `AccessGate`. The user signs in with Google or
 Apple; the worker (`/access/status`) answers `invited` (app unlocks),
 `pending` ("You're on the list", re-polls every 15s), or none (request-access
 form with an optional note → `/access/request`). Sign-out is available from
-every gate state. E2E bypasses the gate: fake JWT in `localStorage` +
-stubbed `/access/status` → `invited`.
+every gate state. A build without `EXPO_PUBLIC_RORK_AUTH_URL`/`APP_KEY` (e.g.
+a repository preview built without `.env`) shows a configuration error on
+sign-in instead of POSTing to a relative URL; an initiate response without an
+`https` `auth_url` is an error too, never `window.open(undefined)`. E2E
+bypasses the gate: fake JWT in `localStorage` + stubbed `/access/status` →
+`invited`.
 
 ## Navigation
 
@@ -214,9 +218,14 @@ whatever they post is relayed only into the frame that asked
 reported (`type:"closed"`, also when a popup that lived as a panel tab is
 closed or the popup was refused), and the stub's `close()`/`focus()`/
 `postMessage()` drive the real window. Placement hints (`popup,width=`) pass
-through, `noopener`/`noreferrer` are stripped so the handle survives. Popup-
-blocked → toast with an Open action; dismissing it reports `closed` so the
-app's "waiting for the popup" spinner settles. `target="_blank"` links (no
+through, `noopener`/`noreferrer` are stripped so the handle survives. A blank
+open (`window.open()`/`about:blank`, the open-now-navigate-later pattern) is
+bridged immediately as `url:"about:blank"` → a real empty window under the
+click; the later `stub.location = url` (same id, `registry.has`) navigates
+that window instead of opening a second one or a panel tab, and a blocked
+blank reports `closed` silently. Popup-blocked URL opens → toast with an
+Open action; dismissing it reports `closed` so the app's "waiting for the
+popup" spinner settles. `target="_blank"` links (no
 id) open as plain tabs with the opener severed, like a browser. The address
 bar (`repo-preview-address`) shows host + live in-app route of the active
 tab; copy/open/expand act on that tab. The inline card (mobile/shared) has no

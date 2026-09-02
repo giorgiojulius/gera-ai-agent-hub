@@ -2,8 +2,8 @@
   "schema": 1,
   "platform": "web",
   "app": "gera-web",
-  "startedAt": "2026-09-02T05:25:38.393Z",
-  "durationMs": 8145,
+  "startedAt": "2026-09-02T05:44:24.442Z",
+  "durationMs": 7936,
   "passed": 17,
   "failed": 0,
   "results": [
@@ -43,13 +43,13 @@
       "scenarioId": "starters-hide-while-typing",
       "title": "Starter chips fade away while a prompt is being written",
       "ok": true,
-      "ms": 160,
+      "ms": 150,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 7
+          "ms": 6
         },
         {
           "index": 1,
@@ -61,7 +61,7 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 70
+          "ms": 61
         },
         {
           "index": 3,
@@ -87,7 +87,7 @@
       "scenarioId": "send-chat-message",
       "title": "Sending a message renders the user turn and a streamed reply",
       "ok": true,
-      "ms": 260,
+      "ms": 265,
       "steps": [
         {
           "index": 0,
@@ -105,13 +105,13 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 29
+          "ms": 38
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 173
+          "ms": 168
         },
         {
           "index": 4,
@@ -129,7 +129,7 @@
           "index": 6,
           "label": "see \"Gera e2e reply\" in message-assistant",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 7,
@@ -143,13 +143,13 @@
       "scenarioId": "code-changes-preview",
       "title": "Code edits open a live Changes workbench and runnable preview",
       "ok": true,
-      "ms": 316,
+      "ms": 320,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 6
+          "ms": 8
         },
         {
           "index": 1,
@@ -161,13 +161,13 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 19
+          "ms": 18
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 109
+          "ms": 113
         },
         {
           "index": 4,
@@ -179,25 +179,25 @@
           "index": 5,
           "label": "tap code-change-changes-tab",
           "ok": true,
-          "ms": 73
+          "ms": 70
         },
         {
           "index": 6,
           "label": "see \"Hello from preview\" in code-change-flow",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 7,
           "label": "tap code-change-preview-tab",
           "ok": true,
-          "ms": 56
+          "ms": 58
         },
         {
           "index": 8,
           "label": "see \"Preview running\" in code-change-flow",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 9,
@@ -211,13 +211,13 @@
       "scenarioId": "new-chat-keeps-history",
       "title": "New chat returns to the launchpad and keeps the thread listed",
       "ok": true,
-      "ms": 465,
+      "ms": 325,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 6
+          "ms": 5
         },
         {
           "index": 1,
@@ -235,31 +235,31 @@
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 204
+          "ms": 129
         },
         {
           "index": 4,
           "label": "see \"Gera e2e reply\" in message-assistant",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 5,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 174
+          "ms": 111
         },
         {
           "index": 6,
           "label": "see launchpad",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 7,
           "label": "see sidebar-thread",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -267,37 +267,37 @@
       "scenarioId": "github-pin-and-send",
       "title": "GitHub repo picker pins a private repo and carries it into a run",
       "ok": true,
-      "ms": 346,
+      "ms": 338,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 9
+          "ms": 6
         },
         {
           "index": 1,
           "label": "see composer-repo",
           "ok": true,
-          "ms": 59
+          "ms": 51
         },
         {
           "index": 2,
           "label": "tap composer-repo",
           "ok": true,
-          "ms": 79
+          "ms": 77
         },
         {
           "index": 3,
           "label": "see composer-repo-panel",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 4,
           "label": "tap composer-repo-option",
           "ok": true,
-          "ms": 77
+          "ms": 80
         },
         {
           "index": 5,
@@ -309,13 +309,13 @@
           "index": 6,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 31
+          "ms": 24
         },
         {
           "index": 7,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 89
+          "ms": 99
         },
         {
           "index": 8,
@@ -329,13 +329,13 @@
       "scenarioId": "github-launch-web-preview",
       "title": "A pinned GitHub web repository launches into a live Rork preview",
       "ok": true,
-      "ms": 2970,
+      "ms": 2839,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 3
+          "ms": 4
         },
         {
           "index": 1,
@@ -347,31 +347,31 @@
           "index": 2,
           "label": "tap composer-repo",
           "ok": true,
-          "ms": 59
+          "ms": 55
         },
         {
           "index": 3,
           "label": "see composer-repo-panel",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 4,
           "label": "tap composer-repo-option",
           "ok": true,
-          "ms": 76
+          "ms": 49
         },
         {
           "index": 5,
           "label": "tap composer-repo-launch",
           "ok": true,
-          "ms": 96
+          "ms": 60
         },
         {
           "index": 6,
           "label": "see repo-launch-dialog",
           "ok": true,
-          "ms": 2
+          "ms": 1
         },
         {
           "index": 7,
@@ -383,19 +383,19 @@
           "index": 8,
           "label": "tap repo-launch-start",
           "ok": true,
-          "ms": 143
+          "ms": 51
         },
         {
           "index": 9,
           "label": "see \"Preview running\" in repo-preview-flow",
           "ok": true,
-          "ms": 2538
+          "ms": 2568
         },
         {
           "index": 10,
           "label": "see repo-preview-panel",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 11,
@@ -409,13 +409,13 @@
       "scenarioId": "switch-chat-model",
       "title": "The picker keeps four primary models up front and opens the rest under More",
       "ok": true,
-      "ms": 327,
+      "ms": 287,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 7
+          "ms": 6
         },
         {
           "index": 1,
@@ -427,19 +427,19 @@
           "index": 2,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 71
+          "ms": 60
         },
         {
           "index": 3,
           "label": "tap model-picker-model-row",
           "ok": true,
-          "ms": 64
+          "ms": 51
         },
         {
           "index": 4,
           "label": "see model-option-spacexai/grok-4.6",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 5,
@@ -457,25 +457,25 @@
           "index": 7,
           "label": "see model-option-openai/gpt-5.6-luna",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 8,
           "label": "tap model-picker-more-row",
           "ok": true,
-          "ms": 46
+          "ms": 54
         },
         {
           "index": 9,
           "label": "tap model-option-anthropic/claude-opus-5",
           "ok": true,
-          "ms": 81
+          "ms": 59
         },
         {
           "index": 10,
           "label": "see \"Claude Opus 5\" in model-picker-trigger",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -483,13 +483,13 @@
       "scenarioId": "switch-chat-effort",
       "title": "The picker's Effort submenu pins the thinking budget",
       "ok": true,
-      "ms": 259,
+      "ms": 243,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 8
+          "ms": 6
         },
         {
           "index": 1,
@@ -501,25 +501,25 @@
           "index": 2,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 72
+          "ms": 59
         },
         {
           "index": 3,
           "label": "tap model-picker-effort-row",
           "ok": true,
-          "ms": 65
+          "ms": 51
         },
         {
           "index": 4,
           "label": "tap effort-option-medium",
           "ok": true,
-          "ms": 62
+          "ms": 75
         },
         {
           "index": 5,
           "label": "see \"Medium\" in model-picker-trigger",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -527,13 +527,13 @@
       "scenarioId": "switch-run-mode",
       "title": "The model-style run-mode picker engages Deep research",
       "ok": true,
-      "ms": 198,
+      "ms": 188,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 8
+          "ms": 9
         },
         {
           "index": 1,
@@ -545,19 +545,19 @@
           "index": 2,
           "label": "tap composer-mode-trigger",
           "ok": true,
-          "ms": 65
+          "ms": 63
         },
         {
           "index": 3,
           "label": "tap run-mode-option-research",
           "ok": true,
-          "ms": 74
+          "ms": 64
         },
         {
           "index": 4,
           "label": "see \"Deep research\" in composer-mode-trigger",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     },
@@ -565,7 +565,7 @@
       "scenarioId": "run-mode-settings-panel",
       "title": "The engaged run mode's gear opens its settings panel",
       "ok": true,
-      "ms": 254,
+      "ms": 258,
       "steps": [
         {
           "index": 0,
@@ -583,19 +583,19 @@
           "index": 2,
           "label": "tap composer-mode-trigger",
           "ok": true,
-          "ms": 69
+          "ms": 74
         },
         {
           "index": 3,
           "label": "tap run-mode-option-research",
           "ok": true,
-          "ms": 72
+          "ms": 64
         },
         {
           "index": 4,
           "label": "tap composer-mode-config",
           "ok": true,
-          "ms": 56
+          "ms": 63
         },
         {
           "index": 5,
@@ -615,13 +615,13 @@
       "scenarioId": "skills-rail-panel",
       "title": "The rail Skills button opens the per-mode packs panel",
       "ok": true,
-      "ms": 112,
+      "ms": 120,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 5
+          "ms": 8
         },
         {
           "index": 1,
@@ -633,7 +633,7 @@
           "index": 2,
           "label": "tap composer-skills",
           "ok": true,
-          "ms": 56
+          "ms": 59
         },
         {
           "index": 3,
@@ -645,7 +645,7 @@
           "index": 4,
           "label": "see \"Skills\" in composer-skills-panel",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     },
@@ -653,13 +653,13 @@
       "scenarioId": "projects-page-opens",
       "title": "Projects page renders with the create action behind the gate",
       "ok": true,
-      "ms": 57,
+      "ms": 59,
       "steps": [
         {
           "index": 0,
           "label": "goto /projects",
           "ok": true,
-          "ms": 6
+          "ms": 7
         },
         {
           "index": 1,
@@ -671,7 +671,7 @@
           "index": 2,
           "label": "see project-create",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     },
@@ -679,13 +679,13 @@
       "scenarioId": "studio-pages-navigate",
       "title": "Workspace tabs hop between Automations, Hub, MCP and Settings",
       "ok": true,
-      "ms": 428,
+      "ms": 494,
       "steps": [
         {
           "index": 0,
           "label": "goto /automations",
           "ok": true,
-          "ms": 6
+          "ms": 7
         },
         {
           "index": 1,
@@ -697,7 +697,7 @@
           "index": 2,
           "label": "tap nav-tab-hub",
           "ok": true,
-          "ms": 50
+          "ms": 47
         },
         {
           "index": 3,
@@ -709,19 +709,19 @@
           "index": 4,
           "label": "tap nav-tab-mcp",
           "ok": true,
-          "ms": 52
+          "ms": 51
         },
         {
           "index": 5,
           "label": "see page-mcp",
           "ok": true,
-          "ms": 86
+          "ms": 111
         },
         {
           "index": 6,
           "label": "tap nav-tab-settings",
           "ok": true,
-          "ms": 80
+          "ms": 124
         },
         {
           "index": 7,
@@ -735,25 +735,25 @@
       "scenarioId": "connect-open-mcp",
       "title": "An open MCP catalog server handshakes and lists its tools",
       "ok": true,
-      "ms": 294,
+      "ms": 309,
       "steps": [
         {
           "index": 0,
           "label": "goto /mcp",
           "ok": true,
-          "ms": 6
+          "ms": 7
         },
         {
           "index": 1,
           "label": "see page-mcp",
           "ok": true,
-          "ms": 93
+          "ms": 122
         },
         {
           "index": 2,
           "label": "tap mcp-catalog-connect-deepwiki",
           "ok": true,
-          "ms": 195
+          "ms": 180
         },
         {
           "index": 3,
@@ -767,13 +767,13 @@
       "scenarioId": "objects-have-addresses",
       "title": "Editors and studio objects open straight from their URLs",
       "ok": true,
-      "ms": 211,
+      "ms": 214,
       "steps": [
         {
           "index": 0,
           "label": "goto /automations/new",
           "ok": true,
-          "ms": 5
+          "ms": 9
         },
         {
           "index": 1,
@@ -785,7 +785,7 @@
           "index": 2,
           "label": "goto /skills/new",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 3,
@@ -823,13 +823,13 @@
       "scenarioId": "stop-run-settles-ui",
       "title": "Stop settles the composer even when the run node lost the run",
       "ok": true,
-      "ms": 362,
+      "ms": 358,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 3
+          "ms": 6
         },
         {
           "index": 1,
@@ -841,7 +841,7 @@
           "index": 2,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 46
+          "ms": 38
         },
         {
           "index": 3,
@@ -859,19 +859,19 @@
           "index": 5,
           "label": "see composer-stop",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 6,
           "label": "tap composer-stop",
           "ok": true,
-          "ms": 110
+          "ms": 111
         },
         {
           "index": 7,
           "label": "see composer-send",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     }

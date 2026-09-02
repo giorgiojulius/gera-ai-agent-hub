@@ -133,10 +133,24 @@ test("the dock turns in-preview popups into tabs and sends other sites to a real
   expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start?state=1", "_blank", "width=500,height=650");
   expect(frames()).toHaveLength(2);
 
+  // Blank-then-navigate (`window.open()` under the click, `popup.location = url` after a fetch): the empty
+  // window opens right away and the navigation reuses it — never a second window, never a panel tab.
+  const blankWindow = { closed: false, location: { href: "about:blank" }, focus: vi.fn(), close: vi.fn(), postMessage: vi.fn() };
+  openSpy.mockReturnValueOnce(blankWindow as unknown as Window);
+  postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: "about:blank", target: "_blank", id: "w2", features: "popup" });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(openSpy).toHaveBeenLastCalledWith("about:blank", "_blank", "popup");
+  postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: `${previewUrl}oauth/done`, target: "_blank", id: "w2", features: "popup" });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(blankWindow.location.href).toBe(`${previewUrl}oauth/done`);
+  expect(openSpy).toHaveBeenCalledTimes(3);
+  expect(frames()).toHaveLength(2);
+  blankWindow.closed = true;
+
   // Same backend origin outside the artifact root is folded back into the sandboxed namespace, never opened raw.
   postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: "https://preview.example/mcp/oauth/callback", target: "_blank" });
   await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/mcp/oauth/callback");
-  expect(openSpy).toHaveBeenCalledTimes(2);
+  expect(openSpy).toHaveBeenCalledTimes(3);
   expect(frames()).toHaveLength(3);
   expect(frames()[2].src).toBe(`${previewUrl}mcp/oauth/callback`);
 

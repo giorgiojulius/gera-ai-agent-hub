@@ -79,6 +79,21 @@ export function usePreviewBridge(options: PreviewBridgeOptions): PreviewBridge {
             if (message.id) registry.notifyClosed(frameKey, message.id);
             return;
           }
+          if (message.id && registry.has(frameKey, message.id)) {
+            // The app navigates a window it already holds (blank-then-navigate): keep that same real window.
+            if (!registry.open(frameKey, message.id, route.url, message.features)) registry.notifyClosed(frameKey, message.id);
+            return;
+          }
+          if (route.kind === "blank") {
+            if (!message.id) {
+              openPreviewPopupExternally(route.url);
+              return;
+            }
+            // A blank window the app will navigate shortly: no toast when the blocker refuses — the
+            // follow-up navigation gets its own offer — but the stub must learn it never opened.
+            if (!registry.open(frameKey, message.id, route.url, message.features)) registry.notifyClosed(frameKey, message.id);
+            return;
+          }
           if (route.kind === "tab" && onOpenTab) {
             onOpenTab(frameKey, route.url, message.id ? { frameKey, id: message.id } : null);
             return;

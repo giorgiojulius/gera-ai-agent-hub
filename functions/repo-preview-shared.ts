@@ -674,7 +674,11 @@ export function repoPreviewContentType(path: string): string {
  * title (`type:"state"`) so the panel's address bar and tab strip stay live.
  *
  * `window.open` returns a window-like stub tied to a popup id; Gera plays
- * opener for the real window it opens on the stub's behalf: `close()`,
+ * opener for the real window it opens on the stub's behalf. A blank open
+ * (`window.open()` / `"about:blank"`, the "open now, navigate after the
+ * fetch" OAuth pattern) is bridged at once as `url:"about:blank"` so a real
+ * window appears under the user's click exactly as it would unsandboxed, and a
+ * later `stub.location = url` navigates that same window. `close()`,
  * `focus()` and `postMessage()` on the stub drive the real window
  * (`type:"close"|"focus"|"message"`), and Gera posts back
  * `{source:"gera-preview-host", type:"closed"}` when the window is gone and
@@ -738,7 +742,7 @@ export function repoPreviewSandboxShim(): string {
     'var loc={assign:go,replace:go,toString:function(){return "about:blank";}};' +
     'Object.defineProperty(loc,"href",{get:function(){return "about:blank";},set:go});' +
     'Object.defineProperty(stub,"location",{get:function(){return loc;},set:go});' +
-    'popups[id]=stub;if(href&&href!=="about:blank")go(href);' +
+    'popups[id]=stub;if(href&&href!=="about:blank"){go(href);}else{post({source:"gera-preview",type:"open",url:"about:blank",target:name,id:id,features:opts});}' +
     "return stub;};" +
     'window.addEventListener("message",function(e){if(e.source!==window.parent)return;var d=e.data;' +
     'if(!d||d.source!=="gera-preview-host"||typeof d.id!=="string")return;var s=popups[d.id];if(!s)return;' +

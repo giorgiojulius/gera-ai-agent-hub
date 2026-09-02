@@ -308,6 +308,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const attemptId = generateCodeVerifier();
       signInAttemptRef.current = attemptId;
       try {
+        if (!AUTH_URL || !APP_KEY) {
+          // A build without the public Rork auth variables (e.g. a repository preview built
+          // without `.env`) would otherwise POST to a relative URL and open a blank popup forever.
+          setError("Sign-in isn’t configured in this build: EXPO_PUBLIC_RORK_AUTH_URL and EXPO_PUBLIC_RORK_APP_KEY are missing.");
+          return;
+        }
         const verifier = generateCodeVerifier();
         const challenge = await generateCodeChallenge(verifier);
         if (!isAuthSessionCurrent(flowNonce) || signInAttemptRef.current !== attemptId) {
@@ -347,7 +353,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const { auth_url: authUrl } = (await response.json()) as { auth_url: string };
+        const { auth_url: authUrl } = (await response.json()) as { auth_url?: unknown };
+        if (typeof authUrl !== "string" || !/^https?:\/\//.test(authUrl)) {
+          clearAuthFlowIfCurrent(attemptId);
+          setError("Sign in failed — the auth service returned no sign-in link.");
+          return;
+        }
 
         if (isPreview) {
           const popup = window.open(authUrl, "_blank", "width=500,height=650");

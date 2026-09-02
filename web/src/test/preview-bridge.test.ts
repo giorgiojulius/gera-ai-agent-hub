@@ -35,6 +35,11 @@ describe("preview bridge routing", () => {
     });
   });
 
+  it("lets a blank open become a real empty window the app navigates later", () => {
+    expect(routePreviewPopup("about:blank", previewUrl)).toEqual({ kind: "blank", url: "about:blank" });
+    expect(routePreviewPopup("about:srcdoc", previewUrl)).toEqual({ kind: "blocked", reason: "scheme" });
+  });
+
   it("refuses non-web schemes, embedded credentials and garbage", () => {
     expect(routePreviewPopup("javascript:alert(1)", previewUrl)).toEqual({ kind: "blocked", reason: "scheme" });
     expect(routePreviewPopup("data:text/html,hi", previewUrl)).toEqual({ kind: "blocked", reason: "scheme" });

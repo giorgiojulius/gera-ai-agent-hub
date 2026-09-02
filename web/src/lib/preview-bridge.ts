@@ -30,6 +30,7 @@ export type PopupOpener = { frameKey: string; id: string };
 export type PopupRoute =
   | { kind: "tab"; url: string }
   | { kind: "external"; url: string }
+  | { kind: "blank"; url: "about:blank" }
   | { kind: "blocked"; reason: "invalid-url" | "scheme" | "credentials" };
 
 function popupId(value: unknown): string | null {
@@ -113,7 +114,9 @@ export function previewBase(previewUrl: string): URL | null {
  * own origin become panel tabs (root-relative paths an app assumed to live at
  * `/` are folded back under the artifact root, mirroring the Worker's HTML
  * rewrite, so nothing escapes the sandboxed namespace), other web origins open
- * as real browser windows, and non-web schemes or embedded credentials are refused.
+ * as real browser windows, a blank open becomes a real empty window the app
+ * navigates later (or the user closes), and non-web schemes or embedded
+ * credentials are refused.
  */
 export function routePreviewPopup(rawUrl: string, previewUrl: string): PopupRoute {
   const base = previewBase(previewUrl);
@@ -123,6 +126,7 @@ export function routePreviewPopup(rawUrl: string, previewUrl: string): PopupRout
   } catch {
     return { kind: "blocked", reason: "invalid-url" };
   }
+  if (url.href === "about:blank") return { kind: "blank", url: "about:blank" };
   if (url.protocol !== "https:" && url.protocol !== "http:") return { kind: "blocked", reason: "scheme" };
   if (url.username || url.password) return { kind: "blocked", reason: "credentials" };
   if (base && url.origin === base.origin) {
@@ -276,6 +280,17 @@ export class PreviewPopupRegistry {
   /** Number of live windows currently proxied. */
   get size(): number {
     return this.entries.size;
+  }
+
+  /** True while a real, still-open window stands in for this popup id. */
+  has(frameKey: string, id: string): boolean {
+    const entry = this.entries.get(PreviewPopupRegistry.key(frameKey, id));
+    if (!entry) return false;
+    try {
+      return !entry.win.closed;
+    } catch {
+      return false;
+    }
   }
 
   /** Opens the real window behind a preview popup, or navigates it when it already exists. */

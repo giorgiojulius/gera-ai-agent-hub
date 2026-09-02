@@ -204,24 +204,29 @@ test("inside the sandbox the shim bridges popups and the page state to the embed
   ]);
 
   const opens = messages.flatMap((message) => (message.source === "gera-preview" && message.type === "open" ? [message] : []));
-  // Relative popups resolve against the served <base>, i.e. inside the artifact root.
+  // Relative popups resolve against the served <base>, i.e. inside the artifact root. A blank open is
+  // bridged at once (a real empty window appears under the click) and the later navigation reuses its id.
   expect(opens.map((message) => message.url)).toEqual([
     `${location.origin}/repo-preview/p.abc/settings?tab=1`,
     "https://accounts.example/login",
+    "about:blank",
     "https://auth.example/start?state=1",
   ]);
   expect(opens[2]?.target).toBe("oauth");
+  expect(opens[3]?.target).toBe("oauth");
   // `window.open` calls carry a popup id and the app's placement hints; anchor clicks carry neither.
   expect(opens[0]?.id).toMatch(/^w[0-9]+$/);
   expect(opens[1]?.id).toBeUndefined();
   expect(opens[2]?.id).toMatch(/^w[0-9]+$/);
+  expect(opens[3]?.id).toBe(opens[2]?.id);
   expect(opens[2]?.features).toBe("popup,width=560,height=720");
+  expect(opens[3]?.features).toBe("popup,width=560,height=720");
 
   const outbound = messages.find((message) => message.source === "gera-preview" && message.type === "message");
   expect(outbound && outbound.source === "gera-preview" && outbound.type === "message" ? outbound : null).toEqual({
     source: "gera-preview",
     type: "message",
-    id: opens[2]?.id,
+    id: opens[3]?.id,
     data: { hello: "popup" },
     targetOrigin: "https://auth.example",
   });

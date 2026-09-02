@@ -270,11 +270,29 @@ export function repoPreviewArchiveFailureMessage(result: Pick<RepoPreviewArchive
   return `Rork storage rejected the preview artifact (HTTP ${result.status}).`;
 }
 
-/** Persisted reason when Rork storage credentials cannot be minted at all. */
+/**
+ * Persisted reason when Rork storage credentials cannot be minted at all.
+ * The storage layer throws `storage_unavailable:<reason>`; the reason is
+ * secret-free (hosts and HTTP statuses only) and is surfaced verbatim so the
+ * next step is obvious instead of a guess.
+ */
 export function repoPreviewStorageUnavailableMessage(error: unknown): string {
   const code = error instanceof Error ? error.message : "";
   if (code === "storage_quota") {
     return "Rork file storage quota is exhausted for this project. Free space or top up storage, then launch the preview again.";
+  }
+  const detail = code.startsWith("storage_unavailable:") ? code.slice("storage_unavailable:".length).trim() : "";
+  if (detail === "no_toolkit_secret") {
+    return "The Gera backend has no Rork toolkit key, so it cannot mint storage credentials (storage_unavailable: no_toolkit_secret). Configure the backend key, then launch the preview again.";
+  }
+  if (detail.startsWith("401")) {
+    return `Rork rejected the Gera backend's toolkit key while minting storage credentials (storage_unavailable: ${detail}). Check the backend's Rork toolkit key, then launch the preview again.`;
+  }
+  if (detail.startsWith("403")) {
+    return `Rork file storage is not enabled for this project (storage_unavailable: ${detail}). Enable file storage for the Gera backend, then launch the preview again.`;
+  }
+  if (detail) {
+    return `No Rork API host would mint storage credentials (storage_unavailable: ${detail}). Launch the preview again; if it repeats, the Gera backend's Rork API address needs fixing.`;
   }
   return "Rork file storage is unavailable for this project (storage_unavailable). Enable file storage for the Gera backend, then launch the preview again.";
 }

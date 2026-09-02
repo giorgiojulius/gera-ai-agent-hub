@@ -1,4 +1,5 @@
 import {
+  ArrowDownToLine,
   ArrowUp,
   AudioLines,
   Check,
@@ -631,10 +632,28 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
           <div
             data-testid={TID.composerDropZone}
             aria-hidden
-            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center gap-2 rounded-3xl border-2 border-dashed border-ember bg-ember/10 text-sm font-medium text-ember"
+            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center overflow-hidden rounded-3xl bg-card/75 backdrop-blur-[3px] animate-in fade-in-0 duration-150"
           >
-            <Paperclip className="h-4 w-4" />
-            {isChat ? "Drop files to attach" : mode === "image" ? "Drop an image to edit" : "Drop an image to animate"}
+            <span className="absolute inset-[5px] rounded-[20px] border-[1.5px] border-dashed border-ember/45" />
+            <span className="absolute inset-0 bg-[radial-gradient(60%_120%_at_50%_100%,hsl(var(--ember)/0.16),transparent_70%)]" />
+            <span className="relative flex items-center gap-3 rounded-full border border-ember/20 bg-card/95 py-2 pl-2 pr-5 shadow-[0_1px_2px_rgba(35,20,28,0.05),0_18px_40px_-20px_hsl(var(--ember)/0.55)] animate-in fade-in-0 zoom-in-95 duration-200">
+              <span className="relative flex h-9 w-9 items-center justify-center rounded-full bg-ember text-ember-foreground">
+                <span className="absolute inset-0 rounded-full bg-ember/35 animate-ping [animation-duration:1.8s]" />
+                <ArrowDownToLine className="relative h-4 w-4" strokeWidth={2.25} />
+              </span>
+              <span className="flex flex-col leading-tight">
+                <span className="font-display text-sm text-foreground">
+                  {isChat ? "Drop to attach" : mode === "image" ? "Drop to edit" : "Drop to animate"}
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  {isChat
+                    ? "Images, PDF, Word and Excel"
+                    : mode === "image"
+                      ? "One image — PNG, JPG or WebP"
+                      : "One image — it becomes the first frame"}
+                </span>
+              </span>
+            </span>
           </div>
         ) : null}
         <textarea

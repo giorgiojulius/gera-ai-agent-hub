@@ -1004,7 +1004,10 @@ All notify paths fail silent.
 
 ## Worker route map
 
-`functions/index.ts` dispatch: `/ping` health · `/access/*` gate+admin ·
+`functions/index.ts` dispatch: `/ping` health · GET `/storage/ping` secret-free
+storage probe (`{ok, bucket, apiHost, expiresAt}` 200 or `{ok:false, error}` 503
+— the first thing to curl when a Repo Preview or knowledge upload reports
+`storage_unavailable`) · `/access/*` gate+admin ·
 `/share/*` · `/arena/*` (usage, battles, log, clear) · `/chats/sync` ·
 `/runs/*` (start, stream SSE, active, steer/stop) · `/diag/*` ·
 `/repo-previews/{inspect|install|start|status|cancel}` authenticated launch
@@ -1013,7 +1016,15 @@ callback (the runner's `PUT …/archive` tar is handled in the entrypoint:
 DO `archive-claim` mints a presigned R2 PUT for a per-run staging key → the
 entrypoint streams the body straight into R2 with a fixed length → DO
 `archive-commit` records bytes or persists a specific storage error; the
-multi-MB body never rides the DO transport) · `/repo-preview/:id/:access/*`
+multi-MB body never rides the DO transport). Storage credentials
+(`knowledge-storage.ts`): the temp-credentials POST tries
+`EXPO_PUBLIC_RORK_API_BASE_URL` → `EXPO_PUBLIC_RORK_AUTH_URL` → `RORK_AUTH_URL`
+→ `https://api.rork.com` with manual redirects and an 8s cap per host; only a
+valid credential or a JSON Rork error (401/403/429) is final, everything else
+(404 HTML dev host, 301, 5xx, timeout) moves to the next host; the winning
+host is remembered. Failures throw `storage_unavailable:<hosts + statuses>`
+(never secrets) and `repoPreviewStorageUnavailableMessage` surfaces that
+reason verbatim. Unit: `rork-storage.test.ts`. · `/repo-preview/:id/:access/*`
 public expiring static artifact delivery ·
 `/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
 `/automations/run-now` · `/projects` +

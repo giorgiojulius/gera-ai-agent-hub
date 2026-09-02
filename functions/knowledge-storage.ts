@@ -11,6 +11,8 @@
 
 export type RorkStorageEnv = {
   EXPO_PUBLIC_RORK_API_BASE_URL?: string;
+  EXPO_PUBLIC_RORK_AUTH_URL?: string;
+  RORK_AUTH_URL?: string;
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
   RORK_TOOLKIT_SECRET_KEY?: string;
 };
@@ -42,25 +44,137 @@ const KEY_PATTERN = /^knowledge\/[a-f0-9]{24}\/[A-Za-z0-9_-]{1,64}\.txt$/;
 
 type TempCreds = RorkStorageCredentials;
 
+/** The public Rork API host — the last resort when no configured base serves storage. */
+const DEFAULT_RORK_API_BASE = "https://api.rork.com";
+const CREDENTIALS_PATH = "/api/storage/temp-credentials";
+/** A dead host must not stall a preview claim; the next candidate gets its turn. */
+const CANDIDATE_TIMEOUT_MS = 8_000;
+/** Error code prefix; the text after the colon is a secret-free, human-readable reason. */
+export const STORAGE_UNAVAILABLE = "storage_unavailable";
+
 let cachedCreds: TempCreds | null = null;
 let inflight: Promise<TempCreds> | null = null;
+/** The base that last minted credentials — tried first on the next refresh. */
+let resolvedBase: string | null = null;
 
+function normalizeBase(value: string | undefined): string | null {
+  const trimmed = (value ?? "").trim().replace(/\/+$/, "");
+  return /^https?:\/\/[^\s]+$/i.test(trimmed) ? trimmed : null;
+}
+
+/**
+ * Where the temp-credentials endpoint may live, most specific first. The
+ * documented variable is tried first, but a project's API base can point at a
+ * per-project dev host that does not serve `/api/storage` at all (it answers
+ * 404 HTML), so the Rork auth host — same API surface — and the public API
+ * host back it up. Duplicates collapse; malformed values are skipped.
+ */
+export function rorkStorageApiCandidates(env: RorkStorageEnv): string[] {
+  const out: string[] = [];
+  for (const raw of [
+    env.EXPO_PUBLIC_RORK_API_BASE_URL,
+    env.EXPO_PUBLIC_RORK_AUTH_URL,
+    env.RORK_AUTH_URL,
+    DEFAULT_RORK_API_BASE,
+  ]) {
+    const base = normalizeBase(raw);
+    if (base && !out.includes(base)) {
+      out.push(base);
+    }
+  }
+  return out;
+}
+
+function isTempCreds(value: unknown): value is TempCreds {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return ["accessKeyId", "secretAccessKey", "sessionToken", "bucket", "endpoint", "expiresAt"].every(
+    (key) => typeof record[key] === "string" && (record[key] as string).length > 0,
+  );
+}
+
+/** The `error` code of a JSON error body, or null when the body is not the Rork API's. */
+async function apiErrorCode(response: Response): Promise<string | null> {
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (!body || typeof body !== "object") {
+    return null;
+  }
+  const code = (body as Record<string, unknown>).error;
+  return typeof code === "string" && code.length > 0 ? code : null;
+}
+
+async function requestCreds(base: string, secret: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CANDIDATE_TIMEOUT_MS);
+  try {
+    // Manual redirects: a misconfigured base that 301s elsewhere must read as
+    // "wrong host", not be silently replayed as a GET against a marketing site.
+    return await fetch(`${base}${CREDENTIALS_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+      redirect: "manual",
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Mints credentials from the first candidate that gives an authoritative
+ * answer. Authoritative: valid credentials, or a JSON error from the Rork API
+ * (401 unauthorized, 403 storage_not_enabled, 429 over_quota). Everything
+ * else — unreachable, timeout, redirect, 404 HTML, 5xx — means "wrong or
+ * dead host" and the next candidate is tried. Failures carry a secret-free
+ * reason so the user sees what actually happened instead of an opaque code.
+ */
 async function fetchTempCreds(env: StorageEnv): Promise<TempCreds> {
-  const base = (env.EXPO_PUBLIC_RORK_API_BASE_URL ?? "https://rork.app").replace(/\/+$/, "");
   const secret = env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? env.RORK_TOOLKIT_SECRET_KEY ?? "";
-  const response = await fetch(`${base}/api/storage/temp-credentials`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
-  });
-  if (response.status === 429) {
-    throw new Error("storage_quota");
+  if (!secret) {
+    throw new Error(`${STORAGE_UNAVAILABLE}:no_toolkit_secret`);
   }
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    console.error("temp-credentials failed", response.status, text.slice(0, 200));
-    throw new Error("storage_unavailable");
+  const candidates = rorkStorageApiCandidates(env);
+  const ordered = resolvedBase && candidates.includes(resolvedBase)
+    ? [resolvedBase, ...candidates.filter((base) => base !== resolvedBase)]
+    : candidates;
+  const failures: string[] = [];
+  for (const base of ordered) {
+    const host = new URL(base).host;
+    let response: Response;
+    try {
+      response = await requestCreds(base, secret);
+    } catch (error) {
+      failures.push(`${host} ${error instanceof Error && error.name === "AbortError" ? "timeout" : "unreachable"}`);
+      continue;
+    }
+    if (response.status === 429) {
+      throw new Error("storage_quota");
+    }
+    if (response.status === 401 || response.status === 403) {
+      const code = await apiErrorCode(response);
+      if (code) {
+        throw new Error(`${STORAGE_UNAVAILABLE}:${response.status} ${code}`);
+      }
+      failures.push(`${host} ${response.status}`);
+      continue;
+    }
+    if (response.ok) {
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (isTempCreds(body)) {
+        resolvedBase = base;
+        return body;
+      }
+      failures.push(`${host} ${response.status} unexpected body`);
+      continue;
+    }
+    failures.push(`${host} ${response.status}`);
   }
-  return (await response.json()) as TempCreds;
+  resolvedBase = null;
+  const reason = failures.join("; ").slice(0, 240);
+  console.error("temp-credentials failed", reason);
+  throw new Error(`${STORAGE_UNAVAILABLE}:${reason}`);
 }
 
 export async function getRorkStorageCredentials(env: RorkStorageEnv): Promise<RorkStorageCredentials> {
@@ -79,6 +193,28 @@ export async function getRorkStorageCredentials(env: RorkStorageEnv): Promise<Ro
       inflight = null;
     });
   return inflight;
+}
+
+export type RorkStorageProbe =
+  | { ok: true; bucket: string; apiHost: string; expiresAt: string }
+  | { ok: false; error: string };
+
+/**
+ * Secret-free health probe: can this Worker mint storage credentials right
+ * now, and which API host answered? Never returns key material.
+ */
+export async function probeRorkStorage(env: RorkStorageEnv): Promise<RorkStorageProbe> {
+  try {
+    const creds = await getRorkStorageCredentials(env);
+    return {
+      ok: true,
+      bucket: creds.bucket,
+      apiHost: resolvedBase ? new URL(resolvedBase).host : "",
+      expiresAt: creds.expiresAt,
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : STORAGE_UNAVAILABLE };
+  }
 }
 
 // --- manual SigV4 presigning (query auth, UNSIGNED-PAYLOAD, host-only) ---
@@ -223,11 +359,12 @@ export async function handleKnowledgeRoute(
 
     return { status: 404, body: { error: "not_found" } };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "storage_unavailable";
+    const message = error instanceof Error ? error.message : STORAGE_UNAVAILABLE;
     if (message === "storage_quota") {
       return { status: 429, body: { error: "storage_quota" } };
     }
     console.error("knowledge storage error", message);
-    return { status: 502, body: { error: "storage_unavailable" } };
+    const detail = message.startsWith(`${STORAGE_UNAVAILABLE}:`) ? message.slice(STORAGE_UNAVAILABLE.length + 1) : "";
+    return { status: 502, body: detail ? { error: STORAGE_UNAVAILABLE, detail } : { error: STORAGE_UNAVAILABLE } };
   }
 }

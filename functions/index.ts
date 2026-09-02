@@ -55,7 +55,7 @@
 import { AccessRegistry } from "./access-registry";
 import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
-import { handleKnowledgeRoute } from "./knowledge-storage";
+import { handleKnowledgeRoute, probeRorkStorage } from "./knowledge-storage";
 import { REPO_PREVIEW_MAX_ARCHIVE_BYTES, verifyRepoPreviewId } from "./repo-preview-shared";
 import { githubRequestHeaders } from "./native-github";
 import { decodeSlackInstallState } from "./native-slack";
@@ -79,6 +79,9 @@ type Env = {
   RORK_TOOLKIT_SECRET_KEY?: string;
   /** Rork API base — the storage temp-credentials endpoint lives there. */
   EXPO_PUBLIC_RORK_API_BASE_URL?: string;
+  /** Rork auth host — same API surface; backs up the API base for storage credentials. */
+  EXPO_PUBLIC_RORK_AUTH_URL?: string;
+  RORK_AUTH_URL?: string;
   /** Stable private salt for opaque repository-preview account shards. */
   RORK_AUTH_SECRET_KEY?: string;
   /** Present only on the isolated black-box acceptance Worker. */
@@ -2804,6 +2807,16 @@ export default {
     }
     if (url.pathname === "/ping") {
       return corsJson({ ok: true, now: new Date().toISOString() }, 200);
+    }
+    if (url.pathname === "/storage/ping") {
+      // Secret-free: reports only whether credentials mint, the bucket, and
+      // which Rork API host answered — the first thing to check when a Repo
+      // Preview or knowledge upload reports storage_unavailable.
+      if (request.method !== "GET") {
+        return corsJson({ error: "method_not_allowed" }, 405);
+      }
+      const probe = await probeRorkStorage(env);
+      return corsJson(probe, probe.ok ? 200 : 503);
     }
     if (url.pathname === "/__staging/account-version") {
       if (!env.STAGING_VERSION || request.method !== "GET") {

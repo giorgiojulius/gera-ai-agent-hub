@@ -504,6 +504,18 @@ describe("repository preview contract", () => {
     expect(repoPreviewStorageUnavailableMessage(new Error("storage_quota"))).toContain("quota");
     expect(repoPreviewStorageUnavailableMessage(new Error("storage_unavailable"))).toContain("storage_unavailable");
     expect(repoPreviewStorageUnavailableMessage("boom")).toContain("Enable file storage");
+    expect(repoPreviewStorageUnavailableMessage(new Error("storage_unavailable:403 storage_not_enabled"))).toContain(
+      "not enabled for this project (storage_unavailable: 403 storage_not_enabled)",
+    );
+    expect(repoPreviewStorageUnavailableMessage(new Error("storage_unavailable:401 unauthorized"))).toContain(
+      "rejected the Gera backend's toolkit key",
+    );
+    expect(repoPreviewStorageUnavailableMessage(new Error("storage_unavailable:no_toolkit_secret"))).toContain(
+      "no Rork toolkit key",
+    );
+    expect(
+      repoPreviewStorageUnavailableMessage(new Error("storage_unavailable:dev-x.rorktest.dev 404; rork.app 301")),
+    ).toContain("No Rork API host would mint storage credentials (storage_unavailable: dev-x.rorktest.dev 404; rork.app 301)");
   });
 
   it("normalizes durable jobs and drops unsafe URLs before rendering", () => {

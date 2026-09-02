@@ -50,10 +50,12 @@ function runInOpaqueSandbox(html: string): Promise<Probe> {
       cleanup();
       reject(new Error("sandboxed probe never reported"));
     }, 10_000);
-    const onMessage = (event: MessageEvent<Probe>) => {
+    const onMessage = (event: MessageEvent<Probe | { source?: string }>) => {
       if (event.source !== frame.contentWindow) return;
+      // The shim's own bridge traffic (route/title reports) is not the probe's verdict.
+      if ((event.data as { source?: string }).source === "gera-preview") return;
       cleanup();
-      resolve(event.data);
+      resolve(event.data as Probe);
     };
     const cleanup = () => {
       window.clearTimeout(timer);
@@ -81,6 +83,100 @@ test("the served preview HTML boots storage and cookies inside the same sandbox"
   expect(served).toContain(repoPreviewSandboxShim());
   const probe = await runInOpaqueSandbox(served);
   expect(probe).toEqual({ ok: true, stage: "done", detail: "" });
+});
+
+type BridgeMessage =
+  | { source: "gera-preview"; type: "open"; url: string; target: string }
+  | { source: "gera-preview"; type: "state"; href: string; title: string }
+  | { source: "probe"; results: { kind: string; ok: boolean }[] };
+
+/** Collects every message the frame posts until the probe's final report. */
+function collectFromOpaqueSandbox(html: string): Promise<BridgeMessage[]> {
+  return new Promise<BridgeMessage[]>((resolve, reject) => {
+    const frame = document.createElement("iframe");
+    frame.setAttribute("sandbox", "allow-scripts");
+    const received: BridgeMessage[] = [];
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(`sandboxed probe never finished: ${JSON.stringify(received)}`));
+    }, 10_000);
+    const onMessage = (event: MessageEvent<BridgeMessage>) => {
+      if (event.source !== frame.contentWindow) return;
+      received.push(event.data);
+      if (event.data.source === "probe") {
+        cleanup();
+        resolve(received);
+      }
+    };
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+      frame.remove();
+    };
+    window.addEventListener("message", onMessage);
+    frame.srcdoc = html;
+    document.body.appendChild(frame);
+  });
+}
+
+const POPUP_PROBE = `<script>
+(function () {
+  var results = [];
+  document.title = "Storefront · Login";
+  var w = window.open("/settings?tab=1");
+  results.push({ kind: "open-returns-window-like", ok: !!w && w.closed === false && typeof w.close === "function" });
+  var a = document.createElement("a");
+  a.href = "https://accounts.example/login";
+  a.target = "_blank";
+  a.textContent = "Sign in";
+  document.body.appendChild(a);
+  var ev = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+  a.dispatchEvent(ev);
+  results.push({ kind: "blank-anchor-prevented", ok: ev.defaultPrevented });
+  var plain = document.createElement("a");
+  plain.href = "https://accounts.example/inline";
+  document.body.appendChild(plain);
+  var plainSeen = null;
+  // The shim listens in the capture phase, so this target-phase listener observes its verdict,
+  // then stops the real navigation so the probe frame survives.
+  plain.addEventListener("click", function (e) { plainSeen = e.defaultPrevented; e.preventDefault(); });
+  plain.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+  results.push({ kind: "plain-anchor-untouched", ok: plainSeen === false });
+  var later = window.open("about:blank", "oauth", "popup,width=560,height=720");
+  later.location.href = "https://auth.example/start?state=1";
+  var blocked = window.open("javascript:alert(1)");
+  results.push({ kind: "javascript-open-stubbed", ok: !!blocked });
+  setTimeout(function () { parent.postMessage({ source: "probe", results: results }, "*"); }, 30);
+})();
+</script>`;
+
+test("inside the sandbox the shim bridges popups and the page state to the embedding Gera page", async () => {
+  const served = rewriteRepoPreviewHtml(
+    `<!doctype html><html><head><title>p</title></head><body>${POPUP_PROBE}</body></html>`,
+    "/repo-preview/p.abc/",
+  );
+  const messages = await collectFromOpaqueSandbox(served);
+
+  const probe = messages.find((message) => message.source === "probe");
+  expect(probe && probe.source === "probe" ? probe.results : []).toEqual([
+    { kind: "open-returns-window-like", ok: true },
+    { kind: "blank-anchor-prevented", ok: true },
+    { kind: "plain-anchor-untouched", ok: true },
+    { kind: "javascript-open-stubbed", ok: true },
+  ]);
+
+  const opens = messages.flatMap((message) => (message.source === "gera-preview" && message.type === "open" ? [message] : []));
+  // Relative popups resolve against the served <base>, i.e. inside the artifact root.
+  expect(opens.map((message) => message.url)).toEqual([
+    `${location.origin}/repo-preview/p.abc/settings?tab=1`,
+    "https://accounts.example/login",
+    "https://auth.example/start?state=1",
+  ]);
+  expect(opens[2]?.target).toBe("oauth");
+
+  const states = messages.flatMap((message) => (message.source === "gera-preview" && message.type === "state" ? [message] : []));
+  expect(states.length).toBeGreaterThan(0);
+  expect(states.map((message) => message.title)).toContain("Storefront · Login");
 });
 
 test("the shim leaves working storage alone", async () => {

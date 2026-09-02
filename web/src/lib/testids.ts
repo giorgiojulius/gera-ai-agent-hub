@@ -87,6 +87,12 @@ export const TID = {
   repoPreviewPanel: "repo-preview-panel",
   /** Closes the docked preview panel for the active thread. */
   repoPreviewPanelClose: "repo-preview-panel-close",
+  /** Browser-style tab strip in the dock; appears once the preview opened a second page. */
+  repoPreviewTabs: "repo-preview-tabs",
+  /** One page tab in the dock (label + close). */
+  repoPreviewTab: "repo-preview-tab",
+  /** Address bar of the active dock tab (host + in-app route). */
+  repoPreviewAddress: "repo-preview-address",
   /** Model picker trigger in the composer rail. */
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */

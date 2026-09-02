@@ -665,6 +665,15 @@ export function repoPreviewContentType(path: string): string {
  * stand-ins only when the real ones are blocked; where storage works it does
  * nothing. Data never leaves the tab and the origin stays opaque.
  *
+ * The same sandbox also cripples popups: `window.open` and `target="_blank"`
+ * links can only ever produce an inert `about:blank` window, which is where
+ * OAuth flows used to die. When the preview runs inside a Gera frame the shim
+ * therefore bridges those to the embedding page (`{source:"gera-preview",
+ * type:"open"}` via `postMessage`) — Gera opens in-preview URLs as panel tabs
+ * and other sites as real browser tabs — and reports the current route and
+ * title (`type:"state"`) so the panel's address bar and tab strip stay live.
+ * The bridge is inert when the preview is the top-level document.
+ *
  * No backslashes on purpose: the text rides through a template literal and
  * a Worker header rewrite; keeping it escape-free means what you read here is
  * exactly what the browser runs.
@@ -696,6 +705,41 @@ export function repoPreviewSandboxShim(): string {
     "var name=pair.slice(0,eq).trim();var value=pair.slice(eq+1).trim();" +
     'var compact=text.toLowerCase().replace(/ /g,"");' +
     "if(/;max-age=(-[0-9]+|0)(;|$)/.test(compact)||/;expires=[^;]*19[0-9][0-9]/.test(compact)){jar.delete(name);}else{jar.set(name,value);}}});}catch(e){}}" +
+    "if(window.parent===window)return;" +
+    'var post=function(msg){try{window.parent.postMessage(msg,"*");}catch(e){}};' +
+    "var resolve=function(href){try{var raw=String(href);var basePath=new URL(document.baseURI).pathname;" +
+    'if(raw.indexOf("/")===0&&raw.indexOf("//")!==0&&raw.indexOf(basePath)!==0)raw=basePath.slice(0,basePath.length-1)+raw;' +
+    "return new URL(raw,document.baseURI).href;}catch(e){return null;}};" +
+    'var web=function(href){return typeof href==="string"&&(href.indexOf("https://")===0||href.indexOf("http://")===0);};' +
+    'var open=function(href,target){var abs=resolve(href);if(!web(abs))return false;post({source:"gera-preview",type:"open",url:abs,target:String(target||"_blank")});return true;};' +
+    "var nativeOpen=window.open;" +
+    "window.open=function(url,target,features){" +
+    'var name=target==null||target===""?"_blank":String(target);' +
+    'if(name==="_self"||name==="_parent"||name==="_top")return nativeOpen.call(window,url,target,features);' +
+    'var href=url==null?"":String(url);' +
+    "var stub={closed:false,opener:null,close:function(){stub.closed=true;},focus:function(){},blur:function(){},postMessage:function(){}};" +
+    'var loc={assign:function(v){open(v,name);},replace:function(v){open(v,name);},toString:function(){return "about:blank";}};' +
+    'Object.defineProperty(loc,"href",{get:function(){return "about:blank";},set:function(v){open(v,name);}});' +
+    'Object.defineProperty(stub,"location",{get:function(){return loc;},set:function(v){open(v,name);}});' +
+    'if(href&&href!=="about:blank")open(href,name);' +
+    "return stub;};" +
+    'document.addEventListener("click",function(e){' +
+    "if(e.defaultPrevented||e.button!==0)return;" +
+    "var path=e.composedPath?e.composedPath():[];var node=path.length?path[0]:e.target;" +
+    "if(node&&node.nodeType===3)node=node.parentElement;" +
+    'var a=node&&node.closest?node.closest("a[href]"):null;' +
+    'if(!a||a.hasAttribute("download"))return;' +
+    'var target=(a.getAttribute("target")||"").toLowerCase();' +
+    'if(target!=="_blank"&&!e.metaKey&&!e.ctrlKey)return;' +
+    'if(open(a.href,target||"_blank"))e.preventDefault();},true);' +
+    'var last="";' +
+    'var report=function(){var next=location.href+"|"+document.title;if(next===last)return;last=next;post({source:"gera-preview",type:"state",href:location.href,title:document.title});};' +
+    "var later=function(){setTimeout(report,0);};" +
+    'var wrap=function(name){var fn=history[name];if(typeof fn!=="function")return;history[name]=function(){var out=fn.apply(this,arguments);later();return out;};};' +
+    'wrap("pushState");wrap("replaceState");' +
+    'window.addEventListener("popstate",later);window.addEventListener("hashchange",later);window.addEventListener("load",later);' +
+    'document.addEventListener("DOMContentLoaded",report);' +
+    "try{new MutationObserver(report).observe(document.head,{childList:true,subtree:true,characterData:true});}catch(e){}" +
     "})();</script>"
   );
 }

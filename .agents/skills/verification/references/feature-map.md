@@ -188,7 +188,32 @@ docked the thread shows only a compact clickable `repo-preview-flow` receipt
 `repo-preview-frame` exists; below `lg`, shared pages and channels keep the
 full inline card. Both surfaces share one polling query per launch
 (`use-repo-preview-job.ts`). Browser: `repo-preview.browser.test.tsx`
-(receipt), e2e `github-launch-web-preview` (panel + frame at 1280px). The Rork backend stores an uncompressed tar in project R2 and a
+(receipt), e2e `github-launch-web-preview` (panel + frame at 1280px).
+
+Popups: the iframe sandbox has no `allow-popups` (`REMOTE_SANDBOX`), because
+from an opaque origin a popup can only ever be an inert `about:blank`. Instead
+the served HTML's shim bridges `window.open` (returns a window-like stub whose
+`location` setter also bridges, so `open('about:blank')` + later navigation
+works), `target="_blank"`/modifier-clicked links, and `pushState`/`popstate`/
+`hashchange`/`<title>` changes to the embedder via `postMessage`
+(`{source:"gera-preview", type:"open"|"state"}`); root-relative popups are
+folded under the artifact `<base>` like the Worker's HTML rewrite. The bridge
+is inert when the preview is the top-level document. Gera validates the shape
+(`parsePreviewBridgeMessage`) and the sender (`findPreviewFrameKey`: only its
+own `data-preview-frame` iframes), then routes (`routePreviewPopup`): same
+origin → a new browser-style tab in the dock (`repo-preview-tabs`,
+`repo-preview-tab`, max 8, inactive pages stay mounted, middle-click/× closes,
+falls back to the left neighbour); other web origins → a real browser tab
+opened from Gera's trusted document with the opener severed (popup-blocked →
+toast with an Open action); non-web schemes/credentials → refused. The
+address bar (`repo-preview-address`) shows host + live in-app route of the
+active tab; copy/open/expand act on that tab. The inline card (mobile/shared)
+has no strip and sends every bridged popup to a real tab. Unit:
+`preview-bridge.test.ts`; browser: `repo-preview-sandbox.browser.test.tsx`
+(real `sandbox="allow-scripts"` frame proves the bridge), panel test in
+`repo-preview.browser.test.tsx`.
+
+The Rork backend stores an uncompressed tar in project R2 and a
 validated path→offset manifest in SQLite; public asset reads are MIME-derived
 R2 Range requests, SPA paths fall back to the indexed root, and Vite/root HTML
 assets are namespaced below the id + separate unguessable read capability.

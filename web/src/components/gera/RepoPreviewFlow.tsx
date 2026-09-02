@@ -16,18 +16,25 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useId, useState } from "react";
 
 import { ArtifactLightbox } from "@/components/gera/artifacts/ArtifactShell";
 import { Button } from "@/components/ui/button";
+import { usePreviewBridge } from "@/hooks/use-preview-bridge";
 import { usePreviewPanel } from "@/hooks/use-preview-panel";
 import { REPO_PREVIEW_ACTIVE_PHASES, useRepoPreviewJob } from "@/hooks/use-repo-preview-job";
 import { safeCodePreviewUrl } from "@/lib/code-changes";
+import { findPreviewFrameKey, openPreviewPopupExternally, routePreviewPopup } from "@/lib/preview-bridge";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob, RepoPreviewPhase } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-const REMOTE_SANDBOX = "allow-scripts allow-forms allow-popups allow-modals";
+/**
+ * Opaque origin, no popups: the served HTML's shim bridges `window.open` and
+ * `target="_blank"` to the embedder instead, so nothing can spawn the inert
+ * `about:blank` windows a sandboxed popup would otherwise become.
+ */
+const REMOTE_SANDBOX = "allow-scripts allow-forms allow-modals";
 const ACTIVE_PHASES = REPO_PREVIEW_ACTIVE_PHASES;
 
 export type StepState = "waiting" | "running" | "done" | "error";
@@ -110,14 +117,29 @@ export function expiryCopy(expiresAt: number): string {
   return hours > 0 ? `expires in ${hours}h` : "expired";
 }
 
-/** Sandboxed iframe for a ready launch; `full` fills its container (dock, lightbox). */
-export function PreviewFrame({ job, full = false }: { job: RepoPreviewJob; full?: boolean }) {
-  const url = job.previewUrl ? safeCodePreviewUrl(job.previewUrl) : null;
-  if (!url) return null;
+/**
+ * Sandboxed iframe for a ready launch; `full` fills its container (dock,
+ * lightbox). `url` may point at another page under the same artifact root
+ * (panel tabs); `frameKey` tags the frame so bridge messages map back to it.
+ */
+export function PreviewFrame({
+  job,
+  full = false,
+  url,
+  frameKey,
+}: {
+  job: RepoPreviewJob;
+  full?: boolean;
+  url?: string | null;
+  frameKey?: string;
+}) {
+  const src = safeCodePreviewUrl(url ?? job.previewUrl ?? "");
+  if (!src) return null;
   return (
     <iframe
       data-testid={TID.repoPreviewFrame}
-      src={url}
+      data-preview-frame={frameKey}
+      src={src}
       sandbox={REMOTE_SANDBOX}
       referrerPolicy="no-referrer"
       title={`${job.repository} web preview`}
@@ -234,6 +256,21 @@ export const RepoPreviewCard = memo(function RepoPreviewCard({
   const states = stepStates(job.phase);
   const previewUrl = job.previewUrl ? safeCodePreviewUrl(job.previewUrl) : null;
   const terminal = !ACTIVE_PHASES.has(job.phase);
+  const frameScope = useId();
+
+  // The inline card has no tab strip: every bridged popup becomes a real browser tab.
+  usePreviewBridge(
+    (source) => findPreviewFrameKey(`${frameScope}:`, source),
+    (_frame, message) => {
+      if (message.type !== "open" || !previewUrl) return;
+      const route = routePreviewPopup(message.url, previewUrl);
+      if (route.kind === "blocked") {
+        console.warn("[repo-preview] refused popup from preview", route.reason);
+        return;
+      }
+      openPreviewPopupExternally(route.url);
+    },
+  );
 
   return (
     <div
@@ -321,7 +358,7 @@ export const RepoPreviewCard = memo(function RepoPreviewCard({
               <Maximize2 className="h-3.5 w-3.5" />
             </button>
           </div>
-          <PreviewFrame job={job} />
+          <PreviewFrame job={job} frameKey={`${frameScope}:inline`} />
         </div>
       ) : (
         <div className="flex min-h-36 flex-col items-center justify-center gap-3 px-7 py-6 text-center">
@@ -410,7 +447,7 @@ export const RepoPreviewCard = memo(function RepoPreviewCard({
           title={`${job.repository} preview`}
           badge="Rork cloud"
         >
-          <PreviewFrame job={job} full />
+          <PreviewFrame job={job} full frameKey={`${frameScope}:expanded`} />
         </ArtifactLightbox>
       ) : null}
     </div>

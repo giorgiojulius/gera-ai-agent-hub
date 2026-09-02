@@ -247,6 +247,11 @@ describe("repository preview contract", () => {
     expect(shimAt).toBeLessThan(html.indexOf('<script src="/repo-preview/p.abc/assets/app.js">'));
     expect(repoPreviewSandboxShim()).not.toContain("\\");
     expect(repoPreviewSandboxShim()).not.toMatch(/<\/script>.+<\/script>/s);
+    // Popups and route changes are bridged to the embedding Gera page instead of dying as about:blank.
+    expect(repoPreviewSandboxShim()).toContain("if(window.parent===window)return;");
+    expect(repoPreviewSandboxShim()).toContain('source:"gera-preview",type:"open"');
+    expect(repoPreviewSandboxShim()).toContain('source:"gera-preview",type:"state"');
+    expect(repoPreviewSandboxShim()).toContain("window.open=function");
     expect(rewriteRepoPreviewHtml("<p>bare</p>", "/repo-preview/p.abc")).toMatch(/^<base href="\/repo-preview\/p\.abc\/"><script data-gera-preview-shim>/);
     const capabilityPrefix = `/repo-preview/${"a".repeat(24)}.${"b".repeat(32)}.${"c".repeat(24)}/${"d".repeat(48)}/`;
     const alreadyNamespaced = rewriteRepoPreviewHtml(

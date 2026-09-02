@@ -387,7 +387,15 @@ function eligibleCloudServer(
       ? raw.disabledTools.filter((item): item is string => typeof item === "string")
       : [],
   );
-  const oauth = oauthTokens[id];
+  // Grants are keyed by the id that signed in. Catalog cards normally share
+  // one id, but imported/legacy rows carry an instance id + catalogId, and
+  // device-flow GitHub always commits under the canonical "github" id. A run
+  // must find the grant through any of those keys — otherwise the health
+  // check stays green while every cloud run silently loses GitHub tools.
+  const oauth =
+    oauthTokens[id] ??
+    (catalogId && catalogId !== id ? oauthTokens[catalogId] : undefined) ??
+    (catalogKey === "github" ? oauthTokens.github : undefined);
 
   if (NATIVE_IDS.has(catalogKey)) {
     const pasted = typeof raw.token === "string" ? raw.token.trim() : "";

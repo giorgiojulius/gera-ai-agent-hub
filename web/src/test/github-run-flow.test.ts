@@ -46,6 +46,102 @@ describe("GitHub cloud run hand-off", () => {
     }
   });
 
+  it("resolves the canonical device-flow grant for a GitHub card with a legacy instance id", async () => {
+    const grant = {
+      accessToken: "gho_device_flow",
+      tokenEndpoint: "https://github.com/login/oauth/access_token",
+      clientId: "Iv1.workspace",
+      mcpUrl: "https://api.github.com",
+    };
+    const eligible = cloudMcpServersForAutomation(
+      [
+        {
+          id: "mcp-legacy-7",
+          catalogId: "github",
+          name: "GitHub",
+          enabled: true,
+          status: "connected",
+          token: "",
+          disabledTools: [],
+        },
+      ],
+      null,
+      { github: grant },
+    );
+
+    expect(eligible).toHaveLength(1);
+    expect(eligible[0].kind).toBe("github");
+    expect(eligible[0].token).toBeUndefined();
+    expect(eligible[0].oauth?.accessToken).toBe("gho_device_flow");
+
+    const runtime = await armCloudMcp(eligible);
+    const route = [...runtime.routes.values()].find(
+      (item) => item.type === "native" && item.kind === "github" && item.toolName === "get_contents",
+    );
+    expect(route?.type).toBe("native");
+    if (route?.type === "native") {
+      expect(route.auth).toBe("Bearer gho_device_flow");
+    }
+  });
+
+  it("lets a grant stored under the catalog id arm a card with a different instance id", () => {
+    const eligible = cloudMcpServersForAutomation(
+      [
+        {
+          id: "row-linear-2",
+          catalogId: "linear",
+          name: "Linear",
+          url: "https://mcp.linear.app/mcp",
+          enabled: true,
+          status: "connected",
+          authMode: "oauth",
+          disabledTools: [],
+        },
+      ],
+      null,
+      {
+        linear: {
+          accessToken: "lin_access",
+          tokenEndpoint: "https://mcp.linear.app/oauth/token",
+          clientId: "client",
+          mcpUrl: "https://mcp.linear.app/mcp",
+        },
+      },
+    );
+
+    expect(eligible).toHaveLength(1);
+    expect(eligible[0].oauth?.accessToken).toBe("lin_access");
+  });
+
+  it("still lets a pasted PAT win over the canonical grant", () => {
+    const eligible = cloudMcpServersForAutomation(
+      [
+        {
+          id: "github",
+          catalogId: "github",
+          name: "GitHub",
+          enabled: true,
+          status: "connected",
+          token: "ghp_pasted",
+          disabledTools: [],
+        },
+      ],
+      null,
+      {
+        github: {
+          accessToken: "gho_device_flow",
+          tokenEndpoint: "https://github.com/login/oauth/access_token",
+          clientId: "Iv1.workspace",
+          mcpUrl: "https://api.github.com",
+        },
+      },
+    );
+
+    expect(eligible).toHaveLength(1);
+    expect(eligible[0].token).toBe("ghp_pasted");
+    expect(eligible[0].oauth).toBeUndefined();
+  });
+
   it("feeds a thread pin to the server research contour without changing the question", () => {
     expect(serverGitHubRunRepoRefs("why does login fail?", "acme/private-app")).toEqual([
       { owner: "acme", repo: "private-app" },

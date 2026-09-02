@@ -2279,7 +2279,12 @@ export class ChatStore extends DurableObject {
     // when a run arms; filtering here made disabled tools disappear forever.
     const candidate = {
       ...rawServer,
-      ...resolvedSecret,
+      // Only shard-resolved secrets may authenticate the arm. The browser's
+      // raw `token` is either already stored above or a non-credential
+      // (`gera-account:*` marker) that would otherwise ride into the request
+      // as a fake PAT, shadow the OAuth grant, and fail with GitHub 401.
+      token: resolvedSecret.token ?? "",
+      headersJson: resolvedSecret.headersJson ?? "",
       disabledTools: [],
       enabled: true,
       status: "connected",

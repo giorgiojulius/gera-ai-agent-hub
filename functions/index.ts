@@ -2927,6 +2927,12 @@ export default {
     if (url.pathname.startsWith("/pv/")) {
       return relayPageViews(request, url, env);
     }
-    return corsJson({ ok: true, service: "gera-functions" }, 200);
+    if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
+      return corsJson({ ok: true, service: "gera-functions" }, 200);
+    }
+    // Unknown routes fail loudly. A blanket 200 here once let a preview build
+    // without EXPO_PUBLIC_RORK_AUTH_URL believe its root-relative
+    // POST /oauth/initiate had succeeded, so it opened a blank sign-in popup.
+    return corsJson({ error: "not_found" }, 404);
   },
 };

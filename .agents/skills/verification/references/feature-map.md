@@ -55,12 +55,17 @@ Every app route is wrapped in `AccessGate`. The user signs in with Google or
 Apple; the worker (`/access/status`) answers `invited` (app unlocks),
 `pending` ("You're on the list", re-polls every 15s), or none (request-access
 form with an optional note → `/access/request`). Sign-out is available from
-every gate state. A build without `EXPO_PUBLIC_RORK_AUTH_URL`/`APP_KEY` (e.g.
-a repository preview built without `.env`) shows a configuration error on
-sign-in instead of POSTing to a relative URL; an initiate response without an
-`https` `auth_url` is an error too, never `window.open(undefined)`. E2E
-bypasses the gate: fake JWT in `localStorage` + stubbed `/access/status` →
-`invited`.
+every gate state. A build without `EXPO_PUBLIC_RORK_AUTH_URL`/`APP_KEY` shows
+a configuration error on sign-in instead of POSTing to a relative URL; an
+initiate response without an `https` `auth_url` is an error too, never
+`window.open(undefined)`. Builds made outside Rork (a Repo Preview of this
+repository from GitHub has no project env) get the public client settings from
+the committed `web/.env.production` — exactly five `EXPO_PUBLIC_*` keys, pinned
+by `env-production.test.ts`, never a secret; real process env wins on Rork’s
+own builds. Related backend rule: the Worker answers unknown routes with
+`404 {error:"not_found"}` (health stays on `GET /`), so a misconfigured client
+never mistakes the catch-all for a successful `/oauth/initiate`. E2E bypasses
+the gate: fake JWT in `localStorage` + stubbed `/access/status` → `invited`.
 
 ## Navigation
 

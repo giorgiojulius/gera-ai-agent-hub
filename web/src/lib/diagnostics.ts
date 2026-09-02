@@ -1,4 +1,10 @@
-import { authedFetch } from "@/lib/backend";
+import { authedFetch, setBackendFailureObserver, type BackendFailure } from "@/lib/backend";
+import {
+  diagnosticContextOf,
+  formatContextValue,
+  redactSecrets,
+  type DiagnosticContext,
+} from "@/lib/diagnostic-context";
 import { newId } from "@/lib/env";
 
 /**
@@ -7,6 +13,12 @@ import { newId } from "@/lib/env";
  * the account's cloud journal — the same per-account database that stores
  * chats — so the journal follows the account across devices. Nothing is
  * written to localStorage.
+ *
+ * Every row carries the FULL picture: the route that failed (method, path,
+ * status, telling response headers, redacted body), the structured context
+ * the thrower attached (server id, error code, per-id auth diagnostics), the
+ * error's cause chain, and the stack. Credentials are scrubbed before any of
+ * it is stored — the journal is metadata, never token material.
  */
 export type DiagnosticEntry = {
   id: string;
@@ -14,18 +26,20 @@ export type DiagnosticEntry = {
   /** Where it happened: api | chat | app | promise | mcp | sync … */
   scope: string;
   message: string;
-  /** Response body / stack excerpt for the expandable row. */
+  /** Route, context, cause chain and stack for the expandable row. */
   detail?: string;
 };
 
 const MAX_ENTRIES = 200;
 const MESSAGE_CHARS = 300;
-const DETAIL_CHARS = 1_200;
+/** Mirrors the server's DIAG_DETAIL_LIMIT; longer text is cut server-side anyway. */
+const DETAIL_CHARS = 4_000;
 /** Identical consecutive errors within this window collapse into one row. */
 const COLLAPSE_MS = 8_000;
 /** Upload queue caps; the oldest pending entries drop first when exceeded. */
 const PENDING_LIMIT = 80;
-const BATCH_LIMIT = 40;
+/** 20 × (4 000 + 300 + JSON overhead) stays well under the relay's 256 KB append body cap. */
+const BATCH_LIMIT = 20;
 const FLUSH_DELAY_MS = 2_500;
 
 /** Browser noise that is not actionable for anyone. */
@@ -233,29 +247,108 @@ function messageOf(error: unknown): string {
   }
 }
 
+function contextLines(context: DiagnosticContext | null | undefined): string[] {
+  if (!context) {
+    return [];
+  }
+  return Object.entries(context)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}: ${formatContextValue(value)}`);
+}
+
+/** `error.cause` without assuming an ES2022 lib target. */
+function causeOf(error: unknown): unknown {
+  return typeof error === "object" && error !== null ? (error as { cause?: unknown }).cause : undefined;
+}
+
+/** Cause chain (error.cause, nested) as "caused by" lines; bounded so a cycle cannot spin. */
+function causeLines(error: unknown): string[] {
+  const lines: string[] = [];
+  let current: unknown = error instanceof Error ? causeOf(error) : undefined;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof Error) {
+      lines.push(`caused by: ${current.name}: ${current.message}`);
+      for (const line of contextLines(diagnosticContextOf(current))) {
+        lines.push(`  ${line}`);
+      }
+      current = causeOf(current);
+    } else {
+      lines.push(`caused by: ${formatContextValue(current)}`);
+      break;
+    }
+  }
+  return lines;
+}
+
+/**
+ * Everything the journal can honestly say about one error: its class, the
+ * structured context attached at the throw site, the cause chain, and the
+ * stack. Pure text, already redacted, not yet truncated.
+ */
+export function describeError(error: unknown, extra?: string | DiagnosticContext): string {
+  const sections: string[] = [];
+  if (typeof extra === "string") {
+    if (extra.trim()) {
+      sections.push(extra.trim());
+    }
+  } else if (extra) {
+    sections.push(...contextLines(extra));
+  }
+  if (error instanceof Error && error.name && error.name !== "Error") {
+    sections.push(`type: ${error.name}`);
+  }
+  sections.push(...contextLines(diagnosticContextOf(error)));
+  sections.push(...causeLines(error));
+  if (error instanceof Error && error.stack) {
+    const stack = error.stack.startsWith(`${error.name}: ${error.message}`)
+      ? error.stack.slice(`${error.name}: ${error.message}`.length).replace(/^\n/, "")
+      : error.stack;
+    if (stack.trim()) {
+      sections.push(`stack:\n${stack}`);
+    }
+  } else if (error !== null && typeof error === "object" && !(error instanceof Error)) {
+    try {
+      sections.push(`value: ${JSON.stringify(error)}`);
+    } catch {
+      // Unserializable thrown object; the message already carries String(error).
+    }
+  }
+  return redactSecrets(sections.join("\n"));
+}
+
 /**
  * Records one error. User-initiated aborts (Stop button) and known browser
- * noise are skipped; identical bursts collapse into the latest row.
+ * noise are skipped; identical bursts (same scope, message AND detail)
+ * collapse into the latest row. `detail` may be free text or a context map
+ * (route, ids, codes) — either way the error's own context, cause chain and
+ * stack are appended so the row is complete on its own.
  */
-export function logDiagnostic(scope: string, error: unknown, detail?: string): void {
+export function logDiagnostic(scope: string, error: unknown, detail?: string | DiagnosticContext): void {
   if (error instanceof DOMException && error.name === "AbortError") {
     return;
   }
-  const message = messageOf(error).trim().slice(0, MESSAGE_CHARS);
+  const message = redactSecrets(messageOf(error).trim()).slice(0, MESSAGE_CHARS);
   if (!message || IGNORED_PATTERNS.some((pattern) => message.includes(pattern))) {
     return;
   }
+  const fullDetail = describeError(error, detail);
+  const entryDetail = fullDetail ? fullDetail.slice(0, DETAIL_CHARS) : undefined;
   const last = entries[0];
-  if (last && last.scope === scope && last.message === message && Date.now() - last.at < COLLAPSE_MS) {
+  if (
+    last &&
+    last.scope === scope &&
+    last.message === message &&
+    (last.detail ?? "") === (entryDetail ?? "") &&
+    Date.now() - last.at < COLLAPSE_MS
+  ) {
     return;
   }
-  const stack = error instanceof Error && error.stack ? error.stack : undefined;
   const entry: DiagnosticEntry = {
     id: newId(),
     at: Date.now(),
     scope,
     message,
-    detail: (detail ?? stack)?.slice(0, DETAIL_CHARS),
+    detail: entryDetail,
   };
   entries = [entry, ...entries].slice(0, MAX_ENTRIES);
   pending = [...pending, entry].slice(-PENDING_LIMIT);
@@ -265,6 +358,66 @@ export function logDiagnostic(scope: string, error: unknown, detail?: string): v
   } catch {
     // A missing timer in tests or odd runtimes must never hide the journal row.
   }
+}
+
+/** Path without its query string — the row headline stays short and comparable. */
+function pathnameOf(path: string): string {
+  const arrow = path.indexOf(" → ");
+  const own = arrow >= 0 ? path.slice(0, arrow) : path;
+  const query = own.indexOf("?");
+  return query >= 0 ? own.slice(0, query) : own;
+}
+
+/**
+ * Journal sink for every failed backend round-trip (installed into the
+ * backend client below). One row per failure: `HTTP <status> · <METHOD> <path>`
+ * with the full route, telling headers, the redacted body and what was asked.
+ */
+export function recordBackendFailure(failure: BackendFailure): void {
+  const headline =
+    failure.status === null
+      ? `network · ${failure.method} ${pathnameOf(failure.path)}`
+      : `HTTP ${failure.status} · ${failure.method} ${pathnameOf(failure.path)}`;
+  const context: DiagnosticContext = {
+    route: `${failure.method} ${failure.path}`,
+    status: failure.status ?? "no response",
+    durationMs: failure.durationMs,
+    ...(failure.request ? { request: failure.request } : {}),
+    ...(Object.keys(failure.headers).length > 0 ? { headers: failure.headers } : {}),
+    ...(failure.body ? { body: failure.body } : {}),
+  };
+  if (failure.status === null && failure.error !== undefined) {
+    const reason = failure.error instanceof Error ? failure.error : new Error(messageOf(failure.error));
+    logDiagnostic("api", withMessage(reason, headline), context);
+    return;
+  }
+  logDiagnostic("api", headline, context);
+}
+
+/** Keeps the network error's stack/cause but headlines the row with the route. */
+function withMessage(error: Error, headline: string): Error {
+  const wrapped = new Error(`${headline} · ${error.message}`);
+  (wrapped as { cause?: unknown }).cause = error;
+  wrapped.name = error.name === "Error" ? "NetworkError" : error.name;
+  wrapped.stack = error.stack;
+  return wrapped;
+}
+
+setBackendFailureObserver(recordBackendFailure);
+
+/**
+ * Which build this browser is running — the hashed main bundle name. Lets a
+ * report prove whether a fix has actually reached the tab (stale bundles
+ * reproduce fixed bugs and look identical otherwise).
+ */
+export function bundleLabel(): string {
+  if (typeof document === "undefined") {
+    return "unknown";
+  }
+  const script = document.querySelector<HTMLScriptElement>('script[type="module"][src*="/assets/"]');
+  const src = script?.getAttribute("src") ?? "";
+  const name = src.split("/").pop() ?? "";
+  return name || (import.meta.env.DEV ? "dev server" : "unknown");
 }
 
 let installed = false;
@@ -283,13 +436,16 @@ export function installGlobalDiagnostics(): void {
     // Storage unavailable — nothing to clean up.
   }
   window.addEventListener("error", (event) => {
-    logDiagnostic(
-      "app",
-      event.error ?? event.message,
-      event.filename ? `${event.filename}:${event.lineno}:${event.colno}` : undefined,
-    );
+    logDiagnostic("app", event.error ?? event.message, {
+      ...(event.filename ? { source: `${event.filename}:${event.lineno}:${event.colno}` } : {}),
+      page: redactSecrets(window.location.pathname + window.location.search),
+      bundle: bundleLabel(),
+    });
   });
   window.addEventListener("unhandledrejection", (event) => {
-    logDiagnostic("promise", event.reason);
+    logDiagnostic("promise", event.reason, {
+      page: redactSecrets(window.location.pathname + window.location.search),
+      bundle: bundleLabel(),
+    });
   });
 }

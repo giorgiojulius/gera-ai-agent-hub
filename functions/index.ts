@@ -57,6 +57,7 @@ import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute } from "./knowledge-storage";
 import { verifyRepoPreviewId } from "./repo-preview-shared";
+import { githubRequestHeaders } from "./native-github";
 import { decodeSlackInstallState } from "./native-slack";
 import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
@@ -2013,12 +2014,14 @@ async function relayGitHubAccount(request: Request, url: URL, env: Env): Promise
     }
     return fetchPublicHttps(target.toString(), {
       method: request.method,
-      headers: {
-        Authorization: authorization,
-        Accept: request.headers.get("X-Gera-GitHub-Accept") ?? "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-      },
+      // Shared builder: includes the User-Agent GitHub requires from servers.
+      // Without it every relayed call came back 403 and the account card
+      // could never resolve who the grant belongs to.
+      headers: githubRequestHeaders(
+        authorization,
+        body !== undefined,
+        request.headers.get("X-Gera-GitHub-Accept") ?? "application/vnd.github+json",
+      ),
       body,
       signal: AbortSignal.timeout(30_000),
     }, { allowCrossOriginGet: request.method === "GET" });
@@ -2049,8 +2052,8 @@ async function relayGitHubAccount(request: Request, url: URL, env: Env): Promise
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-/** Error-journal bodies stay tiny; anything bigger is a bug or abuse. */
-const DIAG_BODY_LIMIT = 131_072;
+/** Error-journal bodies stay small (≤20 rows × ≈4.4 KB); anything bigger is a bug or abuse. */
+const DIAG_BODY_LIMIT = 262_144;
 
 /**
  * /diag/* — per-account error journal (the in-app Diagnostics screen).

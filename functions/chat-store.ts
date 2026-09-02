@@ -111,6 +111,7 @@ import {
   type TombstoneRow,
 } from "./chat-shared";
 import { armCloudMcp } from "./automation-runner";
+import { githubOAuthFormHeaders } from "./native-github";
 import {
   chainRotationBases,
   cloudMcpServersForAutomation,
@@ -1447,7 +1448,7 @@ export class ChatStore extends DurableObject {
     }
     const response = await fetchPublicHttps("https://github.com/login/device/code", {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      headers: githubOAuthFormHeaders(),
       body: new URLSearchParams({
         client_id: clientId,
         scope: "repo read:org read:user user:email gist notifications workflow read:project",
@@ -1539,7 +1540,7 @@ export class ChatStore extends DurableObject {
     try {
       response = await fetchPublicHttps("https://github.com/login/oauth/access_token", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        headers: githubOAuthFormHeaders(),
         body: new URLSearchParams({
           client_id: row.client_id,
           device_code: row.device_code,

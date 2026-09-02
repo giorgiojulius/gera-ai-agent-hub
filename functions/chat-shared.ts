@@ -28,7 +28,8 @@ export const FUTURE_SLACK_MS = 1000 * 60 * 60 * 24;
 export const DIAG_ROWS_LIMIT = 300;
 export const DIAG_BATCH_LIMIT = 40;
 export const DIAG_MESSAGE_LIMIT = 300;
-export const DIAG_DETAIL_LIMIT = 1_200;
+/** Full route + context + cause chain + stack per row; the client mirrors this cap. */
+export const DIAG_DETAIL_LIMIT = 4_000;
 export const DIAG_SCOPE_LIMIT = 24;
 export const DIAG_LIST_LIMIT = 200;
 /** Trigger machinery: per-fire batch caps + run-now force flags. */

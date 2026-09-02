@@ -3,6 +3,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import {
+  bundleLabel,
   clearDiagnostics,
   listDiagnostics,
   markDiagnosticsSeen,
@@ -33,7 +34,20 @@ function buildReport(entries: DiagnosticEntry[]): string {
     const head = `- [${new Date(entry.at).toISOString()}] ${entry.scope}: ${entry.message}`;
     return entry.detail ? `${head}\n  ${entry.detail.replace(/\n/g, "\n  ")}` : head;
   });
-  return `Gera diagnostics — ${new Date().toISOString()}\n${lines.join("\n")}`;
+  const env =
+    typeof navigator === "undefined"
+      ? ""
+      : `\nbundle: ${bundleLabel()}\nbrowser: ${navigator.userAgent}\npage: ${typeof location === "undefined" ? "" : location.pathname}`;
+  return `Gera diagnostics — ${new Date().toISOString()}${env}\n${lines.join("\n")}`;
+}
+
+async function copyText(text: string, okMessage: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast.success(okMessage);
+  } catch {
+    toast.error("Could not copy — clipboard unavailable");
+  }
 }
 
 /**
@@ -52,14 +66,12 @@ export function DiagnosticsJournal({ frame }: { frame: "dialog" | "page" }) {
     markDiagnosticsSeen();
   }, [entries]);
 
-  const copyReport = async () => {
-    try {
-      await navigator.clipboard.writeText(buildReport(entries));
-      toast.success("Report copied");
-    } catch {
-      toast.error("Could not copy — clipboard unavailable");
-    }
-  };
+  const copyReport = () => copyText(buildReport(entries), "Report copied");
+  const copyEntry = (entry: DiagnosticEntry) =>
+    copyText(
+      `[${new Date(entry.at).toISOString()}] ${entry.scope}: ${entry.message}${entry.detail ? `\n${entry.detail}` : ""}\nbundle: ${bundleLabel()}`,
+      "Entry copied",
+    );
 
   const padX = frame === "dialog" ? "px-5" : "px-4 sm:px-5";
 
@@ -94,10 +106,22 @@ export function DiagnosticsJournal({ frame }: { frame: "dialog" | "page" }) {
             <p className="mt-1.5 break-words text-sm leading-snug">{entry.message}</p>
             {entry.detail ? (
               <details className="mt-1.5">
-                <summary className="cursor-pointer select-none text-[11px] text-muted-foreground transition-colors hover:text-foreground">
-                  Details
+                <summary className="flex cursor-pointer select-none items-center gap-2 text-[11px] text-muted-foreground transition-colors hover:text-foreground">
+                  <span>Details</span>
+                  <button
+                    type="button"
+                    aria-label="Copy this entry"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      void copyEntry(entry);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] transition-colors hover:bg-muted hover:text-foreground"
+                  >
+                    <ClipboardCopy className="h-3 w-3" />
+                    Copy
+                  </button>
                 </summary>
-                <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                <pre className="mt-1.5 max-h-80 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
                   {entry.detail}
                 </pre>
               </details>
@@ -106,8 +130,8 @@ export function DiagnosticsJournal({ frame }: { frame: "dialog" | "page" }) {
         ))}
       </div>
       <div className={cn("flex items-center justify-between gap-2 border-t border-border/60 py-3", padX)}>
-        <span className="text-[11px] text-muted-foreground">
-          {entries.length} {entries.length === 1 ? "entry" : "entries"} · account journal
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground" title={`Running bundle: ${bundleLabel()}`}>
+          {entries.length} {entries.length === 1 ? "entry" : "entries"} · account journal · {bundleLabel()}
         </span>
         <div className="flex items-center gap-1.5">
           <button

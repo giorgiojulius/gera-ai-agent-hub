@@ -1836,7 +1836,14 @@ export async function reconnectMcp(
     }));
     toast.error(`${server.name} did not connect`, { description: message });
     if (!(error instanceof McpAccountAuthError)) {
-      logDiagnostic("mcp", error);
+      logDiagnostic("mcp", error, {
+        action: "connect",
+        server: server.id,
+        catalogId: server.catalogId,
+        name: server.name,
+        authMode: server.authMode,
+        credentialStored: server.credentialStored,
+      });
     }
   }
 }
@@ -2010,7 +2017,15 @@ async function revalidateQuietly(
           : item,
       ),
     }));
-    logDiagnostic("mcp", error);
+    logDiagnostic("mcp", error, {
+      action: "health-check",
+      server: server.id,
+      catalogId: server.catalogId,
+      name: server.name,
+      authMode: server.authMode,
+      credentialStored: server.credentialStored,
+      lastHealthyAt: mcpLastHealthyAt.get(server.id),
+    });
     if (error instanceof McpAuthError) {
       toast.error(`${server.name} disconnected`, { description: message });
     }
@@ -2061,7 +2076,13 @@ export async function oauthConnectMcp(
       ),
     }));
     toast.error(`${server.name} sign-in failed`, { description: message });
-    logDiagnostic("mcp", error);
+    logDiagnostic("mcp", error, {
+      action: "oauth-sign-in",
+      server: server.id,
+      catalogId: server.catalogId,
+      name: server.name,
+      url: server.url,
+    });
     return;
   }
   if (oauthAttempts.get(server.id) !== attempt) {

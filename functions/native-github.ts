@@ -23,14 +23,33 @@ const GITHUB_API = "https://api.github.com";
 const GITHUB_USER_AGENT = "Gera-AI-Agent-Hub/1.0";
 const GITHUB_API_VERSION = "2022-11-28";
 
-/** GitHub rejects server requests without an identifying User-Agent with 403. */
-function githubRequestHeaders(authorization: string, hasJsonBody = false): Record<string, string> {
+/**
+ * Headers for every server-side call to api.github.com. Cloudflare Workers'
+ * fetch sends NO default User-Agent, and GitHub answers UA-less requests with
+ * 403 "Request forbidden by administrative rules" (probed live) — which read
+ * as "github 403" / "no account" in the app. The account relay, the native
+ * tools and the device flow all share this one builder so no path can drift.
+ */
+export function githubRequestHeaders(
+  authorization: string,
+  hasJsonBody = false,
+  accept: string = "application/vnd.github+json",
+): Record<string, string> {
   return {
     Authorization: authorization,
-    Accept: "application/vnd.github+json",
+    Accept: accept,
     "User-Agent": GITHUB_USER_AGENT,
     "X-GitHub-Api-Version": GITHUB_API_VERSION,
     ...(hasJsonBody ? { "Content-Type": "application/json" } : {}),
+  };
+}
+
+/** Headers for github.com's OAuth endpoints (device flow): JSON answers, identified client. */
+export function githubOAuthFormHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+    "User-Agent": GITHUB_USER_AGENT,
   };
 }
 

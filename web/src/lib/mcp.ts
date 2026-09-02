@@ -1,6 +1,7 @@
 import { AuthSessionChangedError, RelayAccessError, relayFetch } from "@/lib/backend";
 import { authedFetch } from "@/lib/backend";
 import { authSessionSnapshot, getAccessToken } from "@/lib/auth-tokens";
+import { withDiagnosticContext } from "@/lib/diagnostic-context";
 import { newId } from "@/lib/env";
 import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
@@ -95,7 +96,12 @@ function mcpConfigFingerprint(config: McpServerConfig): string {
 }
 
 /** Auth is truly dead — a key or a fresh provider sign-in is required; not a transient failure. */
-export class McpAuthError extends Error {}
+export class McpAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "McpAuthError";
+  }
+}
 
 /** The Gera account session is unavailable; this says nothing about provider credentials. */
 export class McpAccountAuthError extends Error {
@@ -499,12 +505,14 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
     identity?: unknown;
     credentialStored?: unknown;
     error?: unknown;
+    detail?: unknown;
   };
   if (!response.ok) {
-    let detail = typeof data.error === "string" ? data.error : `server check failed (${response.status})`;
+    const code = typeof data.error === "string" ? data.error : "";
+    let detail = code || `server check failed (${response.status})`;
     if (detail === "server_auth_missing") {
-      const perId = Array.isArray((data as { detail?: unknown }).detail)
-        ? ((data as { detail: unknown[] }).detail
+      const perId = Array.isArray(data.detail)
+        ? data.detail
             .map((item) => {
               const entry = item as { id?: unknown; grantPresent?: unknown; state?: unknown };
               return typeof entry.id === "string"
@@ -512,7 +520,7 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
                 : "";
             })
             .filter(Boolean)
-            .join("; "))
+            .join("; ")
         : "";
       detail = `The server has no usable sign-in for this connector — press "Sign in" to authorize again.${perId ? ` (${perId})` : ""}`;
     }
@@ -525,10 +533,22 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
       rejectedGeraSessionKey = geraSessionKey;
       throw new McpAccountAuthError();
     }
+    // Journal context: the exact route verdict plus the server's per-id auth
+    // snapshot (grant present / tombstoned / blocked state) — metadata only.
+    const context = {
+      path: "POST /mcp/check",
+      status: response.status,
+      code: code || undefined,
+      serverId: config.id,
+      catalogId: config.catalogId,
+      authMode: config.authMode,
+      credentialStored: config.credentialStored,
+      serverDetail: data.detail,
+    };
     if (/auth|credential|sign.?in|token/i.test(detail)) {
-      throw new McpAuthError(detail);
+      throw withDiagnosticContext(new McpAuthError(detail), context);
     }
-    throw new Error(detail);
+    throw withDiagnosticContext(new Error(detail), context);
   }
   rejectedGeraSessionKey = null;
   const serverTools = Array.isArray(data.tools)

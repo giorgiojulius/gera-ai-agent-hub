@@ -8,6 +8,7 @@
 // because github.com's OAuth endpoints send no CORS headers; the relay
 // forwards them verbatim and never stores tokens.
 import { authedFetch } from "@/lib/backend";
+import { withDiagnosticContext } from "@/lib/diagnostic-context";
 import {
   beginOAuthGrantFlow,
   finishOAuthGrantFlow,
@@ -110,10 +111,41 @@ export async function fetchGitHubViewer(authorization: string): Promise<GitHubVi
         },
       });
   if (!response.ok) {
-    if (response.status === 401) {
-      throw new GitHubAuthError("GitHub rejected this credential — sign in again or paste a fresh PAT.");
+    // GitHub's own words ("Bad credentials", "Request forbidden by administrative
+    // rules…", rate-limit notices) or the relay's code — the journal needs the
+    // real reason, not just a status number.
+    let reason = "";
+    try {
+      const body = (await response.clone().json()) as { message?: unknown; error?: unknown };
+      reason =
+        typeof body.message === "string" ? body.message : typeof body.error === "string" ? body.error : "";
+    } catch {
+      // Non-JSON error body — the status alone has to do.
     }
-    throw new Error(`GitHub could not verify the credential right now (HTTP ${response.status}) — retry shortly.`);
+    const context = {
+      path: serverId ? `GET /github-proxy → /user (serverId=${serverId})` : "GET https://api.github.com/user",
+      status: response.status,
+      reason: reason || undefined,
+      rateLimitRemaining: response.headers.get("X-RateLimit-Remaining") ?? undefined,
+      retryAfter: response.headers.get("Retry-After") ?? undefined,
+      oauthScopes: response.headers.get("X-OAuth-Scopes") ?? undefined,
+    };
+    if (response.status === 401) {
+      throw withDiagnosticContext(
+        new GitHubAuthError(
+          reason === "github_sign_in_required"
+            ? 'GitHub has no sign-in for this account — press "Sign in with GitHub".'
+            : "GitHub rejected this credential — sign in again or paste a fresh PAT.",
+        ),
+        context,
+      );
+    }
+    throw withDiagnosticContext(
+      new Error(
+        `GitHub could not verify the credential right now (HTTP ${response.status}${reason ? `: ${reason.slice(0, 160)}` : ""}) — retry shortly.`,
+      ),
+      context,
+    );
   }
   const data = (await response.json()) as { login?: unknown; name?: unknown };
   const login = typeof data.login === "string" ? data.login : "";

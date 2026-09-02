@@ -59,6 +59,7 @@ import { handleKnowledgeRoute, probeRorkStorage } from "./knowledge-storage";
 import { REPO_PREVIEW_MAX_ARCHIVE_BYTES, verifyRepoPreviewId } from "./repo-preview-shared";
 import { githubRequestHeaders } from "./native-github";
 import { decodeSlackInstallState } from "./native-slack";
+import { shardFailureReason } from "./chat-shared";
 import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
 import { chatShardId, migrateOwnerToShard, sweepGlobalMigrations } from "./shard-migration";
@@ -1933,8 +1934,16 @@ async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Re
       headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
     });
   } catch (error) {
-    console.error("account MCP relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "upstream_unreachable", transient: true, retryable: true }, 502);
+    // Everything the shard itself decides — auth states, a provider that did
+    // not connect — came back as a Response above. Reaching here means the
+    // call into Gera's own backend threw (a deploy reset mid-request, an
+    // overloaded object, an internal fault), which says nothing about the MCP
+    // server; labelling it "upstream unreachable" sent people to check a
+    // provider that was fine. The path and a coarse reason are logged; never
+    // the body.
+    const reason = shardFailureReason(error);
+    console.error("account MCP relay failed", url.pathname, reason, error instanceof Error ? error.message : "error");
+    return corsJson({ error: "account_shard_unavailable", reason, transient: true, retryable: true }, 502);
   }
 }
 

@@ -3,6 +3,7 @@ import { authedFetch } from "@/lib/backend";
 import { authSessionSnapshot, getAccessToken } from "@/lib/auth-tokens";
 import { withDiagnosticContext } from "@/lib/diagnostic-context";
 import { newId } from "@/lib/env";
+import { sleep } from "@/lib/errors";
 import { GitHubAuthError } from "@/lib/github-device";
 import { GITHUB_NATIVE_TOOLS, callGitHubNativeTool, resolveGitHubAuth, verifyGitHubNative } from "@/lib/github-native";
 import {
@@ -490,26 +491,87 @@ export function mcpCheckServerPayload(config: McpServerConfig): Record<string, u
   };
 }
 
+/** Pause before the single retry a check gets when the Worker flags its failure as retryable. */
+const MCP_CHECK_RETRY_DELAY_MS = 600;
+
+/**
+ * Failure codes that describe Gera's own plumbing, not the MCP server or its
+ * credential. They are worded plainly, never read as an auth problem, and —
+ * because a health probe is idempotent — retried once before the card reacts.
+ */
+const INFRA_CHECK_CODES: ReadonlySet<string> = new Set([
+  "account_shard_unavailable",
+  "upstream_unreachable",
+  "mcp_check_failed",
+]);
+
+type McpCheckBody = {
+  tools?: unknown;
+  identity?: unknown;
+  credentialStored?: unknown;
+  error?: unknown;
+  detail?: unknown;
+  reason?: unknown;
+  retryable?: unknown;
+};
+
+/**
+ * Plain words for a `/mcp/check` failure that did not come from the provider.
+ * `account_shard_unavailable` is the Worker's verdict that the call into
+ * Gera's backend threw (a deploy reset mid-check, an overloaded shard); the
+ * MCP server itself was never reached, so the text must not blame it. The
+ * wording stays inside `isRecoverableMcpHealthError` ("temporary", "retry")
+ * so a background check keeps the connector armed.
+ */
+export function describeMcpCheckFailure(code: string, body: Pick<McpCheckBody, "reason" | "detail">): string | null {
+  switch (code) {
+    case "account_shard_unavailable": {
+      const why =
+        body.reason === "redeploy"
+          ? "was updating"
+          : body.reason === "overloaded"
+            ? "was busy"
+            : "hit an internal error";
+      return `Gera's backend ${why} while checking this server — a temporary blip; it will retry automatically.`;
+    }
+    case "upstream_unreachable":
+      return "The MCP server did not answer — it may be down or unreachable.";
+    case "mcp_check_failed":
+      return `The server check failed inside Gera${typeof body.detail === "string" && body.detail ? `: ${body.detail}` : "."}`;
+    default:
+      return null;
+  }
+}
+
 export async function connectMcpServer(config: McpServerConfig): Promise<McpConnection> {
   const geraSessionKey = `${authSessionSnapshot()}:${getAccessToken() ?? "signed-out"}`;
   if (rejectedGeraSessionKey === geraSessionKey) {
     throw new McpAccountAuthError();
   }
-  const response = await authedFetch("/mcp/check", {
+  const init: RequestInit = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ server: mcpCheckServerPayload(config) }),
-  });
-  const data = (await response.json().catch(() => ({}))) as {
-    tools?: unknown;
-    identity?: unknown;
-    credentialStored?: unknown;
-    error?: unknown;
-    detail?: unknown;
   };
+  const attempt = async (): Promise<{ response: Response; data: McpCheckBody }> => {
+    const response = await authedFetch("/mcp/check", init);
+    const data = (await response.json().catch(() => ({}))) as McpCheckBody;
+    return { response, data };
+  };
+  let attempts = 1;
+  let { response, data } = await attempt();
+  if (!response.ok && response.status >= 500 && data.retryable === true) {
+    // The Worker vouches this failure is safe to retry — its own call into
+    // the account shard threw, typically a deploy reset mid-check. One short
+    // pause absorbs it instead of flipping the card red for a blip the next
+    // health tick would have healed anyway.
+    await sleep(MCP_CHECK_RETRY_DELAY_MS);
+    attempts += 1;
+    ({ response, data } = await attempt());
+  }
   if (!response.ok) {
     const code = typeof data.error === "string" ? data.error : "";
-    let detail = code || `server check failed (${response.status})`;
+    let detail = describeMcpCheckFailure(code, data) ?? (code || `server check failed (${response.status})`);
     if (detail === "server_auth_missing") {
       const perId = Array.isArray(data.detail)
         ? data.detail
@@ -539,13 +601,17 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
       path: "POST /mcp/check",
       status: response.status,
       code: code || undefined,
+      reason: typeof data.reason === "string" ? data.reason : undefined,
+      attempts,
       serverId: config.id,
       catalogId: config.catalogId,
       authMode: config.authMode,
       credentialStored: config.credentialStored,
       serverDetail: data.detail,
     };
-    if (/auth|credential|sign.?in|token/i.test(detail)) {
+    // Plumbing failures are never auth failures, whatever their detail says
+    // ("stale OAuth refresh result" is a race, not a revoked grant).
+    if (!INFRA_CHECK_CODES.has(code) && /auth|credential|sign.?in|token/i.test(detail)) {
       throw withDiagnosticContext(new McpAuthError(detail), context);
     }
     throw withDiagnosticContext(new Error(detail), context);

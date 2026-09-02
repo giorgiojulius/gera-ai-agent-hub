@@ -104,6 +104,28 @@ export function isValidId(id: unknown): id is string {
   return typeof id === "string" && id.length > 0 && id.length <= ID_LIMIT;
 }
 
+/** Coarse class of a failed call into a Durable Object — never the raw platform text. */
+export type ShardFailureReason = "redeploy" | "overloaded" | "internal";
+
+/**
+ * Classifies why a call into an account shard threw instead of answering. A
+ * Worker deploy resets every Durable Object and aborts the requests in flight
+ * ("reset because its code was updated"); an overloaded object queues too
+ * long; anything else is an internal fault. Only this coarse class leaves
+ * the Worker — the platform's message stays in the server log — and none of
+ * it says anything about the MCP server the shard was talking to.
+ */
+export function shardFailureReason(error: unknown): ShardFailureReason {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (/code was updated|reset because/i.test(message)) {
+    return "redeploy";
+  }
+  if (/overloaded|queued for too long|too many (?:requests|subrequests)/i.test(message)) {
+    return "overloaded";
+  }
+  return "internal";
+}
+
 /**
  * True for the browser's internal "credential lives on the server" marker
  * (`gera-account:<serverId>`, optionally Bearer-prefixed). It is NOT a real

@@ -122,6 +122,7 @@ import {
   intersectMcpAllowIds,
   normalizeOAuthOverride,
   overlayOAuthRotations,
+  redactCloudMcpText,
   type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
@@ -2303,47 +2304,65 @@ export class ChatStore extends DurableObject {
       const bases = chainRotationBases(appliedChains, rotated);
       appliedChains.set(rotated.serverId, bases);
     };
-    const runtime = await armCloudMcp(
-      servers,
-      persist,
-      (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
-      (id) => this.markOAuthRefreshStarted(owner, id),
-    );
-    if (runtime.failures.length > 0 || runtime.routes.size === 0) {
-      // Only a failed arm may surface an auth state — a stale pre-existing
-      // marker must never veto a verification that just succeeded.
-      const authState = grantIds
-        .map((id) => this.oauthGrantState(owner, id))
-        .find((state) => state === "reauth_required" || state === "step_up_required");
-      if (authState) {
-        return json({ error: authState }, authState === "step_up_required" ? 403 : 401);
+    try {
+      const runtime = await armCloudMcp(
+        servers,
+        persist,
+        (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
+        (id) => this.markOAuthRefreshStarted(owner, id),
+      );
+      if (runtime.failures.length > 0 || runtime.routes.size === 0) {
+        // Only a failed arm may surface an auth state — a stale pre-existing
+        // marker must never veto a verification that just succeeded.
+        const authState = grantIds
+          .map((id) => this.oauthGrantState(owner, id))
+          .find((state) => state === "reauth_required" || state === "step_up_required");
+        if (authState) {
+          return json({ error: authState }, authState === "step_up_required" ? 403 : 401);
+        }
+        const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
+        return json({ error: failure }, 502);
       }
-      const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
-      return json({ error: failure }, 502);
-    }
-    if (servers[0]?.oauth) {
-      // The grant just proved itself against the live provider: clear any
-      // stuck reauth/step-up markers so leases and relays use it again.
-      for (const id of grantIds) {
-        if (storedGrants.has(id)) {
-          this.markOAuthReady(owner, id);
+      if (servers[0]?.oauth) {
+        // The grant just proved itself against the live provider: clear any
+        // stuck reauth/step-up markers so leases and relays use it again.
+        for (const id of grantIds) {
+          if (storedGrants.has(id)) {
+            this.markOAuthReady(owner, id);
+          }
         }
       }
+      const tools = [...runtime.routes.entries()].map(([functionName, route]) => {
+        const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
+        return {
+          name: route.toolName,
+          description: definition?.function.description ?? route.toolName,
+          inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
+        };
+      });
+      const credentialStored = Boolean(
+        resolvedSecret.token ||
+        resolvedSecret.headersJson ||
+        oauthTokens[serverId],
+      );
+      return json({ tools, identity: `${servers[0].name} · server verified`, credentialStored });
+    } catch (error) {
+      // An unexpected fault inside the check (a refresh race, a storage error)
+      // must not escape as a Durable Object exception: the Worker would report
+      // Gera's backend as unavailable and the real cause would never reach the
+      // journal. Every credential in scope is redacted first; a health probe
+      // is idempotent, so one retry is always safe.
+      const armed = servers[0];
+      const secrets = [
+        ...Object.values(armed?.headers ?? {}),
+        armed?.token ?? "",
+        resolvedSecret.token ?? "",
+        ...Object.values(oauthTokens).flatMap((grant) => [grant.accessToken, grant.refreshToken ?? ""]),
+      ];
+      const detail = redactCloudMcpText(error instanceof Error ? error.message : "check failed", secrets).slice(0, 300);
+      console.error("mcp check failed", serverId, detail);
+      return json({ error: "mcp_check_failed", detail, retryable: true }, 502);
     }
-    const tools = [...runtime.routes.entries()].map(([functionName, route]) => {
-      const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
-      return {
-        name: route.toolName,
-        description: definition?.function.description ?? route.toolName,
-        inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
-      };
-    });
-    const credentialStored = Boolean(
-      resolvedSecret.token ||
-      resolvedSecret.headersJson ||
-      oauthTokens[serverId],
-    );
-    return json({ tools, identity: `${servers[0].name} · server verified`, credentialStored });
   }
 
   /** Rejects a late refresh when the canonical grant changed while the provider request awaited. */

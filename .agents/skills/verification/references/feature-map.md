@@ -996,7 +996,19 @@ cloud-ready until `/mcp/check` reports a real provider rejection. Re-checking an
 OAuth connector with a server-held grant does not incorrectly reopen sign-in; the
 key field says the credential is stored server-side and accepts a replacement. A
 network/provider outage is likewise retryable and does not erase a credential; only
-a definitive provider rejection marks that connector disconnected. Generic MCP parsing preserves text resources,
+a definitive provider rejection marks that connector disconnected. `/mcp/check`
+failures come in two kinds and the body says which: a verdict the shard reached
+(`server_auth_missing`, `reauth_required`, or a 502 whose `error` is the provider
+failure text such as `Could not connect MCP server "X": HTTP 503`) versus
+`account_shard_unavailable` — the Worker's catch-all when its call into the
+account shard itself threw (`reason: redeploy | overloaded | internal`; a Worker
+deploy resets every Durable Object and aborts checks in flight). The latter says
+nothing about the MCP server and is never labelled "upstream unreachable"; the
+client retries a `retryable: true` 5xx once after 600 ms, then words it as
+"Gera's backend was updating/busy/hit an internal error … a temporary blip", which
+stays recoverable and is never an auth error. An unexpected exception inside the
+shard's check returns `mcp_check_failed` + redacted `detail` instead of escaping
+as a Durable Object error (`mcp-check-retry.test.ts`). Generic MCP parsing preserves text resources,
 `structuredContent`, resource links and request-id matching. Legacy direct-browser
 transport remains test-only for protocol parity; production calls use the Worker.
 Regression coverage: `mcp-server-ownership.test.ts`, `mcp-session.test.ts`,

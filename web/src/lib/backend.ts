@@ -7,6 +7,9 @@ import {
   refreshAccessToken,
 } from "@/lib/auth-tokens";
 import { redactSecrets, withDiagnosticContext } from "@/lib/diagnostic-context";
+import { FUNCTIONS_URL } from "@/lib/functions-url";
+
+export { FUNCTIONS_URL };
 
 /**
  * One failed backend round-trip, as the diagnostics journal wants to see it:
@@ -164,14 +167,6 @@ function reportNetworkFailure(method: string, path: string, init: RequestInit | 
     durationMs: Math.max(0, Date.now() - startedAt),
   });
 }
-
-export const FUNCTIONS_URL: string = (() => {
-  const url = import.meta.env.EXPO_PUBLIC_RORK_FUNCTIONS_URL;
-  if (typeof url === "string" && url.length > 0) {
-    return url.replace(/\/+$/, "");
-  }
-  return "https://gera-ai-agent-hub-backend.rork.app";
-})();
 
 export class AuthSessionChangedError extends Error {
   constructor() {

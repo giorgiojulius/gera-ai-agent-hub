@@ -64,7 +64,16 @@ the committed `web/.env.production` — exactly five `EXPO_PUBLIC_*` keys, pinne
 by `env-production.test.ts`, never a secret; real process env wins on Rork’s
 own builds. Related backend rule: the Worker answers unknown routes with
 `404 {error:"not_found"}` (health stays on `GET /`), so a misconfigured client
-never mistakes the catch-all for a successful `/oauth/initiate`. E2E bypasses
+never mistakes the catch-all for a successful `/oauth/initiate`. A document
+with an opaque origin (the sandboxed Repo Preview, `location.origin === "null"`)
+cannot call `api.rork.com` directly — its CORS answers `Origin: null` with
+`https://rork.com` — so `resolveAuthUrl` (`auth-url.test.ts`) points such
+builds at the Worker’s `POST /auth-relay/oauth/{initiate,token,refresh}`, a
+body-verbatim relay pinned to this app’s public key (403 on mismatch, 404 for
+other paths, 405 for non-POST, 503 when the Worker lacks the key). Sign-in
+errors name the host and status (“… api.rork.com answered 404 (not_found)”,
+“couldn’t reach … (network or CORS)”) and a popup that closes before the
+callback reports “The sign-in window closed before finishing.” E2E bypasses
 the gate: fake JWT in `localStorage` + stubbed `/access/status` → `invited`.
 
 ## Navigation

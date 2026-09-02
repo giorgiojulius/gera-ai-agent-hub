@@ -12,6 +12,7 @@ import {
   AUTH_URL,
   CODE_VERIFIER_KEY,
   REFRESH_TOKEN_KEY,
+  authServiceHost,
   authSessionSnapshot,
   clearTokens,
   invalidateAuthSession,
@@ -348,8 +349,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         if (!response.ok) {
           clearAuthFlowIfCurrent(attemptId);
-          const errorBody = (await response.json().catch(() => ({}))) as { error?: string };
-          setError(errorBody.error ?? `Sign in failed (${response.status})`);
+          const errorBody = (await response.json().catch(() => ({}))) as { error?: unknown };
+          const code = typeof errorBody.error === "string" && errorBody.error ? ` (${errorBody.error})` : "";
+          setError(`Sign in failed — ${authServiceHost()} answered ${response.status}${code}.`);
           return;
         }
 
@@ -397,6 +399,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 clearInterval(pollTimer);
                 window.removeEventListener("message", onMessage);
                 messageListenerRef.current = null;
+                if (isAuthFlowCurrent(attemptId, flowNonce)) {
+                  setError("The sign-in window closed before finishing. Try again.");
+                }
                 clearAuthFlowIfCurrent(attemptId);
                 resolve();
               }
@@ -408,7 +413,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         if (isAuthFlowCurrent(attemptId, flowNonce)) {
           console.error("Sign in failed:", err);
-          setError(err instanceof Error ? err.message : "Sign in failed");
+          // A rejected fetch is a network or CORS failure; the raw "Failed to fetch" says neither.
+          setError(
+            err instanceof TypeError
+              ? `Sign in failed — couldn’t reach ${authServiceHost()} (network or CORS).`
+              : err instanceof Error
+                ? err.message
+                : "Sign in failed",
+          );
           clearAuthFlowIfCurrent(attemptId);
         }
       } finally {

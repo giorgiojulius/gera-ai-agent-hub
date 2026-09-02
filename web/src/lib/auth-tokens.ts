@@ -1,5 +1,6 @@
 // Shared Rork Auth token storage — used by the auth hook and the access API
 // client so a mid-session token refresh works from either side.
+import { FUNCTIONS_URL } from "@/lib/functions-url";
 
 export const ACCESS_TOKEN_KEY = "rork:access_token";
 export const REFRESH_TOKEN_KEY = "rork:refresh_token";
@@ -8,8 +9,48 @@ export const AUTH_FLOW_NONCE_KEY = "rork:auth_flow_nonce";
 export const AUTH_FLOW_ATTEMPT_KEY = "rork:auth_flow_attempt";
 export const AUTH_SESSION_NONCE_KEY = "rork:auth_session_nonce";
 
-export const AUTH_URL: string = import.meta.env.EXPO_PUBLIC_RORK_AUTH_URL ?? "";
+/** The Rork Auth base from the build env, before the sandbox relay decision. */
+export const CONFIGURED_AUTH_URL: string = import.meta.env.EXPO_PUBLIC_RORK_AUTH_URL ?? "";
 export const APP_KEY: string = import.meta.env.EXPO_PUBLIC_RORK_APP_KEY ?? "";
+
+/**
+ * Picks where `/oauth/initiate|token|refresh` are sent. A document with an
+ * opaque origin (a sandboxed iframe without `allow-same-origin`, e.g. a Repo
+ * Preview) reports `location.origin === "null"` and sends `Origin: null`, which
+ * the Rork Auth API's CORS rejects — so those builds go through the Worker's
+ * `/auth-relay`, which forwards the same JSON to the same endpoints. Every
+ * other origin talks to Rork Auth directly. An empty configuration stays empty
+ * so the sign-in guard can report the missing variables.
+ */
+export function resolveAuthUrl(configured: string, documentOrigin: string | null, functionsUrl: string): string {
+  const base = configured.trim().replace(/\/+$/, "");
+  if (!base) {
+    return "";
+  }
+  return documentOrigin === "null" ? `${functionsUrl.replace(/\/+$/, "")}/auth-relay` : base;
+}
+
+function currentDocumentOrigin(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return window.location.origin;
+  } catch {
+    return null;
+  }
+}
+
+export const AUTH_URL: string = resolveAuthUrl(CONFIGURED_AUTH_URL, currentDocumentOrigin(), FUNCTIONS_URL);
+
+/** Host shown in sign-in errors, e.g. `api.rork.com` or the relaying Worker. */
+export function authServiceHost(): string {
+  try {
+    return new URL(AUTH_URL).host;
+  } catch {
+    return AUTH_URL || "the auth service";
+  }
+}
 
 export type AccessTokenRefreshResult =
   | { status: "refreshed"; accessToken: string }

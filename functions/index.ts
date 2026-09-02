@@ -82,6 +82,8 @@ type Env = {
   /** Rork auth host — same API surface; backs up the API base for storage credentials. */
   EXPO_PUBLIC_RORK_AUTH_URL?: string;
   RORK_AUTH_URL?: string;
+  /** Public app key the Gera client sends to Rork Auth; pins the auth relay to this app. */
+  EXPO_PUBLIC_RORK_APP_KEY?: string;
   /** Stable private salt for opaque repository-preview account shards. */
   RORK_AUTH_SECRET_KEY?: string;
   /** Present only on the isolated black-box acceptance Worker. */
@@ -145,6 +147,67 @@ async function readBoundedText(request: Request, limit: number): Promise<string 
     result += decoder.decode(chunk.value, { stream: true });
   }
   return result + decoder.decode();
+}
+
+const AUTH_RELAY_PREFIX = "/auth-relay";
+const AUTH_RELAY_PATHS: ReadonlySet<string> = new Set(["/oauth/initiate", "/oauth/token", "/oauth/refresh"]);
+const AUTH_RELAY_MAX_BODY = 16 * 1024;
+
+/**
+ * CORS relay for the three Rork Auth endpoints the Gera client calls.
+ *
+ * Only a build whose document has an opaque origin uses it: the sandboxed
+ * Repo Preview sends `Origin: null`, which api.rork.com's CORS answers with
+ * `https://rork.com`, so the browser drops the response ("Failed to fetch").
+ * The relay is pinned to this app's public key so it is not an open proxy,
+ * forwards the JSON body verbatim, and never logs a body — codes, verifiers
+ * and refresh tokens pass through untouched.
+ */
+async function relayAuth(request: Request, url: URL, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return corsJson({ error: "method_not_allowed" }, 405);
+  }
+  const path = url.pathname.slice(AUTH_RELAY_PREFIX.length);
+  if (!AUTH_RELAY_PATHS.has(path)) {
+    return corsJson({ error: "not_found" }, 404);
+  }
+  const appKey = env.EXPO_PUBLIC_RORK_APP_KEY ?? "";
+  const authBase = (env.EXPO_PUBLIC_RORK_AUTH_URL ?? env.RORK_AUTH_URL ?? "").replace(/\/+$/, "");
+  if (!appKey || !/^https:\/\/[^/\s]+$/.test(authBase)) {
+    return corsJson({ error: "auth_relay_unconfigured" }, 503);
+  }
+  const raw = await readBoundedText(request, AUTH_RELAY_MAX_BODY);
+  if (raw === null) {
+    return corsJson({ error: "payload_too_large" }, 413);
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return corsJson({ error: "invalid_json" }, 400);
+  }
+  if (!body || typeof body !== "object" || (body as { app_key?: unknown }).app_key !== appKey) {
+    return corsJson({ error: "app_key_mismatch" }, 403);
+  }
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${authBase}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: raw,
+    });
+  } catch (error) {
+    console.error("auth relay: upstream unreachable", error instanceof Error ? error.message : "error");
+    return corsJson({ error: "auth_upstream_unreachable" }, 502);
+  }
+  return new Response(await upstream.text(), {
+    status: upstream.status,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 function relayAuthRequired(): Response {
@@ -2817,6 +2880,9 @@ export default {
       }
       const probe = await probeRorkStorage(env);
       return corsJson(probe, probe.ok ? 200 : 503);
+    }
+    if (url.pathname.startsWith(`${AUTH_RELAY_PREFIX}/`)) {
+      return relayAuth(request, url, env);
     }
     if (url.pathname === "/__staging/account-version") {
       if (!env.STAGING_VERSION || request.method !== "GET") {

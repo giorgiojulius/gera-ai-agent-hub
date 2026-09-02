@@ -161,6 +161,8 @@ export const TID = {
   homeShortcuts: "home-shortcuts",
   /** One-tap profile monogram row at the hero composer's top right. */
   composerProfiles: "composer-profiles",
+  /** Status line of the Rork Auth landing page (/auth/callback): signing in, or handing the code back. */
+  authCallbackStatus: "auth-callback-status",
 } as const;
 
 /** All registry values, for uniqueness checks in tests. */

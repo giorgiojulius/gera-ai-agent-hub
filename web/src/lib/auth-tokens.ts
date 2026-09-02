@@ -53,11 +53,32 @@ export function documentOriginOf(
   }
 }
 
+/** True inside a sandboxed document (opaque origin), e.g. a Repo Preview frame. */
+export const IS_OPAQUE_ORIGIN_DOCUMENT: boolean =
+  documentOriginOf(typeof window === "undefined" ? undefined : window) === "null";
+
 export const AUTH_URL: string = resolveAuthUrl(
   CONFIGURED_AUTH_URL,
   documentOriginOf(typeof window === "undefined" ? undefined : window),
   FUNCTIONS_URL,
 );
+
+export type AuthInitiateEnv = "preview" | "production";
+
+/**
+ * Which Rork Auth flow `/oauth/initiate` sets up. An embedded document (any
+ * iframe) signs in through a popup. The `preview` flow's callback page hands
+ * the code to `window.opener` for the project's Rork preview origin only —
+ * right for Rork's own preview iframe, which is that opener. A sandboxed build
+ * (opaque origin) is not the popup's opener at all: Gera's trusted document
+ * opens the window for it and may run on any Gera origin. It therefore asks
+ * for the `production` flow, whose landing is Gera's own `/auth/callback`;
+ * that page relays the code to whichever Gera origin opened the window
+ * (`proxied-popup.ts`). Top-level documents redirect and use `production`.
+ */
+export function authInitiateEnv(embedded: boolean, opaqueOrigin: boolean): AuthInitiateEnv {
+  return embedded && !opaqueOrigin ? "preview" : "production";
+}
 
 /** Host shown in sign-in errors, e.g. `api.rork.com` or the relaying Worker. */
 export function authServiceHost(): string {

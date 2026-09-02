@@ -6,12 +6,16 @@ import { RepoPreviewCard, RepoPreviewReceipt } from "@/components/gera/RepoPrevi
 import { RepoPreviewPanelView } from "@/components/gera/RepoPreviewPanel";
 import type { LiveRepoPreview } from "@/hooks/use-repo-preview-job";
 import { PreviewPopupRegistry } from "@/lib/preview-bridge";
+import { isProxiedPopupName } from "@/lib/proxied-popup";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob } from "@/lib/types";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+/** The window name Gera mints for every real window it opens on a preview's behalf. */
+const PROXIED_NAME = expect.stringMatching(/^gera-preview-popup-[a-z0-9]+$/);
 
 const now = Date.now();
 const job: RepoPreviewJob = {
@@ -141,7 +145,9 @@ test("the dock turns every popup into a tab: in-preview pages, blank windows, an
     features: "width=500,height=650,noopener",
   });
   await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("auth.rork.app/oauth/start?state=1");
-  expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start?state=1", "_blank", "width=500,height=650");
+  // Real windows open under a name only Gera mints: the OAuth landing reads it to know it must hand its
+  // code back to the opener (see proxied-popup.ts). Plain links above stayed `_blank`.
+  expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start?state=1", PROXIED_NAME, "width=500,height=650");
   expect(frames()).toHaveLength(2);
   expect(tabCount()).toBe(3);
   await expect.element(tabs.nth(2)).toHaveTextContent("auth.rork.app");
@@ -150,7 +156,7 @@ test("the dock turns every popup into a tab: in-preview pages, blank windows, an
   const authWindow = { closed: false, location: { href: "" }, focus: vi.fn(), close: vi.fn(), postMessage: vi.fn() };
   openSpy.mockReturnValueOnce(authWindow as unknown as Window);
   await page.getByTestId(TID.repoPreviewWindowOpen).click();
-  expect(openSpy).toHaveBeenLastCalledWith("https://auth.rork.app/oauth/start?state=1", "_blank", "width=500,height=650");
+  expect(openSpy).toHaveBeenLastCalledWith("https://auth.rork.app/oauth/start?state=1", PROXIED_NAME, "width=500,height=650");
   await expect.element(page.getByTestId(TID.repoPreviewPopupPage)).toHaveAttribute("data-window-state", "open");
 
   // The user closes the real window: within one poll its tab goes away and the left neighbour takes over.
@@ -219,7 +225,8 @@ test("the popup registry plays opener for the preview: callbacks are relayed in,
 
   const registry = new PreviewPopupRegistry(() => frame, 20);
   expect(registry.open("root", "w1", "https://auth.rork.app/oauth/start", "popup,width=500")).toBe(true);
-  expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start", "_blank", "popup,width=500");
+  expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start", PROXIED_NAME, "popup,width=500");
+  expect(isProxiedPopupName(openSpy.mock.calls[0]?.[1])).toBe(true);
   expect(registry.size).toBe(1);
 
   // Only windows the registry opened are relayed — and only into the frame that asked for them.

@@ -1,5 +1,7 @@
 import { toast } from "sonner";
 
+import { proxiedPopupName } from "@/lib/proxied-popup";
+
 /** `source` stamp of every message the served preview's shim posts to its embedder. */
 export const PREVIEW_BRIDGE_SOURCE = "gera-preview";
 
@@ -273,6 +275,10 @@ type PopupEntry = { frameKey: string; id: string; win: Window };
  * - the window keeps `opener` (Gera) so OAuth callback pages can
  *   `opener.postMessage(...)`; whatever they post is relayed into the frame
  *   that asked for the window, and nowhere else;
+ * - the window is opened under a name only Gera mints (`proxiedPopupName`),
+ *   which survives its cross-origin hops because the opener is kept; Gera's
+ *   own `/auth/callback` reads it to know it must hand the code back to its
+ *   opener instead of exchanging it (the PKCE verifier lives in the frame);
  * - `closed` is polled and reported back so "waiting for the popup" spinners
  *   settle when the user dismisses the window;
  * - `close()`, `focus()` and `postMessage()` on the shim's stub drive the
@@ -328,7 +334,7 @@ export class PreviewPopupRegistry {
     }
     let win: Window | null = null;
     try {
-      win = window.open(url, "_blank", features);
+      win = window.open(url, proxiedPopupName(), features);
     } catch {
       win = null;
     }

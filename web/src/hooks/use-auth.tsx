@@ -11,7 +11,9 @@ import {
   AUTH_SESSION_NONCE_KEY,
   AUTH_URL,
   CODE_VERIFIER_KEY,
+  IS_OPAQUE_ORIGIN_DOCUMENT,
   REFRESH_TOKEN_KEY,
+  authInitiateEnv,
   authServiceHost,
   authSessionSnapshot,
   clearTokens,
@@ -21,6 +23,26 @@ import {
 } from "@/lib/auth-tokens";
 
 const ACCOUNT_OWNER_KEY = "rork:gera_account_owner";
+
+/**
+ * How long a closed sign-in popup may still deliver its code. The callback
+ * page posts and closes in the same breath; when the window is a proxied one
+ * (sandboxed preview) the code and the `closed` report travel separate hops,
+ * so "closed" must not be read as "dismissed" until this grace has passed.
+ */
+export const POPUP_CLOSE_GRACE_MS = 1_500;
+
+/** Plain words for a callback that brought a refusal instead of a code. */
+export function describeAuthCallbackRefusal(error: unknown): string {
+  const detail = typeof error === "string" ? error.trim().slice(0, 200) : "";
+  if (!detail || detail === "no_code") {
+    return "Sign in didn’t complete — the provider returned no code. Try again.";
+  }
+  if (/access_denied|cancel|denied/i.test(detail)) {
+    return "Sign in was cancelled. Try again when you’re ready.";
+  }
+  return `Sign in didn’t complete — ${detail}`;
+}
 
 export type AuthUser = {
   id: string;
@@ -327,14 +349,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         sessionStorage.setItem(AUTH_FLOW_ATTEMPT_KEY, attemptId);
 
         const isPreview = window.parent !== window;
+        // A sandboxed build (Repo Preview) is embedded but is not the popup's
+        // opener — Gera's trusted document opens the window for it — so it
+        // asks for the production flow: the popup lands on Gera's own
+        // /auth/callback, which relays the code back here via that opener.
+        const env = authInitiateEnv(isPreview, IS_OPAQUE_ORIGIN_DOCUMENT);
         const body: Record<string, unknown> = {
           app_key: APP_KEY,
           provider,
           code_challenge: challenge,
           target: "web",
-          env: isPreview ? "preview" : "production",
+          env,
         };
-        if (isPreview) {
+        if (env === "preview") {
           body.app_path = "web";
         }
 
@@ -371,21 +398,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }
 
           await new Promise<void>((resolve) => {
+            let settled = false;
+            let graceTimer: number | null = null;
+            const settle = (): void => {
+              settled = true;
+              window.removeEventListener("message", onMessage);
+              messageListenerRef.current = null;
+              clearInterval(pollTimer);
+              if (graceTimer !== null) {
+                window.clearTimeout(graceTimer);
+                graceTimer = null;
+              }
+            };
             const onMessage = (event: MessageEvent) => {
-              const payload = event.data as { type?: string; code?: string } | null;
+              const payload = event.data as { type?: unknown; code?: unknown; error?: unknown } | null;
               if (
+                settled ||
                 !payload ||
+                typeof payload !== "object" ||
                 payload.type !== "rork_auth_callback" ||
                 !isAuthFlowCurrent(attemptId, flowNonce)
               ) {
                 return;
               }
-              window.removeEventListener("message", onMessage);
-              messageListenerRef.current = null;
-              clearInterval(pollTimer);
+              settle();
               const finish = async () => {
-                if (payload.code) {
+                if (typeof payload.code === "string" && payload.code) {
                   await exchangeCode(payload.code, attemptId);
+                } else {
+                  setError(describeAuthCallbackRefusal(payload.error));
+                  clearAuthFlowIfCurrent(attemptId);
                 }
                 resolve();
               };
@@ -395,16 +437,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             window.addEventListener("message", onMessage);
 
             const pollTimer = window.setInterval(() => {
-              if (popup.closed) {
-                clearInterval(pollTimer);
-                window.removeEventListener("message", onMessage);
-                messageListenerRef.current = null;
+              if (!popup.closed || graceTimer !== null) {
+                return;
+              }
+              graceTimer = window.setTimeout(() => {
+                if (settled) {
+                  return;
+                }
+                settle();
                 if (isAuthFlowCurrent(attemptId, flowNonce)) {
                   setError("The sign-in window closed before finishing. Try again.");
                 }
                 clearAuthFlowIfCurrent(attemptId);
                 resolve();
-              }
+              }, POPUP_CLOSE_GRACE_MS);
             }, 500);
           });
         } else {

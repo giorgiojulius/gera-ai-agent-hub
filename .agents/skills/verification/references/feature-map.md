@@ -74,7 +74,36 @@ body-verbatim relay pinned to this app’s public key (403 on mismatch, 404 for
 other paths, 405 for non-POST, 503 when the Worker lacks the key). Sign-in
 errors name the host and status (“… api.rork.com answered 404 (not_found)”,
 “couldn’t reach … (network or CORS)”) and a popup that closes before the
-callback reports “The sign-in window closed before finishing.” E2E bypasses
+callback reports “The sign-in window closed before finishing.” — only after a
+1.5 s grace (`POPUP_CLOSE_GRACE_MS`), because the callback page posts and
+closes in one breath and in a proxied window the code and the `closed` report
+travel separate hops. Which Rork Auth flow `/oauth/initiate` asks for is
+`authInitiateEnv` (`proxied-popup.test.ts`): Rork’s own preview iframe uses
+`preview` (its callback page posts the code to `window.opener` for the
+project’s preview origin only); a sandboxed build is embedded but is *not* the
+popup’s opener — Gera’s trusted document opens the window for it and may run
+on any Gera origin — so it asks for `production`, whose landing is Gera’s own
+`/auth/callback` (`AuthCallback.tsx`). That page relays: in a window whose
+`window.name` carries the Gera-minted `gera-preview-popup-*` marker
+(`PreviewPopupRegistry.open` names every real window it opens; the name
+survives cross-origin hops because the opener is kept) it posts
+`{type:"rork_auth_callback", code | error}` to `window.opener` once per
+trusted origin (`trustedRelayOrigins`: the page’s own origin plus
+`https://<EXPO_PUBLIC_PROJECT_ID>-web.rork.live`, never `"*"` — a hostile
+opener of a flow it initiated must not receive a victim’s code), shows
+“Returning you to Gera…” (`auth-callback-status`) and closes itself; Gera relays
+into the frame, which completes the PKCE exchange through the relay. A window
+with an opener but no verifier of its own and no marker (an older Gera still
+opening `_blank`, a browser that dropped the name) cannot finish the exchange
+itself either: it gets the same relay and shows “you can close this window”
+instead of failing with “session expired”, but never closes itself; the
+top-level landing exchanges with this tab’s verifier as before. Deploy note:
+`runChecks` publishes only the `*-web.rork.live` preview host — the production
+landing at `gera-ai-agent-hub.rork.app` ships with Rork’s Publish, and a
+sandboxed build’s sign-in depends on that landing carrying the relay. A callback that
+brought a refusal instead of a code is worded by `describeAuthCallbackRefusal`
+(“Sign in was cancelled…”). Browser: `auth-callback.browser.test.tsx`,
+`repo-preview.browser.test.tsx` (window name). E2E bypasses
 the gate: fake JWT in `localStorage` + stubbed `/access/status` → `invited`.
 
 ## Navigation

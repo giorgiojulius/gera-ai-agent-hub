@@ -71,6 +71,13 @@ function statusTone(inspection: RepoPreviewInspection): string {
   return "border-emerald-300/25 bg-emerald-300/[0.08] text-emerald-100";
 }
 
+/** Explains an auto-picked root so a monorepo launch never looks like a guess. */
+function rootSourceLabel(inspection: RepoPreviewInspection): string | null {
+  if (inspection.rootSource === "rork.json") return `${inspection.rootDirectory} · declared as the web app in rork.json`;
+  if (inspection.rootSource === "detected") return `${inspection.rootDirectory} · auto-detected web app folder`;
+  return null;
+}
+
 export function RepoLaunchDialog({ open, onOpenChange, repository, conversationId, server }: RepoLaunchDialogProps) {
   const { recordRepoPreview } = useAgent();
   const navigate = useNavigate();
@@ -88,21 +95,25 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
     [server.disabledTools],
   );
 
-  const input = useCallback((): RepoPreviewInput => ({
+  const input = useCallback((rootOverride?: string): RepoPreviewInput => ({
     repository,
     ref: ref.trim() || undefined,
-    rootDirectory: rootDirectory.trim() || ".",
+    rootDirectory: (rootOverride ?? rootDirectory).trim() || ".",
     outputDirectory: outputDirectory.trim() || undefined,
   }), [outputDirectory, ref, repository, rootDirectory]);
 
-  const inspect = useCallback(async (showSpinner = true): Promise<RepoPreviewInspection | null> => {
+  const inspect = useCallback(async (showSpinner = true, rootOverride?: string): Promise<RepoPreviewInspection | null> => {
     if (!repository) return null;
     if (showSpinner) setLoading(true);
     setError("");
+    if (rootOverride !== undefined) setRootDirectory(rootOverride);
     try {
       const auth = await resolveGitHubAuth(server);
-      const result = await inspectRepoPreview(input(), auth);
+      const result = await inspectRepoPreview(input(rootOverride), auth);
       setInspection(result);
+      // The backend may have resolved "." into the real app folder (rork.json,
+      // ranked candidates); launch must build exactly what was inspected.
+      setRootDirectory(result.rootDirectory);
       setRef((current) => current || result.ref);
       setSetup(null);
       return result;
@@ -130,6 +141,7 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
       .then((result) => {
         if (cancelled) return;
         setInspection(result);
+        setRootDirectory(result.rootDirectory);
         setRef(result.ref);
       })
       .catch((cause) => {
@@ -170,6 +182,7 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
       const auth = await resolveGitHubAuth(server);
       const latest = await inspectRepoPreview(input(), auth);
       setInspection(latest);
+      setRootDirectory(latest.rootDirectory);
       if (latest.runner !== "ready") {
         throw new RepoPreviewApiError("runner_setup_required", 428, latest);
       }
@@ -239,7 +252,7 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
                 <Input
                   value={rootDirectory}
                   onChange={(event) => setRootDirectory(event.target.value)}
-                  placeholder="."
+                  placeholder=". (auto-detects web/, apps/*, rork.json)"
                   className="border-white/10 bg-black/20 font-mono text-xs text-white placeholder:text-white/25"
                 />
               </label>
@@ -257,7 +270,8 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
               />
             </label>
 
-            {inspection?.rootSuggestions && inspection.rootSuggestions.length > 1 ? (
+            {inspection?.rootSuggestions &&
+            (inspection.rootSuggestions.length > 1 || inspection.rootSuggestions[0] !== rootDirectory.trim()) ? (
               <div className="space-y-1.5">
                 <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-white/35">Detected app roots</p>
                 <div className="flex flex-wrap gap-1.5">
@@ -265,7 +279,8 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
                     <button
                       key={root}
                       type="button"
-                      onClick={() => setRootDirectory(root)}
+                      disabled={loading}
+                      onClick={() => void inspect(true, root)}
                       className={cn(
                         "rounded-lg border px-2 py-1 font-mono text-[10px] transition-colors",
                         root === rootDirectory
@@ -305,11 +320,17 @@ export function RepoLaunchDialog({ open, onOpenChange, repository, conversationI
                     </p>
                     <p className="mt-1 text-[11px] leading-relaxed opacity-65">
                       {!inspection.projectFound
-                        ? "Pick a detected app root or enter the directory that contains package.json / index.html."
+                        ? "Gera checked the repository root, rork.json and the usual app folders. Pick a detected app root or enter the directory that contains package.json / index.html."
                         : inspection.runner === "ready"
                           ? `Ready to build ${inspection.ref} at ${inspection.rootDirectory}.`
                           : "Gera installs a small read-only workflow through a reviewable pull request. Merge it once; future launches do not modify code."}
                     </p>
+                    {inspection.projectFound && rootSourceLabel(inspection) ? (
+                      <p className="mt-1.5 inline-flex items-center gap-1 rounded-md bg-black/20 px-1.5 py-0.5 font-mono text-[10px] opacity-80">
+                        <FolderGit2 className="h-3 w-3" />
+                        {rootSourceLabel(inspection)}
+                      </p>
+                    ) : null}
                   </div>
                 </div>
               </div>

@@ -60,12 +60,19 @@ export type RepoPreviewDetection = {
   projectFound: boolean;
 };
 
+/**
+ * How the project root was chosen: typed by the user, the repository root itself,
+ * declared by a Rork workspace's rork.json, or picked from ranked app folders.
+ */
+export type RepoPreviewRootSource = "explicit" | "root" | "rork.json" | "detected";
+
 export type RepoPreviewInspection = RepoPreviewDetection & {
   repository: string;
   defaultBranch: string;
   ref: string;
   commitSha: string;
   rootDirectory: string;
+  rootSource: RepoPreviewRootSource;
   outputDirectory?: string;
   rootSuggestions: string[];
   runner: "ready" | "missing" | "outdated";
@@ -288,6 +295,116 @@ export function detectRepoPreviewProject(
                     ? "static"
                     : "unknown";
   return { framework, packageManager, projectFound: true };
+}
+
+/** A confident web entry: a recognised framework or a static index.html, not just any package.json. */
+export function isRepoPreviewWebEntry(detection: RepoPreviewDetection): boolean {
+  return detection.projectFound && detection.framework !== "unknown";
+}
+
+/**
+ * Rork workspaces (this repository's own shape) keep every app in a subfolder and
+ * declare them in a root rork.json: `{ apps: [{ path: "web", framework: "web" }, ...] }`.
+ * The first "web" app's path is the preview root; other frameworks (expo, cloudflare,
+ * ios, android) are not static web builds and are ignored.
+ */
+export function repoPreviewRorkWebRoot(rorkJsonText: string | null): string | null {
+  if (!rorkJsonText) {
+    return null;
+  }
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = record(JSON.parse(rorkJsonText) as unknown);
+  } catch {
+    return null;
+  }
+  const apps = Array.isArray(parsed?.apps) ? parsed.apps : [];
+  for (const item of apps) {
+    const app = record(item);
+    if (app?.framework !== "web") {
+      continue;
+    }
+    const path = normalizeRepoPreviewDirectory(app.path);
+    if (path) {
+      return path;
+    }
+  }
+  return null;
+}
+
+const WORKSPACE_MARKERS = ["rork.json", "pnpm-workspace.yaml", "lerna.json", "nx.json", "turbo.json"];
+
+/**
+ * A root that only orchestrates sub-apps (Rork workspace, npm/pnpm workspaces,
+ * turbo/nx/lerna, or a package.json with nothing to build) should never be built
+ * itself — the web app lives in one of its folders.
+ */
+export function repoPreviewRootIsWorkspaceShell(packageJsonText: string | null, rootPaths: string[]): boolean {
+  const paths = new Set(rootPaths.map((path) => path.replace(/^\.\//, "")));
+  if (WORKSPACE_MARKERS.some((marker) => paths.has(marker))) {
+    return true;
+  }
+  if (!packageJsonText) {
+    return true;
+  }
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = record(JSON.parse(packageJsonText) as unknown);
+  } catch {
+    return false;
+  }
+  if (!parsed) {
+    return false;
+  }
+  if (parsed.workspaces !== undefined) {
+    return true;
+  }
+  const scripts = record(parsed.scripts);
+  return typeof scripts?.build !== "string";
+}
+
+const ROOT_MAX_DEPTH = 4;
+const ROOT_IGNORED_SEGMENT = /^(?:node_modules|dist|build|out|public|static|assets|coverage|vendor|\..*)$/i;
+const ROOT_WEB_HINT = /^(?:web|www|site|website|app|apps|frontend|front|client|ui|dashboard|admin|landing|portal|storefront|shop|studio|console)$/i;
+const ROOT_NON_WEB_HINT = /^(?:functions?|api|server|backend|workers?|services?|supabase|convex|infra|scripts?|tools?|e2e|tests?|__tests__|spec|fixtures?|examples?|packages?|libs?|shared|common|utils?|cli|bot|mobile|ios|android|expo|native)$/i;
+
+/**
+ * Directories that can be a web project root, best first. Ranking prefers a
+ * Vite-style folder (package.json + index.html), web-ish names such as `web` or
+ * `apps/site`, and shallow paths; backend-ish names such as `functions`, `api`
+ * or `server` sink to the bottom. Build output and dot folders never qualify.
+ */
+export function rankRepoPreviewRoots(repositoryPaths: string[]): string[] {
+  const markers = new Map<string, { packageJson: boolean; indexHtml: boolean }>();
+  for (const raw of repositoryPaths) {
+    const parts = raw.replace(/^\.\//, "").split("/");
+    const name = parts[parts.length - 1];
+    if (name !== "package.json" && name !== "index.html") {
+      continue;
+    }
+    const directory = parts.slice(0, -1);
+    if (directory.length > ROOT_MAX_DEPTH || directory.some((part) => !part || ROOT_IGNORED_SEGMENT.test(part))) {
+      continue;
+    }
+    const key = directory.length === 0 ? "." : directory.join("/");
+    const entry = markers.get(key) ?? { packageJson: false, indexHtml: false };
+    if (name === "package.json") {
+      entry.packageJson = true;
+    } else {
+      entry.indexHtml = true;
+    }
+    markers.set(key, entry);
+  }
+  const scored = [...markers.entries()].map(([directory, marks]) => {
+    const parts = directory === "." ? [] : directory.split("/");
+    let score = marks.packageJson && marks.indexHtml ? 4 : marks.indexHtml ? 1 : 0;
+    if (parts.some((part) => ROOT_WEB_HINT.test(part))) score += 2;
+    if (parts.some((part) => ROOT_NON_WEB_HINT.test(part))) score -= 3;
+    score -= parts.length;
+    return { directory, score };
+  });
+  scored.sort((a, b) => b.score - a.score || a.directory.localeCompare(b.directory));
+  return scored.map((item) => item.directory).slice(0, 12);
 }
 
 /** Extracts the installed runner marker without trusting the workflow body. */

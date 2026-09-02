@@ -6,14 +6,18 @@ import {
   detectRepoPreviewProject,
   isRepoPreviewAccessToken,
   isRepoPreviewArtifactPath,
+  isRepoPreviewWebEntry,
   normalizeRepoPreviewDirectory,
   normalizeRepoPreviewManifest,
   normalizeRepoPreviewRef,
   parseRepoPreviewRepository,
+  rankRepoPreviewRoots,
   redactRepoPreviewLog,
   repoPreviewContentSecurityPolicy,
   repoPreviewContentType,
   repoPreviewPublicPrefix,
+  repoPreviewRootIsWorkspaceShell,
+  repoPreviewRorkWebRoot,
   repoPreviewRunnerVersion,
   repoPreviewSafeRouteLabel,
   repoPreviewWorkflowMatches,
@@ -29,7 +33,7 @@ import {
   type GitHubOidcClaims,
 } from "../../../functions/github-oidc";
 import { stripRepoPreviewCapabilities } from "../../../functions/share-safety";
-import { normalizeRepoPreviewJob } from "@/lib/repo-preview";
+import { normalizeRepoPreviewInspection, normalizeRepoPreviewJob } from "@/lib/repo-preview";
 import { buildShareSnapshot } from "@/lib/shares";
 import type { Conversation, RepoPreviewJob } from "@/lib/types";
 
@@ -78,6 +82,99 @@ describe("repository preview contract", () => {
       packageManager: "none",
       projectFound: false,
     });
+  });
+
+  // Gera's own repository shape: rork.json at the root, the Vite app in web/,
+  // the Worker in functions/ and no runnable root package.json.
+  const rorkWorkspacePaths = [
+    "rork.json",
+    ".gitignore",
+    ".rork/plans/plan.md",
+    "functions/package.json",
+    "functions/index.ts",
+    "web/package.json",
+    "web/bun.lock",
+    "web/index.html",
+    "web/vite.config.ts",
+    "web/public/robots.txt",
+    "web/src/main.tsx",
+    "web/e2e/index.html",
+    "web/node_modules/vite/package.json",
+  ];
+
+  it("reads the web app root from a Rork workspace's rork.json and ignores other frameworks", () => {
+    const rorkJson = JSON.stringify({
+      apps: [
+        { name: "Functions", path: "functions", framework: "cloudflare" },
+        { name: "Gera AI", path: "web/", framework: "web" },
+      ],
+    });
+    expect(repoPreviewRorkWebRoot(rorkJson)).toBe("web");
+    expect(repoPreviewRorkWebRoot(JSON.stringify({ apps: [{ path: "expo", framework: "expo" }] }))).toBeNull();
+    expect(repoPreviewRorkWebRoot(JSON.stringify({ apps: [{ path: "../escape", framework: "web" }] }))).toBeNull();
+    expect(repoPreviewRorkWebRoot(JSON.stringify({ apps: [{ framework: "web" }] }))).toBe(".");
+    expect(repoPreviewRorkWebRoot("{not json")).toBeNull();
+    expect(repoPreviewRorkWebRoot(null)).toBeNull();
+  });
+
+  it("ranks the web folder above the Worker and never proposes output or dependency folders", () => {
+    const ranked = rankRepoPreviewRoots(rorkWorkspacePaths);
+    expect(ranked[0]).toBe("web");
+    expect(ranked).toContain("functions");
+    expect(ranked.indexOf("web")).toBeLessThan(ranked.indexOf("functions"));
+    expect(ranked).not.toContain("web/node_modules/vite");
+    expect(ranked).not.toContain("web/public");
+    expect(ranked).not.toContain(".rork/plans");
+    expect(ranked).not.toContain(".");
+
+    expect(rankRepoPreviewRoots(["package.json", "apps/api/package.json", "apps/site/package.json", "apps/site/index.html"]))
+      .toEqual(["apps/site", ".", "apps/api"]);
+    expect(rankRepoPreviewRoots(["packages/ui/package.json", "dist/index.html", "build/index.html"]))
+      .toEqual(["packages/ui"]);
+  });
+
+  it("treats workspace shells as non-buildable roots but respects a real root build", () => {
+    expect(repoPreviewRootIsWorkspaceShell(null, rorkWorkspacePaths)).toBe(true);
+    expect(repoPreviewRootIsWorkspaceShell(null, ["README.md"])).toBe(true);
+    expect(
+      repoPreviewRootIsWorkspaceShell(JSON.stringify({ workspaces: ["apps/*"], scripts: { build: "turbo run build" } }), [
+        "package.json",
+      ]),
+    ).toBe(true);
+    expect(repoPreviewRootIsWorkspaceShell(JSON.stringify({ scripts: { build: "webpack" } }), ["package.json", "turbo.json"]))
+      .toBe(true);
+    expect(repoPreviewRootIsWorkspaceShell(JSON.stringify({ scripts: { test: "vitest" } }), ["package.json"])).toBe(true);
+    expect(repoPreviewRootIsWorkspaceShell(JSON.stringify({ scripts: { build: "webpack" } }), ["package.json"])).toBe(false);
+
+    expect(isRepoPreviewWebEntry({ framework: "vite", packageManager: "bun", projectFound: true })).toBe(true);
+    expect(isRepoPreviewWebEntry({ framework: "static", packageManager: "none", projectFound: true })).toBe(true);
+    expect(isRepoPreviewWebEntry({ framework: "unknown", packageManager: "npm", projectFound: true })).toBe(false);
+    expect(
+      isRepoPreviewWebEntry(
+        detectRepoPreviewProject(JSON.stringify({ dependencies: { hono: "4" } }), ["package.json", "index.ts"]),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps the resolved root source and defaults it for older backends", () => {
+    const base = {
+      repository: "acme/gera",
+      defaultBranch: "main",
+      ref: "main",
+      commitSha: "c".repeat(40),
+      rootSuggestions: ["web", "functions"],
+      runner: "ready",
+      framework: "vite",
+      packageManager: "bun",
+      projectFound: true,
+    };
+    expect(normalizeRepoPreviewInspection({ ...base, rootDirectory: "web", rootSource: "rork.json" })).toMatchObject({
+      rootDirectory: "web",
+      rootSource: "rork.json",
+      rootSuggestions: ["web", "functions"],
+    });
+    expect(normalizeRepoPreviewInspection({ ...base, rootDirectory: "web", rootSource: "made-up" })?.rootSource).toBe("explicit");
+    expect(normalizeRepoPreviewInspection({ ...base, rootDirectory: "." })?.rootSource).toBe("root");
   });
 
   it("accepts only bounded tar offsets and a real indexed entry point", () => {

@@ -19,14 +19,18 @@ import {
   detectRepoPreviewProject,
   isRepoPreviewAccessToken,
   isRepoPreviewId,
+  isRepoPreviewWebEntry,
   normalizeRepoPreviewDirectory,
   normalizeRepoPreviewManifest,
   normalizeRepoPreviewRef,
   parseRepoPreviewRepository,
+  rankRepoPreviewRoots,
   redactRepoPreviewLog,
   repoPreviewContentSecurityPolicy,
   repoPreviewContentType,
   repoPreviewPublicPrefix,
+  repoPreviewRootIsWorkspaceShell,
+  repoPreviewRorkWebRoot,
   repoPreviewRunnerVersion,
   repoPreviewSafeRouteLabel,
   repoPreviewWorkflowRunMatches,
@@ -34,12 +38,14 @@ import {
   repoPreviewWorkflowSource,
   rewriteRepoPreviewHtml,
   signRepoPreviewId,
+  type RepoPreviewDetection,
   type RepoPreviewFramework,
   type RepoPreviewInspection,
   type RepoPreviewJob,
   type RepoPreviewManifest,
   type RepoPreviewPackageManager,
   type RepoPreviewPhase,
+  type RepoPreviewRootSource,
 } from "./repo-preview-shared";
 
 const GITHUB_API = "https://api.github.com";
@@ -233,19 +239,60 @@ function relativeToRoot(path: string, root: string): string | null {
   return path.startsWith(prefix) ? path.slice(prefix.length) : null;
 }
 
-function rootSuggestions(paths: string[]): string[] {
-  const suggestions = new Set<string>();
-  for (const path of paths) {
-    if (!/(?:^|\/)(?:package\.json|index\.html)$/.test(path) || path.includes("node_modules/")) {
-      continue;
+/** One inspected project root: its files relative to the root plus what they say about the stack. */
+type RootProbe = {
+  rootDirectory: string;
+  paths: string[];
+  packageJson: string | null;
+  detection: RepoPreviewDetection;
+};
+
+const AUTO_ROOT_CANDIDATES = 6;
+
+/**
+ * Resolves which folder to build when the user left the root at ".". Repositories
+ * shaped like Gera's own (rork.json + `web/` + `functions/`) have no runnable
+ * root, so the declared "web" app wins; otherwise ranked app folders are probed
+ * until one is a confident web entry. An explicit root is always respected.
+ */
+async function resolveProjectRoot(
+  requestedRoot: string,
+  allPaths: string[],
+  probe: (root: string) => Promise<RootProbe>,
+  readRootFile: (path: string) => Promise<string | null>,
+): Promise<{ resolved: RootProbe; rootSource: RepoPreviewRootSource; rootSuggestions: string[] }> {
+  const requested = await probe(requestedRoot);
+  const ranked = rankRepoPreviewRoots(allPaths);
+  let resolved = requested;
+  let rootSource: RepoPreviewRootSource = requestedRoot === "." ? "root" : "explicit";
+  const rootIsShell = !requested.detection.projectFound ||
+    repoPreviewRootIsWorkspaceShell(requested.packageJson, requested.paths);
+  if (requestedRoot === "." && !isRepoPreviewWebEntry(requested.detection) && rootIsShell) {
+    const tried = new Set<string>(["."]);
+    const rorkRoot = allPaths.includes("rork.json") ? repoPreviewRorkWebRoot(await readRootFile("rork.json")) : null;
+    if (rorkRoot && rorkRoot !== ".") {
+      tried.add(rorkRoot);
+      const declared = await probe(rorkRoot);
+      if (declared.detection.projectFound) {
+        resolved = declared;
+        rootSource = "rork.json";
+      }
     }
-    const parts = path.split("/");
-    if (parts.length > 5) {
-      continue;
+    if (rootSource === "root") {
+      for (const candidate of ranked.filter((root) => !tried.has(root)).slice(0, AUTO_ROOT_CANDIDATES)) {
+        const probed = await probe(candidate);
+        if (isRepoPreviewWebEntry(probed.detection)) {
+          resolved = probed;
+          rootSource = "detected";
+          break;
+        }
+      }
     }
-    suggestions.add(parts.length === 1 ? "." : parts.slice(0, -1).join("/"));
   }
-  return [...suggestions].slice(0, 12);
+  const rootSuggestions = [
+    ...new Set([...(resolved.detection.projectFound ? [resolved.rootDirectory] : []), ...ranked]),
+  ].slice(0, 12);
+  return { resolved, rootSource, rootSuggestions };
 }
 
 async function inspectRepository(auth: string, input: InspectInput): Promise<RepoPreviewInspection> {
@@ -288,13 +335,26 @@ async function inspectRepository(auth: string, input: InspectInput): Promise<Rep
         return path && (entry?.type === "blob" || entry?.type === "tree") ? [path] : [];
       })
     : [];
-  const selectedPaths = allPaths.flatMap((path): string[] => {
-    const relative = relativeToRoot(path, rootDirectory);
-    return relative ? [relative] : [];
-  });
-  const packagePath = rootDirectory === "." ? "package.json" : `${rootDirectory}/package.json`;
-  const packageFile = await readRepoFile(auth, repository.owner, repository.repo, packagePath, commitSha);
-  const detection = detectRepoPreviewProject(packageFile?.content ?? null, selectedPaths);
+  const readRootFile = async (path: string): Promise<string | null> =>
+    (await readRepoFile(auth, repository.owner, repository.repo, path, commitSha))?.content ?? null;
+  const probe = async (root: string): Promise<RootProbe> => {
+    const paths = allPaths.flatMap((path): string[] => {
+      const relative = relativeToRoot(path, root);
+      return relative ? [relative] : [];
+    });
+    // The requested root is always read (a truncated tree must not hide it);
+    // auto-probed candidates came from the tree, so a missing marker is definitive.
+    const packageJson = root === rootDirectory || paths.includes("package.json")
+      ? await readRootFile(root === "." ? "package.json" : `${root}/package.json`)
+      : null;
+    return { rootDirectory: root, paths, packageJson, detection: detectRepoPreviewProject(packageJson, paths) };
+  };
+  const { resolved, rootSource, rootSuggestions } = await resolveProjectRoot(
+    rootDirectory,
+    allPaths,
+    probe,
+    readRootFile,
+  );
 
   const runnerFile = await readRepoFile(
     auth,
@@ -315,12 +375,13 @@ async function inspectRepository(auth: string, input: InspectInput): Promise<Rep
     defaultBranch,
     ref: rawRef,
     commitSha: commitSha.toLowerCase(),
-    rootDirectory,
+    rootDirectory: resolved.rootDirectory,
+    rootSource,
     ...(outputDirectory ? { outputDirectory } : {}),
-    rootSuggestions: rootSuggestions(allPaths),
+    rootSuggestions,
     runner,
     ...(installedVersion ? { runnerVersion: installedVersion } : {}),
-    ...detection,
+    ...resolved.detection,
   };
 }
 

@@ -166,12 +166,16 @@ export type RepoPreviewJob = {
   error?: string;
 };
 
+/** Who chose the project root: the user, the repo root, a Rork workspace's rork.json, or ranked app folders. */
+export type RepoPreviewRootSource = "explicit" | "root" | "rork.json" | "detected";
+
 export type RepoPreviewInspection = {
   repository: string;
   defaultBranch: string;
   ref: string;
   commitSha: string;
   rootDirectory: string;
+  rootSource: RepoPreviewRootSource;
   outputDirectory?: string;
   rootSuggestions: string[];
   runner: "ready" | "missing" | "outdated";

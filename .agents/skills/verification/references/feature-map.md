@@ -150,6 +150,18 @@ authenticated publish job, after the public GitHub handoff artifact already
 exists. The build uses a fixed base placeholder; trusted publish rewrites text
 entries and regenerates the tar manifest locally before direct Rork upload.
 
+The launch dialog inspects with root `.`; when the repository root is not a
+confident web entry (no package.json/index.html, or a workspace shell with
+rork.json / workspaces / turbo / nx / lerna / no build script) the backend
+resolves the real app folder itself: first the `framework: "web"` app declared in
+a Rork workspace's `rork.json` (this repo's own `web/` + `functions/` shape), then
+ranked candidate folders (`web`, `apps/site`… above `functions`, `api`, `server`;
+never `dist`, `public`, `node_modules`, dot folders) until one has a recognised
+framework or a static index.html. The inspection carries `rootSource`
+(`explicit | root | rork.json | detected`); the dialog adopts the resolved root,
+shows why it was chosen, and re-inspects immediately when a root chip is
+clicked. An explicitly typed root is always respected.
+
 The launch writes an ordinary user turn + durable `repo-preview-flow` receipt
 into the existing chat — no new IDE/page. Source → Install → Build → Preview
 phases poll the account's Rork Durable Object and survive tab close, reload and
@@ -1036,7 +1048,9 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
 Repository-launch coverage: `repo-preview.test.ts` pins repository/ref/path
-validation, framework + lockfile detection, manifest offset bounds, HTML asset
+validation, framework + lockfile detection, Rork-workspace root resolution
+(`rork.json` web app, ranked `web` > `functions`, workspace-shell roots,
+`rootSource` normalization), manifest offset bounds, HTML asset
 namespacing, SVG sandboxing + XML rejection, capability/credential redaction,
 synced job normalization, dispatch-run + OIDC claim binding, and the generated
 workflow's immutable/read-only/no-dispatched-secret contract. It also asserts

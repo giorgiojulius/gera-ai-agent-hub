@@ -5,6 +5,7 @@ import type {
   RepoPreviewJob,
   RepoPreviewPackageManager,
   RepoPreviewPhase,
+  RepoPreviewRootSource,
 } from "@/lib/types";
 
 const PHASES = new Set<RepoPreviewPhase>([
@@ -31,6 +32,7 @@ const FRAMEWORKS = new Set<RepoPreviewFramework>([
   "unknown",
 ]);
 const PACKAGE_MANAGERS = new Set<RepoPreviewPackageManager>(["bun", "pnpm", "yarn", "npm", "none"]);
+const ROOT_SOURCES = new Set<RepoPreviewRootSource>(["explicit", "root", "rork.json", "detected"]);
 const PREVIEW_ID = /^[a-f0-9]{24}\.[A-Za-z0-9_-]{32,64}\.[a-f0-9]{24}$/;
 const REPOSITORY = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/;
 
@@ -189,12 +191,19 @@ export function normalizeRepoPreviewInspection(value: unknown): RepoPreviewInspe
   ) {
     return undefined;
   }
+  // Older backends omit rootSource; a "." root is the repo root, anything else was typed.
+  const rootSource: RepoPreviewRootSource = ROOT_SOURCES.has(raw.rootSource as RepoPreviewRootSource)
+    ? (raw.rootSource as RepoPreviewRootSource)
+    : rootDirectory === "."
+      ? "root"
+      : "explicit";
   return {
     repository,
     defaultBranch,
     ref,
     commitSha: commitSha.toLowerCase(),
     rootDirectory,
+    rootSource,
     ...(outputDirectory ? { outputDirectory } : {}),
     rootSuggestions: Array.isArray(raw.rootSuggestions)
       ? raw.rootSuggestions.flatMap((item): string[] => {

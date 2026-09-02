@@ -93,6 +93,10 @@ export const TID = {
   repoPreviewTab: "repo-preview-tab",
   /** Address bar of the active dock tab (host + in-app route). */
   repoPreviewAddress: "repo-preview-address",
+  /** Dock tab body standing in for a popup that is not an in-preview page (empty page or real window). */
+  repoPreviewPopupPage: "repo-preview-popup-page",
+  /** Retries the real window behind a popup tab after the browser blocked it. */
+  repoPreviewWindowOpen: "repo-preview-window-open",
   /** Model picker trigger in the composer rail. */
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */

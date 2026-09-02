@@ -1,5 +1,7 @@
 import {
   AlertTriangle,
+  AppWindow,
+  ArrowUpRight,
   Box,
   Check,
   CircleDashed,
@@ -14,7 +16,9 @@ import {
   Play,
   RefreshCw,
   RotateCw,
+  ShieldAlert,
   Square,
+  SquareDashed,
   Workflow,
   X,
   type LucideIcon,
@@ -25,10 +29,10 @@ import { toast } from "sonner";
 import { ArtifactLightbox } from "@/components/gera/artifacts/ArtifactShell";
 import { PreviewFrame, expiryCopy, phaseCopy, stepStates, type StepState } from "@/components/gera/RepoPreviewFlow";
 import { Button } from "@/components/ui/button";
-import { usePreviewBridge } from "@/hooks/use-preview-bridge";
+import { usePreviewBridge, type PreviewTabHost } from "@/hooks/use-preview-bridge";
 import { REPO_PREVIEW_ACTIVE_PHASES, useRepoPreviewJob, type LiveRepoPreview } from "@/hooks/use-repo-preview-job";
 import { safeCodePreviewUrl } from "@/lib/code-changes";
-import { MAX_PREVIEW_TABS, previewRoutePath, type PopupOpener } from "@/lib/preview-bridge";
+import { MAX_PREVIEW_TABS, previewRoutePath, sameOpener, type PopupOpener, type PopupPage } from "@/lib/preview-bridge";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -36,24 +40,56 @@ import { cn } from "@/lib/utils";
 type PanelMode = "preview" | "log";
 
 /**
- * One browser-style page inside the dock. `href`/`title` arrive live from the
- * frame's shim; `opener` is set when the page stands in for a `window.open`
- * made by another tab, so closing it can be reported back there.
+ * One browser-style tab inside the dock. `page` tabs hold a sandboxed frame
+ * (`href`/`title` arrive live from its shim); `blank` tabs are windows the app
+ * opened but has not navigated yet; `window` tabs stand in for a real browser
+ * window (other origins cannot run inside the panel). `opener` names the
+ * `window.open` the tab stands in for, so closing it can be reported back.
  */
 type PreviewTab = {
   id: string;
+  kind: "page" | "blank" | "window";
   url: string;
   href: string | null;
   title: string | null;
   nonce: number;
   opener: PopupOpener | null;
+  /** `window`: placement hints for a retry after the browser blocked it. */
+  features: string;
+  /** `window`: a real window currently stands behind the tab. */
+  opened: boolean;
 };
 
 const ROOT_TAB_ID = "root";
 const STAGE_LABELS = ["Source", "Install", "Build", "Preview"] as const;
 
 function rootTab(url: string): PreviewTab {
-  return { id: ROOT_TAB_ID, url, href: null, title: null, nonce: 0, opener: null };
+  return { id: ROOT_TAB_ID, kind: "page", url, href: null, title: null, nonce: 0, opener: null, features: "", opened: true };
+}
+
+function popupTab(id: string, page: PopupPage, opener: PopupOpener | null): PreviewTab {
+  const base = { id, href: null, title: null, nonce: 0, opener, features: "", opened: true };
+  if (page.kind === "page") return { ...base, kind: "page", url: page.url };
+  if (page.kind === "blank") return { ...base, kind: "blank", url: "about:blank" };
+  return { ...base, kind: "window", url: page.url, features: page.features, opened: page.opened };
+}
+
+/** The app navigated a popup it already holds: the same tab shows the new destination. */
+function retargetTab(tab: PreviewTab, page: PopupPage): PreviewTab {
+  return { ...popupTab(tab.id, page, tab.opener), nonce: tab.nonce + 1 };
+}
+
+function tabLabel(tab: PreviewTab, previewUrl: string): string {
+  if (tab.kind === "blank") return "New tab";
+  if (tab.kind === "window") return hostOf(tab.url);
+  return tab.title || previewRoutePath(tab.href ?? tab.url, previewUrl);
+}
+
+function tabIcon(tab: PreviewTab): LucideIcon {
+  if (tab.id === ROOT_TAB_ID) return Box;
+  if (tab.kind === "blank") return SquareDashed;
+  if (tab.kind === "window") return AppWindow;
+  return Globe;
 }
 
 function stageIcon(state: StepState): LucideIcon {
@@ -125,6 +161,15 @@ function hostOf(url: string): string {
   }
 }
 
+function pathOf(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return "";
+  }
+}
+
 function HeaderIconButton({
   label,
   onClick,
@@ -181,9 +226,8 @@ function TabStrip({
     >
       {tabs.map((tab) => {
         const active = tab.id === activeId;
-        const route = previewRoutePath(tab.href ?? tab.url, previewUrl);
-        const label = tab.title || route;
-        const Icon = tab.id === ROOT_TAB_ID ? Box : Globe;
+        const label = tabLabel(tab, previewUrl);
+        const Icon = tabIcon(tab);
         const onAux = (event: ReactMouseEvent<HTMLButtonElement>) => {
           if (event.button === 1 && tabs.length > 1) onClose(tab.id);
         };
@@ -232,12 +276,92 @@ function TabStrip({
   );
 }
 
+/** Body of a `blank` tab: the app opened a window and has not loaded anything into it yet. */
+function BlankPage() {
+  return (
+    <div data-testid={TID.repoPreviewPopupPage} className="flex h-full flex-col items-center justify-center gap-2.5 bg-white px-8 text-center">
+      <SquareDashed className="h-6 w-6 text-muted-foreground/40" />
+      <p className="font-mono text-[12px] text-muted-foreground/70">about:blank</p>
+      <p className="max-w-xs text-[12px] leading-relaxed text-muted-foreground/60">
+        The preview opened an empty window and hasn’t loaded a page into it yet. Close this tab if nothing follows.
+      </p>
+    </div>
+  );
+}
+
+/** Body of a `window` tab: the stand-in for a real browser window, with a retry when the browser blocked it. */
+function WindowPage({
+  tab,
+  onOpen,
+  onFocus,
+  onClose,
+}: {
+  tab: PreviewTab;
+  onOpen: () => void;
+  onFocus: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      data-testid={TID.repoPreviewPopupPage}
+      data-window-state={tab.opened ? "open" : "blocked"}
+      className="flex h-full flex-col items-center justify-center gap-5 overflow-y-auto bg-background px-8 py-10 text-center"
+    >
+      <span
+        className={cn(
+          "flex h-14 w-14 items-center justify-center rounded-[18px] border shadow-[0_18px_40px_-28px_rgba(35,20,28,0.5)]",
+          tab.opened ? "border-border/70 bg-card text-foreground" : "border-amber-500/30 bg-amber-500/10 text-amber-700",
+        )}
+      >
+        {tab.opened ? <AppWindow className="h-6 w-6" /> : <ShieldAlert className="h-6 w-6" />}
+      </span>
+      <div className="max-w-sm">
+        <p className="font-display text-[20px] leading-tight tracking-[-0.01em] text-foreground">
+          {tab.opened ? "Continues in a separate window" : "Your browser blocked the window"}
+        </p>
+        <p className="mt-1.5 truncate font-mono text-[11.5px] text-muted-foreground" title={tab.url}>
+          {hostOf(tab.url)}
+        </p>
+        <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">
+          {tab.opened
+            ? "Other sites — sign-in pages included — can’t run inside the preview, so this tab stands in for the window the preview opened. It closes on its own when that window does."
+            : "The preview tried to open another site. Open it from here; the preview keeps waiting for the result."}
+        </p>
+      </div>
+      <div className="flex items-center gap-2">
+        {tab.opened ? (
+          <Button type="button" size="sm" variant="outline" onClick={onFocus} className="h-9 gap-1.5 rounded-full px-4 text-xs">
+            <ArrowUpRight className="h-3.5 w-3.5" />
+            Show window
+          </Button>
+        ) : (
+          <Button
+            type="button"
+            size="sm"
+            data-testid={TID.repoPreviewWindowOpen}
+            onClick={onOpen}
+            className="h-9 gap-1.5 rounded-full bg-[#101E24] px-4 text-xs text-cyan-100 hover:bg-[#17303A]"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open window
+          </Button>
+        )}
+        <Button type="button" size="sm" variant="ghost" onClick={onClose} className="h-9 rounded-full px-4 text-xs text-muted-foreground hover:text-foreground">
+          Close
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Presentational dock (v0-style): the live repository preview pinned to the
  * right of the thread with browser-like chrome — page tabs, an address bar
- * for the active tab, reload/copy/open/expand and the build log. Popups from
- * the sandboxed preview arrive over the shim bridge: in-preview pages become
- * tabs here, other sites open as real browser tabs.
+ * for the active tab, reload/copy/open/expand and the build log. Every popup
+ * the sandboxed preview opens arrives over the shim bridge and becomes a tab
+ * here: in-preview pages load in a frame, blank windows show an empty page
+ * until the app navigates them, and other sites open as a real browser window
+ * with a tab standing in for it (retry when the browser blocked it).
  */
 export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview; onClose: () => void }) {
   const { job } = live;
@@ -246,7 +370,10 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
   const [mode, setMode] = useState<PanelMode>(job.phase === "failed" ? "log" : "preview");
   const [expanded, setExpanded] = useState<boolean>(false);
   const previewUrl = job.previewUrl ? safeCodePreviewUrl(job.previewUrl) : null;
-  const [tabs, setTabs] = useState<PreviewTab[]>(() => (previewUrl ? [rootTab(previewUrl)] : []));
+  const [tabs, setTabsState] = useState<PreviewTab[]>(() => (previewUrl ? [rootTab(previewUrl)] : []));
+  // Bridge messages arrive back-to-back (open, then navigate) before React re-renders: the ref is the
+  // synchronous source of truth and state mirrors it.
+  const tabsRef = useRef<PreviewTab[]>(tabs);
   const [activeTabId, setActiveTabId] = useState<string>(ROOT_TAB_ID);
   const running = REPO_PREVIEW_ACTIVE_PHASES.has(job.phase);
   const ready = job.phase === "ready" && Boolean(previewUrl);
@@ -254,8 +381,37 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
   const states = stepStates(job.phase);
   const [owner, name] = job.repository.split("/");
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0] ?? null;
-  const activeHref = activeTab ? activeTab.href ?? activeTab.url : previewUrl;
+  const activeHref = activeTab
+    ? activeTab.kind === "page"
+      ? activeTab.href ?? activeTab.url
+      : activeTab.kind === "window"
+        ? activeTab.url
+        : null
+    : previewUrl;
   const routePath = previewUrl && activeTab ? previewRoutePath(activeTab.href ?? activeTab.url, previewUrl) : "/";
+
+  const updateTabs = useCallback((update: (current: PreviewTab[]) => PreviewTab[]) => {
+    tabsRef.current = update(tabsRef.current);
+    setTabsState(tabsRef.current);
+  }, []);
+
+  /** Drops matching tabs (never the last one) and moves a closed active tab to its left neighbour. */
+  const removeTabs = useCallback(
+    (match: (tab: PreviewTab) => boolean): PreviewTab[] => {
+      const before = tabsRef.current;
+      const removed = before.filter(match);
+      if (removed.length === 0 || removed.length === before.length) return [];
+      const next = before.filter((tab) => !match(tab));
+      updateTabs(() => next);
+      setActiveTabId((active) => {
+        if (!removed.some((tab) => tab.id === active)) return active;
+        const index = before.findIndex((tab) => tab.id === active);
+        return next[Math.max(0, index - 1)]?.id ?? next[0].id;
+      });
+      return removed;
+    },
+    [updateTabs],
+  );
 
   // A failing build lands on its log; a fresh ready build returns to the preview.
   useEffect(() => {
@@ -266,54 +422,83 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
   // The preview URL appears when the launch turns ready (or changes on rebuild): reset to one root tab.
   useEffect(() => {
     if (!previewUrl) return;
-    setTabs((current) => (current[0]?.url === previewUrl ? current : [rootTab(previewUrl)]));
+    updateTabs((current) => (current[0]?.url === previewUrl ? current : [rootTab(previewUrl)]));
     setActiveTabId((current) => current || ROOT_TAB_ID);
-  }, [previewUrl]);
+  }, [previewUrl, updateTabs]);
 
-  const bridge = usePreviewBridge({
-    prefix: `${panelId}:`,
-    previewUrl,
-    onOpenTab: (_frameKey, url, opener) => {
-      if (tabs.length >= MAX_PREVIEW_TABS) {
+  const tabHost: PreviewTabHost = {
+    open: (_frameKey, page, opener) => {
+      const existing = opener ? tabsRef.current.find((tab) => sameOpener(tab.opener, opener)) : undefined;
+      if (existing) {
+        updateTabs((current) => current.map((tab) => (tab.id === existing.id ? retargetTab(tab, page) : tab)));
+        return;
+      }
+      if (tabsRef.current.length >= MAX_PREVIEW_TABS) {
         toast.error("Preview tab limit reached", { description: "Close a tab in the preview panel to open another page." });
-        if (opener) bridge.notifyClosed(opener);
+        // A real window that did open keeps working on its own; a page that never got a tab reports closed.
+        if (opener && !(page.kind === "window" && page.opened)) bridge.dismissPopup(opener);
         return;
       }
       tabSeq.current += 1;
       const id = `tab-${tabSeq.current}`;
-      setTabs((current) =>
-        current.length >= MAX_PREVIEW_TABS ? current : [...current, { id, url, href: null, title: null, nonce: 0, opener }],
-      );
+      updateTabs((current) => [...current, popupTab(id, page, opener)]);
       setActiveTabId(id);
       setMode("preview");
     },
+    close: (opener) => {
+      removeTabs((tab) => sameOpener(tab.opener, opener));
+    },
+    focus: (opener) => {
+      const tab = tabsRef.current.find((item) => sameOpener(item.opener, opener));
+      if (!tab) return;
+      setActiveTabId(tab.id);
+      setMode("preview");
+    },
+    closed: (opener) => {
+      removeTabs((tab) => sameOpener(tab.opener, opener));
+    },
+  };
+
+  const bridge = usePreviewBridge({
+    prefix: `${panelId}:`,
+    previewUrl,
+    tabs: tabHost,
     onState: (frameKey, state) => {
       const tabId = frameKey.startsWith("expanded:") ? frameKey.slice("expanded:".length) : frameKey;
-      setTabs((current) =>
-        current.map((tab) => (tab.id === tabId ? { ...tab, href: state.href, title: state.title || null } : tab)),
+      updateTabs((current) =>
+        current.map((tab) => (tab.id === tabId && tab.kind === "page" ? { ...tab, href: state.href, title: state.title || null } : tab)),
       );
     },
   });
 
+  /** The user closes a tab: any real window behind it goes too, and the opener hears `closed`. */
   const closeTab = useCallback(
     (id: string) => {
-      const index = tabs.findIndex((tab) => tab.id === id);
-      if (index < 0 || tabs.length <= 1) return;
-      const closing = tabs[index];
-      const next = tabs.filter((tab) => tab.id !== id);
-      setTabs(next);
-      if (activeTabId === id) setActiveTabId(next[Math.max(0, index - 1)]?.id ?? next[0].id);
-      if (closing.opener) bridge.notifyClosed(closing.opener);
+      if (tabsRef.current.length <= 1) return;
+      const [closing] = removeTabs((tab) => tab.id === id);
+      if (closing?.opener) bridge.dismissPopup(closing.opener);
     },
-    [activeTabId, bridge, tabs],
+    [bridge, removeTabs],
+  );
+
+  const reopenWindow = useCallback(
+    (tab: PreviewTab) => {
+      if (!tab.opener) return;
+      if (bridge.openPopupWindow(tab.opener, tab.url, tab.features)) {
+        updateTabs((current) => current.map((item) => (item.id === tab.id ? { ...item, opened: true } : item)));
+        return;
+      }
+      toast.error("The browser blocked the window again", { description: "Allow popups for Gera, then try once more." });
+    },
+    [bridge, updateTabs],
   );
 
   const reloadActive = useCallback(() => {
-    if (!activeTab) return;
-    setTabs((current) =>
+    if (!activeTab || activeTab.kind !== "page") return;
+    updateTabs((current) =>
       current.map((tab) => (tab.id === activeTab.id ? { ...tab, href: null, title: null, nonce: tab.nonce + 1 } : tab)),
     );
-  }, [activeTab]);
+  }, [activeTab, updateTabs]);
 
   const copyLink = async () => {
     if (!activeHref) return;
@@ -427,37 +612,62 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
         <TabStrip tabs={tabs} activeId={activeTab?.id ?? ROOT_TAB_ID} previewUrl={previewUrl} onSelect={setActiveTabId} onClose={closeTab} />
       ) : null}
 
-      {mode === "preview" && ready && previewUrl && activeHref ? (
+      {mode === "preview" && ready && previewUrl && activeTab ? (
         <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-border/60 bg-background/70 px-2.5">
-          <HeaderIconButton label="Reload preview" onClick={reloadActive}>
+          <HeaderIconButton label="Reload preview" onClick={reloadActive} disabled={activeTab.kind !== "page"}>
             <RotateCw className="h-3.5 w-3.5" />
           </HeaderIconButton>
           <div
             data-testid={TID.repoPreviewAddress}
-            title={activeHref}
+            title={activeHref ?? "about:blank"}
             className="flex h-7 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border/60 bg-card px-2.5 font-mono text-[11px] text-muted-foreground shadow-[inset_0_1px_2px_rgba(35,20,28,0.04)]"
           >
-            <Lock className="h-3 w-3 shrink-0 text-emerald-600" />
+            {activeTab.kind === "page" ? (
+              <Lock className="h-3 w-3 shrink-0 text-emerald-600" />
+            ) : activeTab.kind === "window" ? (
+              <AppWindow className="h-3 w-3 shrink-0 text-muted-foreground" />
+            ) : (
+              <SquareDashed className="h-3 w-3 shrink-0 text-muted-foreground/70" />
+            )}
             <span className="truncate">
-              <span className="text-foreground/80">{hostOf(previewUrl)}</span>
-              <span className="text-muted-foreground/50">/…</span>
-              <span className="text-foreground/80">{routePath}</span>
+              {activeTab.kind === "page" ? (
+                <>
+                  <span className="text-foreground/80">{hostOf(previewUrl)}</span>
+                  <span className="text-muted-foreground/50">/…</span>
+                  <span className="text-foreground/80">{routePath}</span>
+                </>
+              ) : activeTab.kind === "window" ? (
+                <>
+                  <span className="text-foreground/80">{hostOf(activeTab.url)}</span>
+                  <span className="text-muted-foreground/70">{pathOf(activeTab.url)}</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground/70">about:blank</span>
+              )}
             </span>
-            <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10px] font-sans">
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
-                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+            {activeTab.kind === "page" ? (
+              <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10px] font-sans">
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                </span>
+                {expiryCopy(job.expiresAt)}
               </span>
-              {expiryCopy(job.expiresAt)}
-            </span>
+            ) : null}
           </div>
-          <HeaderIconButton label="Copy preview link" onClick={() => void copyLink()}>
+          <HeaderIconButton label="Copy preview link" onClick={() => void copyLink()} disabled={!activeHref}>
             <Link2 className="h-3.5 w-3.5" />
           </HeaderIconButton>
-          <HeaderIconButton label="Open preview in a new tab" href={activeHref}>
-            <ExternalLink className="h-3.5 w-3.5" />
-          </HeaderIconButton>
-          <HeaderIconButton label="Expand preview" onClick={() => setExpanded(true)}>
+          {activeHref ? (
+            <HeaderIconButton label="Open preview in a new tab" href={activeHref}>
+              <ExternalLink className="h-3.5 w-3.5" />
+            </HeaderIconButton>
+          ) : (
+            <HeaderIconButton label="Open preview in a new tab" disabled>
+              <ExternalLink className="h-3.5 w-3.5" />
+            </HeaderIconButton>
+          )}
+          <HeaderIconButton label="Expand preview" onClick={() => setExpanded(true)} disabled={activeTab.kind !== "page"}>
             <Maximize2 className="h-3.5 w-3.5" />
           </HeaderIconButton>
         </div>
@@ -480,7 +690,20 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
             {tabs.map((tab) => (
               // Inactive pages stay mounted (hidden) so switching tabs never reloads them.
               <div key={tab.id} className={cn("h-full", tab.id !== activeTab.id && "hidden")} aria-hidden={tab.id !== activeTab.id}>
-                <PreviewFrame key={tab.nonce} job={job} url={tab.url} frameKey={`${panelId}:${tab.id}`} full />
+                {tab.kind === "page" ? (
+                  <PreviewFrame key={tab.nonce} job={job} url={tab.url} frameKey={`${panelId}:${tab.id}`} full />
+                ) : tab.kind === "blank" ? (
+                  <BlankPage />
+                ) : (
+                  <WindowPage
+                    tab={tab}
+                    onOpen={() => reopenWindow(tab)}
+                    onFocus={() => {
+                      if (tab.opener) bridge.focusPopupWindow(tab.opener);
+                    }}
+                    onClose={() => closeTab(tab.id)}
+                  />
+                )}
               </div>
             ))}
           </div>
@@ -531,7 +754,7 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
         )}
       </div>
 
-      {previewUrl && activeTab ? (
+      {previewUrl && activeTab && activeTab.kind === "page" ? (
         <ArtifactLightbox
           open={expanded}
           onOpenChange={setExpanded}

@@ -204,11 +204,18 @@ works), `target="_blank"`/modifier-clicked links, and `pushState`/`popstate`/
 folded under the artifact `<base>` like the Worker's HTML rewrite. The bridge
 is inert when the preview is the top-level document. Gera validates the shape
 (`parsePreviewBridgeMessage`) and the sender (`findPreviewFrameKey`: only its
-own `data-preview-frame` iframes), then routes (`routePreviewPopup`): same
-origin → a new browser-style tab in the dock (`repo-preview-tabs`,
-`repo-preview-tab`, max 8, inactive pages stay mounted, middle-click/× closes,
-falls back to the left neighbour); other web origins → a real browser window
-opened from Gera's trusted document; non-web schemes/credentials → refused.
+own `data-preview-frame` iframes), then routes (`routePreviewPopup`). In the
+dock every popup becomes a tab (`repo-preview-tabs`, `repo-preview-tab`, max
+8, inactive pages stay mounted, middle-click/× closes, falls back to the left
+neighbour), and the tab's body depends on the destination: same origin → a
+sandboxed frame; `about:blank` → an empty page (`repo-preview-popup-page`,
+"New tab") until the app navigates it; other web origins → a real browser
+window opened from Gera's trusted document with the tab standing in for it
+(host label, "Continues in a separate window", Show window/Close; when the
+blocker refused, `data-window-state="blocked"` with an Open window button
+(`repo-preview-window-open`) that retries under the click — no toast); the
+stand-in disappears when the real window closes. Non-web
+schemes/credentials → refused.
 For `window.open` the shim mints a popup id and Gera plays opener for the
 real window (`PreviewPopupRegistry`, `use-preview-bridge.ts`): the window
 keeps `opener` so OAuth callback pages can `opener.postMessage(...)`, and
@@ -220,16 +227,20 @@ closed or the popup was refused), and the stub's `close()`/`focus()`/
 `postMessage()` drive the real window. Placement hints (`popup,width=`) pass
 through, `noopener`/`noreferrer` are stripped so the handle survives. A blank
 open (`window.open()`/`about:blank`, the open-now-navigate-later pattern) is
-bridged immediately as `url:"about:blank"` → a real empty window under the
-click; the later `stub.location = url` (same id, `registry.has`) navigates
-that window instead of opening a second one or a panel tab, and a blocked
-blank reports `closed` silently. Popup-blocked URL opens → toast with an
-Open action; dismissing it reports `closed` so the app's "waiting for the
-popup" spinner settles. `target="_blank"` links (no
-id) open as plain tabs with the opener severed, like a browser. The address
-bar (`repo-preview-address`) shows host + live in-app route of the active
-tab; copy/open/expand act on that tab. The inline card (mobile/shared) has no
-strip and sends every bridged popup to a real window/tab. Unit:
+bridged immediately as `url:"about:blank"`; the later `stub.location = url`
+carries the same id, so the dock retargets that tab (`PreviewTabHost.open`
+with a known opener) and a real window already held (`registry.has`) is
+navigated instead of a second one appearing. `popup.close()`/`focus()` from
+the app close/activate the tab; closing a tab (×, Close) closes any real
+window behind it and reports `closed`, so the app's "waiting for the popup"
+spinner settles. `target="_blank"` links (no id) to other origins open as
+plain browser tabs with the opener severed, like a browser. The address bar
+(`repo-preview-address`) shows host + live in-app route of the active page
+tab, the real window's host + path for a stand-in, or `about:blank`;
+reload/expand only act on page tabs, copy/open on anything with a URL. The
+inline card (mobile/shared) has no strip: popups become real windows, blank
+ones silently report `closed` when blocked, and blocked URL opens get a
+toast with an Open action. Unit:
 `preview-bridge.test.ts`; browser: `repo-preview-sandbox.browser.test.tsx`
 (real `sandbox="allow-scripts"` frame runs the OAuth wait pattern end to end
 against a scripted host), registry + panel tests in

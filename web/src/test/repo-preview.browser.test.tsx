@@ -81,7 +81,15 @@ function postFromFrame(frame: HTMLIFrameElement | Window, data: Record<string, u
   window.dispatchEvent(new MessageEvent("message", { data, origin: "null", source }));
 }
 
-test("the dock turns in-preview popups into tabs and sends other sites to a real browser tab", async () => {
+function tabCount(): number {
+  return document.querySelectorAll(`[data-testid="${TID.repoPreviewTab}"]`).length;
+}
+
+function popupPages(): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>(`[data-testid="${TID.repoPreviewPopupPage}"]`));
+}
+
+test("the dock turns every popup into a tab: in-preview pages, blank windows, and stand-ins for real windows", async () => {
   const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
   const screen = await render(<RepoPreviewPanelView live={live} onClose={() => undefined} />);
   const previewUrl = job.previewUrl ?? "";
@@ -119,8 +127,11 @@ test("the dock turns in-preview popups into tabs and sends other sites to a real
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(openSpy).toHaveBeenCalledWith("https://github.com/login/oauth/authorize?client_id=1", "_blank");
   expect(frames()).toHaveLength(2);
+  expect(tabCount()).toBe(2);
 
-  // A `window.open` from the app (OAuth popup) → a proxied real window carrying the app's placement hints minus opener-severing tokens.
+  // A `window.open` from the app (OAuth popup) → a real window carrying the app's placement hints minus
+  // opener-severing tokens, plus a tab standing in for it. The blocker refused here (the spy hands back
+  // null), so that tab offers to open the window under a genuine click instead of a toast.
   postFromFrame(rootFrame, {
     source: "gera-preview",
     type: "open",
@@ -129,28 +140,51 @@ test("the dock turns in-preview popups into tabs and sends other sites to a real
     id: "w1",
     features: "width=500,height=650,noopener",
   });
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("auth.rork.app/oauth/start?state=1");
   expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start?state=1", "_blank", "width=500,height=650");
   expect(frames()).toHaveLength(2);
+  expect(tabCount()).toBe(3);
+  await expect.element(tabs.nth(2)).toHaveTextContent("auth.rork.app");
+  await expect.element(page.getByTestId(TID.repoPreviewPopupPage)).toHaveAttribute("data-window-state", "blocked");
+
+  const authWindow = { closed: false, location: { href: "" }, focus: vi.fn(), close: vi.fn(), postMessage: vi.fn() };
+  openSpy.mockReturnValueOnce(authWindow as unknown as Window);
+  await page.getByTestId(TID.repoPreviewWindowOpen).click();
+  expect(openSpy).toHaveBeenLastCalledWith("https://auth.rork.app/oauth/start?state=1", "_blank", "width=500,height=650");
+  await expect.element(page.getByTestId(TID.repoPreviewPopupPage)).toHaveAttribute("data-window-state", "open");
+
+  // The user closes the real window: within one poll its tab goes away and the left neighbour takes over.
+  authWindow.closed = true;
+  await vi.waitFor(() => expect(popupPages()).toHaveLength(0), { timeout: 2_000 });
+  expect(tabCount()).toBe(2);
+  await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/settings/profile");
 
   // Blank-then-navigate (`window.open()` under the click, `popup.location = url` after a fetch): the empty
-  // window opens right away and the navigation reuses it — never a second window, never a panel tab.
-  const blankWindow = { closed: false, location: { href: "about:blank" }, focus: vi.fn(), close: vi.fn(), postMessage: vi.fn() };
-  openSpy.mockReturnValueOnce(blankWindow as unknown as Window);
+  // window is a tab at once — no real window — and the navigation reuses that tab instead of adding one.
+  const windowsBefore = openSpy.mock.calls.length;
   postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: "about:blank", target: "_blank", id: "w2", features: "popup" });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  expect(openSpy).toHaveBeenLastCalledWith("about:blank", "_blank", "popup");
+  await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("about:blank");
+  expect(tabCount()).toBe(3);
+  await expect.element(tabs.nth(2)).toHaveTextContent("New tab");
+  expect(popupPages()).toHaveLength(1);
   postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: `${previewUrl}oauth/done`, target: "_blank", id: "w2", features: "popup" });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  expect(blankWindow.location.href).toBe(`${previewUrl}oauth/done`);
-  expect(openSpy).toHaveBeenCalledTimes(3);
-  expect(frames()).toHaveLength(2);
-  blankWindow.closed = true;
+  await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/oauth/done");
+  expect(tabCount()).toBe(3);
+  expect(frames()).toHaveLength(3);
+  expect(frames()[2].src).toBe(`${previewUrl}oauth/done`);
+  expect(popupPages()).toHaveLength(0);
+  expect(openSpy.mock.calls.length).toBe(windowsBefore);
+
+  // The app closes its popup (`popup.close()`): the tab goes with it.
+  postFromFrame(rootFrame, { source: "gera-preview", type: "close", id: "w2" });
+  await vi.waitFor(() => expect(frames()).toHaveLength(2));
+  expect(tabCount()).toBe(2);
+  await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/settings/profile");
 
   // Same backend origin outside the artifact root is folded back into the sandboxed namespace, never opened raw.
   postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: "https://preview.example/mcp/oauth/callback", target: "_blank" });
   await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/mcp/oauth/callback");
-  expect(openSpy).toHaveBeenCalledTimes(3);
+  expect(openSpy.mock.calls.length).toBe(windowsBefore);
   expect(frames()).toHaveLength(3);
   expect(frames()[2].src).toBe(`${previewUrl}mcp/oauth/callback`);
 

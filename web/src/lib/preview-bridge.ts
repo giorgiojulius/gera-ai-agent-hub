@@ -26,6 +26,23 @@ export type PreviewHostMessage =
 /** Names the frame and shim-side popup id a real window (or panel tab) stands in for. */
 export type PopupOpener = { frameKey: string; id: string };
 
+/** Two openers name the same shim-side popup. */
+export function sameOpener(a: PopupOpener | null | undefined, b: PopupOpener | null | undefined): boolean {
+  return Boolean(a && b && a.frameKey === b.frameKey && a.id === b.id);
+}
+
+/**
+ * What a tab standing in for a popup shows: a page under the artifact root, an
+ * empty page the app has not navigated yet, or the stand-in for a real browser
+ * window (other origins cannot run inside the panel and OAuth callback pages
+ * need a genuine `opener`). `opened` is false when the popup blocker refused
+ * the window, so the tab can offer a retry under a real click.
+ */
+export type PopupPage =
+  | { kind: "page"; url: string }
+  | { kind: "blank" }
+  | { kind: "window"; url: string; features: string; opened: boolean };
+
 /** Where a popup requested by the sandboxed preview should go. */
 export type PopupRoute =
   | { kind: "tab"; url: string }
@@ -268,6 +285,9 @@ export class PreviewPopupRegistry {
   private readonly entries = new Map<string, PopupEntry>();
   private timer: number | null = null;
 
+  /** Fires whenever a popup is reported gone to its frame (window closed, refused, dismissed). */
+  onClosed: ((frameKey: string, id: string) => void) | null = null;
+
   constructor(
     private readonly frameFor: (frameKey: string) => HTMLIFrameElement | null,
     private readonly pollMs: number = 500,
@@ -354,6 +374,7 @@ export class PreviewPopupRegistry {
     this.entries.delete(PreviewPopupRegistry.key(frameKey, id));
     this.postToFrame(frameKey, { source: PREVIEW_HOST_SOURCE, type: "closed", id });
     if (this.entries.size === 0) this.stopLoop();
+    this.onClosed?.(frameKey, id);
   }
 
   /**

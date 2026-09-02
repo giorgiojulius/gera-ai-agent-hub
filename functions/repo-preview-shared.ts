@@ -673,13 +673,15 @@ export function repoPreviewContentType(path: string): string {
  * and other sites as real browser windows — and reports the current route and
  * title (`type:"state"`) so the panel's address bar and tab strip stay live.
  *
- * `window.open` returns a window-like stub tied to a popup id; Gera plays
- * opener for the real window it opens on the stub's behalf. A blank open
- * (`window.open()` / `"about:blank"`, the "open now, navigate after the
- * fetch" OAuth pattern) is bridged at once as `url:"about:blank"` so a real
- * window appears under the user's click exactly as it would unsandboxed, and a
- * later `stub.location = url` navigates that same window. `close()`,
- * `focus()` and `postMessage()` on the stub drive the real window
+ * `window.open` returns a window-like stub tied to a popup id; in Gera's dock
+ * every popup becomes a tab (an in-preview page, an empty page, or the stand-in
+ * for a real window Gera opens on the stub's behalf and plays opener for). A
+ * blank open (`window.open()` / `"about:blank"`, the "open now, navigate after
+ * the fetch" OAuth pattern) is bridged at once as `url:"about:blank"` so the
+ * tab appears under the user's click, and a later `stub.location = url`
+ * carries the same id so that tab (or real window) is navigated rather than a
+ * second one opening. `close()`, `focus()` and `postMessage()` on the stub
+ * drive the tab or real window
  * (`type:"close"|"focus"|"message"`), and Gera posts back
  * `{source:"gera-preview-host", type:"closed"}` when the window is gone and
  * `type:"message"` with whatever the window posted to its opener, which the

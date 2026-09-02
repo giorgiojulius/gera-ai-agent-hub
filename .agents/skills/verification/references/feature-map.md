@@ -1003,7 +1003,12 @@ All notify paths fail silent.
 `/runs/*` (start, stream SSE, active, steer/stop) · `/diag/*` ·
 `/repo-previews/{inspect|install|start|status|cancel}` authenticated launch
 control · `/repo-preview-hook/:id/*` GitHub Actions OIDC-authenticated workflow
-callback · `/repo-preview/:id/:access/*` public expiring static artifact delivery ·
+callback (the runner's `PUT …/archive` tar is handled in the entrypoint:
+DO `archive-claim` mints a presigned R2 PUT for a per-run staging key → the
+entrypoint streams the body straight into R2 with a fixed length → DO
+`archive-commit` records bytes or persists a specific storage error; the
+multi-MB body never rides the DO transport) · `/repo-preview/:id/:access/*`
+public expiring static artifact delivery ·
 `/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
 `/automations/run-now` · `/projects` +
 `/projects/create` + `/projects/:id/*` (overview, messages, message, read,

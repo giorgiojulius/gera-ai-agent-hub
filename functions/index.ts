@@ -56,7 +56,7 @@ import { AccessRegistry } from "./access-registry";
 import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute } from "./knowledge-storage";
-import { verifyRepoPreviewId } from "./repo-preview-shared";
+import { REPO_PREVIEW_MAX_ARCHIVE_BYTES, verifyRepoPreviewId } from "./repo-preview-shared";
 import { githubRequestHeaders } from "./native-github";
 import { decodeSlackInstallState } from "./native-slack";
 import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
@@ -2640,12 +2640,112 @@ async function relayRepoPreviewPublic(request: Request, url: URL, env: Env): Pro
   headers.delete("X-Rork-User-Id");
   headers.delete("X-Rork-User-Email");
   headers.delete("X-Rork-User-Name");
+  if (isHook && request.method === "PUT" && rest === `${id}/archive`) {
+    return relayRepoPreviewArchive(request, env, ownerKey, id, headers);
+  }
   const upstream = await repoPreviewStoreRequest(env, request.url, ownerKey, targetPath, {
     method: request.method,
     headers,
     body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
   });
   return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+}
+
+type FixedLengthStreamConstructor = new (
+  expectedLength: number,
+) => { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
+
+/**
+ * Gives the outgoing PUT an exact Content-Length (R2 rejects chunked bodies)
+ * and fails the transfer if the runner sends more or fewer bytes than declared.
+ */
+function fixedLengthBody(body: ReadableStream<Uint8Array>, length: number): ReadableStream<Uint8Array> {
+  const FixedLength = (globalThis as { FixedLengthStream?: FixedLengthStreamConstructor }).FixedLengthStream;
+  if (!FixedLength) {
+    return body;
+  }
+  const { readable, writable } = new FixedLength(length);
+  // A length mismatch or an aborted client surfaces on the fetch side.
+  body.pipeTo(writable).catch(() => undefined);
+  return readable;
+}
+
+function hookJson(data: unknown, status: number): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+/**
+ * Runner artifact upload. The Durable Object stays a control plane: it
+ * authenticates the runner (GitHub OIDC), claims the row and mints a
+ * short-lived presigned PUT; this entrypoint streams the tar straight into
+ * R2 without buffering and reports the outcome back. The multi-megabyte
+ * body therefore never rides the DO transport, and any storage failure is
+ * persisted as a specific preview error instead of surfacing as an opaque 5xx.
+ */
+async function relayRepoPreviewArchive(
+  request: Request,
+  env: Env,
+  ownerKey: string,
+  id: string,
+  hookHeaders: Headers,
+): Promise<Response> {
+  const contentType = (request.headers.get("Content-Type") ?? "").split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/x-tar") {
+    return hookJson({ error: "unsupported_content_type" }, 415);
+  }
+  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
+  const body = request.body;
+  if (!body || !Number.isInteger(contentLength) || contentLength <= 0 || contentLength > REPO_PREVIEW_MAX_ARCHIVE_BYTES) {
+    return hookJson({ error: "invalid_archive_size" }, 413);
+  }
+  const control = new Headers({ "Content-Type": "application/json" });
+  const oidc = hookHeaders.get("X-Gera-GitHub-OIDC");
+  if (oidc) {
+    control.set("X-Gera-GitHub-OIDC", oidc);
+  }
+  const claim = await repoPreviewStoreRequest(env, request.url, ownerKey, `/hook/${id}/archive-claim`, {
+    method: "POST",
+    headers: control,
+    body: JSON.stringify({ contentLength }),
+  });
+  if (!claim.ok) {
+    await body.cancel().catch(() => undefined);
+    console.error("repo preview archive claim refused", claim.status);
+    return new Response(claim.body, { status: claim.status, headers: claim.headers });
+  }
+  const granted = (await claim.json().catch(() => null)) as { uploadUrl?: unknown; stagingKey?: unknown } | null;
+  const uploadUrl = typeof granted?.uploadUrl === "string" ? granted.uploadUrl : "";
+  const stagingKey = typeof granted?.stagingKey === "string" ? granted.stagingKey : "";
+  let status = 0;
+  let failure = "";
+  if (!uploadUrl || !stagingKey) {
+    failure = "The preview store returned an invalid upload grant.";
+    await body.cancel().catch(() => undefined);
+  } else {
+    try {
+      const upload = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "application/x-tar" },
+        body: fixedLengthBody(body, contentLength),
+      });
+      status = upload.status;
+      await upload.body?.cancel().catch(() => undefined);
+    } catch (error) {
+      failure = error instanceof Error ? error.message.slice(0, 200) : "transfer failed";
+    }
+  }
+  if (status < 200 || status >= 300 || failure) {
+    console.error("repo preview archive transfer failed", status, failure ? "transfer_error" : "rejected");
+  }
+  const commit = await repoPreviewStoreRequest(env, request.url, ownerKey, `/hook/${id}/archive-commit`, {
+    method: "POST",
+    headers: control,
+    body: JSON.stringify({ stagingKey, contentLength, status, failure }),
+  });
+  return new Response(commit.body, { status: commit.status, headers: commit.headers });
 }
 
 /**

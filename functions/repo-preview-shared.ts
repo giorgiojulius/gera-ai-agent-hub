@@ -201,6 +201,84 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+const ARCHIVE_KEY_PATTERN = /^previews\/[a-f0-9]{24}\/[a-f0-9]{64}\.tar$/;
+const STAGING_KEY_SUFFIX = ".upload-run-";
+
+/** Outcome the entrypoint reports after streaming the runner artifact into storage. */
+export type RepoPreviewArchiveCommit = {
+  stagingKey: string;
+  contentLength: number;
+  status: number;
+  failure: string;
+  uploaded: boolean;
+};
+
+/** Final object key; a staging key left behind by an aborted run collapses to it. */
+export function repoPreviewArchiveBaseKey(key: string): string {
+  const index = key.indexOf(STAGING_KEY_SUFFIX);
+  return index >= 0 ? key.slice(0, index) : key;
+}
+
+/** Object key used while one exact workflow run is transferring its artifact. */
+export function repoPreviewStagingKey(archiveKey: string, runId: string): string {
+  return `${repoPreviewArchiveBaseKey(archiveKey)}${STAGING_KEY_SUFFIX}${runId}`;
+}
+
+/** Only the staging key minted for this exact run may be committed. */
+export function isRepoPreviewStagingKey(value: unknown, runId: string): value is string {
+  if (typeof value !== "string" || !/^\d+$/.test(runId)) return false;
+  const suffix = `${STAGING_KEY_SUFFIX}${runId}`;
+  return value.endsWith(suffix) && ARCHIVE_KEY_PATTERN.test(value.slice(0, -suffix.length));
+}
+
+/** Declared artifact size accepted for a claim: positive, integral, bounded. */
+export function normalizeRepoPreviewArchiveLength(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= REPO_PREVIEW_MAX_ARCHIVE_BYTES
+    ? value
+    : null;
+}
+
+/** Validates the entrypoint's transfer report before the row can become servable. */
+export function normalizeRepoPreviewArchiveCommit(value: unknown, runId: string): RepoPreviewArchiveCommit | null {
+  const raw = record(value);
+  const contentLength = normalizeRepoPreviewArchiveLength(raw?.contentLength);
+  if (!raw || contentLength === null || !isRepoPreviewStagingKey(raw.stagingKey, runId)) {
+    return null;
+  }
+  const status =
+    typeof raw.status === "number" && Number.isInteger(raw.status) && raw.status >= 0 && raw.status <= 999
+      ? raw.status
+      : 0;
+  const failure = typeof raw.failure === "string" ? raw.failure.trim().slice(0, 200) : "";
+  return {
+    stagingKey: raw.stagingKey,
+    contentLength,
+    status,
+    failure,
+    uploaded: !failure && status >= 200 && status < 300,
+  };
+}
+
+/** Persisted reason when the artifact never landed in storage — specific, never opaque. */
+export function repoPreviewArchiveFailureMessage(result: Pick<RepoPreviewArchiveCommit, "status" | "failure">): string {
+  if (result.failure) {
+    return `The preview artifact could not be transferred to Rork storage: ${result.failure}`;
+  }
+  if (result.status === 0) {
+    return "The preview artifact transfer to Rork storage did not complete.";
+  }
+  return `Rork storage rejected the preview artifact (HTTP ${result.status}).`;
+}
+
+/** Persisted reason when Rork storage credentials cannot be minted at all. */
+export function repoPreviewStorageUnavailableMessage(error: unknown): string {
+  const code = error instanceof Error ? error.message : "";
+  if (code === "storage_quota") {
+    return "Rork file storage quota is exhausted for this project. Free space or top up storage, then launch the preview again.";
+  }
+  return "Rork file storage is unavailable for this project (storage_unavailable). Enable file storage for the Gera backend, then launch the preview again.";
+}
+
 /** Verifies the workflow run GitHub created before any callback identity is accepted. */
 export function repoPreviewWorkflowRunMatches(
   value: unknown,

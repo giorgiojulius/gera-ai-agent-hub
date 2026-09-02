@@ -6,13 +6,18 @@ import {
   detectRepoPreviewProject,
   isRepoPreviewAccessToken,
   isRepoPreviewArtifactPath,
+  isRepoPreviewStagingKey,
   isRepoPreviewWebEntry,
+  normalizeRepoPreviewArchiveCommit,
+  normalizeRepoPreviewArchiveLength,
   normalizeRepoPreviewDirectory,
   normalizeRepoPreviewManifest,
   normalizeRepoPreviewRef,
   parseRepoPreviewRepository,
   rankRepoPreviewRoots,
   redactRepoPreviewLog,
+  repoPreviewArchiveBaseKey,
+  repoPreviewArchiveFailureMessage,
   repoPreviewContentSecurityPolicy,
   repoPreviewContentType,
   repoPreviewPublicPrefix,
@@ -20,6 +25,8 @@ import {
   repoPreviewRorkWebRoot,
   repoPreviewRunnerVersion,
   repoPreviewSafeRouteLabel,
+  repoPreviewStagingKey,
+  repoPreviewStorageUnavailableMessage,
   repoPreviewWorkflowMatches,
   repoPreviewWorkflowRunMatches,
   repoPreviewWorkflowSource,
@@ -446,6 +453,57 @@ describe("repository preview contract", () => {
     expect(serverSanitized.messages[0]?.repoPreview).toBeUndefined();
     expect(serverSanitized.messages[0]?.content).toContain("stay private");
     expect(JSON.stringify(serverSanitized)).not.toContain(job.id);
+  });
+
+  it("binds the artifact staging key to one exact workflow run", () => {
+    const archiveKey = `previews/${"a".repeat(24)}/${"b".repeat(64)}.tar`;
+    const stagingKey = repoPreviewStagingKey(archiveKey, "123456");
+    expect(stagingKey).toBe(`${archiveKey}.upload-run-123456`);
+    expect(repoPreviewStagingKey(stagingKey, "777")).toBe(`${archiveKey}.upload-run-777`);
+    expect(repoPreviewArchiveBaseKey(stagingKey)).toBe(archiveKey);
+    expect(repoPreviewArchiveBaseKey(archiveKey)).toBe(archiveKey);
+    expect(isRepoPreviewStagingKey(stagingKey, "123456")).toBe(true);
+    expect(isRepoPreviewStagingKey(stagingKey, "654321")).toBe(false);
+    expect(isRepoPreviewStagingKey(archiveKey, "123456")).toBe(false);
+    expect(isRepoPreviewStagingKey(`../${stagingKey}`, "123456")).toBe(false);
+    expect(isRepoPreviewStagingKey(stagingKey, "12a")).toBe(false);
+    expect(isRepoPreviewStagingKey(undefined, "123456")).toBe(false);
+  });
+
+  it("accepts only bounded artifact sizes and well-formed transfer reports", () => {
+    expect(normalizeRepoPreviewArchiveLength(8_388_608)).toBe(8_388_608);
+    expect(normalizeRepoPreviewArchiveLength(REPO_PREVIEW_MAX_ARCHIVE_BYTES)).toBe(REPO_PREVIEW_MAX_ARCHIVE_BYTES);
+    expect(normalizeRepoPreviewArchiveLength(REPO_PREVIEW_MAX_ARCHIVE_BYTES + 1)).toBeNull();
+    expect(normalizeRepoPreviewArchiveLength(0)).toBeNull();
+    expect(normalizeRepoPreviewArchiveLength(12.5)).toBeNull();
+    expect(normalizeRepoPreviewArchiveLength("8")).toBeNull();
+
+    const stagingKey = repoPreviewStagingKey(`previews/${"a".repeat(24)}/${"b".repeat(64)}.tar`, "42");
+    const uploaded = normalizeRepoPreviewArchiveCommit({ stagingKey, contentLength: 1024, status: 200, failure: "" }, "42");
+    expect(uploaded).toEqual({ stagingKey, contentLength: 1024, status: 200, failure: "", uploaded: true });
+
+    const rejected = normalizeRepoPreviewArchiveCommit({ stagingKey, contentLength: 1024, status: 403 }, "42");
+    expect(rejected?.uploaded).toBe(false);
+    expect(repoPreviewArchiveFailureMessage(rejected!)).toBe("Rork storage rejected the preview artifact (HTTP 403).");
+
+    const broken = normalizeRepoPreviewArchiveCommit(
+      { stagingKey, contentLength: 1024, status: 200, failure: " Network connection lost. " },
+      "42",
+    );
+    expect(broken?.uploaded).toBe(false);
+    expect(repoPreviewArchiveFailureMessage(broken!)).toContain("Network connection lost.");
+    expect(repoPreviewArchiveFailureMessage({ status: 0, failure: "" })).toBe(
+      "The preview artifact transfer to Rork storage did not complete.",
+    );
+
+    expect(normalizeRepoPreviewArchiveCommit({ stagingKey, contentLength: 1024, status: 200 }, "43")).toBeNull();
+    expect(normalizeRepoPreviewArchiveCommit({ stagingKey: "previews/x.tar", contentLength: 1024, status: 200 }, "42")).toBeNull();
+    expect(normalizeRepoPreviewArchiveCommit({ stagingKey, contentLength: 0, status: 200 }, "42")).toBeNull();
+    expect(normalizeRepoPreviewArchiveCommit(null, "42")).toBeNull();
+
+    expect(repoPreviewStorageUnavailableMessage(new Error("storage_quota"))).toContain("quota");
+    expect(repoPreviewStorageUnavailableMessage(new Error("storage_unavailable"))).toContain("storage_unavailable");
+    expect(repoPreviewStorageUnavailableMessage("boom")).toContain("Enable file storage");
   });
 
   it("normalizes durable jobs and drops unsafe URLs before rendering", () => {

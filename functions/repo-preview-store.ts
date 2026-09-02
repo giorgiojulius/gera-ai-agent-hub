@@ -11,7 +11,6 @@ import {
   type RorkStorageEnv,
 } from "./knowledge-storage";
 import {
-  REPO_PREVIEW_MAX_ARCHIVE_BYTES,
   REPO_PREVIEW_MAX_LOG_CHARS,
   REPO_PREVIEW_RUNNER_TTL_MS,
   REPO_PREVIEW_TTL_MS,
@@ -20,12 +19,16 @@ import {
   isRepoPreviewAccessToken,
   isRepoPreviewId,
   isRepoPreviewWebEntry,
+  normalizeRepoPreviewArchiveCommit,
+  normalizeRepoPreviewArchiveLength,
   normalizeRepoPreviewDirectory,
   normalizeRepoPreviewManifest,
   normalizeRepoPreviewRef,
   parseRepoPreviewRepository,
   rankRepoPreviewRoots,
   redactRepoPreviewLog,
+  repoPreviewArchiveBaseKey,
+  repoPreviewArchiveFailureMessage,
   repoPreviewContentSecurityPolicy,
   repoPreviewContentType,
   repoPreviewPublicPrefix,
@@ -33,6 +36,8 @@ import {
   repoPreviewRorkWebRoot,
   repoPreviewRunnerVersion,
   repoPreviewSafeRouteLabel,
+  repoPreviewStagingKey,
+  repoPreviewStorageUnavailableMessage,
   repoPreviewWorkflowRunMatches,
   repoPreviewWorkflowMatches,
   repoPreviewWorkflowSource,
@@ -1240,7 +1245,10 @@ export class RepoPreviewStore extends DurableObject {
     const parts = url.pathname.slice("/hook/".length).split("/");
     if (parts.length !== 2) return null;
     const [id, action] = parts;
-    if (!isRepoPreviewId(id) || !["configuration", "started", "phase", "archive", "manifest", "logs", "complete"].includes(action)) {
+    if (
+      !isRepoPreviewId(id) ||
+      !["configuration", "started", "phase", "archive-claim", "archive-commit", "manifest", "logs", "complete"].includes(action)
+    ) {
       return null;
     }
     const row = this.row(id);
@@ -1276,16 +1284,12 @@ export class RepoPreviewStore extends DurableObject {
       return json({ error: "hook_not_found" }, 404);
     }
     const { row, id, action, oidcToken, runId } = auth;
-    const expectedMethod = ["archive", "manifest", "logs"].includes(action) ? "PUT" : "POST";
+    const expectedMethod = ["manifest", "logs"].includes(action) ? "PUT" : "POST";
     if (request.method !== expectedMethod) {
       return json({ error: "method_not_allowed" }, 405);
     }
     const contentType = (request.headers.get("Content-Type") ?? "").split(";", 1)[0].trim().toLowerCase();
-    const expectedType = action === "archive"
-      ? "application/x-tar"
-      : action === "logs"
-        ? "text/plain"
-        : "application/json";
+    const expectedType = action === "logs" ? "text/plain" : "application/json";
     if (contentType !== expectedType) {
       return json({ error: "unsupported_content_type" }, 415);
     }
@@ -1343,14 +1347,13 @@ export class RepoPreviewStore extends DurableObject {
       );
       return json({ ok: true });
     }
-    if (action === "archive") {
-      const contentLength = Number(request.headers.get("Content-Length") ?? "0");
-      if (
-        !request.body ||
-        !Number.isInteger(contentLength) ||
-        contentLength <= 0 ||
-        contentLength > REPO_PREVIEW_MAX_ARCHIVE_BYTES
-      ) {
+    // The artifact body never enters this object: the entrypoint claims a
+    // staging key here, streams the tar straight into R2 with the presigned
+    // PUT minted below, then reports the outcome through archive-commit.
+    if (action === "archive-claim") {
+      const input = await readRequestJson(request, CONTROL_BODY_LIMIT);
+      const contentLength = normalizeRepoPreviewArchiveLength(input?.contentLength);
+      if (contentLength === null) {
         return json({ error: "invalid_archive_size" }, 413);
       }
       const current = this.row(id);
@@ -1362,7 +1365,8 @@ export class RepoPreviewStore extends DurableObject {
       ) {
         return json({ error: "archive_already_claimed" }, 409);
       }
-      const stagingKey = `${row.archive_key}.upload-run-${runId}`;
+      const baseKey = repoPreviewArchiveBaseKey(current.archive_key);
+      const stagingKey = repoPreviewStagingKey(baseKey, runId);
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET phase = 'uploading', archive_key = ?, archive_bytes = -1, manifest = '', updated_at = ?
           WHERE id = ? AND run_id = ? AND archive_bytes = 0
@@ -1376,51 +1380,79 @@ export class RepoPreviewStore extends DurableObject {
       if (!claimed || claimed.run_id !== runId || claimed.archive_bytes !== -1 || claimed.phase !== "uploading") {
         return json({ error: "archive_claim_failed" }, 409);
       }
-      const creds = await getRorkStorageCredentials(this.workerEnv);
-      const upload = await fetch(await presignRorkStorageUrl(creds, "PUT", stagingKey), {
-        method: "PUT",
-        headers: { "Content-Type": "application/x-tar" },
-        body: request.body,
-      });
-      if (!upload.ok) {
-        console.error("repo preview R2 upload failed", upload.status);
-        const deleted = await this.deleteStorageKey(stagingKey);
+      let uploadUrl = "";
+      try {
+        const creds = await getRorkStorageCredentials(this.workerEnv);
+        uploadUrl = await presignRorkStorageUrl(creds, "PUT", stagingKey);
+      } catch (error) {
+        const message = repoPreviewStorageUnavailableMessage(error);
+        console.error("repo preview storage unavailable", error instanceof Error ? error.message : "error");
+        // Nothing reached storage yet: release the staging key and fail with the real reason.
         this.ctx.storage.sql.exec(
-          `UPDATE repo_previews SET phase = 'failed', archive_bytes = ?, manifest = '', updated_at = ?, error = ?
-            WHERE id = ? AND run_id = ? AND archive_bytes = -1`,
-          deleted ? 0 : -2,
+          `UPDATE repo_previews SET phase = 'failed', archive_key = ?, archive_bytes = 0, manifest = '', updated_at = ?, error = ?
+            WHERE id = ? AND run_id = ? AND archive_key = ? AND archive_bytes = -1`,
+          baseKey,
           Date.now(),
-          "Rork storage rejected the preview artifact.",
+          message,
           id,
           runId,
+          stagingKey,
         );
-        return json({ error: "archive_upload_failed" }, 502);
+        return json({ error: "storage_unavailable", message }, 503);
       }
-      const afterUpload = this.row(id);
+      return json({ uploadUrl, stagingKey, contentLength });
+    }
+    if (action === "archive-commit") {
+      const input = await readRequestJson(request, CONTROL_BODY_LIMIT);
+      const commit = normalizeRepoPreviewArchiveCommit(input, runId);
+      if (!commit) {
+        return json({ error: "invalid_archive_commit" }, 400);
+      }
+      const current = this.row(id);
       if (
-        !afterUpload ||
-        afterUpload.run_id !== runId ||
-        afterUpload.runner_expires_at <= Date.now() ||
-        afterUpload.phase !== "uploading" ||
-        afterUpload.archive_bytes !== -1
+        !current ||
+        current.run_id !== runId ||
+        current.phase !== "uploading" ||
+        current.archive_bytes !== -1 ||
+        current.archive_key !== commit.stagingKey
       ) {
-        if (!(await this.deleteStorageKey(stagingKey))) {
+        return json({ error: "archive_commit_out_of_order" }, 409);
+      }
+      if (!commit.uploaded) {
+        const message = repoPreviewArchiveFailureMessage(commit);
+        console.error("repo preview artifact transfer failed", commit.status, commit.failure ? "transfer_error" : "rejected");
+        const deleted = await this.deleteStorageKey(commit.stagingKey);
+        this.ctx.storage.sql.exec(
+          `UPDATE repo_previews SET phase = 'failed', archive_bytes = ?, manifest = '', updated_at = ?, error = ?
+            WHERE id = ? AND run_id = ? AND archive_key = ? AND archive_bytes = -1`,
+          deleted ? 0 : -2,
+          Date.now(),
+          message,
+          id,
+          runId,
+          commit.stagingKey,
+        );
+        return json({ error: "archive_upload_failed", message }, 502);
+      }
+      if (current.runner_expires_at <= Date.now()) {
+        if (!(await this.deleteStorageKey(commit.stagingKey))) {
           this.ctx.storage.sql.exec(
             `UPDATE repo_previews SET archive_bytes = -2, manifest = ''
               WHERE id = ? AND archive_key = ? AND archive_bytes <= 0`,
             id,
-            stagingKey,
+            commit.stagingKey,
           );
         }
         return json({ error: "preview_no_longer_active" }, 409);
       }
       this.ctx.storage.sql.exec(
         `UPDATE repo_previews SET archive_bytes = ?, updated_at = ?
-          WHERE id = ? AND run_id = ? AND phase = 'uploading' AND archive_bytes = -1`,
-        contentLength,
+          WHERE id = ? AND run_id = ? AND phase = 'uploading' AND archive_bytes = -1 AND archive_key = ?`,
+        commit.contentLength,
         Date.now(),
         id,
         runId,
+        commit.stagingKey,
       );
       return json({ ok: true });
     }
@@ -1547,10 +1579,22 @@ export class RepoPreviewStore extends DurableObject {
       headers.set("Content-Length", String(file.size));
       return new Response(null, { status: 200, headers });
     }
-    const creds = await getRorkStorageCredentials(this.workerEnv);
-    const signed = await presignRorkStorageUrl(creds, "GET", row.archive_key);
+    let signed: string;
+    try {
+      const creds = await getRorkStorageCredentials(this.workerEnv);
+      signed = await presignRorkStorageUrl(creds, "GET", row.archive_key);
+    } catch (error) {
+      console.error("repo preview storage unavailable", error instanceof Error ? error.message : "error");
+      return new Response("Preview storage is temporarily unavailable.", { status: 503 });
+    }
     const range = `bytes=${file.offset}-${file.offset + file.size - 1}`;
-    const upstream = await fetch(signed, { headers: { Range: range } });
+    let upstream: Response;
+    try {
+      upstream = await fetch(signed, { headers: { Range: range } });
+    } catch (error) {
+      console.error("repo preview R2 range unreachable", error instanceof Error ? error.message : "error");
+      return new Response("Preview artifact is unavailable.", { status: 502 });
+    }
     if (!upstream.ok || upstream.status !== 206) {
       console.error("repo preview R2 range failed", upstream.status);
       return new Response("Preview artifact is unavailable.", { status: 502 });

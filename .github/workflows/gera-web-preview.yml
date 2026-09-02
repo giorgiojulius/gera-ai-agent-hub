@@ -1,0 +1,384 @@
+# gera-web-preview-runner: 3
+name: Gera web preview
+run-name: Gera web preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      preview_id:
+        description: Gera preview id
+        required: true
+        type: string
+      commit_sha:
+        description: Immutable source commit
+        required: true
+        type: string
+      root_directory:
+        description: Web project root
+        required: true
+        default: .
+        type: string
+      output_directory:
+        description: Optional build output directory
+        required: false
+        default: ""
+        type: string
+      callback_url:
+        description: Gera backend callback origin
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  begin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: none
+      id-token: write
+    steps:
+      - name: Authenticate exact runner
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          set -euo pipefail
+          PREVIEW_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["preview_id"])' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$PREVIEW_ID"
+          for ATTEMPT in {1..10}; do
+            OIDC_TOKEN="$(curl --fail --silent --show-error               -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+            if printf '{}' | curl --fail --silent --show-error               -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @-               "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/started"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+  build:
+    needs: begin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: none
+    outputs:
+      exit_code: ${{ steps.build.outputs.exit_code }}
+    steps:
+      - name: Check out immutable source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Install, build and package
+        id: build
+        shell: bash
+        env:
+          ROOT_DIRECTORY: ${{ inputs.root_directory }}
+          REQUESTED_OUTPUT: ${{ inputs.output_directory }}
+        run: |
+          set +e
+          LOG_FILE="$RUNNER_TEMP/gera-preview.log"
+          {
+            set -euo pipefail
+            case "$ROOT_DIRECTORY" in
+              /*|*".."*) echo "Unsafe root directory."; exit 2 ;;
+            esac
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+            if [ "$ROOT_DIRECTORY" != "." ]; then PROJECT_DIR="$GITHUB_WORKSPACE/$ROOT_DIRECTORY"; fi
+            if [ ! -d "$PROJECT_DIR" ]; then echo "Project root not found: $ROOT_DIRECTORY"; exit 2; fi
+            cd "$PROJECT_DIR"
+            PREVIEW_BASE="/repo-preview/__GERA_PREVIEW_BASE__/"
+
+            if [ -f package.json ]; then
+              corepack enable || true
+              if [ -f bun.lock ] || [ -f bun.lockb ]; then
+                PACKAGE_MANAGER=bun
+                bun install --frozen-lockfile
+              elif [ -f pnpm-lock.yaml ]; then
+                PACKAGE_MANAGER=pnpm
+                PACKAGE_MANAGER_SPEC="$(node -p 'require("./package.json").packageManager || ""')"
+                if [[ "$PACKAGE_MANAGER_SPEC" == pnpm@* ]]; then corepack prepare "$PACKAGE_MANAGER_SPEC" --activate; else corepack prepare pnpm@9.15.9 --activate; fi
+                pnpm install --frozen-lockfile
+              elif [ -f yarn.lock ]; then
+                PACKAGE_MANAGER=yarn
+                PACKAGE_MANAGER_SPEC="$(node -p 'require("./package.json").packageManager || ""')"
+                if [[ "$PACKAGE_MANAGER_SPEC" == yarn@* ]]; then corepack prepare "$PACKAGE_MANAGER_SPEC" --activate; else corepack prepare yarn@1.22.22 --activate; fi
+                yarn install --immutable || yarn install --frozen-lockfile
+              elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+                PACKAGE_MANAGER=npm
+                npm ci
+              else
+                PACKAGE_MANAGER=npm
+                npm install
+              fi
+
+              if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.build ? 0 : 1)'; then
+                if node -e 'const p=require("./package.json"); const d={...(p.dependencies||{}),...(p.devDependencies||{})}; process.exit(d.vite ? 0 : 1)'; then
+                  case "$PACKAGE_MANAGER" in
+                    bun) bun run build -- --base="$PREVIEW_BASE" ;;
+                    pnpm) pnpm run build -- --base="$PREVIEW_BASE" ;;
+                    yarn) yarn build --base="$PREVIEW_BASE" ;;
+                    *) npm run build -- --base="$PREVIEW_BASE" ;;
+                  esac
+                else
+                  export PUBLIC_URL="$PREVIEW_BASE"
+                  export BASE_URL="$PREVIEW_BASE"
+                  case "$PACKAGE_MANAGER" in
+                    bun) bun run build ;;
+                    pnpm) pnpm run build ;;
+                    yarn) yarn build ;;
+                    *) npm run build ;;
+                  esac
+                fi
+              elif [ ! -f index.html ]; then
+                echo "package.json has no build script and the project root has no index.html."
+                exit 3
+              fi
+            elif [ ! -f index.html ]; then
+              echo "No package.json or index.html found in $ROOT_DIRECTORY."
+              exit 3
+            fi
+
+            export REQUESTED_OUTPUT
+            OUTPUT_DIR="$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path.cwd()
+          requested = os.environ.get("REQUESTED_OUTPUT", "").strip().strip("/")
+          candidates = [requested] if requested else ["dist", "build", "out", ".output/public", "public", "."]
+          for candidate in candidates:
+              if not candidate:
+                  continue
+              path = (root / candidate).resolve()
+              try:
+                  path.relative_to(root.resolve())
+              except ValueError:
+                  continue
+              if path.is_dir() and (path / "index.html").is_file():
+                  print(path)
+                  raise SystemExit(0)
+          for parent in (root / "dist", root / "build", root / "out"):
+              if parent.is_dir():
+                  for index in sorted(parent.glob("**/index.html")):
+                      if len(index.relative_to(parent).parts) <= 4:
+                          print(index.parent.resolve())
+                          raise SystemExit(0)
+          raise SystemExit("Build completed, but no static index.html output was found. Set the output directory explicitly.")
+          PY
+            )"
+            export OUTPUT_DIR
+            python3 - <<'PY'
+          import json
+          import os
+          import tarfile
+          from pathlib import Path
+          root = Path(os.environ["OUTPUT_DIR"]).resolve()
+          tar_path = Path(os.environ["RUNNER_TEMP"]) / "gera-preview.tar"
+          manifest_path = Path(os.environ["RUNNER_TEMP"]) / "gera-preview-manifest.json"
+          files = []
+          allowed_extensions = {
+              ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".json", ".webmanifest", ".txt", ".csv",
+              ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
+              ".woff", ".woff2", ".ttf", ".otf", ".wasm",
+              ".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".webm", ".mov",
+              ".pdf", ".glb", ".gltf", ".usdz", ".bin",
+          }
+          blocked_names = {
+              "package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb",
+              "tsconfig.json", "jsconfig.json", "config.json", "secrets.json", "credentials.json", "service-account.json",
+              "wrangler.json", "wrangler.jsonc", "wrangler.toml",
+          }
+          def sensitive_name(name):
+              lower = name.lower()
+              return (
+                  lower in blocked_names
+                  or ".config." in lower
+                  or (lower.startswith(("tsconfig.", "jsconfig.")) and lower.endswith(".json"))
+                  or any(marker in f"-{lower.replace('_', '-').replace('.', '-')}-" for marker in ("-secret-", "-secrets-", "-credential-", "-credentials-", "-service-account-"))
+              )
+          for path in sorted(root.rglob("*")):
+              if path.is_symlink() or not path.is_file() or path.suffix.lower() not in allowed_extensions:
+                  continue
+              relative_path = path.relative_to(root)
+              if any(part.startswith(".") for part in relative_path.parts) or sensitive_name(path.name):
+                  continue
+              relative = relative_path.as_posix()
+              files.append((path, relative))
+          if not files or len(files) > 1000:
+              raise SystemExit(f"Preview output has {len(files)} files; expected 1..1000.")
+          if not any(relative == "index.html" for _, relative in files):
+              raise SystemExit("Preview output has no root index.html.")
+          if sum(path.stat().st_size for path, _ in files) > 50 * 1024 * 1024:
+              raise SystemExit("Preview output exceeds 50 MiB.")
+          with tarfile.open(tar_path, "w", format=tarfile.GNU_FORMAT) as archive:
+              for path, relative in files:
+                  archive.add(path, arcname=relative, recursive=False)
+          with tarfile.open(tar_path, "r") as archive:
+              entries = [
+                  {"path": member.name, "offset": member.offset_data, "size": member.size}
+                  for member in archive.getmembers()
+                  if member.isfile()
+              ]
+          if tar_path.stat().st_size > 50 * 1024 * 1024:
+              raise SystemExit("Packaged preview exceeds 50 MiB.")
+          manifest_path.write_text(json.dumps({"version": 1, "entry": "index.html", "files": entries}), encoding="utf-8")
+          print(f"Packaged {len(entries)} files ({tar_path.stat().st_size} bytes).")
+          PY
+          } > >(tee "$LOG_FILE") 2>&1
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Stage bounded handoff
+        if: always()
+        shell: bash
+        run: |
+          touch "$RUNNER_TEMP/gera-preview.log"
+          if [ "${{ steps.build.outputs.exit_code }}" != "0" ]; then
+            rm -f "$RUNNER_TEMP/gera-preview.tar" "$RUNNER_TEMP/gera-preview-manifest.json"
+          fi
+
+      - name: Transfer bounded handoff
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gera-preview-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gera-preview.tar
+            ${{ runner.temp }}/gera-preview.log
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: [begin, build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: none
+      id-token: write
+    steps:
+      - name: Receive bounded handoff
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: gera-preview-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gera-preview-handoff
+
+      - name: Publish from trusted job
+        if: always()
+        shell: bash
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_CODE: ${{ needs.build.outputs.exit_code }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          PREVIEW_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["preview_id"])' "$GITHUB_EVENT_PATH")"
+          echo "::add-mask::$PREVIEW_ID"
+          OIDC_TOKEN="$(curl --fail --silent --show-error             -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gera-repo-preview" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+          PREVIEW_BASE="$(printf '{}' | curl --fail --silent --show-error             -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @-             "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/configuration"             | python3 -c 'import json,re,sys; value=json.load(sys.stdin).get("previewBase", ""); prefix=f"/repo-preview/{sys.argv[1]}/"; token=value[len(prefix):-1] if value.startswith(prefix) and value.endswith("/") else ""; assert re.fullmatch(r"[a-f0-9]{48}", token); print(value)' "$PREVIEW_ID")"
+          PREVIEW_ACCESS="${PREVIEW_BASE%/}"
+          PREVIEW_ACCESS="${PREVIEW_ACCESS##*/}"
+          echo "::add-mask::$PREVIEW_ACCESS"
+          echo "::add-mask::$PREVIEW_BASE"
+          set +e
+          HANDOFF_DIR="$RUNNER_TEMP/gera-preview-handoff"
+          LOG_FILE="$HANDOFF_DIR/gera-preview.log"
+          if [ -f "$LOG_FILE" ]; then
+            tail -c 120000 "$LOG_FILE" | curl --fail --silent --show-error -X PUT               -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: text/plain; charset=utf-8" --data-binary @-               "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/logs" >/dev/null || true
+          fi
+
+          REWRITE_CODE=1
+          if [ "$BUILD_RESULT" = "success" ] && [ "$BUILD_CODE" = "0" ]             && [ -f "$HANDOFF_DIR/gera-preview.tar" ]; then
+            export HANDOFF_DIR PREVIEW_BASE
+            python3 - <<'PY'
+          import io
+          import json
+          import os
+          import tarfile
+          from pathlib import Path
+
+          limit = 50 * 1024 * 1024
+          placeholder = b"/repo-preview/__GERA_PREVIEW_BASE__/"
+          replacement = os.environ["PREVIEW_BASE"].encode("utf-8")
+          handoff = Path(os.environ["HANDOFF_DIR"])
+          source = handoff / "gera-preview.tar"
+          target = handoff / "gera-preview-bound.tar"
+          manifest_path = handoff / "gera-preview-manifest.json"
+          text_extensions = {".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".json", ".webmanifest", ".txt", ".csv", ".svg", ".gltf"}
+          seen = set()
+          total = 0
+          with tarfile.open(source, "r:") as incoming, tarfile.open(target, "w", format=tarfile.GNU_FORMAT) as outgoing:
+              members = incoming.getmembers()
+              if not members or len(members) > 1000:
+                  raise SystemExit("Invalid handoff file count.")
+              for member in members:
+                  parts = member.name.split("/")
+                  if not member.isfile() or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts) or member.name in seen:
+                      raise SystemExit("Unsafe handoff entry.")
+                  if member.size < 0 or member.size > limit or total + member.size > limit:
+                      raise SystemExit("Oversized handoff entry.")
+                  stream = incoming.extractfile(member)
+                  if stream is None:
+                      raise SystemExit("Unreadable handoff entry.")
+                  data = stream.read(member.size + 1)
+                  if len(data) != member.size:
+                      raise SystemExit("Handoff entry size mismatch.")
+                  if Path(member.name).suffix.lower() in text_extensions:
+                      data = data.replace(placeholder, replacement)
+                  total += len(data)
+                  if total > limit:
+                      raise SystemExit("Bound preview exceeds 50 MiB.")
+                  info = tarfile.TarInfo(member.name)
+                  info.size = len(data)
+                  info.mode = 0o644
+                  info.mtime = 0
+                  outgoing.addfile(info, io.BytesIO(data))
+                  seen.add(member.name)
+          if "index.html" not in seen or target.stat().st_size > limit:
+              raise SystemExit("Bound preview is invalid or too large.")
+          with tarfile.open(target, "r:") as archive:
+              entries = [
+                  {"path": member.name, "offset": member.offset_data, "size": member.size}
+                  for member in archive.getmembers()
+                  if member.isfile()
+              ]
+          manifest_path.write_text(json.dumps({"version": 1, "entry": "index.html", "files": entries}), encoding="utf-8")
+          os.replace(target, source)
+          PY
+            REWRITE_CODE=$?
+          fi
+
+          UPLOAD_CODE=1
+          if [ "$REWRITE_CODE" = "0" ]; then
+            printf '{"phase":"uploading"}' | curl --fail --silent --show-error               -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @-               "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/phase"             && curl --fail --silent --show-error -X PUT               -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/x-tar"               --data-binary @"$HANDOFF_DIR/gera-preview.tar"               "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/archive"             && curl --fail --silent --show-error -X PUT               -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json"               --data-binary @"$HANDOFF_DIR/gera-preview-manifest.json"               "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/manifest"
+            UPLOAD_CODE=$?
+          fi
+
+          if [ "$UPLOAD_CODE" = "0" ]; then
+            STATUS=success
+            MESSAGE="Static preview is ready."
+          else
+            STATUS=failed
+            MESSAGE="Install, build, packaging, transfer, or upload failed. Open the bounded log in Gera."
+          fi
+          printf '{"status":"%s","message":"%s"}' "$STATUS" "$MESSAGE" | curl --fail --silent --show-error             -H "Authorization: Bearer $OIDC_TOKEN" -H "Content-Type: application/json" --data-binary @-             "$CALLBACK_URL/repo-preview-hook/$PREVIEW_ID/complete"
+          COMPLETE_CODE=$?
+          if [ "$STATUS" != "success" ] || [ "$COMPLETE_CODE" != "0" ]; then exit 1; fi

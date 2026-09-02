@@ -87,7 +87,13 @@ describe("sanitizeChatModel", () => {
     expect(sanitizeChatModel("spacexai/grok-4.6:xhigh")).toBe("spacexai/grok-4.6:xhigh");
     expect(sanitizeChatModel("anthropic/claude-opus-5")).toBe("anthropic/claude-opus-5");
     expect(sanitizeChatModel("anthropic/claude-opus-5:high")).toBe("anthropic/claude-opus-5:high");
-    expect(sanitizeChatModel("anthropic/claude-fable-5")).toBe("anthropic/claude-fable-5");
+    expect(sanitizeChatModel("anthropic/claude-fable-5.1")).toBe("anthropic/claude-fable-5.1");
+    expect(sanitizeChatModel("anthropic/claude-fable-5.1:high")).toBe("anthropic/claude-fable-5.1:high");
+  });
+
+  it("upgrades a retired pick to its successor instead of the default", () => {
+    expect(sanitizeChatModel("anthropic/claude-fable-5")).toBe("anthropic/claude-fable-5.1");
+    expect(sanitizeChatModel("anthropic/claude-fable-5:xhigh")).toBe("anthropic/claude-fable-5.1:xhigh");
   });
 
   it("snaps stale or removed chat models to the default", () => {
@@ -111,7 +117,8 @@ describe("catalog ids match the live gateway", () => {
     expect(MODE_MODEL_IDS.audio).not.toContain("xai/grok-tts");
   });
 
-  it("fable is back in the chat catalog for coding work", () => {
-    expect(MODE_MODEL_IDS.chat).toContain("anthropic/claude-fable-5");
+  it("fable runs the current 5.1 generation in the chat catalog", () => {
+    expect(MODE_MODEL_IDS.chat).toContain("anthropic/claude-fable-5.1");
+    expect(MODE_MODEL_IDS.chat).not.toContain("anthropic/claude-fable-5");
   });
 });

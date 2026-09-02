@@ -13,7 +13,7 @@ export const DEFAULT_CHAT_MODEL = "spacexai/grok-4.6:xhigh";
 export const PRIMARY_CHAT_MODEL_IDS = [
   "spacexai/grok-4.6",
   "openai/gpt-5.6-sol",
-  "anthropic/claude-fable-5",
+  "anthropic/claude-fable-5.1",
   "openai/gpt-5.6-luna",
 ] as const;
 export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.7-flash"] as const;
@@ -60,7 +60,7 @@ export const MODE_MODEL_IDS: Record<CreateMode, string[]> = {
     "openai/gpt-5.6-terra",
     "openai/gpt-5.6-luna",
     "anthropic/claude-opus-5",
-    "anthropic/claude-fable-5",
+    "anthropic/claude-fable-5.1",
     "spacexai/grok-4.6:high",
     "spacexai/grok-4.6:xhigh",
     "spacexai/grok-4.20-reasoning",
@@ -261,15 +261,33 @@ export function modeForModelType(type: ModelType): CreateMode {
 const CHAT_CATALOG_IDS = new Set(MODE_MODEL_IDS.chat.map((id) => parseModelSelection(id).catalogId));
 
 /**
+ * Retired picks that have a direct successor in the catalog. Without this a
+ * pinned model would fall all the way back to the default on the next
+ * generation — moving a user off Anthropic entirely instead of onto the
+ * newer Anthropic model they actually wanted.
+ */
+const MODEL_SUCCESSORS: Record<string, string> = {
+  "anthropic/claude-fable-5": "anthropic/claude-fable-5.1",
+};
+
+/**
  * Stale chat model ids (removed from the gateway or the curated list) would
  * otherwise persist in settings forever and silently degrade every answer —
- * snap them to the current default instead.
+ * upgrade them to their successor, or snap them to the current default.
  */
 export function sanitizeChatModel(id: string | undefined): string {
   if (!id) {
     return DEFAULT_CHAT_MODEL;
   }
-  return CHAT_CATALOG_IDS.has(parseModelSelection(id).catalogId) ? id : DEFAULT_CHAT_MODEL;
+  const parsed = parseModelSelection(id);
+  if (CHAT_CATALOG_IDS.has(parsed.catalogId)) {
+    return id;
+  }
+  const successor = MODEL_SUCCESSORS[parsed.catalogId];
+  if (successor && CHAT_CATALOG_IDS.has(successor)) {
+    return withEffort(successor, parsed.reasoningEffort);
+  }
+  return DEFAULT_CHAT_MODEL;
 }
 
 /** The model selection id driving the given creation tab. */

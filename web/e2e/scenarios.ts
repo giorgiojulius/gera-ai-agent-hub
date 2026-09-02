@@ -146,7 +146,7 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "tap", target: TID.modelPickerModelRow },
       { do: "see", target: modelOptionTid("spacexai/grok-4.6") },
       { do: "see", target: modelOptionTid("openai/gpt-5.6-sol") },
-      { do: "see", target: modelOptionTid("anthropic/claude-fable-5") },
+      { do: "see", target: modelOptionTid("anthropic/claude-fable-5.1") },
       { do: "see", target: modelOptionTid("openai/gpt-5.6-luna") },
       { do: "tap", target: TID.modelPickerMoreRow },
       { do: "tap", target: modelOptionTid(SWITCH_TARGET_MODEL_ID) },

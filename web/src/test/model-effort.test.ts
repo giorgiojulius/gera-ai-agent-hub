@@ -80,7 +80,7 @@ describe("groupChatModels", () => {
       gatewayModel("openai/gpt-5.6-sol"),
       gatewayModel("openai/gpt-5.6-luna"),
       gatewayModel("anthropic/claude-opus-5"),
-      gatewayModel("anthropic/claude-fable-5"),
+      gatewayModel("anthropic/claude-fable-5.1"),
       gatewayModel("spacexai/grok-4.6"),
     ];
 
@@ -89,7 +89,7 @@ describe("groupChatModels", () => {
     expect(groups.primary.map((model) => model.id)).toEqual([
       "spacexai/grok-4.6",
       "openai/gpt-5.6-sol",
-      "anthropic/claude-fable-5",
+      "anthropic/claude-fable-5.1",
       "openai/gpt-5.6-luna",
     ]);
     expect(groups.more.map((model) => model.id)).toEqual([

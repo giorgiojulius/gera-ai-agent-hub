@@ -203,14 +203,27 @@ is inert when the preview is the top-level document. Gera validates the shape
 own `data-preview-frame` iframes), then routes (`routePreviewPopup`): same
 origin → a new browser-style tab in the dock (`repo-preview-tabs`,
 `repo-preview-tab`, max 8, inactive pages stay mounted, middle-click/× closes,
-falls back to the left neighbour); other web origins → a real browser tab
-opened from Gera's trusted document with the opener severed (popup-blocked →
-toast with an Open action); non-web schemes/credentials → refused. The
-address bar (`repo-preview-address`) shows host + live in-app route of the
-active tab; copy/open/expand act on that tab. The inline card (mobile/shared)
-has no strip and sends every bridged popup to a real tab. Unit:
+falls back to the left neighbour); other web origins → a real browser window
+opened from Gera's trusted document; non-web schemes/credentials → refused.
+For `window.open` the shim mints a popup id and Gera plays opener for the
+real window (`PreviewPopupRegistry`, `use-preview-bridge.ts`): the window
+keeps `opener` so OAuth callback pages can `opener.postMessage(...)`, and
+whatever they post is relayed only into the frame that asked
+(`{source:"gera-preview-host", type:"message"}` → re-dispatched as a real
+`message` event with the popup's origin); `closed` is polled every 500ms and
+reported (`type:"closed"`, also when a popup that lived as a panel tab is
+closed or the popup was refused), and the stub's `close()`/`focus()`/
+`postMessage()` drive the real window. Placement hints (`popup,width=`) pass
+through, `noopener`/`noreferrer` are stripped so the handle survives. Popup-
+blocked → toast with an Open action; dismissing it reports `closed` so the
+app's "waiting for the popup" spinner settles. `target="_blank"` links (no
+id) open as plain tabs with the opener severed, like a browser. The address
+bar (`repo-preview-address`) shows host + live in-app route of the active
+tab; copy/open/expand act on that tab. The inline card (mobile/shared) has no
+strip and sends every bridged popup to a real window/tab. Unit:
 `preview-bridge.test.ts`; browser: `repo-preview-sandbox.browser.test.tsx`
-(real `sandbox="allow-scripts"` frame proves the bridge), panel test in
+(real `sandbox="allow-scripts"` frame runs the OAuth wait pattern end to end
+against a scripted host), registry + panel tests in
 `repo-preview.browser.test.tsx`.
 
 The Rork backend stores an uncompressed tar in project R2 and a

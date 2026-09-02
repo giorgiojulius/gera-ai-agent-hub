@@ -24,7 +24,6 @@ import { usePreviewBridge } from "@/hooks/use-preview-bridge";
 import { usePreviewPanel } from "@/hooks/use-preview-panel";
 import { REPO_PREVIEW_ACTIVE_PHASES, useRepoPreviewJob } from "@/hooks/use-repo-preview-job";
 import { safeCodePreviewUrl } from "@/lib/code-changes";
-import { findPreviewFrameKey, openPreviewPopupExternally, routePreviewPopup } from "@/lib/preview-bridge";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob, RepoPreviewPhase } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -258,19 +257,8 @@ export const RepoPreviewCard = memo(function RepoPreviewCard({
   const terminal = !ACTIVE_PHASES.has(job.phase);
   const frameScope = useId();
 
-  // The inline card has no tab strip: every bridged popup becomes a real browser tab.
-  usePreviewBridge(
-    (source) => findPreviewFrameKey(`${frameScope}:`, source),
-    (_frame, message) => {
-      if (message.type !== "open" || !previewUrl) return;
-      const route = routePreviewPopup(message.url, previewUrl);
-      if (route.kind === "blocked") {
-        console.warn("[repo-preview] refused popup from preview", route.reason);
-        return;
-      }
-      openPreviewPopupExternally(route.url);
-    },
-  );
+  // The inline card has no tab strip: every bridged popup becomes a real browser window or tab.
+  usePreviewBridge({ prefix: `${frameScope}:`, previewUrl });
 
   return (
     <div

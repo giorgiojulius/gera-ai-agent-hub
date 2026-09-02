@@ -1,34 +1,117 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 
-import { parsePreviewBridgeMessage, type PreviewBridgeMessage } from "@/lib/preview-bridge";
+import {
+  PreviewPopupRegistry,
+  findPreviewFrame,
+  findPreviewFrameKey,
+  offerBlockedPopup,
+  openPreviewPopupExternally,
+  parsePreviewBridgeMessage,
+  routePreviewPopup,
+  type PopupOpener,
+} from "@/lib/preview-bridge";
+
+export type PreviewBridgeOptions = {
+  /** `data-preview-frame` prefix shared by this surface's frames; the remainder is the frame key. */
+  prefix: string;
+  /** Artifact root; decides between in-panel pages and real browser windows. */
+  previewUrl: string | null;
+  /**
+   * Receives same-origin popups as new pages. `opener` names the shim-side
+   * popup to report as closed when that page goes away (`notifyClosed`).
+   * Surfaces without a tab strip omit this and every popup becomes a window.
+   */
+  onOpenTab?: (frameKey: string, url: string, opener: PopupOpener | null) => void;
+  /** Live route/title of a frame, for address bars and tab labels. */
+  onState?: (frameKey: string, state: { href: string; title: string }) => void;
+};
+
+export type PreviewBridge = {
+  /** Reports a popup that lived as a panel tab as closed to the frame that opened it. */
+  notifyClosed: (opener: PopupOpener) => void;
+};
 
 /**
- * Listens for bridge messages posted by sandboxed preview frames. `resolveFrame`
- * turns the event source into the caller's own frame key (or null to ignore the
- * message); `onMessage` receives validated payloads for matched frames only.
- * Both callbacks may close over fresh state — the latest render's versions run.
+ * Wires one preview surface to the shim running inside its sandboxed frames:
+ * validates bridge messages, maps them to the surface's own frames, routes
+ * popups (page tab, proxied real window, or refused) and plays opener for the
+ * real windows via `PreviewPopupRegistry`. Options may close over fresh state;
+ * the latest render's versions run.
  */
-export function usePreviewBridge(
-  resolveFrame: (source: MessageEventSource | null) => string | null,
-  onMessage: (frameKey: string, message: PreviewBridgeMessage) => void,
-): void {
-  const resolveRef = useRef<typeof resolveFrame>(resolveFrame);
-  const handlerRef = useRef<typeof onMessage>(onMessage);
+export function usePreviewBridge(options: PreviewBridgeOptions): PreviewBridge {
+  const optionsRef = useRef<PreviewBridgeOptions>(options);
+  const registryRef = useRef<PreviewPopupRegistry | null>(null);
 
   useLayoutEffect(() => {
-    resolveRef.current = resolveFrame;
-    handlerRef.current = onMessage;
+    optionsRef.current = options;
   });
 
   useEffect(() => {
+    const registry = new PreviewPopupRegistry((frameKey) => findPreviewFrame(optionsRef.current.prefix, frameKey));
+    registryRef.current = registry;
+
     const listener = (event: MessageEvent) => {
+      if (registry.relay(event)) return;
       const message = parsePreviewBridgeMessage(event.data);
       if (!message) return;
-      const key = resolveRef.current(event.source);
-      if (key === null) return;
-      handlerRef.current(key, message);
+      const { prefix, previewUrl, onOpenTab, onState } = optionsRef.current;
+      const frameKey = findPreviewFrameKey(prefix, event.source);
+      if (frameKey === null) return;
+
+      switch (message.type) {
+        case "state":
+          onState?.(frameKey, { href: message.href, title: message.title });
+          return;
+        case "close":
+          registry.close(frameKey, message.id);
+          return;
+        case "focus":
+          registry.focus(frameKey, message.id);
+          return;
+        case "message":
+          registry.send(frameKey, message.id, message.data, message.targetOrigin);
+          return;
+        case "open": {
+          if (!previewUrl) return;
+          const route = routePreviewPopup(message.url, previewUrl);
+          if (route.kind === "blocked") {
+            console.warn("[repo-preview] refused popup from preview", route.reason);
+            if (message.id) registry.notifyClosed(frameKey, message.id);
+            return;
+          }
+          if (route.kind === "tab" && onOpenTab) {
+            onOpenTab(frameKey, route.url, message.id ? { frameKey, id: message.id } : null);
+            return;
+          }
+          if (!message.id) {
+            // A `target="_blank"` link: a plain new tab with the opener severed, like the browser would.
+            openPreviewPopupExternally(route.url);
+            return;
+          }
+          const { id, features } = message;
+          if (registry.open(frameKey, id, route.url, features)) return;
+          offerBlockedPopup(
+            route.url,
+            () => registry.open(frameKey, id, route.url, features),
+            () => registry.notifyClosed(frameKey, id),
+          );
+          return;
+        }
+      }
     };
+
     window.addEventListener("message", listener);
-    return () => window.removeEventListener("message", listener);
+    return () => {
+      window.removeEventListener("message", listener);
+      registry.dispose();
+      registryRef.current = null;
+    };
   }, []);
+
+  return useMemo<PreviewBridge>(
+    () => ({
+      notifyClosed: (opener) => registryRef.current?.notifyClosed(opener.frameKey, opener.id),
+    }),
+    [],
+  );
 }

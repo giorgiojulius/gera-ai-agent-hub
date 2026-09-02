@@ -6,6 +6,7 @@ import {
   previewBase,
   previewRoutePath,
   routePreviewPopup,
+  sanitizePopupFeatures,
 } from "@/lib/preview-bridge";
 
 const previewUrl = `https://gera-backend.rork.app/repo-preview/${"a".repeat(24)}.${"b".repeat(32)}.${"c".repeat(24)}/${"d".repeat(48)}/`;
@@ -56,7 +57,29 @@ describe("preview bridge routing", () => {
     expect(parsePreviewBridgeMessage("open")).toBeNull();
     expect(parsePreviewBridgeMessage({ source: "other", type: "open", url: "https://x" })).toBeNull();
     expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "open", url: 42 })).toBeNull();
-    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "open", url: "https://x/" })).toEqual({ type: "open", url: "https://x/", target: "_blank" });
+    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "open", url: "https://x/" })).toEqual({
+      type: "open",
+      url: "https://x/",
+      target: "_blank",
+      id: null,
+      features: "",
+    });
+    // A proxied `window.open`: the popup id rides along, placement hints survive, opener-severing tokens do not.
+    expect(
+      parsePreviewBridgeMessage({ source: "gera-preview", type: "open", url: "https://x/", target: "oauth", id: "w2", features: "popup,width=560,noopener,noreferrer" }),
+    ).toEqual({ type: "open", url: "https://x/", target: "oauth", id: "w2", features: "popup,width=560" });
+    const badId = parsePreviewBridgeMessage({ source: "gera-preview", type: "open", url: "https://x/", id: "../w" });
+    expect(badId?.type === "open" ? badId.id : "unexpected").toBeNull();
+    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "close", id: "w2" })).toEqual({ type: "close", id: "w2" });
+    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "close" })).toBeNull();
+    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "focus", id: 7 })).toBeNull();
+    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "message", id: "w2", data: { hello: 1 }, targetOrigin: "https://auth.example" })).toEqual({
+      type: "message",
+      id: "w2",
+      data: { hello: 1 },
+      targetOrigin: "https://auth.example",
+    });
+    expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "message", id: "w2" })?.type).toBe("message");
     expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "state", href: "https://x/a", title: `  ${"t".repeat(300)} ` })).toEqual({
       type: "state",
       href: "https://x/a",
@@ -64,5 +87,12 @@ describe("preview bridge routing", () => {
     });
     expect(parsePreviewBridgeMessage({ source: "gera-preview", type: "evil" })).toBeNull();
     expect(MAX_PREVIEW_TABS).toBeGreaterThan(1);
+  });
+
+  it("keeps window placement hints but never lets the app sever the proxy's handle", () => {
+    expect(sanitizePopupFeatures("")).toBe("");
+    expect(sanitizePopupFeatures(" popup, width=500 ,height=650")).toBe("popup,width=500,height=650");
+    expect(sanitizePopupFeatures("noopener,noreferrer=yes,width=1")).toBe("width=1");
+    expect(sanitizePopupFeatures("x".repeat(1_000)).length).toBe(256);
   });
 });

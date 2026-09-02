@@ -670,9 +670,18 @@ export function repoPreviewContentType(path: string): string {
  * OAuth flows used to die. When the preview runs inside a Gera frame the shim
  * therefore bridges those to the embedding page (`{source:"gera-preview",
  * type:"open"}` via `postMessage`) — Gera opens in-preview URLs as panel tabs
- * and other sites as real browser tabs — and reports the current route and
+ * and other sites as real browser windows — and reports the current route and
  * title (`type:"state"`) so the panel's address bar and tab strip stay live.
- * The bridge is inert when the preview is the top-level document.
+ *
+ * `window.open` returns a window-like stub tied to a popup id; Gera plays
+ * opener for the real window it opens on the stub's behalf: `close()`,
+ * `focus()` and `postMessage()` on the stub drive the real window
+ * (`type:"close"|"focus"|"message"`), and Gera posts back
+ * `{source:"gera-preview-host", type:"closed"}` when the window is gone and
+ * `type:"message"` with whatever the window posted to its opener, which the
+ * shim re-dispatches as a `message` event so OAuth callback listeners fire
+ * exactly as they would unsandboxed. The bridge is inert when the preview is
+ * the top-level document.
  *
  * No backslashes on purpose: the text rides through a template literal and
  * a Worker header rewrite; keeping it escape-free means what you read here is
@@ -711,18 +720,30 @@ export function repoPreviewSandboxShim(): string {
     'if(raw.indexOf("/")===0&&raw.indexOf("//")!==0&&raw.indexOf(basePath)!==0)raw=basePath.slice(0,basePath.length-1)+raw;' +
     "return new URL(raw,document.baseURI).href;}catch(e){return null;}};" +
     'var web=function(href){return typeof href==="string"&&(href.indexOf("https://")===0||href.indexOf("http://")===0);};' +
-    'var open=function(href,target){var abs=resolve(href);if(!web(abs))return false;post({source:"gera-preview",type:"open",url:abs,target:String(target||"_blank")});return true;};' +
+    'var open=function(href,target,id,features){var abs=resolve(href);if(!web(abs))return false;' +
+    'var msg={source:"gera-preview",type:"open",url:abs,target:String(target||"_blank")};' +
+    'if(id){msg.id=id;msg.features=String(features||"");}post(msg);return true;};' +
+    "var seq=0;var popups={};" +
     "var nativeOpen=window.open;" +
     "window.open=function(url,target,features){" +
     'var name=target==null||target===""?"_blank":String(target);' +
     'if(name==="_self"||name==="_parent"||name==="_top")return nativeOpen.call(window,url,target,features);' +
-    'var href=url==null?"":String(url);' +
-    "var stub={closed:false,opener:null,close:function(){stub.closed=true;},focus:function(){},blur:function(){},postMessage:function(){}};" +
-    'var loc={assign:function(v){open(v,name);},replace:function(v){open(v,name);},toString:function(){return "about:blank";}};' +
-    'Object.defineProperty(loc,"href",{get:function(){return "about:blank";},set:function(v){open(v,name);}});' +
-    'Object.defineProperty(stub,"location",{get:function(){return loc;},set:function(v){open(v,name);}});' +
-    'if(href&&href!=="about:blank")open(href,name);' +
+    'var href=url==null?"":String(url);var id="w"+(++seq);var opts=features==null?"":String(features);' +
+    "var stub={closed:false,opener:null," +
+    'close:function(){if(stub.closed)return;stub.closed=true;delete popups[id];post({source:"gera-preview",type:"close",id:id});},' +
+    'focus:function(){post({source:"gera-preview",type:"focus",id:id});},blur:function(){},' +
+    'postMessage:function(data,origin){var to=typeof origin==="string"?origin:(origin&&typeof origin.targetOrigin==="string"?origin.targetOrigin:"*");' +
+    'post({source:"gera-preview",type:"message",id:id,data:data,targetOrigin:to});}};' +
+    "var go=function(v){open(v,name,id,opts);};" +
+    'var loc={assign:go,replace:go,toString:function(){return "about:blank";}};' +
+    'Object.defineProperty(loc,"href",{get:function(){return "about:blank";},set:go});' +
+    'Object.defineProperty(stub,"location",{get:function(){return loc;},set:go});' +
+    'popups[id]=stub;if(href&&href!=="about:blank")go(href);' +
     "return stub;};" +
+    'window.addEventListener("message",function(e){if(e.source!==window.parent)return;var d=e.data;' +
+    'if(!d||d.source!=="gera-preview-host"||typeof d.id!=="string")return;var s=popups[d.id];if(!s)return;' +
+    'if(d.type==="closed"){s.closed=true;delete popups[d.id];return;}' +
+    'if(d.type==="message"){try{window.dispatchEvent(new MessageEvent("message",{data:d.data,origin:typeof d.origin==="string"?d.origin:"",source:null}));}catch(err){}}});' +
     'document.addEventListener("click",function(e){' +
     "if(e.defaultPrevented||e.button!==0)return;" +
     "var path=e.composedPath?e.composedPath():[];var node=path.length?path[0]:e.target;" +

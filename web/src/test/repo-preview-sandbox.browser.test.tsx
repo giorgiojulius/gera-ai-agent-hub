@@ -86,12 +86,20 @@ test("the served preview HTML boots storage and cookies inside the same sandbox"
 });
 
 type BridgeMessage =
-  | { source: "gera-preview"; type: "open"; url: string; target: string }
+  | { source: "gera-preview"; type: "open"; url: string; target: string; id?: string; features?: string }
   | { source: "gera-preview"; type: "state"; href: string; title: string }
+  | { source: "gera-preview"; type: "close" | "focus"; id: string }
+  | { source: "gera-preview"; type: "message"; id: string; data: unknown; targetOrigin: string }
   | { source: "probe"; results: { kind: string; ok: boolean }[] };
 
-/** Collects every message the frame posts until the probe's final report. */
-function collectFromOpaqueSandbox(html: string): Promise<BridgeMessage[]> {
+/**
+ * Collects every message the frame posts until the probe's final report;
+ * `respond` lets the test play Gera and answer the frame like the real host.
+ */
+function collectFromOpaqueSandbox(
+  html: string,
+  respond?: (frame: HTMLIFrameElement, message: BridgeMessage) => void,
+): Promise<BridgeMessage[]> {
   return new Promise<BridgeMessage[]>((resolve, reject) => {
     const frame = document.createElement("iframe");
     frame.setAttribute("sandbox", "allow-scripts");
@@ -106,7 +114,9 @@ function collectFromOpaqueSandbox(html: string): Promise<BridgeMessage[]> {
       if (event.data.source === "probe") {
         cleanup();
         resolve(received);
+        return;
       }
+      respond?.(frame, event.data);
     };
     const cleanup = () => {
       window.clearTimeout(timer);
@@ -146,7 +156,23 @@ const POPUP_PROBE = `<script>
   later.location.href = "https://auth.example/start?state=1";
   var blocked = window.open("javascript:alert(1)");
   results.push({ kind: "javascript-open-stubbed", ok: !!blocked });
-  setTimeout(function () { parent.postMessage({ source: "probe", results: results }, "*"); }, 30);
+  // The OAuth pattern every popup sign-in uses: wait for the callback page's message or for the window to close.
+  var callback = null;
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "rork_auth_callback") callback = { code: e.data.code, origin: e.origin };
+  });
+  later.postMessage({ hello: "popup" }, "https://auth.example");
+  var tries = 0;
+  var wait = setInterval(function () {
+    tries += 1;
+    if (!(callback && later.closed) && tries < 150) return;
+    clearInterval(wait);
+    results.push({ kind: "callback-relayed", ok: !!callback && callback.code === "abc" && callback.origin === "https://auth.example" });
+    results.push({ kind: "closed-relayed", ok: later.closed === true });
+    w.close();
+    results.push({ kind: "close-marks-closed", ok: w.closed === true });
+    parent.postMessage({ source: "probe", results: results }, "*");
+  }, 20);
 })();
 </script>`;
 
@@ -155,7 +181,16 @@ test("inside the sandbox the shim bridges popups and the page state to the embed
     `<!doctype html><html><head><title>p</title></head><body>${POPUP_PROBE}</body></html>`,
     "/repo-preview/p.abc/",
   );
-  const messages = await collectFromOpaqueSandbox(served);
+  // Play Gera: once the OAuth window is "open", its callback page posts back and the window closes.
+  const messages = await collectFromOpaqueSandbox(served, (frame, message) => {
+    if (message.source !== "gera-preview" || message.type !== "open" || !message.id || !message.url.startsWith("https://auth.example/")) return;
+    const target = frame.contentWindow as Window;
+    target.postMessage(
+      { source: "gera-preview-host", type: "message", id: message.id, origin: "https://auth.example", data: { type: "rork_auth_callback", code: "abc" } },
+      "*",
+    );
+    target.postMessage({ source: "gera-preview-host", type: "closed", id: message.id }, "*");
+  });
 
   const probe = messages.find((message) => message.source === "probe");
   expect(probe && probe.source === "probe" ? probe.results : []).toEqual([
@@ -163,6 +198,9 @@ test("inside the sandbox the shim bridges popups and the page state to the embed
     { kind: "blank-anchor-prevented", ok: true },
     { kind: "plain-anchor-untouched", ok: true },
     { kind: "javascript-open-stubbed", ok: true },
+    { kind: "callback-relayed", ok: true },
+    { kind: "closed-relayed", ok: true },
+    { kind: "close-marks-closed", ok: true },
   ]);
 
   const opens = messages.flatMap((message) => (message.source === "gera-preview" && message.type === "open" ? [message] : []));
@@ -173,6 +211,22 @@ test("inside the sandbox the shim bridges popups and the page state to the embed
     "https://auth.example/start?state=1",
   ]);
   expect(opens[2]?.target).toBe("oauth");
+  // `window.open` calls carry a popup id and the app's placement hints; anchor clicks carry neither.
+  expect(opens[0]?.id).toMatch(/^w[0-9]+$/);
+  expect(opens[1]?.id).toBeUndefined();
+  expect(opens[2]?.id).toMatch(/^w[0-9]+$/);
+  expect(opens[2]?.features).toBe("popup,width=560,height=720");
+
+  const outbound = messages.find((message) => message.source === "gera-preview" && message.type === "message");
+  expect(outbound && outbound.source === "gera-preview" && outbound.type === "message" ? outbound : null).toEqual({
+    source: "gera-preview",
+    type: "message",
+    id: opens[2]?.id,
+    data: { hello: "popup" },
+    targetOrigin: "https://auth.example",
+  });
+  const closes = messages.flatMap((message) => (message.source === "gera-preview" && message.type === "close" ? [message] : []));
+  expect(closes.map((message) => message.id)).toEqual([opens[0]?.id]);
 
   const states = messages.flatMap((message) => (message.source === "gera-preview" && message.type === "state" ? [message] : []));
   expect(states.length).toBeGreaterThan(0);

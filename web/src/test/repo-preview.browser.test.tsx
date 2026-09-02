@@ -5,6 +5,7 @@ import { render } from "vitest-browser-react";
 import { RepoPreviewCard, RepoPreviewReceipt } from "@/components/gera/RepoPreviewFlow";
 import { RepoPreviewPanelView } from "@/components/gera/RepoPreviewPanel";
 import type { LiveRepoPreview } from "@/hooks/use-repo-preview-job";
+import { PreviewPopupRegistry } from "@/lib/preview-bridge";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob } from "@/lib/types";
 
@@ -113,16 +114,29 @@ test("the dock turns in-preview popups into tabs and sends other sites to a real
   await expect.element(tabs.nth(1)).toHaveTextContent("Profile · Storefront");
   await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/settings/profile");
 
-  // Another origin (OAuth) → a real browser tab from Gera's trusted document, never an in-panel frame.
+  // A `target="_blank"` link to another origin → a real browser tab from Gera's trusted document, never an in-panel frame.
   postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: "https://github.com/login/oauth/authorize?client_id=1", target: "_blank" });
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(openSpy).toHaveBeenCalledWith("https://github.com/login/oauth/authorize?client_id=1", "_blank");
   expect(frames()).toHaveLength(2);
 
+  // A `window.open` from the app (OAuth popup) → a proxied real window carrying the app's placement hints minus opener-severing tokens.
+  postFromFrame(rootFrame, {
+    source: "gera-preview",
+    type: "open",
+    url: "https://auth.rork.app/oauth/start?state=1",
+    target: "_blank",
+    id: "w1",
+    features: "width=500,height=650,noopener",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start?state=1", "_blank", "width=500,height=650");
+  expect(frames()).toHaveLength(2);
+
   // Same backend origin outside the artifact root is folded back into the sandboxed namespace, never opened raw.
   postFromFrame(rootFrame, { source: "gera-preview", type: "open", url: "https://preview.example/mcp/oauth/callback", target: "_blank" });
   await expect.element(page.getByTestId(TID.repoPreviewAddress)).toHaveTextContent("/mcp/oauth/callback");
-  expect(openSpy).toHaveBeenCalledTimes(1);
+  expect(openSpy).toHaveBeenCalledTimes(2);
   expect(frames()).toHaveLength(3);
   expect(frames()[2].src).toBe(`${previewUrl}mcp/oauth/callback`);
 
@@ -134,4 +148,56 @@ test("the dock turns in-preview popups into tabs and sends other sites to a real
   await expect.element(page.getByTestId(TID.repoPreviewAddress)).not.toHaveTextContent("/settings");
   expect(frames()).toHaveLength(1);
   expect(screen.container.querySelector(`[data-testid="${TID.repoPreviewTabs}"]`)).toBeNull();
+});
+
+async function mountFrame(title: string): Promise<HTMLIFrameElement> {
+  const frame = document.createElement("iframe");
+  frame.srcdoc = `<!doctype html><title>${title}</title>`;
+  document.body.appendChild(frame);
+  await new Promise<void>((resolve) => frame.addEventListener("load", () => resolve(), { once: true }));
+  return frame;
+}
+
+test("the popup registry plays opener for the preview: callbacks are relayed in, closing is reported, foreign windows are ignored", async () => {
+  // Same-origin stand-ins so the test can listen on both ends: the preview frame and the real popup window.
+  const frame = await mountFrame("preview");
+  const popupHost = await mountFrame("popup");
+  const popupWin = popupHost.contentWindow as Window;
+  const frameInbox: unknown[] = [];
+  (frame.contentWindow as Window).addEventListener("message", (event) => frameInbox.push(event.data));
+  const popupInbox: unknown[] = [];
+  popupWin.addEventListener("message", (event) => popupInbox.push(event.data));
+  const openSpy = vi.spyOn(window, "open").mockReturnValue(popupWin);
+
+  const registry = new PreviewPopupRegistry(() => frame, 20);
+  expect(registry.open("root", "w1", "https://auth.rork.app/oauth/start", "popup,width=500")).toBe(true);
+  expect(openSpy).toHaveBeenCalledWith("https://auth.rork.app/oauth/start", "_blank", "popup,width=500");
+  expect(registry.size).toBe(1);
+
+  // Only windows the registry opened are relayed — and only into the frame that asked for them.
+  expect(registry.relay(new MessageEvent("message", { data: { type: "rork_auth_callback", code: "nope" }, origin: "https://evil.example", source: window }))).toBe(false);
+  expect(
+    registry.relay(new MessageEvent("message", { data: { type: "rork_auth_callback", code: "abc" }, origin: "https://auth.rork.app", source: popupWin })),
+  ).toBe(true);
+  await vi.waitFor(() =>
+    expect(frameInbox).toContainEqual({
+      source: "gera-preview-host",
+      type: "message",
+      id: "w1",
+      origin: "https://auth.rork.app",
+      data: { type: "rork_auth_callback", code: "abc" },
+    }),
+  );
+
+  // The preview's `popup.postMessage` reaches the real window.
+  registry.send("root", "w1", { hello: "popup" }, "*");
+  await vi.waitFor(() => expect(popupInbox).toContainEqual({ hello: "popup" }));
+
+  // The user closes the window: within one poll the frame hears `closed` and tracking is dropped.
+  popupHost.remove();
+  await vi.waitFor(() => expect(frameInbox).toContainEqual({ source: "gera-preview-host", type: "closed", id: "w1" }));
+  expect(registry.size).toBe(0);
+
+  registry.dispose();
+  frame.remove();
 });

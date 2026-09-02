@@ -28,33 +28,32 @@ import { Button } from "@/components/ui/button";
 import { usePreviewBridge } from "@/hooks/use-preview-bridge";
 import { REPO_PREVIEW_ACTIVE_PHASES, useRepoPreviewJob, type LiveRepoPreview } from "@/hooks/use-repo-preview-job";
 import { safeCodePreviewUrl } from "@/lib/code-changes";
-import {
-  MAX_PREVIEW_TABS,
-  findPreviewFrameKey,
-  openPreviewPopupExternally,
-  previewRoutePath,
-  routePreviewPopup,
-} from "@/lib/preview-bridge";
+import { MAX_PREVIEW_TABS, previewRoutePath, type PopupOpener } from "@/lib/preview-bridge";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type PanelMode = "preview" | "log";
 
-/** One browser-style page inside the dock. `href`/`title` arrive live from the frame's shim. */
+/**
+ * One browser-style page inside the dock. `href`/`title` arrive live from the
+ * frame's shim; `opener` is set when the page stands in for a `window.open`
+ * made by another tab, so closing it can be reported back there.
+ */
 type PreviewTab = {
   id: string;
   url: string;
   href: string | null;
   title: string | null;
   nonce: number;
+  opener: PopupOpener | null;
 };
 
 const ROOT_TAB_ID = "root";
 const STAGE_LABELS = ["Source", "Install", "Build", "Preview"] as const;
 
 function rootTab(url: string): PreviewTab {
-  return { id: ROOT_TAB_ID, url, href: null, title: null, nonce: 0 };
+  return { id: ROOT_TAB_ID, url, href: null, title: null, nonce: 0, opener: null };
 }
 
 function stageIcon(state: StepState): LucideIcon {
@@ -271,30 +270,42 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
     setActiveTabId((current) => current || ROOT_TAB_ID);
   }, [previewUrl]);
 
-  const openTab = useCallback(
-    (url: string) => {
+  const bridge = usePreviewBridge({
+    prefix: `${panelId}:`,
+    previewUrl,
+    onOpenTab: (_frameKey, url, opener) => {
       if (tabs.length >= MAX_PREVIEW_TABS) {
         toast.error("Preview tab limit reached", { description: "Close a tab in the preview panel to open another page." });
+        if (opener) bridge.notifyClosed(opener);
         return;
       }
       tabSeq.current += 1;
       const id = `tab-${tabSeq.current}`;
-      setTabs((current) => (current.length >= MAX_PREVIEW_TABS ? current : [...current, { id, url, href: null, title: null, nonce: 0 }]));
+      setTabs((current) =>
+        current.length >= MAX_PREVIEW_TABS ? current : [...current, { id, url, href: null, title: null, nonce: 0, opener }],
+      );
       setActiveTabId(id);
       setMode("preview");
     },
-    [tabs.length],
-  );
+    onState: (frameKey, state) => {
+      const tabId = frameKey.startsWith("expanded:") ? frameKey.slice("expanded:".length) : frameKey;
+      setTabs((current) =>
+        current.map((tab) => (tab.id === tabId ? { ...tab, href: state.href, title: state.title || null } : tab)),
+      );
+    },
+  });
 
   const closeTab = useCallback(
     (id: string) => {
       const index = tabs.findIndex((tab) => tab.id === id);
       if (index < 0 || tabs.length <= 1) return;
+      const closing = tabs[index];
       const next = tabs.filter((tab) => tab.id !== id);
       setTabs(next);
       if (activeTabId === id) setActiveTabId(next[Math.max(0, index - 1)]?.id ?? next[0].id);
+      if (closing.opener) bridge.notifyClosed(closing.opener);
     },
-    [activeTabId, tabs],
+    [activeTabId, bridge, tabs],
   );
 
   const reloadActive = useCallback(() => {
@@ -303,28 +314,6 @@ export function RepoPreviewPanelView({ live, onClose }: { live: LiveRepoPreview;
       current.map((tab) => (tab.id === activeTab.id ? { ...tab, href: null, title: null, nonce: tab.nonce + 1 } : tab)),
     );
   }, [activeTab]);
-
-  usePreviewBridge(
-    (source) => findPreviewFrameKey(`${panelId}:`, source),
-    (frameKey, message) => {
-      if (!previewUrl) return;
-      const tabId = frameKey.startsWith("expanded:") ? frameKey.slice("expanded:".length) : frameKey;
-      if (message.type === "state") {
-        setTabs((current) =>
-          current.map((tab) => (tab.id === tabId ? { ...tab, href: message.href, title: message.title || null } : tab)),
-        );
-        return;
-      }
-      const route = routePreviewPopup(message.url, previewUrl);
-      if (route.kind === "tab") {
-        openTab(route.url);
-      } else if (route.kind === "external") {
-        openPreviewPopupExternally(route.url);
-      } else {
-        console.warn("[repo-preview] refused popup from preview", route.reason);
-      }
-    },
-  );
 
   const copyLink = async () => {
     if (!activeHref) return;

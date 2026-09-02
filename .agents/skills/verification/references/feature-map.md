@@ -81,9 +81,15 @@ stubbed `/access/status` → `invited`.
   hold a message; the blank draft and incognito threads stay at `/`
   (incognito ids never enter browser history). The two-way URL↔state sync is
   `hooks/use-chat-url.ts`: links/back/forward select the chat, app actions
-  rewrite the URL (push on switches, replace on boot/first-message/deletion),
+  rewrite the URL (push on switches, replace on first-message/deletion),
   an id missing on this device waits for cloud sync (8s signed-in / 2s out)
-  then honestly toasts "Chat not found" and lands on `/`. Editor addresses
+  — opens it the moment it lands, never rewrites the address meanwhile —
+  then honestly toasts "Chat not found" and lands on `/`. Page loads are
+  decided before the first render by `bootActiveId` (`lib/agent-store.ts`):
+  a reload at `/` is a fresh thread (no remembered chat, and pulled history
+  never yanks a null selection), `/c/<id>` opens exactly that thread, only
+  non-chat pages (settings, projects…) fall back to the remembered thread so
+  "← Chat" still returns somewhere sensible. Unit: `chat-url-boot.test.ts`. Editor addresses
   (automations/profiles/skills `/new|/<id>`) resolve after a 2.5s profile-sync
   grace, else toast + return to the list. Background-run toasts and desktop
   notifications navigate to the finished chat via the NavBridge

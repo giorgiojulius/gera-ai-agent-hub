@@ -28,3 +28,22 @@ export function appNavigate(to: string): void {
 export function chatPath(id: string): string {
   return `/c/${encodeURIComponent(id)}`;
 }
+
+/** The chat id a `/c/<id>` address points at; null for every other address. */
+export function chatIdFromPath(pathname: string): string | null {
+  const match = /^\/c\/([^/]+)\/?$/.exec(pathname);
+  if (!match) {
+    return null;
+  }
+  try {
+    const id = decodeURIComponent(match[1]);
+    return id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The chat home — a fresh thread, never a remembered one. */
+export function isChatHomePath(pathname: string): boolean {
+  return pathname === "/" || pathname === "";
+}

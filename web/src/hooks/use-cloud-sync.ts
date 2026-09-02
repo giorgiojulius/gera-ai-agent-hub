@@ -192,8 +192,11 @@ export function useCloudSync(args: CloudSyncArgs): {
           if (conversations === prev.conversations) {
             return prev;
           }
+          // Only a thread deleted elsewhere moves the selection. A fresh
+          // thread (null) stays fresh — pulled history must never yank the
+          // user out of the launchpad into whichever chat synced first.
           const activeId =
-            prev.activeId && conversations.some((item) => item.id === prev.activeId)
+            prev.activeId === null || conversations.some((item) => item.id === prev.activeId)
               ? prev.activeId
               : conversations[0]?.id ?? null;
           const queued = { ...prev.queued };

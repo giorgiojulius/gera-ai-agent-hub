@@ -35,6 +35,7 @@ import {
   saveSettings,
   titleFromPrompt,
 } from "@/lib/history";
+import { chatIdFromPath, isChatHomePath } from "@/lib/nav";
 import { RESUME_NOTE, planBootAutoResume } from "@/lib/resume";
 import { logDiagnostic } from "@/lib/diagnostics";
 import { fallbackQuery, fetchGrounding, type Grounding } from "@/lib/grounding";
@@ -144,12 +145,33 @@ function settleSkillOps(
   }
 }
 
-export function initialAgentState(): AgentState {
+/**
+ * Which thread a page load opens. The address is authoritative: `/c/<id>`
+ * opens that thread (null while a deep link waits for cloud sync), the chat
+ * home `/` always opens a fresh thread, and only pages that say nothing
+ * about chats (settings, projects…) fall back to the remembered thread so
+ * "← Chat" still returns somewhere sensible after a reload there.
+ */
+export function bootActiveId(
+  conversations: Conversation[],
+  pathname: string,
+  remembered: string | null,
+): string | null {
+  const linked = chatIdFromPath(pathname);
+  if (linked !== null) {
+    return conversations.some((item) => item.id === linked) ? linked : null;
+  }
+  if (isChatHomePath(pathname)) {
+    return null;
+  }
+  return conversations.some((item) => item.id === remembered) ? remembered : conversations[0]?.id ?? null;
+}
+
+export function initialAgentState(
+  pathname: string = typeof window !== "undefined" ? window.location.pathname : "/",
+): AgentState {
   const loaded = loadConversations();
-  const savedActive = loadActiveId();
-  const activeId = loaded.some((item) => item.id === savedActive)
-    ? savedActive
-    : loaded[0]?.id ?? null;
+  const activeId = bootActiveId(loaded, pathname, loadActiveId());
   // Seamless publish recovery: a fresh reply that a reload cut mid-stream is
   // re-marked pending before the first render (the "interrupted" chip never
   // flashes) and boot recovery silently picks it back up.

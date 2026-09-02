@@ -16,7 +16,11 @@ import { chatPath } from "@/lib/nav";
  *
  * URL changes (links, back/forward) select the chat; app actions (sidebar
  * click, new chat, deletion) rewrite the URL. A deep link to a chat that is
- * not on this device yet waits for cloud sync before giving up honestly.
+ * not on this device yet waits for cloud sync (and opens the chat the moment
+ * it lands) before giving up honestly.
+ *
+ * Page loads are decided before the first render by `bootActiveId`: a reload
+ * at `/` is a fresh thread, never the remembered one.
  */
 export function useChatUrl(): void {
   const { chatId } = useParams<{ chatId?: string }>();
@@ -26,8 +30,8 @@ export function useChatUrl(): void {
   const conversations = state.conversations;
   const activeId = state.activeId;
 
-  // undefined start: the very first run treats the URL as authoritative,
-  // so a deep-linked /c/<id> wins over the locally stored active chat.
+  // undefined start: the very first run treats a /c/<id> address as
+  // authoritative, so a deep link wins over whatever thread state remembers.
   const prevParamRef = useRef<string | undefined>(undefined);
   const prevActiveRef = useRef<string | null>(activeId);
 
@@ -38,11 +42,12 @@ export function useChatUrl(): void {
     prevActiveRef.current = activeId;
 
     const active = conversations.find((item) => item.id === activeId) ?? null;
+    const linked = chatId !== undefined && conversations.some((item) => item.id === chatId);
 
     // --- URL-driven: a link, back/forward, or an app push landed here.
     if (paramChanged) {
       if (chatId) {
-        if (chatId !== activeId && conversations.some((item) => item.id === chatId)) {
+        if (linked && chatId !== activeId) {
           selectChat(chatId);
         }
         // Unknown ids are owned by the not-found effect below.
@@ -56,16 +61,26 @@ export function useChatUrl(): void {
       return;
     }
 
+    // --- The address still points at a chat this device was waiting for:
+    // open it the moment cloud sync lands it, and never let unrelated state
+    // churn rewrite the address while the wait is on.
+    if (chatId !== undefined && !activeChanged && chatId !== activeId) {
+      if (linked) {
+        selectChat(chatId);
+      }
+      return;
+    }
+
     // --- App-driven: the active chat changed, or state needs normalizing
-    // (boot at "/", the first message landing in a blank draft, deletions).
+    // (the first message landing in a blank draft, deletions).
     if (!active) {
       return;
     }
     const wantsUrl = active.incognito !== true && active.messages.length > 0;
     if (wantsUrl && chatId !== active.id) {
       // Push on real switches; replace when the current address just died
-      // (active chat deleted) or on the silent boot/first-message pass.
-      const deadParam = chatId !== undefined && !conversations.some((item) => item.id === chatId);
+      // (active chat deleted) or on the silent first-message pass.
+      const deadParam = chatId !== undefined && !linked;
       navigate(chatPath(active.id), { replace: !activeChanged || deadParam });
     } else if (!wantsUrl && chatId !== undefined) {
       // Blank drafts and incognito threads live at the clean root address.

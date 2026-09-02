@@ -65,8 +65,9 @@ by `env-production.test.ts`, never a secret; real process env wins on Rork’s
 own builds. Related backend rule: the Worker answers unknown routes with
 `404 {error:"not_found"}` (health stays on `GET /`), so a misconfigured client
 never mistakes the catch-all for a successful `/oauth/initiate`. A document
-with an opaque origin (the sandboxed Repo Preview, `location.origin === "null"`)
-cannot call `api.rork.com` directly — its CORS answers `Origin: null` with
+with an opaque origin (the sandboxed Repo Preview: `self.origin === "null"` —
+never `location.origin`, which serialises the URL and stays `https://` in a
+sandbox) cannot call `api.rork.com` directly — its CORS answers `Origin: null` with
 `https://rork.com` — so `resolveAuthUrl` (`auth-url.test.ts`) points such
 builds at the Worker’s `POST /auth-relay/oauth/{initiate,token,refresh}`, a
 body-verbatim relay pinned to this app’s public key (403 on mismatch, 404 for

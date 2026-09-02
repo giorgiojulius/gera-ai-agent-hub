@@ -16,7 +16,7 @@ export const APP_KEY: string = import.meta.env.EXPO_PUBLIC_RORK_APP_KEY ?? "";
 /**
  * Picks where `/oauth/initiate|token|refresh` are sent. A document with an
  * opaque origin (a sandboxed iframe without `allow-same-origin`, e.g. a Repo
- * Preview) reports `location.origin === "null"` and sends `Origin: null`, which
+ * Preview) reports `self.origin === "null"` and sends `Origin: null`, which
  * the Rork Auth API's CORS rejects — so those builds go through the Worker's
  * `/auth-relay`, which forwards the same JSON to the same endpoints. Every
  * other origin talks to Rork Auth directly. An empty configuration stays empty
@@ -30,18 +30,34 @@ export function resolveAuthUrl(configured: string, documentOrigin: string | null
   return documentOrigin === "null" ? `${functionsUrl.replace(/\/+$/, "")}/auth-relay` : base;
 }
 
-function currentDocumentOrigin(): string | null {
-  if (typeof window === "undefined") {
+/**
+ * Serialisation of the document's own origin: `self.origin`, which is `"null"`
+ * for an opaque origin. Never `location.origin` for this purpose — per spec it
+ * serialises the URL's origin, so a sandboxed `https://` document still says
+ * `"https://host"` there and the sandbox would go undetected.
+ */
+export function documentOriginOf(
+  win: { origin?: unknown; location?: { origin?: unknown } } | undefined,
+): string | null {
+  if (!win) {
     return null;
   }
   try {
-    return window.location.origin;
+    if (typeof win.origin === "string") {
+      return win.origin;
+    }
+    const fromUrl = win.location?.origin;
+    return typeof fromUrl === "string" ? fromUrl : null;
   } catch {
     return null;
   }
 }
 
-export const AUTH_URL: string = resolveAuthUrl(CONFIGURED_AUTH_URL, currentDocumentOrigin(), FUNCTIONS_URL);
+export const AUTH_URL: string = resolveAuthUrl(
+  CONFIGURED_AUTH_URL,
+  documentOriginOf(typeof window === "undefined" ? undefined : window),
+  FUNCTIONS_URL,
+);
 
 /** Host shown in sign-in errors, e.g. `api.rork.com` or the relaying Worker. */
 export function authServiceHost(): string {

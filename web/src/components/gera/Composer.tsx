@@ -632,20 +632,20 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
           <div
             data-testid={TID.composerDropZone}
             aria-hidden
-            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center overflow-hidden rounded-3xl bg-card/75 backdrop-blur-[3px] animate-in fade-in-0 duration-150"
+            className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center overflow-hidden rounded-3xl bg-card/80 backdrop-blur-md animate-in fade-in-0 duration-150"
           >
-            <span className="absolute inset-[5px] rounded-[20px] border-[1.5px] border-dashed border-ember/45" />
-            <span className="absolute inset-0 bg-[radial-gradient(60%_120%_at_50%_100%,hsl(var(--ember)/0.16),transparent_70%)]" />
-            <span className="relative flex items-center gap-3 rounded-full border border-ember/20 bg-card/95 py-2 pl-2 pr-5 shadow-[0_1px_2px_rgba(35,20,28,0.05),0_18px_40px_-20px_hsl(var(--ember)/0.55)] animate-in fade-in-0 zoom-in-95 duration-200">
-              <span className="relative flex h-9 w-9 items-center justify-center rounded-full bg-ember text-ember-foreground">
-                <span className="absolute inset-0 rounded-full bg-ember/35 animate-ping [animation-duration:1.8s]" />
-                <ArrowDownToLine className="relative h-4 w-4" strokeWidth={2.25} />
+            <span className="absolute inset-[6px] rounded-[20px] border border-dashed border-ember/40" />
+            <span className="absolute inset-0 bg-[radial-gradient(70%_140%_at_50%_110%,hsl(var(--ember)/0.14),transparent_65%)]" />
+            <span className="relative flex items-center gap-3.5 animate-in fade-in-0 slide-in-from-bottom-1 duration-200">
+              <span className="relative flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-b from-ember to-ember/80 text-ember-foreground shadow-[0_8px_24px_-8px_hsl(var(--ember)/0.7),inset_0_1px_0_rgba(255,255,255,0.25)]">
+                <span className="absolute inset-0 rounded-2xl border border-ember/30 animate-ping [animation-duration:2s]" />
+                <ArrowDownToLine className="relative h-[18px] w-[18px] animate-bounce [animation-duration:1.6s]" strokeWidth={2.25} />
               </span>
-              <span className="flex flex-col leading-tight">
-                <span className="font-display text-sm text-foreground">
+              <span className="flex flex-col gap-0.5 leading-none">
+                <span className="font-display text-[17px] tracking-[-0.01em] text-foreground">
                   {isChat ? "Drop to attach" : mode === "image" ? "Drop to edit" : "Drop to animate"}
                 </span>
-                <span className="text-[11px] text-muted-foreground">
+                <span className="text-[11.5px] tracking-[0.01em] text-muted-foreground">
                   {isChat
                     ? "Images, PDF, Word and Excel"
                     : mode === "image"

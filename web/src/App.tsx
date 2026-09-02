@@ -49,7 +49,8 @@ const App = () => (
     <AuthProvider>
       <AccountProviders>
           <Toaster />
-          <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+          {/* Vite's --base makes the router follow when the build is hosted below a path (Repo Preview); "/" in production. */}
+          <BrowserRouter basename={import.meta.env.BASE_URL} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
             <NavBridge />
             <Routes>
               <Route

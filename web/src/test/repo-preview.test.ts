@@ -32,6 +32,7 @@ import {
   repoPreviewWorkflowSource,
   signRepoPreviewId,
   verifyRepoPreviewId,
+  repoPreviewSandboxShim,
   rewriteRepoPreviewHtml,
 } from "../../../functions/repo-preview-shared";
 import {
@@ -240,6 +241,13 @@ describe("repository preview contract", () => {
     expect(html).toContain('<base href="/repo-preview/p.abc/">');
     expect(html).toContain('src="/repo-preview/p.abc/assets/app.js"');
     expect(html).toContain('src="https://cdn.example/a.png"');
+    // The storage shim boots before the app's own scripts and stays escape-free.
+    const shimAt = html.indexOf("<script data-gera-preview-shim>");
+    expect(shimAt).toBeGreaterThan(html.indexOf("<base "));
+    expect(shimAt).toBeLessThan(html.indexOf('<script src="/repo-preview/p.abc/assets/app.js">'));
+    expect(repoPreviewSandboxShim()).not.toContain("\\");
+    expect(repoPreviewSandboxShim()).not.toMatch(/<\/script>.+<\/script>/s);
+    expect(rewriteRepoPreviewHtml("<p>bare</p>", "/repo-preview/p.abc")).toMatch(/^<base href="\/repo-preview\/p\.abc\/"><script data-gera-preview-shim>/);
     const capabilityPrefix = `/repo-preview/${"a".repeat(24)}.${"b".repeat(32)}.${"c".repeat(24)}/${"d".repeat(48)}/`;
     const alreadyNamespaced = rewriteRepoPreviewHtml(
       `<script src="${capabilityPrefix}assets/app.js"></script>`,

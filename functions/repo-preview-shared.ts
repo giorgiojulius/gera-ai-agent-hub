@@ -652,7 +652,58 @@ export function repoPreviewContentType(path: string): string {
   return values[extension] ?? "application/octet-stream";
 }
 
-/** Makes root-relative build assets resolve inside one preview's path namespace. */
+/**
+ * Inline boot script served ahead of every preview's own code.
+ *
+ * Preview HTML runs in an opaque origin (CSP `sandbox` + the iframe sandbox,
+ * both without `allow-same-origin`), and in that mode browsers throw a
+ * SecurityError on the mere read of `window.localStorage`,
+ * `window.sessionStorage` or `document.cookie`. Nearly every SPA touches one
+ * of those while booting (auth tokens, theme, drafts), so without help the
+ * app crashes before its first render and the user sees an empty page with
+ * the site's background colour. The shim swaps in per-document in-memory
+ * stand-ins only when the real ones are blocked; where storage works it does
+ * nothing. Data never leaves the tab and the origin stays opaque.
+ *
+ * No backslashes on purpose: the text rides through a template literal and
+ * a Worker header rewrite; keeping it escape-free means what you read here is
+ * exactly what the browser runs.
+ */
+export function repoPreviewSandboxShim(): string {
+  return (
+    "<script data-gera-preview-shim>(function(){" +
+    "function memory(){var data=new Map();var api={" +
+    "key:function(i){var k=Array.from(data.keys());return i>=0&&i<k.length?k[i]:null;}," +
+    "getItem:function(k){k=String(k);return data.has(k)?data.get(k):null;}," +
+    "setItem:function(k,v){data.set(String(k),String(v));}," +
+    "removeItem:function(k){data.delete(String(k));}," +
+    "clear:function(){data.clear();}};" +
+    'Object.defineProperty(api,"length",{get:function(){return data.size;}});' +
+    'if(typeof Proxy!=="function")return api;' +
+    "return new Proxy(api,{" +
+    'get:function(t,p){if(typeof p==="symbol"||p in t)return t[p];return data.has(p)?data.get(p):undefined;},' +
+    'set:function(t,p,v){if(typeof p==="symbol")return false;data.set(String(p),String(v));return true;},' +
+    'deleteProperty:function(t,p){if(typeof p==="symbol")return false;data.delete(String(p));return true;},' +
+    'has:function(t,p){return (typeof p!=="symbol"&&data.has(p))||p in t;}});}' +
+    "function blocked(read){try{read();return false;}catch(e){return true;}}" +
+    '["localStorage","sessionStorage"].forEach(function(name){' +
+    "if(!blocked(function(){return window[name];}))return;" +
+    "try{Object.defineProperty(window,name,{value:memory(),configurable:true,enumerable:true});}catch(e){}});" +
+    "if(blocked(function(){return document.cookie;})){var jar=new Map();" +
+    'try{Object.defineProperty(document,"cookie",{configurable:true,' +
+    'get:function(){var out=[];jar.forEach(function(v,k){out.push(k+"="+v);});return out.join("; ");},' +
+    'set:function(raw){var text=String(raw);var pair=text.split(";")[0];var eq=pair.indexOf("=");if(eq<1)return;' +
+    "var name=pair.slice(0,eq).trim();var value=pair.slice(eq+1).trim();" +
+    'var compact=text.toLowerCase().replace(/ /g,"");' +
+    "if(/;max-age=(-[0-9]+|0)(;|$)/.test(compact)||/;expires=[^;]*19[0-9][0-9]/.test(compact)){jar.delete(name);}else{jar.set(name,value);}}});}catch(e){}}" +
+    "})();</script>"
+  );
+}
+
+/**
+ * Makes root-relative build assets resolve inside one preview's path namespace
+ * and installs the sandbox storage shim before the app's own scripts.
+ */
 export function rewriteRepoPreviewHtml(html: string, previewPrefix: string): string {
   const prefix = previewPrefix.endsWith("/") ? previewPrefix : `${previewPrefix}/`;
   const namespacedPath = prefix.replace(/^\/+/, "");
@@ -662,11 +713,11 @@ export function rewriteRepoPreviewHtml(html: string, previewPrefix: string): str
       ? full
       : `${attribute}=${quote}${prefix}${path}${quote}`,
   );
-  const base = `<base href="${prefix}">`;
+  const boot = `<base href="${prefix}">${repoPreviewSandboxShim()}`;
   if (/<head(?:\s[^>]*)?>/i.test(rewritten)) {
-    return rewritten.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${base}`);
+    return rewritten.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${boot}`);
   }
-  return `${base}${rewritten}`;
+  return `${boot}${rewritten}`;
 }
 
 /** Build logs are useful evidence, but credential-shaped output is never persisted. */

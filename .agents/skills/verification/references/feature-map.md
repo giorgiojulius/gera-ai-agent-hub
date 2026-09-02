@@ -179,7 +179,14 @@ validated path→offset manifest in SQLite; public asset reads are MIME-derived
 R2 Range requests, SPA paths fall back to the indexed root, and Vite/root HTML
 assets are namespaced below the id + separate unguessable read capability.
 HTML stays origin-
-sandboxed; SVG keeps image rendering but receives its own no-script CSP sandbox
+sandboxed; because an opaque origin throws on the mere read of
+`localStorage`/`sessionStorage`/`document.cookie` (which blanks almost any SPA
+before first render), the Worker injects an inline storage shim right after
+`<base>` — per-document in-memory stand-ins installed only where the real ones
+are blocked (`repoPreviewSandboxShim`, `repo-preview-sandbox.browser.test.tsx`
+proves both the failure and the fix inside a real `sandbox="allow-scripts"`
+frame). Gera's own router follows Vite's `--base` (`basename={BASE_URL}`), so
+the app previews itself at its access gate instead of a 404; SVG keeps image rendering but receives its own no-script CSP sandbox
 so direct navigation cannot gain the backend origin, while active XML is not
 accepted as a public artifact. Capability-bearing hook/asset paths and preview
 ids are redacted from backend/build diagnostics. Limits: 50 MiB, 1,000 files,

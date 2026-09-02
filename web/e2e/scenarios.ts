@@ -133,6 +133,7 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "seeText", target: TID.repoLaunchDialog, text: "Vite · bun", timeoutMs: 20_000 },
       { do: "tap", target: TID.repoLaunchStart },
       { do: "seeText", target: TID.repoPreviewFlow, text: "Preview running", timeoutMs: 20_000 },
+      { do: "see", target: TID.repoPreviewPanel },
       { do: "see", target: TID.repoPreviewFrame },
     ],
   },

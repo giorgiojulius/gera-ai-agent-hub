@@ -174,7 +174,21 @@ phases poll the account's Rork Durable Object and survive tab close, reload and
 cloud sync. The receipt links the exact GitHub Actions run, exposes bounded
 credential-redacted logs (`repo-preview-logs`), Stop, and terminal Rebuild.
 Ready artifacts run in `repo-preview-frame` (opaque-origin sandboxed iframe +
-fullscreen, never an unsandboxed backend-origin tab) for 24h. The Rork backend stores an uncompressed tar in project R2 and a
+fullscreen, never an unsandboxed backend-origin tab) for 24h. On desktop
+(`lg`, 1024px+) the chat workspace docks the launch v0-style to the right of
+the thread: `PreviewPanelProvider` (`use-preview-panel.tsx`, mounted in
+`Index`) tracks the active thread's launches; a fresh launch always takes the
+dock over, closing is remembered per thread for the session, and the `TopNav`
+`PanelRight` button toggles it. The dock (`repo-preview-panel`,
+`RepoPreviewPanel.tsx`) carries browser-like chrome — Preview/Log tabs, an
+address bar with reload/copy/open/expand, Stop/Rebuild, `repo-preview-panel-close`
+— and a draggable divider (ratio persisted as `gera.preview.ratio.v1`). While
+docked the thread shows only a compact clickable `repo-preview-flow` receipt
+(`RepoPreviewReceipt`, `aria-pressed` when focused) so exactly one
+`repo-preview-frame` exists; below `lg`, shared pages and channels keep the
+full inline card. Both surfaces share one polling query per launch
+(`use-repo-preview-job.ts`). Browser: `repo-preview.browser.test.tsx`
+(receipt), e2e `github-launch-web-preview` (panel + frame at 1280px). The Rork backend stores an uncompressed tar in project R2 and a
 validated path→offset manifest in SQLite; public asset reads are MIME-derived
 R2 Range requests, SPA paths fall back to the indexed root, and Vite/root HTML
 assets are namespaced below the id + separate unguessable read capability.

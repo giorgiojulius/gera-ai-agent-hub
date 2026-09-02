@@ -1,42 +1,36 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Box,
   Check,
+  ChevronRight,
   CircleDashed,
   CloudCog,
   ExternalLink,
   FileTerminal,
   Loader2,
   Maximize2,
+  PanelRight,
   Play,
   RefreshCw,
   Square,
   X,
   type LucideIcon,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
-import { toast } from "sonner";
+import { memo, useState } from "react";
 
 import { ArtifactLightbox } from "@/components/gera/artifacts/ArtifactShell";
 import { Button } from "@/components/ui/button";
-import { useAgent } from "@/hooks/use-agent";
+import { usePreviewPanel } from "@/hooks/use-preview-panel";
+import { REPO_PREVIEW_ACTIVE_PHASES, useRepoPreviewJob } from "@/hooks/use-repo-preview-job";
 import { safeCodePreviewUrl } from "@/lib/code-changes";
-import { errorFromUnknown } from "@/lib/errors";
-import { resolveGitHubAuth } from "@/lib/github-native";
-import {
-  cancelRepoPreview,
-  getRepoPreview,
-  startRepoPreview,
-} from "@/lib/repo-preview";
 import { TID } from "@/lib/testids";
 import type { RepoPreviewJob, RepoPreviewPhase } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const REMOTE_SANDBOX = "allow-scripts allow-forms allow-popups allow-modals";
-const ACTIVE_PHASES = new Set<RepoPreviewPhase>(["queued", "installing", "building", "packaging", "uploading"]);
+const ACTIVE_PHASES = REPO_PREVIEW_ACTIVE_PHASES;
 
-type StepState = "waiting" | "running" | "done" | "error";
+export type StepState = "waiting" | "running" | "done" | "error";
 
 type RepoPreviewCardProps = {
   job: RepoPreviewJob;
@@ -84,7 +78,8 @@ function Step({ label, state }: { label: string; state: StepState }) {
   );
 }
 
-function phaseCopy(job: RepoPreviewJob): { label: string; detail: string } {
+/** Headline + detail for every launch phase; shared by the inline card, the receipt and the dock. */
+export function phaseCopy(job: RepoPreviewJob): { label: string; detail: string } {
   const values: Record<RepoPreviewPhase, { label: string; detail: string }> = {
     queued: { label: "Runner queued", detail: "GitHub is allocating an isolated build machine" },
     installing: { label: "Installing dependencies", detail: `Using ${job.packageManager === "none" ? "a static site" : job.packageManager}` },
@@ -99,7 +94,8 @@ function phaseCopy(job: RepoPreviewJob): { label: string; detail: string } {
   return values[job.phase];
 }
 
-function stepStates(phase: RepoPreviewPhase): [StepState, StepState, StepState, StepState] {
+/** Source → Install → Build → Preview progress for a phase. */
+export function stepStates(phase: RepoPreviewPhase): [StepState, StepState, StepState, StepState] {
   if (phase === "failed") return ["done", "done", "error", "waiting"];
   if (phase === "cancelled" || phase === "expired") return ["done", "done", "done", "error"];
   if (phase === "queued") return ["done", "running", "waiting", "waiting"];
@@ -109,12 +105,13 @@ function stepStates(phase: RepoPreviewPhase): [StepState, StepState, StepState, 
   return ["done", "done", "done", "done"];
 }
 
-function expiryCopy(expiresAt: number): string {
+export function expiryCopy(expiresAt: number): string {
   const hours = Math.max(0, Math.ceil((expiresAt - Date.now()) / 3_600_000));
   return hours > 0 ? `expires in ${hours}h` : "expired";
 }
 
-function PreviewFrame({ job, full = false }: { job: RepoPreviewJob; full?: boolean }) {
+/** Sandboxed iframe for a ready launch; `full` fills its container (dock, lightbox). */
+export function PreviewFrame({ job, full = false }: { job: RepoPreviewJob; full?: boolean }) {
   const url = job.previewUrl ? safeCodePreviewUrl(job.previewUrl) : null;
   if (!url) return null;
   return (
@@ -128,6 +125,97 @@ function PreviewFrame({ job, full = false }: { job: RepoPreviewJob; full?: boole
     />
   );
 }
+
+function phaseTone(phase: RepoPreviewPhase): string {
+  if (ACTIVE_PHASES.has(phase)) return "border-cyan-700/20 bg-cyan-700/[0.08] text-cyan-800";
+  if (phase === "ready") return "border-emerald-600/20 bg-emerald-600/[0.08] text-emerald-700";
+  if (phase === "failed") return "border-rose-600/20 bg-rose-600/[0.08] text-rose-700";
+  return "border-border bg-foreground/[0.04] text-muted-foreground";
+}
+
+function dotTone(state: StepState): string {
+  if (state === "done") return "bg-emerald-500";
+  if (state === "running") return "bg-cyan-500 animate-pulse";
+  if (state === "error") return "bg-rose-500";
+  return "bg-border";
+}
+
+/**
+ * Compact thread receipt used when the live preview is docked to the right
+ * of the chat (v0-style). Clicking focuses that launch in the dock.
+ */
+export const RepoPreviewReceipt = memo(function RepoPreviewReceipt({
+  job,
+  active,
+  statusUnavailable = false,
+  onOpen,
+}: {
+  job: RepoPreviewJob;
+  active: boolean;
+  statusUnavailable?: boolean;
+  onOpen: () => void;
+}) {
+  const copy = phaseCopy(job);
+  const states = stepStates(job.phase);
+  const running = ACTIVE_PHASES.has(job.phase);
+  return (
+    <button
+      type="button"
+      data-testid={TID.repoPreviewFlow}
+      aria-pressed={active}
+      onClick={onOpen}
+      title={active ? "Shown in the preview panel" : "Open in the preview panel"}
+      className={cn(
+        "group mb-3 flex w-full items-center gap-3 rounded-2xl border bg-card px-3 py-2.5 text-left shadow-sm transition-all",
+        active
+          ? "border-ember/40 shadow-[0_0_0_3px_hsl(var(--ember)/0.08),0_1px_2px_rgba(35,20,28,0.05)]"
+          : "border-border/70 hover:border-ember/30 hover:bg-secondary/40",
+      )}
+    >
+      <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#101E24] text-cyan-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+        <CloudCog className={cn("h-4 w-4", running && "animate-pulse")} />
+        {job.phase === "ready" ? (
+          <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full bg-emerald-400 ring-2 ring-card" />
+        ) : null}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="truncate text-sm font-medium text-foreground">{copy.label}</span>
+          <span
+            className={cn(
+              "shrink-0 rounded-full border px-1.5 py-px text-[9px] font-semibold uppercase tracking-[0.12em]",
+              phaseTone(job.phase),
+            )}
+          >
+            {job.phase}
+          </span>
+        </span>
+        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+          {job.repository} · {job.ref} · {job.commitSha.slice(0, 7)}
+          {statusUnavailable ? " · status offline" : ""}
+        </span>
+      </span>
+      <span className="flex shrink-0 items-center gap-1" aria-hidden>
+        {states.map((state, index) => (
+          <span key={index} className={cn("h-1.5 w-1.5 rounded-full", dotTone(state))} />
+        ))}
+      </span>
+      <span className="hidden shrink-0 items-center gap-1 text-[11px] font-medium sm:flex">
+        {active ? (
+          <>
+            <PanelRight className="h-3.5 w-3.5 text-ember" />
+            <span className="text-ember">In panel</span>
+          </>
+        ) : (
+          <>
+            <span className="text-muted-foreground transition-colors group-hover:text-foreground">Open</span>
+            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+          </>
+        )}
+      </span>
+    </button>
+  );
+});
 
 /** Pure receipt used by browser regressions and the live query wrapper. */
 export const RepoPreviewCard = memo(function RepoPreviewCard({
@@ -329,92 +417,36 @@ export const RepoPreviewCard = memo(function RepoPreviewCard({
   );
 });
 
-/** Live status wrapper; the durable job remains recoverable after reload/tab close. */
+/**
+ * Live status wrapper; the durable job remains recoverable after reload/tab
+ * close. Inside the chat workspace on desktop the thread only keeps a compact
+ * receipt and the preview itself lives in the dock to the right.
+ */
 export function RepoPreviewFlow({ initialJob, readOnly = false }: { initialJob: RepoPreviewJob; readOnly?: boolean }) {
-  const { state, recordRepoPreview, updateRepoPreview } = useAgent();
-  const queryClient = useQueryClient();
-  const [actionBusy, setActionBusy] = useState<boolean>(false);
-  const query = useQuery({
-    queryKey: ["repo-preview", initialJob.id],
-    queryFn: () => getRepoPreview(initialJob.id),
-    initialData: initialJob,
-    enabled: !readOnly,
-    staleTime: 1_000,
-    refetchInterval: (current) => {
-      const job = current.state.data;
-      return job && ACTIVE_PHASES.has(job.phase) ? 2_500 : false;
-    },
-    retry: 2,
-  });
-  const job = query.data ?? initialJob;
-  const server = state.settings.mcpServers.find(
-    (item) => item.enabled && (item.catalogId ?? item.id) === "github",
-  );
-  const conversationId = state.conversations.find((conversation) =>
-    conversation.messages.some((message) => message.repoPreview?.id === initialJob.id),
-  )?.id;
+  const live = useRepoPreviewJob(initialJob, { readOnly });
+  const panel = usePreviewPanel();
 
-  useEffect(() => {
-    if (job.phase !== initialJob.phase || job.expiresAt !== initialJob.expiresAt) {
-      updateRepoPreview(job);
-    }
-  }, [initialJob.expiresAt, initialJob.phase, job, updateRepoPreview]);
-
-  const resolveAuth = async (): Promise<string | undefined> => {
-    if (!server) return undefined;
-    try {
-      return await resolveGitHubAuth(server);
-    } catch {
-      return undefined;
-    }
-  };
-
-  const cancel = async (): Promise<void> => {
-    setActionBusy(true);
-    try {
-      const next = await cancelRepoPreview(job.id, await resolveAuth());
-      queryClient.setQueryData(["repo-preview", job.id], next);
-      toast.success("Preview stopped");
-    } catch (error) {
-      toast.error("Could not stop the preview", { description: errorFromUnknown(error) });
-    } finally {
-      setActionBusy(false);
-    }
-  };
-
-  const rebuild = async (): Promise<void> => {
-    setActionBusy(true);
-    try {
-      const auth = await resolveAuth();
-      if (!auth) throw new Error("Reconnect GitHub before rebuilding this repository.");
-      const next = await startRepoPreview(
-        {
-          repository: job.repository,
-          ref: job.ref,
-          rootDirectory: job.rootDirectory,
-          outputDirectory: job.outputDirectory,
-        },
-        auth,
-      );
-      recordRepoPreview(next, conversationId);
-      toast.success("Fresh repository preview started", { description: `${job.repository}@${job.commitSha.slice(0, 7)}` });
-    } catch (error) {
-      toast.error("Could not rebuild the preview", { description: errorFromUnknown(error) });
-    } finally {
-      setActionBusy(false);
-    }
-  };
+  if (panel && panel.isDesktop && !readOnly) {
+    return (
+      <RepoPreviewReceipt
+        job={live.job}
+        active={panel.openJob?.id === live.job.id}
+        statusUnavailable={live.statusUnavailable}
+        onOpen={() => panel.open(live.job.id)}
+      />
+    );
+  }
 
   return (
     <RepoPreviewCard
-      job={job}
-      isRefreshing={query.isFetching}
-      statusUnavailable={query.isError}
+      job={live.job}
+      isRefreshing={live.isRefreshing}
+      statusUnavailable={live.statusUnavailable}
       readOnly={readOnly}
-      onRefresh={() => void query.refetch()}
-      onCancel={() => void cancel()}
-      onRebuild={() => void rebuild()}
-      actionBusy={actionBusy}
+      onRefresh={live.refresh}
+      onCancel={live.cancel}
+      onRebuild={live.rebuild}
+      actionBusy={live.actionBusy}
     />
   );
 }

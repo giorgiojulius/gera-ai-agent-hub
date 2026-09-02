@@ -3,6 +3,7 @@ import {
   EyeOff,
   Ghost,
   PanelLeft,
+  PanelRight,
   Pencil,
   Pin,
   PinOff,
@@ -22,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useAgent } from "@/hooks/use-agent";
+import { usePreviewPanel } from "@/hooks/use-preview-panel";
 import { cn } from "@/lib/utils";
 
 /**
@@ -37,6 +39,7 @@ export function TopNav({
 }) {
   const { state, active, newChat, togglePinChat, markUnreadChat, renameChat, deleteChat } =
     useAgent();
+  const preview = usePreviewPanel();
   const [shareOpen, setShareOpen] = useState<boolean>(false);
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const [renaming, setRenaming] = useState<boolean>(false);
@@ -47,6 +50,8 @@ export function TopNav({
   const isIncognito = active?.incognito === true;
   const canShare = (active?.messages.length ?? 0) > 0 && !isIncognito;
   const attention = state.runningIds.length > 0 || state.unreadIds.length > 0;
+  // The dock toggle only exists where the split layout can render: desktop threads with a launch.
+  const previewToggle = preview && preview.isDesktop && preview.jobs.length > 0 ? preview : null;
 
   const startRename = () => {
     if (!active) {
@@ -198,6 +203,22 @@ export function TopNav({
       ) : null}
 
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
+        {previewToggle ? (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={previewToggle.toggle}
+            aria-pressed={Boolean(previewToggle.openJob)}
+            aria-label={previewToggle.openJob ? "Hide preview panel" : "Show preview panel"}
+            title={previewToggle.openJob ? "Hide preview panel" : "Show preview panel"}
+            className={cn(
+              "h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground",
+              previewToggle.openJob && "bg-foreground/[0.06] text-foreground",
+            )}
+          >
+            <PanelRight className="h-4 w-4" />
+          </Button>
+        ) : null}
         {canShare ? (
           <Button
             variant="ghost"

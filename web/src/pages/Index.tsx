@@ -13,6 +13,7 @@ import { TopNav } from "@/components/gera/TopNav";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { useAgent } from "@/hooks/use-agent";
 import { useChatUrl } from "@/hooks/use-chat-url";
+import { PreviewPanelProvider } from "@/hooks/use-preview-panel";
 import { cn } from "@/lib/utils";
 
 const SIDEBAR_PREF_KEY = "gera.sidebar.v1";
@@ -214,10 +215,12 @@ const Index = () => {
           />
         ) : null}
       </aside>
-      <div className="relative z-10 flex h-full min-w-0 flex-1 flex-col">
-        <TopNav sidebarCollapsed={sidebarCollapsed} onOpenNav={openNav} />
-        <ChatPane />
-      </div>
+      <PreviewPanelProvider>
+        <div className="relative z-10 flex h-full min-w-0 flex-1 flex-col">
+          <TopNav sidebarCollapsed={sidebarCollapsed} onOpenNav={openNav} />
+          <ChatPane />
+        </div>
+      </PreviewPanelProvider>
       <Sheet open={state.sidebarOpen} onOpenChange={setSidebarOpen}>
         <SheetContent side="left" className="w-[300px] border-border/70 bg-[#F5EFF3] p-0">
           <SheetTitle className="sr-only">Chats</SheetTitle>

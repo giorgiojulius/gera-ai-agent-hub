@@ -83,6 +83,10 @@ export const TID = {
   repoPreviewStop: "repo-preview-stop",
   /** Starts a fresh build of a terminal repository launch. */
   repoPreviewRebuild: "repo-preview-rebuild",
+  /** v0-style dock to the right of the thread hosting the live repository preview (desktop). */
+  repoPreviewPanel: "repo-preview-panel",
+  /** Closes the docked preview panel for the active thread. */
+  repoPreviewPanelClose: "repo-preview-panel-close",
   /** Model picker trigger in the composer rail. */
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */

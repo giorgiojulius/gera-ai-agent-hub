@@ -9,8 +9,15 @@
 //    skills-as-subject failure on thin questions.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { runServerDeepResearch, synthesisSystem } from "../../../functions/research-runner";
-import type { ResearchState } from "../../../functions/run-protocol";
+import { buildResearchLog as browserResearchLog, sourceDedupeKey as browserDedupeKey } from "@/lib/deep-research";
+import {
+  buildResearchLog,
+  RESEARCH_LOG_BUDGET,
+  runServerDeepResearch,
+  sourceDedupeKey,
+  synthesisSystem,
+} from "../../../functions/research-runner";
+import type { ResearchState, ResearchStep } from "../../../functions/run-protocol";
 
 describe("runServerDeepResearch empty-question guard", () => {
   afterEach(() => {
@@ -37,6 +44,32 @@ describe("runServerDeepResearch empty-question guard", () => {
     // The panel settles honestly: the final emitted state is an error, not a
     // forever-running spinner.
     expect(updates[updates.length - 1]?.status).toBe("error");
+  });
+});
+
+// The research hand-off (dedupe key, research log) exists in both engines; a
+// drift between them would make the same question yield different dossiers
+// on the server and in the browser.
+describe("research hand-off twins", () => {
+  it("dedupe key and research log match the browser twin byte for byte", () => {
+    for (const url of [
+      "http://www.a.test/page/?utm_source=x&b=2&a=1",
+      "https://github.com/o/r#readme",
+      "https://a.test/search?q=term",
+      "not a url",
+    ]) {
+      expect(sourceDedupeKey(url)).toBe(browserDedupeKey(url));
+    }
+    const steps: ResearchStep[] = [
+      { id: "1", kind: "browse", label: "x.test/prices", status: "error", detail: "needs JavaScript" },
+      { id: "2", kind: "search", label: "alpha", status: "done", detail: "+2 sources" },
+      { id: "3", kind: "synthesize", label: "Writing report", status: "running" },
+    ];
+    const input = { queries: ["alpha", "beta"], notes: ["Wave 1: missing the 2025 filing"], steps };
+    expect(buildResearchLog(input)).toBe(browserResearchLog(input));
+    expect(buildResearchLog(input)).toContain("- browse: x.test/prices — needs JavaScript");
+    expect(buildResearchLog({ ...input, budget: 64 })).toBe(browserResearchLog({ ...input, budget: 64 }));
+    expect(RESEARCH_LOG_BUDGET).toBe(8_000);
   });
 });
 

@@ -4,14 +4,17 @@ import { streamCompletion } from "@/lib/chat";
 import {
   buildDossier,
   buildReflectionList,
+  buildResearchLog,
   matchContentPages,
   REFLECT_LIST_BUDGET,
   RESEARCH_PROFILES,
   runDeepResearch,
+  sourceDedupeKey,
   synthesisSystem,
   type RegistrySource,
 } from "@/lib/deep-research";
 import { toolkitFetch } from "@/lib/toolkit";
+import type { ResearchStep } from "@/lib/types";
 
 vi.mock("@/lib/chat", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/chat")>();
@@ -92,6 +95,81 @@ describe("buildDossier", () => {
     expect(dossier).toContain("Published: 2026-01-15");
     expect(dossier).toContain("Notes: snippet for source 1");
     expect(dossier).not.toContain("Full text:");
+  });
+});
+
+describe("buildDossier freshness marker", () => {
+  it("marks pages the live browser fetched so the writer can weigh them as today's state", () => {
+    const live = registryOf([makeSource(1, { text: "Z".repeat(10), liveAt: "2026-09-03" })]);
+    expect(buildDossier(live, 1000)).toContain("Fetched live: 2026-09-03");
+    expect(buildDossier(registryOf([makeSource(2)]), 1000)).not.toContain("Fetched live");
+  });
+});
+
+describe("sourceDedupeKey", () => {
+  it("folds scheme, www, trailing slash, parameter order and tracking params into one key", () => {
+    const key = sourceDedupeKey("https://a.test/page");
+    expect(sourceDedupeKey("http://www.a.test/page/")).toBe(key);
+    expect(sourceDedupeKey("https://a.test/page?utm_source=x&fbclid=y")).toBe(key);
+    expect(sourceDedupeKey("https://a.test/search?b=2&a=1")).toBe(sourceDedupeKey("https://a.test/search?a=1&b=2"));
+  });
+
+  it("keeps meaningful queries and fragments apart", () => {
+    expect(sourceDedupeKey("https://a.test/search?q=one")).not.toBe(sourceDedupeKey("https://a.test/search?q=two"));
+    // Repository sources hang the README off the overview URL by fragment.
+    expect(sourceDedupeKey("https://github.com/o/r#readme")).not.toBe(sourceDedupeKey("https://github.com/o/r"));
+  });
+
+  it("falls back to the trimmed lowercase text for unparsable input", () => {
+    expect(sourceDedupeKey("  Not A Url ")).toBe("not a url");
+  });
+});
+
+describe("buildResearchLog", () => {
+  const step = (
+    kind: ResearchStep["kind"],
+    label: string,
+    status: ResearchStep["status"],
+    detail?: string,
+  ): ResearchStep => ({ id: label, kind, label, status, detail });
+
+  it("is empty when there is nothing to hand over", () => {
+    expect(buildResearchLog({ queries: [], notes: [], steps: [] })).toBe("");
+  });
+
+  it("carries notes, failures and queries — never the steps that succeeded", () => {
+    const log = buildResearchLog({
+      queries: ["alpha query", "beta query"],
+      notes: ["Wave 1: no primary data yet"],
+      steps: [
+        step("search", "alpha query", "done", "+3 sources"),
+        step("browse", "example.com/prices", "error", "needs JavaScript — SelfSurf is HTTP-only"),
+        step("read", "Some paper", "error", "no text"),
+        step("synthesize", "Writing report", "running"),
+      ],
+    });
+    expect(log).toContain("- Wave 1: no primary data yet");
+    expect(log).toContain("- browse: example.com/prices — needs JavaScript — SelfSurf is HTTP-only");
+    expect(log).toContain("- read: Some paper — no text");
+    expect(log).not.toContain("+3 sources");
+    expect(log).toContain("Queries run (2):\n- alpha query\n- beta query");
+    // Notes first, failures second, queries last — a budget cut trims the cheapest section.
+    expect(log.indexOf("Reflection notes")).toBeLessThan(log.indexOf("Could not be obtained"));
+    expect(log.indexOf("Could not be obtained")).toBeLessThan(log.indexOf("Queries run"));
+  });
+
+  it("caps the failure list and clips to the budget from the end", () => {
+    const steps = Array.from({ length: 30 }, (_, index) => step("read", `Page ${index}`, "error", "no text"));
+    expect(buildResearchLog({ queries: ["q"], notes: [], steps })).toContain("- …and 5 more");
+    const clipped = buildResearchLog({
+      queries: Array.from({ length: 40 }, (_, index) => `query ${index}`),
+      notes: ["Wave 1: n"],
+      steps: [],
+      budget: 200,
+    });
+    expect(clipped.length).toBe(200);
+    expect(clipped.endsWith("…")).toBe(true);
+    expect(clipped.startsWith("Reflection notes")).toBe(true);
   });
 });
 
@@ -239,6 +317,8 @@ function scriptToolkit(options?: { contents?: Array<{ url: string; title?: strin
         results: [
           { title: "Alpha", url: "https://a.test/page", publishedDate: "2026-01-02T00:00:00Z", highlights: ["ha"] },
           { title: "Beta", url: "https://b.test/page", highlights: ["hb"] },
+          // The same article behind a tracked, www, trailing-slash variant — must not become a third source.
+          { title: "Alpha (tracked link)", url: "http://www.a.test/page/?utm_source=x", highlights: ["dup"] },
         ],
       });
     }
@@ -304,6 +384,7 @@ describe("runDeepResearch", () => {
     expect(result.research.status).toBe("done");
     // Same model that was asked — no ghost-writer chip.
     expect(result.servedBy).toBeUndefined();
+    // The tracked www variant of page A folded into source 1 instead of minting a third slot.
     expect(result.research.sources.map((source) => source.url)).toEqual([
       "https://a.test/page",
       "https://b.test/page",
@@ -319,6 +400,71 @@ describe("runDeepResearch", () => {
     expect(dossier).toContain("Z".repeat(300));
     // The read gave the source its real page title.
     expect(result.research.sources[0].title).toBe("Alpha Full");
+  });
+
+  it("hands the reflector its earlier notes and the writer the research log", async () => {
+    let reflections = 0;
+    toolkitFetchMock.mockImplementation(async (path, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        messages?: Array<{ content?: string }>;
+        query?: string;
+      };
+      if (path === "/v2/vercel/v1/chat/completions") {
+        const system = String(body.messages?.[0]?.content ?? "");
+        if (system.includes("split a research question")) {
+          return jsonResponse({ choices: [{ message: { content: '{"queries":["alpha query"]}' } }] });
+        }
+        reflections += 1;
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content:
+                  reflections === 1
+                    ? '{"notes":"no primary data yet","queries":["gamma query"],"read":[],"browse":[],"done":false}'
+                    : '{"notes":"primary data covered","queries":[],"read":[],"browse":[],"done":true}',
+              },
+            },
+          ],
+        });
+      }
+      if (path === "/v2/exa/search") {
+        if (body.query === "gamma query") {
+          throw new Error("search backend down");
+        }
+        return jsonResponse({ results: [{ title: "Alpha", url: "https://a.test/page", highlights: ["ha"] }] });
+      }
+      throw new Error(`unexpected toolkit path: ${path}`);
+    });
+    streamCompletionMock.mockResolvedValue({ content: "Report", toolCalls: [], images: [], servedModelId: "test/model-a" });
+
+    const result = await runDeepResearch({
+      prompt: "Question",
+      history: [],
+      modelId: "test/model-a",
+      depth: "eco",
+      onUpdate: vi.fn(),
+      onText: vi.fn(),
+    });
+
+    const reflectCalls = toolkitFetchMock.mock.calls
+      .filter(([path]) => path === "/v2/vercel/v1/chat/completions")
+      .map(([, init]) => JSON.parse(String(init?.body ?? "{}")) as { messages: Array<{ content: string }> })
+      .filter((body) => body.messages[0].content.includes("steer an ongoing web research loop"));
+    expect(reflectCalls).toHaveLength(2);
+    // Wave 1 has no earlier notes; wave 2 sees what wave 1 judged missing.
+    expect(reflectCalls[0].messages[1].content).not.toContain("Your notes from earlier waves");
+    expect(reflectCalls[1].messages[1].content).toContain("Your notes from earlier waves:\n- Wave 1: no primary data yet");
+
+    const call = streamCompletionMock.mock.calls[0][0];
+    const writer = String(call.messages[call.messages.length - 1]?.content ?? "");
+    expect(writer.indexOf("<research_dossier>")).toBeLessThan(writer.indexOf("<research_log>"));
+    expect(writer).toContain("- Wave 1: no primary data yet");
+    expect(writer).toContain("- Wave 2: primary data covered");
+    expect(writer).toContain("- search: gamma query — search failed");
+    expect(writer).toContain("Queries run (2):\n- alpha query\n- gamma query");
+    expect(writer).toContain("</research_log>");
+    expect(result.research.status).toBe("done");
   });
 
   it("threads fallbacks:false to the report write and discloses a ghost-writer", async () => {

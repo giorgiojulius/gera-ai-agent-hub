@@ -113,7 +113,7 @@ Rules:
 - Match the question's language for local/regional topics; use English for global or technical topics; for regional topics add one English query for the international view.
 - Add the current year to time-sensitive queries.`;
 
-const reflectPrompt = (profile: ResearchProfile, repoMode: boolean) => `You steer an ongoing web research loop. Given the research question, queries already used, and the numbered sources found so far, decide the next actions.
+const reflectPrompt = (profile: ResearchProfile, repoMode: boolean) => `You steer an ongoing web research loop. Given the research question, queries already used, your own notes from earlier waves (when any), and the numbered sources found so far, decide the next actions.
 
 Reply with ONLY compact JSON, no markdown:
 {"notes":"one short sentence on what is still missing","queries":["up to ${profile.reflectQueries} NEW search queries"],"read":[source numbers worth reading in full, up to ${profile.readsPerWave}],"browse":["up to ${profile.browsePerWave} exact URLs to open live in the browser"]${repoMode ? `,"files":["up to ${profile.readsPerWave} repo reads — owner/repo:path/to/file for a source file, owner/repo@sha for a commit diff, owner/repo#123 for a PR diff"]` : ""},"done":true|false}
@@ -121,6 +121,7 @@ Reply with ONLY compact JSON, no markdown:
 Rules:
 - Set "done": true ONLY when the sources cover the question from several independent angles INCLUDING primary data, and extra searching would add little.
 - Never repeat or trivially rephrase earlier queries; drill into gaps, follow leads found in the sources, chase missing numbers and dates.
+- Build on your earlier notes: a gap noted before that the sources still do not fill needs a DIFFERENT angle (primary source, other language, on-site search, live browse) or must be accepted as unfindable — never re-run the angle that already came up empty; a gap the sources now fill is closed, move on.
 - Prefer primary sources for "read": official statistics, reports, filings, papers, documentation — not aggregator listicles.
 - Chase the non-obvious: exact figures, direct quotes from named people, fine print, edge cases, practitioner complaints, contradictions between sources. A dossier of news listicles alone is a failure — pull in primary documents and community/expert threads (forums, Reddit, HN, specialist blogs, interviews).
 - "browse" opens pages live via SelfSurf, an HTTP browser with cookies and redirects but NO JavaScript. Use it whenever FRESHNESS matters: if the question needs today's state (prices, versions, releases, schedules, rankings, laws, live stats) and search snippets look dated, open the official page directly instead of trusting a cached snippet. Also use it for exact URLs search cannot reach well: official registries or databases, documents and stats pages mentioned inside sources, or on-site search URLs like https://example.com/search?q=term. Skip app-like pages that need JS; use [] when nothing qualifies.
@@ -128,7 +129,9 @@ ${repoMode ? `- "files" reads straight from the user's connected GitHub repos: s
 ` : ""}- Actively seek dissenting or critical sources if all current ones agree.
 - If done, "queries" and "browse" must be [].`;
 
-const synthesisPrompt = (citeNumeric: boolean) => `You are Gera in deep research mode. You are given a research dossier of numbered sources — web pages (search notes plus full page texts) and, when the question names a repository, file trees, source files, commit diffs, CI runs, and failure logs pulled from the user's connected GitHub. Write a deep, insight-dense report that answers the user's question. Today's date: ${new Date().toISOString().slice(0, 10)} (UTC) — weigh source freshness accordingly.
+const synthesisPrompt = (citeNumeric: boolean) => `You are Gera in deep research mode. You are given a research dossier of numbered sources — web pages (search notes plus full page texts) and, when the question names a repository, file trees, source files, commit diffs, CI runs, and failure logs pulled from the user's connected GitHub. Write a deep, insight-dense report that answers the user's question. Today's date: ${new Date().toISOString().slice(0, 10)} (UTC) — weigh source freshness accordingly. A source marked "Fetched live" was opened today by the live browser — treat it as today's state.
+
+A <research_log> may follow the dossier: the queries the loop ran, its own notes on what was still missing after each wave, and the pages or tools that failed. Use it to write "Limitations" factually — what was searched for and not found, which pages could not be opened — and to tell "no public data found" apart from "never looked for". The log is not a source: never cite it, and never present a failed fetch as evidence.
 
 Citations — dense, Perplexity-style:
 ${citeNumeric
@@ -183,6 +186,8 @@ export type RegistrySource = {
   published?: string;
   highlights: string[];
   text?: string;
+  /** ISO date when SelfSurf fetched the text live — the writer weighs it as today's state. */
+  liveAt?: string;
 };
 
 type SearchHit = {
@@ -198,6 +203,10 @@ function domainOf(url: string): string {
   } catch {
     return url.slice(0, 40);
   }
+}
+
+function isoToday(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function urlsInPrompt(prompt: string): string[] {
@@ -323,6 +332,30 @@ function normalizedUrlKey(url: string): string {
   }
 }
 
+/** Query parameters that only track the click and never change the document. */
+const TRACKING_PARAM = /^(utm_\w+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|yclid|_ga)$/i;
+
+/**
+ * One registry slot per document. Scheme, `www.`, trailing slashes, parameter
+ * order and tracking parameters never mint a second source for the same page —
+ * otherwise the reflector spends two reads (and the writer two page texts) on
+ * one article. Meaningful queries stay (`?q=term` is a different page) and so
+ * does the fragment: repository sources rely on it (`…/repo#readme` next to
+ * the overview at `…/repo`). Kept in sync with the browser twin.
+ */
+export function sourceDedupeKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const kept = [...parsed.searchParams.entries()]
+      .filter(([key]) => !TRACKING_PARAM.test(key))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const search = kept.length > 0 ? `?${new URLSearchParams(kept).toString()}` : "";
+    return `${parsed.hostname.replace(/^www\./, "").toLowerCase()}${parsed.pathname.replace(/\/+$/, "")}${search}${parsed.hash}`;
+  } catch {
+    return url.trim().toLowerCase();
+  }
+}
+
 /**
  * Pairs content-API results back to the requested sources without guessing:
  * exact URL match first, then a normalized match. Positional pairing is
@@ -420,6 +453,9 @@ export function buildDossier(registry: Map<string, RegistrySource>, budget: numb
     if (source.published) {
       lines.push(`Published: ${source.published.slice(0, 10)}`);
     }
+    if (source.liveAt) {
+      lines.push(`Fetched live: ${source.liveAt}`);
+    }
     if (source.highlights.length > 0) {
       lines.push(`Notes: ${source.highlights.join(" ")}`);
     }
@@ -471,6 +507,52 @@ export function buildReflectionList(sources: RegistrySource[], budget: number): 
   return note + kept.map((line) => line.text).join("\n");
 }
 
+export const RESEARCH_LOG_BUDGET = 8_000;
+const REFLECTION_NOTE_CHARS = 300;
+
+/**
+ * The loop's working notes, handed to the writer next to the dossier. A text
+ * hand-off keeps the findings and drops the considerations behind them; this
+ * keeps them: what the reflector judged still missing after each wave, which
+ * pages or tools failed, and every query run — so "Limitations" states what
+ * was actually looked for and not found instead of guessing. Sections are
+ * ordered by value per character, so a budget cut trims the query list first.
+ * Kept in sync with the browser twin.
+ */
+export function buildResearchLog(input: {
+  queries: string[];
+  notes: string[];
+  steps: ResearchStep[];
+  budget?: number;
+}): string {
+  const budget = input.budget ?? RESEARCH_LOG_BUDGET;
+  const clip = (text: string, limit: number): string => text.replace(/\s+/g, " ").trim().slice(0, limit);
+  const sections: string[] = [];
+  const notes = input.notes.map((note) => clip(note, REFLECTION_NOTE_CHARS + 20)).filter((note) => note.length > 0);
+  if (notes.length > 0) {
+    sections.push(
+      `Reflection notes — what the loop judged still missing after each wave:\n${notes.map((note) => `- ${note}`).join("\n")}`,
+    );
+  }
+  const failures = input.steps
+    .filter((step) => step.status === "error" && step.kind !== "synthesize")
+    .map((step) => `- ${step.kind}: ${clip(step.label, 100)}${step.detail ? ` — ${clip(step.detail, 140)}` : ""}`);
+  if (failures.length > 0) {
+    const shown = failures.slice(0, 25);
+    const hidden = failures.length - shown.length;
+    sections.push(
+      `Could not be obtained (not sources — never cite; mention in Limitations when relevant):\n${shown.join("\n")}${hidden > 0 ? `\n- …and ${hidden} more` : ""}`,
+    );
+  }
+  if (input.queries.length > 0) {
+    sections.push(
+      `Queries run (${input.queries.length}):\n${input.queries.map((query) => `- ${clip(query, 120)}`).join("\n")}`,
+    );
+  }
+  const log = sections.join("\n\n");
+  return log.length > budget ? `${log.slice(0, Math.max(0, budget - 1))}…` : log;
+}
+
 function historyMessages(history: WireMessage[]): EngineMessage[] {
   return history
     .filter((message) => message.content.trim().length > 0)
@@ -512,7 +594,11 @@ export async function runServerDeepResearch(
   const profile = RESEARCH_PROFILES[params.depth ?? "balanced"];
   const state: ResearchState = { status: "running", steps: [], sources: [], startedAt: Date.now() };
   const registry = new Map<string, RegistrySource>();
+  /** The same document under variant URLs resolves to one registry slot. */
+  const registryByKey = new Map<string, RegistrySource>();
   const usedQueries: string[] = [];
+  /** The reflector's own "still missing" notes, wave by wave — handed forward. */
+  const reflectionNotes: string[] = [];
   let readsTotal = 0;
 
   const snapshot = (): ResearchState => ({
@@ -539,17 +625,21 @@ export async function runServerDeepResearch(
       throw new RunStoppedError();
     }
   };
+  const findSource = (url: string): RegistrySource | undefined =>
+    registry.get(url) ?? registryByKey.get(sourceDedupeKey(url));
   const registerHit = (hit: SearchHit): boolean => {
-    if (registry.has(hit.url)) {
+    if (findSource(hit.url)) {
       return false;
     }
-    registry.set(hit.url, {
+    const source: RegistrySource = {
       index: registry.size + 1,
       url: hit.url,
       title: hit.title,
       published: hit.published,
       highlights: hit.highlights,
-    });
+    };
+    registry.set(hit.url, source);
+    registryByKey.set(sourceDedupeKey(hit.url), source);
     state.sources.push({ url: hit.url, title: hit.title });
     return true;
   };
@@ -573,10 +663,10 @@ export async function runServerDeepResearch(
   const githubDisabled = new Set(params.githubDisabledTools ?? []);
   const canGitHub = (toolName: string): boolean => !githubDisabled.has(toolName);
   const upsertRepoSource = (url: string, title: string, text: string) => {
-    if (!registry.has(url)) {
+    if (!findSource(url)) {
       registerHit({ url, title, highlights: [] });
     }
-    const source = registry.get(url);
+    const source = findSource(url);
     if (source) {
       source.text = text;
       retitle(source, title);
@@ -594,7 +684,7 @@ export async function runServerDeepResearch(
         return;
       }
       const url = normalizeBrowseUrl(raw);
-      if (!url || browsedUrls.has(url) || registry.get(url)?.text) {
+      if (!url || browsedUrls.has(url) || findSource(url)?.text) {
         continue;
       }
       browsedUrls.add(url);
@@ -619,13 +709,14 @@ export async function runServerDeepResearch(
       const finalUrl = page.url.startsWith("http") ? page.url : url;
       browsedUrls.add(finalUrl);
       const title = page.title.trim() || finalUrl;
-      let source = registry.get(finalUrl) ?? registry.get(url);
+      let source = findSource(finalUrl) ?? findSource(url);
       if (!source) {
         registerHit({ url: finalUrl, title, highlights: [] });
-        source = registry.get(finalUrl);
+        source = findSource(finalUrl);
       }
       if (source) {
         source.text = text.slice(0, profile.pageChars);
+        source.liveAt = isoToday();
         retitle(source, title);
         if (source.highlights.length === 0) {
           source.highlights = [text.slice(0, 180).replace(/\s+/g, " ").trim()];
@@ -799,6 +890,9 @@ export async function runServerDeepResearch(
             user: [
               `Research question:\n"""${params.prompt.slice(0, 1500)}"""`,
               `Queries already used:\n${usedQueries.map((query) => `- ${query}`).join("\n")}`,
+              ...(reflectionNotes.length > 0
+                ? [`Your notes from earlier waves:\n${reflectionNotes.map((note) => `- ${note}`).join("\n")}`]
+                : []),
               `Sources so far:\n${buildReflectionList([...registry.values()], REFLECT_LIST_BUDGET)}`,
             ].join("\n\n"),
             maxTokens: 900,
@@ -815,6 +909,9 @@ export async function runServerDeepResearch(
       }
       const notes = typeof reflectJson.notes === "string" ? reflectJson.notes.trim() : "";
       finishStep(reflectStep, "done", notes ? notes.slice(0, 110) : undefined);
+      if (notes) {
+        reflectionNotes.push(`Wave ${wave}: ${notes.slice(0, REFLECTION_NOTE_CHARS)}`);
+      }
 
       const isDone = reflectJson?.done === true && wave >= profile.minWavesBeforeDone;
       if (canQueryMore && !isDone) {
@@ -870,6 +967,7 @@ export async function runServerDeepResearch(
             const liveText = live && live.status > 0 ? live.text.trim() : "";
             if (liveText) {
               source.text = liveText.slice(0, profile.pageChars);
+              source.liveAt = isoToday();
               retitle(source, live?.title ?? "");
               readsTotal += 1;
               finishStep(readSteps[index], "done", `${domainOf(source.url)} · via SelfSurf`);
@@ -965,6 +1063,7 @@ export async function runServerDeepResearch(
     ensureAlive();
     const writeStep = addStep("synthesize", "Writing report", `${state.sources.length} sources`);
     const dossier = buildDossier(registry, profile.dossierCharBudget);
+    const log = buildResearchLog({ queries: usedQueries, notes: reflectionNotes, steps: state.steps });
     const system = synthesisSystem(
       synthesisPrompt((params.citations ?? "numeric") === "numeric"),
       params.systemPrompt,
@@ -974,7 +1073,7 @@ export async function runServerDeepResearch(
       ...historyMessages(params.history),
       {
         role: "user",
-        content: `${params.prompt}\n\n<research_dossier>\n${dossier || "No sources found — say so honestly and answer from general knowledge, flagging uncertainty."}\n</research_dossier>`,
+        content: `${params.prompt}\n\n<research_dossier>\n${dossier || "No sources found — say so honestly and answer from general knowledge, flagging uncertainty."}\n</research_dossier>${log ? `\n\n<research_log>\n${log}\n</research_log>` : ""}`,
       },
     ];
     // The dossier is already collected — a network blip while writing the

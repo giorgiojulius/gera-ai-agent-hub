@@ -547,6 +547,28 @@ context (profile + skills + knowledge) rides into the report writer via
 `synthesisSystem` framed as guidance that "is NOT the research subject",
 replacing the old "User instructions (always follow these)" label.
 
+Hand-off between the loop's agents (2026-09-03). Planner, per-wave reflector
+and report writer used to pass each other findings only; the considerations
+behind them died as a 110-char step caption. Now the reflector receives its
+own earlier notes ("Your notes from earlier waves: - Wave 1: …") and is told
+to change angle or accept a gap as unfindable rather than re-run an angle
+that came up empty; the writer receives a `<research_log>` after the
+`<research_dossier>` (`buildResearchLog`, ≤ 8 000 chars, sections ordered
+notes → failures → queries so a budget cut trims the query list first): the
+reflector's per-wave "still missing" notes, every step that errored (search
+failed, page needs JavaScript, connector disabled, repo read failed) and
+every query run — so "Limitations" states what was looked for and not found,
+and the log is never cited as a source. Pages SelfSurf fetched live carry
+`Fetched live: <date>` in the dossier and the writer treats them as today's
+state. The registry keys sources by `sourceDedupeKey` (scheme, `www.`,
+trailing slash, parameter order and tracking params collapse; meaningful
+queries and fragments stay — repo sources hang `#readme` off the overview
+URL), so one article behind variant URLs costs one read and one dossier
+slot instead of two. Both engines carry identical copies; unit
+`deep-research.test.ts` (`sourceDedupeKey`, `buildResearchLog`, live
+marker, two-wave run with a failed search) and `research-runner.test.ts`
+(byte-for-byte twin parity).
+
 ## Julius
 
 Composer toggle: parallel candidate answers compete, or the council

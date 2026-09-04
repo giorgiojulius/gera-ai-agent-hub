@@ -44,7 +44,7 @@ import {
   type NativeConnectorKind,
 } from "./mcp-policy";
 import {
-  callCloudMcpTool,
+  callCloudMcpToolRich,
   cloudMcpFunctionName,
   cloudServerRedactions,
   connectCloudMcp,
@@ -60,6 +60,7 @@ import {
   type CloudOAuthRefreshFailure,
   type RefreshedOAuth,
 } from "./mcp-cloud";
+import { createCredentialLease, stripCloudMcpCredentials, type CredentialLease } from "./mcp-credentials";
 import {
   JSON_RPC_INVALID_PARAMS,
   JSON_RPC_METHOD_NOT_FOUND,
@@ -76,6 +77,7 @@ import {
   type McpPromptInfo,
   type McpResourceInfo,
   type McpResourceTemplateInfo,
+  type McpResultFile,
   type McpServerCapabilities,
   type McpServerRequest,
   type McpServerRequestReply,
@@ -630,7 +632,17 @@ export async function callNativeConnectorTool(
 // ---------------------------------------------------------------------------
 // The resolver.
 
-export type McpToolOutcome = { text: string; isError?: boolean };
+/** An audio part or embedded binary resource of a tool result, as a bounded data URL. */
+export type McpToolFile = { name: string; mime: string; dataUrl: string; bytes: number };
+
+export type McpToolOutcome = {
+  text: string;
+  isError?: boolean;
+  /** `type: "image"` parts of the result as data URLs (up to 5 / 4 MB per call). */
+  images?: string[];
+  /** Audio parts and embedded binary resources (up to 4 MB each) as data URLs. */
+  files?: McpToolFile[];
+};
 
 export type McpToolsetServerInfo = {
   id: string;
@@ -737,6 +749,13 @@ export type ResolveMcpToolsetOptions = {
    * grants are never rotated locally.
    */
   reconnect?: (serverId: string) => Promise<CloudMcpServer | null>;
+  /**
+   * Per-request credential source: re-resolves one server with freshly opened
+   * credentials (vault rows read per call, an expiring grant refreshed and
+   * persisted inside; `force` re-redeems after an auth rejection). When set,
+   * no credential material is retained between requests.
+   */
+  credentials?: (serverId: string, options: { force: boolean }) => Promise<CloudMcpServer | null>;
   now?: () => number;
   /** Injected transport for conformance tests; production keeps the public-HTTPS guard. */
   fetch?: McpFetch;
@@ -754,7 +773,9 @@ export type ResolveMcpToolsetOptions = {
 };
 
 type ServerState = {
+  /** Credential-free copy — the material lives behind `lease`. */
   server: CloudMcpServer;
+  lease: CredentialLease;
   catalog: CloudMcpTool[] | null;
   session: CloudMcpSession | null;
   connecting: Promise<void> | null;
@@ -789,6 +810,17 @@ function visibleTools(state: ServerState, policy: McpRunPolicy): CloudMcpTool[] 
   return state.catalog.filter(
     (tool) => !disabled.has(tool.name) && tool.uiOnly !== true && mcpToolAllowed(policy, state.server.id, tool.name),
   );
+}
+
+/** A tool result with its binary parts as an outcome: text for the model, media for the surface. */
+function richOutcome(result: { text: string; media: { images: Array<{ dataUrl: string }>; files: McpResultFile[] } }): McpToolOutcome {
+  return {
+    text: result.text.trim().length > 0 ? result.text : "(empty result)",
+    ...(result.media.images.length > 0 ? { images: result.media.images.map((image) => image.dataUrl) } : {}),
+    ...(result.media.files.length > 0
+      ? { files: result.media.files.map((file) => ({ name: file.name, mime: file.mimeType, dataUrl: file.dataUrl, bytes: file.bytes })) }
+      : {}),
+  };
 }
 
 function withTimeout<T>(task: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
@@ -867,14 +899,28 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     infos.push({ id: server.id, name: server.name, kind: server.kind, toolCount: runtime.routes.size - before, deferred: false });
   }
 
-  // 3. Generic MCP servers.
+  // 3. Generic MCP servers. Credential material leaves the shared objects here:
+  // each state keeps a stripped server plus a lease that opens the credential
+  // per request (through `credentials`) or holds it privately for the run.
+  const repairGrant = async (server: CloudMcpServer): Promise<boolean> => {
+    const outcome = await forceRefreshCloudOAuthOutcome(server, runtime.refreshed, options.persist, options.beginRefresh).catch(() => null);
+    if (outcome?.ok === false) {
+      await options.reportFailure?.(server.id, outcome);
+    }
+    return outcome?.ok === true;
+  };
   const states: ServerState[] = servers
     .filter((server) => server.kind === "mcp" && !unavailable.has(server.id))
     .map((server) => {
       const cached = options.catalog?.read(server.id) ?? null;
       const fresh = cached !== null && now() - cached.fetchedAt < CATALOG_TTL_MS;
+      const credentials = options.credentials;
+      const lease = createCredentialLease(server, {
+        ...(credentials ? { resolve: (force: boolean) => credentials(server.id, { force }) } : { repairGrant }),
+      });
       return {
-        server,
+        server: stripCloudMcpCredentials(server),
+        lease,
         catalog: fresh ? cached.tools : null,
         session: null,
         connecting: null,
@@ -1064,6 +1110,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       maxTools: DEFERRED_TOOLS_PER_SERVER,
       includeDisabled: true,
       inventory: options.inventory === true,
+      lease: () => state.lease.get(),
       ...(options.fetch ? { fetch: options.fetch } : {}),
       onServerRequest: serverRequestHandler(state),
       onNotification: notificationHandler(state),
@@ -1106,30 +1153,23 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
           if (stepUp) {
             throw new Error(stepUp);
           }
-          if (options.reconnect) {
+          if (options.reconnect && !options.credentials) {
+            // Legacy project-agent path: the owner's shard refreshes and persists;
+            // the fresh material moves behind a new lease, never onto the state.
             const fresh = await options.reconnect(state.server.id).catch(() => null);
             if (fresh) {
-              state.server = fresh;
-              return connectRaw(state, fresh);
+              state.lease = createCredentialLease(fresh, { repairGrant });
+              state.server = stripCloudMcpCredentials(fresh);
+              return connectRaw(state, state.server);
             }
             throw error;
           }
           // The recorded expiry may be missing or wrong (no expires_in, revoked
-          // early). Redeem the refresh token once and retry — mirrors the
-          // browser's 401 replay, so a sleeping sign-in repairs instead of failing.
-          if (state.server.oauth?.refreshToken) {
-            const outcome = await forceRefreshCloudOAuthOutcome(
-              state.server,
-              runtime.refreshed,
-              options.persist,
-              options.beginRefresh,
-            ).catch(() => null);
-            if (outcome?.ok === false) {
-              await options.reportFailure?.(state.server.id, outcome);
-            }
-            if (outcome?.ok) {
-              return connectRaw(state, state.server);
-            }
+          // early). Redeem the refresh token once (resolver-backed leases
+          // re-resolve with force) and retry — mirrors the browser's 401 replay,
+          // so a sleeping sign-in repairs instead of failing.
+          if (await state.lease.repair()) {
+            return connectRaw(state, state.server);
           }
           throw error;
         }
@@ -1473,8 +1513,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       }
     }
     try {
-      const output = await callCloudMcpTool(state.session, toolName, callArgs);
-      return { text: output.trim().length > 0 ? output : "(empty result)" };
+      return richOutcome(await callCloudMcpToolRich(state.session, toolName, callArgs));
     } catch (error) {
       const stepUp = await parkForStepUp(state, error);
       if (stepUp) {
@@ -1531,11 +1570,11 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
           return refused;
         }
         try {
-          const output =
-            route.type === "native"
-              ? await callNativeConnectorTool(route, args)
-              : await callCloudMcpTool(route.session, route.toolName, args);
-          return { text: output.trim().length > 0 ? output : "(empty result)" };
+          if (route.type === "native") {
+            const output = await callNativeConnectorTool(route, args);
+            return { text: output.trim().length > 0 ? output : "(empty result)" };
+          }
+          return richOutcome(await callCloudMcpToolRich(route.session, route.toolName, args));
         } catch (error) {
           const stepUp = state ? await parkForStepUp(state, error) : null;
           if (stepUp) {

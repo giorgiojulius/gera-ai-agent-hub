@@ -59,8 +59,15 @@ import { handleKnowledgeRoute, probeRorkStorage } from "./knowledge-storage";
 import { REPO_PREVIEW_MAX_ARCHIVE_BYTES, verifyRepoPreviewId } from "./repo-preview-shared";
 import { githubRequestHeaders } from "./native-github";
 import { decodeSlackInstallState } from "./native-slack";
-import { shardFailureReason } from "./chat-shared";
-import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
+import {
+  relayAccountMcp,
+  relayBrowserOAuthRefresh,
+  relayMcp,
+  relayMcpOAuthCallback,
+  relayOAuthRotations,
+  type McpRelayContext,
+} from "./mcp-relay";
+import { fetchPublicHttps, isForbiddenHost } from "./network-safety";
 import { SecretVault } from "./secret-vault";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
 import { chatShardId, migrateOwnerToShard, sweepGlobalMigrations } from "./shard-migration";
@@ -737,18 +744,24 @@ async function isInvitedCached(env: Env, requestUrl: string, email: string): Pro
 async function shardCall(
   env: Env,
   requestUrl: string,
-  principal: string | Pick<AccountPrincipal, "storageOwner" | "shardId">,
+  principal: string | (Pick<AccountPrincipal, "storageOwner" | "shardId"> & Partial<Pick<AccountPrincipal, "userId">>),
   path: string,
   options: { method: "GET" | "POST"; body?: string },
 ): Promise<Response> {
   const origin = new URL(requestUrl).origin;
   const storageOwner = typeof principal === "string" ? principal : principal.storageOwner;
   const shardId = typeof principal === "string" ? chatShardId(principal) : principal.shardId;
+  // The verified immutable subject rides along so the shard can bind its
+  // credential vault to the account (vault-scope.ts); cron fires carry none.
+  const accountId = typeof principal === "string" ? "" : principal.userId ?? "";
   const dispatch = (): Promise<Response> => {
     const headers = new Headers();
     headers.set("X-Rork-DO-Class", "ChatStore");
     headers.set("X-Rork-DO-Id", shardId);
     headers.set("X-Gera-Email", encodeURIComponent(storageOwner));
+    if (accountId) {
+      headers.set("X-Gera-Account-Id", encodeURIComponent(accountId));
+    }
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");
     }
@@ -1795,260 +1808,16 @@ async function relayChatSync(request: Request, url: URL, env: Env): Promise<Resp
   }
 }
 
-/**
- * GET /mcp/oauth-rotations — server-rotated MCP grants for the signed-in
- * account. The browser adopts these instead of dropping a sign-in whose
- * refresh token was already rotated by a server run. Same trust chain as
- * chat sync: platform-verified identity + invite, then the account shard.
- */
-async function relayOAuthRotations(request: Request, url: URL, env: Env): Promise<Response> {
-  try {
-    if (request.method !== "GET") {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    const account = await requireInvitedAccount(request, env);
-    if (account instanceof Response) {
-      return account;
-    }
-    const upstream = await shardCall(env, request.url, account, "/mcp/oauth-rotations", { method: "GET" });
-    const text = await upstream.text();
-    return new Response(text, {
-      status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
-    });
-  } catch (error) {
-    console.error("oauth rotations relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "upstream_unreachable" }, 502);
-  }
-}
-
-const MCP_OAUTH_REFRESH_BODY_LIMIT = 64_000;
-
-function oauthAppOrigin(request: Request): string | null {
-  const raw = request.headers.get("Origin") ?? "";
-  try {
-    const origin = new URL(raw);
-    const host = origin.hostname.toLowerCase();
-    const allowedHost =
-      host.endsWith(".rork.live") ||
-      host.endsWith(".rork.app") ||
-      host.endsWith(".workers.dev") ||
-      host === "localhost" ||
-      host === "127.0.0.1";
-    return origin.protocol === "https:" && !origin.username && !origin.password && allowedHost
-      ? origin.origin
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-async function oauthRouteCall(
-  env: Env,
-  origin: string,
-  path: "/oauth-route/register" | "/oauth-route/resolve" | "/oauth-route/consume",
-  body: Record<string, unknown>,
-): Promise<Response> {
-  return env.DO.fetch(
-    new Request(new URL(path, origin).toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Rork-DO-Class": "AccessRegistry",
-        "X-Rork-DO-Id": "global",
-        "X-Gera-Internal-Route": "oauth",
-      },
-      body: JSON.stringify(body),
-    }),
-  );
-}
-
-/** Server-owned MCP state/control routes for one authenticated account shard. */
-async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Response> {
-  try {
-    const methods: Record<string, "GET" | "POST"> = {
-      "/mcp/oauth-start": "POST",
-      "/mcp/oauth-status": "GET",
-      "/mcp/oauth-complete": "POST",
-      "/mcp/github-device-start": "POST",
-      "/mcp/github-device-status": "GET",
-      "/mcp/oauth-store": "POST",
-      "/mcp/oauth-clear": "POST",
-      "/mcp/check": "POST",
-      "/mcp/inventory": "POST",
-      "/mcp/prompt-get": "POST",
-      "/mcp/resource-read": "POST",
-    };
-    const method = methods[url.pathname];
-    if (!method || request.method !== method) {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    const account = await requireInvitedAccount(request, env);
-    if (account instanceof Response) {
-      return account;
-    }
-    let body: string | undefined;
-    if (method === "POST") {
-      body = await request.text();
-      if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
-        return corsJson({ error: "body_too_large" }, 413);
-      }
-      if (url.pathname === "/mcp/oauth-start") {
-        const returnOrigin = oauthAppOrigin(request);
-        if (!returnOrigin) {
-          return corsJson({ error: "invalid_return_origin" }, 400);
-        }
-        let parsed: Record<string, unknown>;
-        try {
-          const value = JSON.parse(body) as unknown;
-          parsed = value && typeof value === "object" && !Array.isArray(value)
-            ? (value as Record<string, unknown>)
-            : {};
-        } catch {
-          return corsJson({ error: "invalid_body" }, 400);
-        }
-        body = JSON.stringify({ ...parsed, returnOrigin });
-      }
-    }
-    const targetPath = `${url.pathname}${method === "GET" ? url.search : ""}`;
-    const upstream = await shardCall(env, request.url, account, targetPath, { method, body });
-    const text = await upstream.text();
-    if (upstream.ok && url.pathname === "/mcp/oauth-start") {
-      const data = JSON.parse(text) as { state?: unknown; expiresAt?: unknown };
-      if (typeof data.state !== "string" || typeof data.expiresAt !== "number") {
-        return corsJson({ error: "oauth_start_invalid" }, 502);
-      }
-      const registered = await oauthRouteCall(env, new URL(request.url).origin, "/oauth-route/register", {
-        state: data.state,
-        shardId: account.shardId,
-        storageOwner: account.storageOwner,
-        expiresAt: data.expiresAt,
-      });
-      if (!registered.ok) {
-        return corsJson({ error: "oauth_callback_route_unavailable" }, 503);
-      }
-    }
-    if (upstream.ok && url.pathname === "/mcp/oauth-complete" && body) {
-      try {
-        const parsed = JSON.parse(body) as { state?: unknown };
-        if (typeof parsed.state === "string") {
-          const consumed = await oauthRouteCall(env, new URL(request.url).origin, "/oauth-route/consume", {
-            state: parsed.state,
-          });
-          if (!consumed.ok && consumed.status !== 404) {
-            return corsJson({ error: "oauth_route_cleanup_unavailable", retryable: true }, 503);
-          }
-        }
-      } catch {
-        // The account shard already validated the body; route cleanup is best effort.
-      }
-    }
-    return new Response(text, {
-      status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
-    });
-  } catch (error) {
-    // Everything the shard itself decides — auth states, a provider that did
-    // not connect — came back as a Response above. Reaching here means the
-    // call into Gera's own backend threw (a deploy reset mid-request, an
-    // overloaded object, an internal fault), which says nothing about the MCP
-    // server; labelling it "upstream unreachable" sent people to check a
-    // provider that was fine. The path and a coarse reason are logged; never
-    // the body.
-    const reason = shardFailureReason(error);
-    console.error("account MCP relay failed", url.pathname, reason, error instanceof Error ? error.message : "error");
-    return corsJson({ error: "account_shard_unavailable", reason, transient: true, retryable: true }, 502);
-  }
-}
-
-/**
- * POST /mcp/oauth-refresh — refreshes a browser MCP grant inside its account
- * shard and durably records a rotating response before returning it. The body
- * is never logged; platform identity and invite checks match sync/rotations.
- */
-async function relayBrowserOAuthRefresh(request: Request, env: Env): Promise<Response> {
-  try {
-    if (request.method !== "POST") {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    const account = await requireInvitedAccount(request, env);
-    if (account instanceof Response) {
-      return account;
-    }
-    const body = await request.text();
-    if (body.length > MCP_OAUTH_REFRESH_BODY_LIMIT) {
-      return corsJson({ error: "body_too_large" }, 413);
-    }
-    const upstream = await shardCall(env, request.url, account, "/mcp/oauth-refresh", { method: "POST", body });
-    const text = await upstream.text();
-    return new Response(text, {
-      status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json", "Cache-Control": "no-store" },
-    });
-  } catch (error) {
-    console.error("browser oauth refresh relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "upstream_unreachable", transient: true }, 502);
-  }
-}
-
-/** Public provider redirect; state routes to one account shard and is consumed once. */
-async function relayMcpOAuthCallback(request: Request, url: URL, env: Env): Promise<Response> {
-  if (request.method !== "GET") {
-    return new Response("Method not allowed", { status: 405 });
-  }
-  const state = url.searchParams.get("state") ?? "";
-  if (!/^[a-f0-9]{64}$/.test(state)) {
-    return new Response("OAuth state is invalid or expired.", { status: 400 });
-  }
-  const origin = new URL(request.url).origin;
-  const route = await oauthRouteCall(env, origin, "/oauth-route/resolve", { state });
-  if (!route.ok) {
-    return new Response(
-      route.status === 404
-        ? "OAuth state is invalid, expired, or already used."
-        : "OAuth callback routing is temporarily unavailable. Retry shortly.",
-      { status: route.status === 404 ? 400 : 503 },
-    );
-  }
-  const target = (await route.json()) as { shardId?: unknown; storageOwner?: unknown };
-  if (typeof target.shardId !== "string" || typeof target.storageOwner !== "string") {
-    return new Response("OAuth callback route is unavailable.", { status: 503 });
-  }
-  const headers = new Headers({
-    "Content-Type": "application/json",
-    "X-Rork-DO-Class": "ChatStore",
-    "X-Rork-DO-Id": target.shardId,
-    "X-Gera-Email": encodeURIComponent(target.storageOwner),
-  });
-  let upstream: Response;
-  try {
-    upstream = await env.DO.fetch(
-      new Request(new URL("/mcp/oauth-callback", origin).toString(), {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          state,
-          code: (url.searchParams.get("code") ?? "").slice(0, 8_000),
-          error: (url.searchParams.get("error_description") ?? url.searchParams.get("error") ?? "").slice(0, 300),
-          issuer: (url.searchParams.get("iss") ?? "").slice(0, 2_000),
-        }),
-      }),
-    );
-  } catch {
-    return new Response("OAuth callback could not reach the account store. Retry from Gera.", { status: 503 });
-  }
-  const data = (await upstream.json().catch(() => ({}))) as { redirectUrl?: unknown; error?: unknown };
-  const redirectUrl = typeof data.redirectUrl === "string" ? safePublicHttpsUrl(data.redirectUrl) : null;
-  if (redirectUrl) {
-    return new Response(null, {
-      status: 302,
-      headers: { Location: redirectUrl.toString(), "Cache-Control": "no-store" },
-    });
-  }
-  return new Response(
-    upstream.ok ? "OAuth sign-in completed. You can close this window." : "OAuth sign-in failed. Return to Gera and retry.",
-    { status: upstream.ok ? 200 : 400, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } },
-  );
+/** The Worker helpers the MCP relay module (mcp-relay.ts) runs on. */
+function mcpRelayContext(env: Env): McpRelayContext<AccountPrincipal> {
+  return {
+    durable: env.DO,
+    corsHeaders: CORS_HEADERS,
+    corsJson,
+    requireInvitedAccount: (request) => requireInvitedAccount(request, env),
+    shardCall: (requestUrl, account, path, options) => shardCall(env, requestUrl, account, path, options),
+    relayAccessProblem: (request) => relayAccessProblem(request, env),
+  };
 }
 
 async function accountAuthorizationLease(
@@ -2402,172 +2171,6 @@ async function relayRunNow(request: Request, url: URL, env: Env, ctx: ExecutionC
     console.error("run-now relay failed", error instanceof Error ? error.message : "error");
     return corsJson({ error: "upstream_unreachable" }, 502);
   }
-}
-
-/** JSON-RPC bodies bigger than this are refused; tool args stay well under it. */
-const MCP_BODY_LIMIT = 262_144;
-
-/** Hop-by-hop, caller-identity, and platform headers never forwarded to MCP targets. */
-const MCP_DROP_HEADERS = new Set<string>([
-  "host",
-  "origin",
-  "referer",
-  "cookie",
-  "content-length",
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-  "upgrade",
-  "te",
-  "trailer",
-  "expect",
-  "accept-encoding",
-  "user-agent",
-  "x-real-ip",
-  "cdn-loop",
-  "priority",
-  "dnt",
-  "authorization",
-  "x-gera-upstream-authorization",
-  "x-gera-upstream-url",
-]);
-
-const MCP_DROP_PREFIXES = ["cf-", "sec-", "x-forwarded-", "x-rork-", "x-gera-"];
-
-/**
- * Forwards MCP Streamable HTTP POSTs — and plain GETs (GitHub Actions job
- * logs sit behind a redirect to blob storage that sends no CORS headers, so
- * browsers cannot follow it). Redirects are manual: same-origin hops retain
- * auth, while a cross-origin GET follows with every caller credential removed;
- * cross-origin POST redirects are refused. Bodies are size-capped, only https
- * targets on public hosts are allowed, and nothing beyond host/path/status is
- * ever logged.
- */
-async function relayMcp(request: Request, url: URL, env: Env): Promise<Response> {
-  if (request.method !== "POST" && request.method !== "GET") {
-    return corsJson({ error: "method_not_allowed" }, 405);
-  }
-  const accessProblem = await relayAccessProblem(request, env);
-  if (accessProblem) {
-    return accessProblem;
-  }
-  const target = request.headers.get("X-Gera-Upstream-Url") ?? url.searchParams.get("url") ?? "";
-  let parsed: URL;
-  try {
-    parsed = new URL(target);
-  } catch {
-    return corsJson({ error: "invalid_url" }, 400);
-  }
-  if (parsed.protocol !== "https:") {
-    return corsJson({ error: "https_required" }, 400);
-  }
-  if (parsed.username || parsed.password) {
-    return corsJson({ error: "credentials_not_allowed" }, 400);
-  }
-  if (isForbiddenHost(parsed.hostname)) {
-    return corsJson({ error: "host_not_allowed" }, 400);
-  }
-
-  const body = request.method === "POST" ? await request.text() : "";
-  if (body.length > MCP_BODY_LIMIT) {
-    return corsJson({ error: "body_too_large" }, 413);
-  }
-
-  const headers: Record<string, string> = {};
-  const upstreamAuthorization = request.headers.get("X-Gera-Upstream-Authorization");
-  request.headers.forEach((value, name) => {
-    const lower = name.toLowerCase();
-    if (MCP_DROP_HEADERS.has(lower) || MCP_DROP_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
-      return;
-    }
-    headers[lower] = value;
-  });
-  if (upstreamAuthorization) {
-    headers.authorization = upstreamAuthorization;
-  }
-  // MCP servers reply 406 unless Accept lists both types (probed live) —
-  // normalize weak values like */* instead of forwarding them. GETs are not
-  // MCP traffic; their Accept passes through untouched.
-  if (request.method === "POST" && (!headers.accept || !headers.accept.includes("text/event-stream"))) {
-    headers.accept = "application/json, text/event-stream";
-  }
-  headers["user-agent"] = "Gera-AI-Relay/1.0";
-
-  let upstream: Response | null = null;
-  let current = parsed;
-  let method: "GET" | "POST" = request.method === "POST" ? "POST" : "GET";
-  let forwardBody: string | undefined = method === "POST" ? body : undefined;
-  let forwardHeaders = { ...headers };
-  for (let hop = 0; hop <= 5; hop += 1) {
-    try {
-      upstream = await fetch(current.toString(), {
-        method,
-        headers: forwardHeaders,
-        body: forwardBody,
-        redirect: "manual",
-      });
-    } catch (error) {
-      console.error("mcp relay unreachable", current.hostname, error instanceof Error ? error.message : "fetch failed");
-      return corsJson({ error: "upstream_unreachable" }, 502);
-    }
-    if (upstream.status < 300 || upstream.status >= 400) {
-      break;
-    }
-    const location = upstream.headers.get("location");
-    if (!location) {
-      return corsJson({ error: "redirect_without_location" }, 502);
-    }
-    let next: URL;
-    try {
-      next = new URL(location, current);
-    } catch {
-      return corsJson({ error: "invalid_redirect" }, 502);
-    }
-    if (next.protocol !== "https:" || next.username || next.password || isForbiddenHost(next.hostname)) {
-      return corsJson({ error: "redirect_not_allowed" }, 502);
-    }
-    if (next.origin !== current.origin) {
-      if (method === "POST") {
-        return corsJson({ error: "cross_origin_redirect_refused" }, 502);
-      }
-      // GitHub's signed Actions blob needs no API credential. Dropping every
-      // caller-controlled header is safer than guessing which custom name is a key.
-      forwardHeaders = {
-        accept: forwardHeaders.accept ?? "*/*",
-        "user-agent": "Gera-AI-Relay/1.0",
-      };
-    }
-    if (upstream.status === 303 && method === "POST") {
-      method = "GET";
-      forwardBody = undefined;
-      delete forwardHeaders["content-type"];
-    }
-    current = next;
-    upstream = null;
-  }
-  if (!upstream) {
-    return corsJson({ error: "too_many_redirects" }, 502);
-  }
-
-  console.log("mcp relay", parsed.hostname, upstream.status);
-  const responseHeaders: Record<string, string> = {
-    ...CORS_HEADERS,
-    "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
-  };
-  const sessionId = upstream.headers.get("Mcp-Session-Id");
-  if (sessionId) {
-    responseHeaders["Mcp-Session-Id"] = sessionId;
-  }
-  const protocolVersion = upstream.headers.get("MCP-Protocol-Version");
-  if (protocolVersion) {
-    responseHeaders["MCP-Protocol-Version"] = protocolVersion;
-  }
-  const challenge = upstream.headers.get("WWW-Authenticate");
-  if (challenge) {
-    responseHeaders["WWW-Authenticate"] = challenge;
-  }
-  // Stream the body through so long-running SSE tool calls arrive as sent.
-  return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
 }
 
 async function repoPreviewHmac(secret: string, value: string): Promise<string> {
@@ -2959,16 +2562,16 @@ export default {
       return relayDiagnostics(request, url, env);
     }
     if (url.pathname === "/mcp/oauth/callback") {
-      return relayMcpOAuthCallback(request, url, env);
+      return relayMcpOAuthCallback(mcpRelayContext(env), request, url);
     }
     if (url.pathname === "/github-proxy") {
       return relayGitHubAccount(request, url, env);
     }
     if (url.pathname === "/mcp/oauth-rotations") {
-      return relayOAuthRotations(request, url, env);
+      return relayOAuthRotations(mcpRelayContext(env), request);
     }
     if (url.pathname === "/mcp/oauth-refresh") {
-      return relayBrowserOAuthRefresh(request, env);
+      return relayBrowserOAuthRefresh(mcpRelayContext(env), request);
     }
     if (
       url.pathname === "/mcp/oauth-start" ||
@@ -2983,7 +2586,7 @@ export default {
       url.pathname === "/mcp/prompt-get" ||
       url.pathname === "/mcp/resource-read"
     ) {
-      return relayAccountMcp(request, url, env);
+      return relayAccountMcp(mcpRelayContext(env), request, url);
     }
     if (url.pathname === "/automations/run-now") {
       return relayRunNow(request, url, env, ctx);
@@ -3004,7 +2607,7 @@ export default {
       return relayOAuth(request, url, env);
     }
     if (url.pathname === "/mcp-proxy") {
-      return relayMcp(request, url, env);
+      return relayMcp(mcpRelayContext(env), request, url);
     }
     if (url.pathname.startsWith("/intercom/")) {
       return relayIntercom(request, url, env);

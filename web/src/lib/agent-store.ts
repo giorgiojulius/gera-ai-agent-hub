@@ -8,6 +8,7 @@ import {
   attachServerRun,
   listActiveServerRuns,
   resolveCloudMediaRefs,
+  resolveToolCallMedia,
   startServerRun,
   steerServerRun,
   stopServerRun,
@@ -49,6 +50,7 @@ import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerab
 import { McpAccountAuthError, McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
 import { hasOAuthRefreshToken, hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
 import {
+  cachedAcceptsImages,
   cachedContextWindow,
   IMAGE_EDIT_MODEL,
   modelIdForMode,
@@ -446,9 +448,15 @@ async function settleDone(done: ServerRunDone): Promise<Partial<ChatMessage>> {
     const { resolved } = await resolveCloudMediaRefs([message.audioUrl]);
     audioUrl = resolved[0] ? await vaultDataUrl(resolved[0]) : undefined;
   }
+  // Images / files an MCP tool returned ride on the tool record as cloud refs
+  // — resolve and vault them too, so thumbnails and Save survive media expiry.
+  const toolCalls =
+    message.toolCalls && message.toolCalls.length > 0
+      ? await Promise.all(message.toolCalls.map((call) => resolveToolCallMedia(call, vaultDataUrl)))
+      : undefined;
   return {
     content: message.content,
-    toolCalls: message.toolCalls && message.toolCalls.length > 0 ? message.toolCalls : undefined,
+    toolCalls,
     codeChanges: message.codeChanges,
     execution: normalizeExecutionOutcome(message.execution),
     sources: message.sources && message.sources.length > 0 ? message.sources : undefined,
@@ -554,14 +562,16 @@ function mcpRunConfig(
   settings: AgentSettings,
   selectionId: string,
   conversation?: Pick<Conversation, "mcpApproved">,
-): Pick<ServerRunConfig, "mcpToolLoading" | "confirmWriteTools" | "mcpApproved" | "contextWindow"> {
+): Pick<ServerRunConfig, "mcpToolLoading" | "confirmWriteTools" | "mcpApproved" | "contextWindow" | "vision"> {
   const contextWindow = cachedContextWindow(selectionId);
+  const vision = cachedAcceptsImages(selectionId);
   const approved = conversation?.mcpApproved ?? [];
   return {
     mcpToolLoading: settings.mcpToolLoading,
     confirmWriteTools: settings.confirmWriteTools,
     ...(approved.length > 0 ? { mcpApproved: approved } : {}),
     ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(vision !== undefined ? { vision } : {}),
   };
 }
 

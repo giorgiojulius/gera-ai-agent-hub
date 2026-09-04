@@ -46,4 +46,19 @@ describe("vault status line", () => {
       warn: false,
     });
   });
+
+  it("names the scope binding and asks to reconnect servers the account-scope sweep could not open", () => {
+    expect(vaultStatusLabel({ vault: "enabled", swept: true, rows: { grants: tally(3, 3, 3) }, scope: "account" })).toEqual({
+      text: "Credential vault · key active · 3/3 sealed · swept under current key · bound to account",
+      warn: false,
+    });
+    expect(vaultStatusLabel({ vault: "enabled", swept: true, rows: { grants: tally(3, 3, 3) }, scope: "owner" })).toEqual({
+      text: "Credential vault · key active · 3/3 sealed · swept under current key · bound to owner (account binding pending)",
+      warn: false,
+    });
+    expect(vaultStatusLabel({ vault: "enabled", swept: true, rows: { grants: tally(4, 4, 4) }, scope: "account", unreadable: 2 })).toEqual({
+      text: "Credential vault · key active · 4/4 sealed · swept under current key · bound to account · 2 unreadable — reconnect those servers",
+      warn: true,
+    });
+  });
 });

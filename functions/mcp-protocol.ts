@@ -184,6 +184,23 @@ export type McpServerRequest = { id: JsonRpcId; method: string; params: unknown 
 export type McpNotification = { method: string; params: unknown };
 
 /**
+ * Credential material for exactly one HTTP request. Produced by a session's
+ * lease right before the request and dropped right after it: the headers ride
+ * on the wire, the redactions scrub that request's response, and neither is
+ * kept on the session object.
+ */
+export type McpLeasedCredential = {
+  /** Request URL when the credential lives in it (token path/query); the session URL otherwise. */
+  url?: string;
+  headers: Record<string, string>;
+  /** Exact credential values to strip from this request's response and errors. */
+  redactions: string[];
+};
+
+/** Opens the current credential on demand (vault row, refreshed grant) — called once per request. */
+export type McpCredentialLease = () => Promise<McpLeasedCredential>;
+
+/**
  * One Streamable HTTP session. Field names stay compatible with the historical
  * CloudMcpSession literal (url, headers, omitMcpHeaders, protocolVersion,
  * sessionId, nextId, redactions) so existing callers and tests keep working.
@@ -192,6 +209,11 @@ export type McpProtocolSession = {
   url: string;
   /** Fully resolved request headers (Authorization included when a key is set). */
   headers: Record<string, string>;
+  /**
+   * Per-request credential source. When set, `headers` and `redactions` carry
+   * no credential material — every request leases what it needs and forgets it.
+   */
+  lease?: McpCredentialLease;
   /** Google hosts reject the MCP protocol headers — skip them there. */
   omitMcpHeaders: boolean;
   /** Negotiated revision; sent as MCP-Protocol-Version after initialize. */
@@ -299,13 +321,31 @@ function protocolHeaders(session: McpProtocolSession, includeVersion: boolean): 
   };
 }
 
-function requestHeaders(session: McpProtocolSession, includeVersion: boolean): Record<string, string> {
+function requestHeaders(
+  session: McpProtocolSession,
+  includeVersion: boolean,
+  leased: McpLeasedCredential,
+): Record<string, string> {
   return {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
     ...protocolHeaders(session, includeVersion),
     ...session.headers,
+    ...leased.headers,
   };
+}
+
+/** The credential for one request: leased on demand, or the static session headers (already redacted via `session.redactions`). */
+async function leaseCredential(session: McpProtocolSession): Promise<McpLeasedCredential> {
+  if (!session.lease) {
+    return { headers: {}, redactions: [] };
+  }
+  return session.lease();
+}
+
+/** Redactions for one request's provider-originated text: session-level values plus the leased credential. */
+function requestRedactions(session: McpProtocolSession, leased: McpLeasedCredential): string[] {
+  return leased.redactions.length > 0 ? [...sessionRedactions(session), ...leased.redactions] : sessionRedactions(session);
 }
 
 function sessionFetch(session: McpProtocolSession): McpFetch {
@@ -510,13 +550,14 @@ export async function mcpRequest(
 ): Promise<unknown> {
   session.nextId += 1;
   const requestId = session.nextId;
+  const leased = await leaseCredential(session);
   const idle = idleAbort(timeoutMs);
   idle.arm();
   let response: Response;
   try {
-    response = await sessionFetch(session)(session.url, {
+    response = await sessionFetch(session)(leased.url ?? session.url, {
       method: "POST",
-      headers: requestHeaders(session, method !== "initialize"),
+      headers: requestHeaders(session, method !== "initialize", leased),
       body: JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params: params ?? {} }),
       signal: idle.signal,
     });
@@ -554,17 +595,17 @@ export async function mcpRequest(
       }
       throw new Error("unexpected response shape");
     }
+    const redactions = requestRedactions(session, leased);
     if (parsed.error) {
       const message = parsed.error.message || "MCP request failed";
-      const error = new Error(redactMcpText(message, sessionRedactions(session)));
+      const error = new Error(redactMcpText(message, redactions));
       (error as Error & { rpcCode?: number; rpcData?: unknown }).rpcCode = parsed.error.code;
-      (error as Error & { rpcCode?: number; rpcData?: unknown }).rpcData = redactMcpValue(
-        parsed.error.data,
-        sessionRedactions(session),
-      );
+      (error as Error & { rpcCode?: number; rpcData?: unknown }).rpcData = redactMcpValue(parsed.error.data, redactions);
       throw error;
     }
-    return parsed.result;
+    // A leased credential is gone after this call — its redaction happens here,
+    // deep, so no caller needs to hold the credential to scrub the result.
+    return leased.redactions.length > 0 ? redactMcpValue(parsed.result, leased.redactions) : parsed.result;
   } finally {
     idle.clear();
   }
@@ -573,9 +614,10 @@ export async function mcpRequest(
 /** Sends a notification (no response expected); failures are swallowed — notifications are best effort. */
 export async function mcpNotify(session: McpProtocolSession, method: string, params?: unknown): Promise<void> {
   try {
-    const response = await sessionFetch(session)(session.url, {
+    const leased = await leaseCredential(session);
+    const response = await sessionFetch(session)(leased.url ?? session.url, {
       method: "POST",
-      headers: requestHeaders(session, true),
+      headers: requestHeaders(session, true, leased),
       body: JSON.stringify({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) }),
       signal: AbortSignal.timeout(6_000),
     });
@@ -592,9 +634,10 @@ export async function mcpRespond(session: McpProtocolSession, id: JsonRpcId, rep
     "result" in reply
       ? { jsonrpc: "2.0", id, result: reply.result ?? {} }
       : { jsonrpc: "2.0", id, error: { code: reply.error.code, message: reply.error.message } };
-  const response = await sessionFetch(session)(session.url, {
+  const leased = await leaseCredential(session);
+  const response = await sessionFetch(session)(leased.url ?? session.url, {
     method: "POST",
-    headers: requestHeaders(session, true),
+    headers: requestHeaders(session, true, leased),
     body: JSON.stringify(frame),
     signal: AbortSignal.timeout(10_000),
   });
@@ -727,12 +770,14 @@ export async function openMcpNotificationStream(
   );
   let response: Response;
   try {
-    response = await sessionFetch(session)(session.url, {
+    const leased = await leaseCredential(session);
+    response = await sessionFetch(session)(leased.url ?? session.url, {
       method: "GET",
       headers: {
         Accept: "text/event-stream",
         ...protocolHeaders(session, true),
         ...session.headers,
+        ...leased.headers,
       },
       signal: controller.signal,
     });
@@ -1261,4 +1306,105 @@ export function stringifyMcpResourceRead(result: unknown): string {
 /** Text of a `prompts/get` message part (embedded resources flattened, media described). */
 export function stringifyMcpPromptContent(content: unknown): string {
   return stringifyContentPart(content);
+}
+
+// ---------------------------------------------------------------------------
+// Binary parts of a tool result (images, audio, blobs) — bounded, as data URLs.
+
+/** Images shipped per tool call; the rest is described in text. */
+export const MCP_MEDIA_MAX_IMAGES = 5;
+/** Total bytes of images per tool call, and the cap for one audio/blob attachment. */
+export const MCP_MEDIA_MAX_BYTES = 4 * 1024 * 1024;
+
+export type McpResultImage = { dataUrl: string; mimeType: string; bytes: number };
+
+/** An audio part or an embedded binary resource small enough to ship. */
+export type McpResultFile = { name: string; mimeType: string; dataUrl: string; bytes: number };
+
+export type McpResultMedia = {
+  images: McpResultImage[];
+  files: McpResultFile[];
+  /** Human notes for parts left out (over the caps), appended to the model text. */
+  omitted: string[];
+};
+
+function base64Bytes(data: string): number {
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
+}
+
+function describeBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function fileNameFor(mimeType: string, uri: string, index: number): string {
+  const fromUri = uri.split(/[/\\]/).pop()?.split("?")[0] ?? "";
+  if (fromUri && fromUri.length <= 120) {
+    return fromUri;
+  }
+  const subtype = mimeType.split("/")[1]?.split(";")[0]?.replace(/[^a-z0-9.+-]/gi, "") ?? "";
+  const ext = subtype === "mpeg" ? "mp3" : subtype || "bin";
+  return `${mimeType.startsWith("audio/") ? "audio" : "file"}-${index + 1}.${ext}`;
+}
+
+/**
+ * Collects the binary content parts of a `tools/call` result as data URLs:
+ * `type: "image"` parts (image/*, up to MCP_MEDIA_MAX_IMAGES and
+ * MCP_MEDIA_MAX_BYTES in total), `type: "audio"` parts and embedded
+ * `resource` blobs (each up to MCP_MEDIA_MAX_BYTES). Errors ship nothing.
+ */
+export function extractMcpResultMedia(result: unknown): McpResultMedia {
+  const media: McpResultMedia = { images: [], files: [], omitted: [] };
+  if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) {
+    return media;
+  }
+  let imageBytes = 0;
+  let imagesOver = 0;
+  let fileIndex = 0;
+  for (const part of result.content) {
+    if (!isRecord(part)) {
+      continue;
+    }
+    if (part.type === "image" && typeof part.data === "string" && part.data.length > 0) {
+      const mimeType = typeof part.mimeType === "string" && /^image\//i.test(part.mimeType) ? part.mimeType : "image/png";
+      const bytes = base64Bytes(part.data);
+      if (media.images.length >= MCP_MEDIA_MAX_IMAGES || imageBytes + bytes > MCP_MEDIA_MAX_BYTES) {
+        imagesOver += 1;
+        continue;
+      }
+      imageBytes += bytes;
+      media.images.push({ dataUrl: `data:${mimeType};base64,${part.data}`, mimeType, bytes });
+      continue;
+    }
+    let blob = "";
+    let mimeType = "";
+    let uri = "";
+    if (part.type === "audio" && typeof part.data === "string" && part.data.length > 0) {
+      blob = part.data;
+      mimeType = typeof part.mimeType === "string" && part.mimeType ? part.mimeType : "audio/wav";
+    } else if (part.type === "resource" && isRecord(part.resource) && typeof part.resource.blob === "string" && part.resource.blob.length > 0) {
+      blob = part.resource.blob;
+      mimeType = typeof part.resource.mimeType === "string" && part.resource.mimeType ? part.resource.mimeType : "application/octet-stream";
+      uri = typeof part.resource.uri === "string" ? part.resource.uri : "";
+    } else {
+      continue;
+    }
+    const bytes = base64Bytes(blob);
+    const name = fileNameFor(mimeType, uri, fileIndex);
+    fileIndex += 1;
+    if (bytes > MCP_MEDIA_MAX_BYTES) {
+      media.omitted.push(`${name} (${mimeType}, ${describeBytes(bytes)}) exceeds the 4 MB attachment limit and was not attached`);
+      continue;
+    }
+    media.files.push({ name, mimeType, dataUrl: `data:${mimeType};base64,${blob}`, bytes });
+  }
+  if (imagesOver > 0) {
+    media.omitted.push(
+      `${imagesOver} more image${imagesOver === 1 ? "" : "s"} omitted (limit ${MCP_MEDIA_MAX_IMAGES} images / 4 MB per call)`,
+    );
+  }
+  return media;
 }

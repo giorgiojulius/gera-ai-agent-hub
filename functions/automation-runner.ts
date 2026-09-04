@@ -285,6 +285,8 @@ export async function runAutomationJob(
   reportOAuthFailure?: (serverId: string, outcome: CloudOAuthRefreshFailure) => Promise<void>,
   beginOAuthRefresh?: BeginCloudOAuthRefresh,
   catalog?: McpCatalogStore,
+  /** Per-request credential lease (the shard re-opens the grant/key for every MCP request). */
+  credentials?: (serverId: string, options: { force: boolean }) => Promise<CloudMcpServer | null>,
 ): Promise<AutomationRunResult> {
   // MCP first, so the system prompt lists what actually connected and the
   // thread shows honest records for servers that did not.
@@ -299,6 +301,7 @@ export async function runAutomationJob(
         persist: persistOAuth,
         reportFailure: reportOAuthFailure,
         beginRefresh: beginOAuthRefresh,
+        ...(credentials ? { credentials } : {}),
       })
     : idleToolset();
   const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs, executionOutcomeToolDefinition()];

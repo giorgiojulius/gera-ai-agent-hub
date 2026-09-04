@@ -732,7 +732,14 @@ export async function executeServerTool(
 
   if (ctx.mcpToolset?.owns(name)) {
     const outcome = await ctx.mcpToolset.execute(name, args);
-    return { text: capText(outcome.text, 60_000), ...(outcome.isError ? { isError: true } : {}) };
+    return {
+      text: capText(outcome.text, 60_000),
+      ...(outcome.isError ? { isError: true } : {}),
+      // Binary parts ride separately: images become media (and vision input
+      // when the model accepts it), audio/blobs become saveable files.
+      ...(outcome.images && outcome.images.length > 0 ? { images: outcome.images } : {}),
+      ...(outcome.files && outcome.files.length > 0 ? { files: outcome.files } : {}),
+    };
   }
 
   const route = ctx.mcpRoutes?.get(name);

@@ -1,4 +1,5 @@
 import {
+  extractMcpResultMedia,
   isUiOnlyTool,
   mcpInitialize,
   mcpListAll,
@@ -16,8 +17,10 @@ import {
   stringifyMcpResourceRead,
   stringifyMcpToolResult,
   type JsonRpcMessage,
+  type McpCredentialLease,
   type McpFetch,
   type McpNotification,
+  type McpResultMedia,
   type McpPromptInfo,
   type McpProtocolSession,
   type McpResourceInfo,
@@ -956,6 +959,12 @@ export type ConnectCloudMcpOptions = {
   onServerRequest?: (request: McpServerRequest) => Promise<McpServerRequestReply>;
   /** Receives notifications (list_changed, progress, logging) on any stream. */
   onNotification?: (notification: McpNotification) => void;
+  /**
+   * Per-request credential source (mcp-credentials.ts). When set, the session
+   * carries no credential strings: headers and redactions are leased per
+   * request and dropped, and `server.headers` / `server.oauth` are ignored.
+   */
+  lease?: McpCredentialLease;
 };
 
 export type CloudMcpConnection = {
@@ -1051,8 +1060,8 @@ export async function connectCloudMcp(
   server: CloudMcpServer,
   options: ConnectCloudMcpOptions = {},
 ): Promise<CloudMcpConnection> {
-  const headers: Record<string, string> = { ...server.headers };
-  if (server.oauth && !headers.Authorization) {
+  const headers: Record<string, string> = options.lease ? {} : { ...server.headers };
+  if (!options.lease && server.oauth && !headers.Authorization) {
     headers.Authorization = `Bearer ${server.oauth.accessToken}`;
   }
   const session: CloudMcpSession = {
@@ -1061,7 +1070,8 @@ export async function connectCloudMcp(
     omitMcpHeaders: server.omitMcpHeaders,
     protocolVersion: MCP_PROTOCOL_VERSION,
     nextId: 0,
-    redactions: serverCredentialValues(server),
+    redactions: options.lease ? [] : serverCredentialValues(server),
+    ...(options.lease ? { lease: options.lease } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
     ...(options.onServerRequest ? { onServerRequest: options.onServerRequest } : {}),
     ...(options.onNotification ? { onNotification: options.onNotification } : {}),
@@ -1099,13 +1109,30 @@ export async function callCloudMcpTool(
   name: string,
   args: unknown,
 ): Promise<string> {
+  return (await callCloudMcpToolRich(session, name, args)).text;
+}
+
+/** A tool result with its binary parts kept: text for the model plus bounded images / files. */
+export type CloudMcpToolResult = { text: string; media: McpResultMedia };
+
+/**
+ * Same as callCloudMcpTool, but keeps the result's images (up to 5 / 4 MB) and
+ * audio/blob parts (up to 4 MB each) as data URLs; whatever exceeds a cap is
+ * described in the text instead.
+ */
+export async function callCloudMcpToolRich(
+  session: CloudMcpSession,
+  name: string,
+  args: unknown,
+): Promise<CloudMcpToolResult> {
   const result = await rpc(session, "tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
   const redactions = session.redactions ?? [];
   const rendered = redactCloudMcpText(stringifyCloudMcpResult(result), redactions);
   if (isRecord(result) && result.isError === true) {
     throw new Error(rendered || "MCP tool reported an error.");
   }
-  const pieces = [rendered];
+  const media = extractMcpResultMedia(result);
+  const pieces = [rendered, ...media.omitted.map((note) => `[${note}]`)];
   for (const uri of mcpResourceLinks(result, MAX_RESOURCE_LINK_READS)) {
     try {
       const resource = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
@@ -1121,9 +1148,12 @@ export async function callCloudMcpTool(
     }
   }
   const output = redactCloudMcpText(pieces.filter((piece) => piece.length > 0).join("\n\n"), redactions);
-  return output.length > MAX_MCP_RENDER_CHARS
-    ? `${output.slice(0, MAX_MCP_RENDER_CHARS)}\n… [MCP result truncated]`
-    : output;
+  return {
+    text: output.length > MAX_MCP_RENDER_CHARS
+      ? `${output.slice(0, MAX_MCP_RENDER_CHARS)}\n… [MCP result truncated]`
+      : output,
+    media,
+  };
 }
 
 /** Text cap for one resource read handed to the composer as an attachment. */

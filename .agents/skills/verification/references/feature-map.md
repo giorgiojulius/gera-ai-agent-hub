@@ -1,6 +1,17 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-04 · commit `e08cd72` (+ MCP policies & confirmations:
+Last synced: 2026-09-04 · commit `960b5b0` (+ Worker MCP/OAuth relays moved
+  verbatim to `functions/mcp-relay.ts` (`/mcp/oauth/callback`, `/mcp/oauth-rotations`,
+  `/mcp/oauth-refresh`, account `/mcp/*` control routes, `/mcp-proxy`) behind
+  the `McpRelayContext` seam; project-agent tool assembly (`buildAgentToolset`,
+  `resolveOwnerMcp`, `resolveOwnerAuth`) moved verbatim to
+  `functions/agent-toolset.ts` behind `AgentToolsetContext` — MCP secrets & results: vault
+  scopes bound to the Rork Auth account (`vault-scope.ts` one-time sweep,
+  `/diag/vault` reports `scope` + `unreadable`), per-request credential leases
+  on cloud MCP sessions (`mcp-credentials.ts` — no token strings on session or
+  server objects), images / audio / blobs from tool results as thumbnails,
+  saveable files and vision input (`message-tool-images`,
+  `message-tool-file`) — MCP policies & confirmations:
   one policy gate in the toolset resolver — per-agent tool allowlists and a
   write policy for project agents, the account "Confirm write tools by
   default" switch, a Run once / Always allow in this chat / Decline card on
@@ -1107,7 +1118,21 @@ longer truncates big servers at 90) and by every handshake a run performs;
 `/mcp/resolve` ships `toolLoading` + the cached `catalog` to project shards so
 agents defer without a handshake. Chat rows for the meta calls read
 "MCP · <server> · <tool>" (`describeToolCall`, testid `message-tool-call`)
-with the same running/done/failed chip as native tools. Unit
+with the same running/done/failed chip as native tools. Binary parts of a
+result (2026-09-04, `extractMcpResultMedia` in `mcp-protocol.ts`): `type:
+"image"` parts (up to 5 / 4 MB per call) become thumbnails under the row
+(`message-tool-images`, `ToolCallMedia`) and message images; audio parts and
+embedded `resource` blobs (4 MB each) become saveable chips
+(`message-tool-file`, Save = download via `downloadOrOpenMedia`); anything
+over a cap is described in the model text. The run persists them as
+`gera-cloud:` refs on `toolCalls[].images` / `.files` (`persistMedia` →
+`agent_run_media`, per-run idx counter); the tab resolves and vaults them
+(`resolveToolCallMedia`, pulled chats too). A vision model (web: `vision`
+from the catalog's `modalities.input`; background runs / old clients:
+`model-catalog.ts`, gateway `/v1/models` cached 10 min, unknown → no) gets
+the pictures as one extra user message per tool round ("Images returned by
+<tool> (n):" + `image_url` parts, max 8); text-only models keep the stub.
+Unit `mcp-result-media.test.ts`. Unit
 `mcp-toolset.test.ts` (a–e acceptance: 3×40 tools → exactly two MCP
 functions, search by description word and schema field, call refused before
 search then lazy connect, disabled tools invisible + refused, setting picks
@@ -1333,11 +1358,26 @@ slackAppId/team/mcpSelection stays readable so the agent list and
 authenticated data binds each value to its row and field
 (`mcp-oauth-grant:<owner>:<serverId>#accessToken`,
 `project-agent:<agentId>#slackToken`, …), so a ciphertext copied into another
-row or field fails to open. `<owner>` is the account's `storageOwner` — the
-alias AccessRegistry freezes at first claim and binds to the Rork user id; a
-changed email becomes an alias, so neither the shard nor the scope moves.
-RunManager seals/opens grants through the same `secret-rows` helpers as
-ChatStore. Migration export/import moves envelopes as-is (same owner + server
+row or field fails to open. `<owner>` started as the account's
+`storageOwner` — the alias AccessRegistry freezes at first claim and binds to
+the Rork user id. Since 2026-09-04 (`functions/vault-scope.ts`,
+`vault-scope-sweep.ts`) it is `acct:<account_id>` (the immutable Rork Auth
+subject): the Worker stamps `X-Gera-Account-Id` on every relayed shard call
+(`shardCall`); the shard adopts it on first sight — or, when an internal call
+(`/mcp/resolve`, `/mcp/auth-lease`, cron `/fire`) comes first, asks the
+AccessRegistry (`POST /principal/lookup`, internal route `principal-lookup`,
+misses remembered 5 min) — and runs a one-time sweep under
+`blockConcurrencyWhile` that re-seals every credential row + the KV escrow
+into the account scope and stamps the new `account_id` column
+(`mcp_oauth_grants`, `mcp_server_secrets`, `mcp_oauth_pending`,
+`mcp_github_device_pending`). The sweep tries the new scope first, then the
+old one, so it is idempotent and resumable; values it can open under neither
+are kept (never deleted) and counted; marker `vaultScope` in KV. After it,
+`CredentialScope.subject(owner)` names the account and the owner scope is
+dead outside the sweep. A request whose account id contradicts the adopted
+one is refused (409 `wrong_account`); requests without the header keep
+working. Unit `vault-scope.test.ts`. RunManager seals/opens grants through
+the same `secret-rows` helpers (and the same `CredentialScope`) as ChatStore. Migration export/import moves envelopes as-is (same owner + server
 id ⇒ same scope). No plaintext passthrough: `open` accepts only envelopes and
 refuses a plaintext value where a credential should be (`secret_unreadable`,
 "plaintext rejected"), so a row swapped for plaintext in storage never
@@ -1356,9 +1396,11 @@ message (agent save, Slack app-manager token, OAuth store/complete,
 keys). A row the key set cannot open is logged coarse and treated as a
 missing grant (never a crashed run). Self-check: `GET /diag/vault` (identity
 + invite, same relay as the journal) returns counts only — `vault`, `swept`
-(marker equals current key id) and per-table `{ total, sealed, current,
-plaintext }` for grants, serverSecrets, pending, deviceCodes, escrow; the
-Diagnostics dialog/tab renders it as the "Credential vault · …" line
+(marker equals current key id), per-table `{ total, sealed, current,
+plaintext }` for grants, serverSecrets, pending, deviceCodes, escrow, plus
+`scope` (`account` | `owner`) and `unreadable` (values the account-scope
+sweep could not open — the line says "N unreadable — reconnect those
+servers"); the Diagnostics dialog/tab renders it as the "Credential vault · …" line
 (`data-testid="vault-status"`, ember-tinted when anything is plaintext, under
 a previous key, unswept, or the server key is unusable). Unit
 `secret-vault.test.ts` (key-format acceptance/refusal incl. previous-key

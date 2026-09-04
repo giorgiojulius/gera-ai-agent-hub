@@ -421,6 +421,21 @@ export function cachedContextWindow(selectionId: string): number | undefined {
   return typeof model?.context_window === "number" && model.context_window > 0 ? model.context_window : undefined;
 }
 
+/**
+ * Whether the picked model accepts image input per the last loaded gateway
+ * catalog (`modalities.input` lists "image"); undefined until the catalog
+ * loaded or when the gateway omits modalities. Server runs use it to decide
+ * whether images an MCP tool returns are shown to the model or described.
+ */
+export function cachedAcceptsImages(selectionId: string): boolean | undefined {
+  const model = resolveSelectionModel(lastGatewayModels, selectionId);
+  const inputs = model?.modalities?.input;
+  if (!Array.isArray(inputs)) {
+    return undefined;
+  }
+  return inputs.some((item) => typeof item === "string" && item.toLowerCase() === "image");
+}
+
 export async function fetchGatewayModels(): Promise<GatewayModel[]> {
   const urls = [`${getToolkitUrl()}/v2/vercel/v1/models`, "https://ai-gateway.vercel.sh/v1/models"];
   let lastError: Error | null = null;

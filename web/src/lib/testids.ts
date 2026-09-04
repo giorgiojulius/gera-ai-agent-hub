@@ -167,6 +167,10 @@ export const TID = {
   settingsMcpLoading: "settings-mcp-loading",
   /** One tool-call row under an assistant reply (repeats; MCP meta calls render as "MCP · server · tool"). */
   messageToolCall: "message-tool-call",
+  /** Thumbnail strip of images an MCP tool returned (under its row). */
+  messageToolImages: "message-tool-images",
+  /** One saveable audio/blob chip an MCP tool returned (repeats). */
+  messageToolFile: "message-tool-file",
   /** Composer `/` (prompts) or `@` (resources) MCP menu panel. */
   composerMcpMenu: "composer-mcp-menu",
   /** Prompt-arguments / template-variables dialog opened from the MCP menu. */

@@ -250,6 +250,10 @@ export type VaultStatus = {
   vault: string;
   swept: boolean;
   rows: Record<string, VaultTally>;
+  /** Which subject the scopes are bound to: the Rork Auth account, or (pre-migration) the storage owner. */
+  scope?: "account" | "owner";
+  /** Credential values the account-scope sweep could not open — reconnect those servers. */
+  unreadable?: number;
 };
 
 function isTally(value: unknown): value is VaultTally {
@@ -262,7 +266,7 @@ function isTally(value: unknown): value is VaultTally {
 
 export async function fetchVaultStatus(): Promise<VaultStatus> {
   const response = await authedFetch("/diag/vault");
-  const data = await parseOrThrow<{ vault?: unknown; swept?: unknown; rows?: unknown }>(
+  const data = await parseOrThrow<{ vault?: unknown; swept?: unknown; rows?: unknown; scope?: unknown; unreadable?: unknown }>(
     response,
     "Could not check the credential vault",
   );
@@ -278,6 +282,8 @@ export async function fetchVaultStatus(): Promise<VaultStatus> {
     vault: typeof data.vault === "string" && data.vault ? data.vault : "unknown",
     swept: data.swept === true,
     rows,
+    ...(data.scope === "account" || data.scope === "owner" ? { scope: data.scope } : {}),
+    ...(typeof data.unreadable === "number" && data.unreadable > 0 ? { unreadable: data.unreadable } : {}),
   };
 }
 

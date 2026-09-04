@@ -92,12 +92,22 @@ export type EngineToolDef = {
   function: { name: string; description: string; parameters: Record<string, unknown> };
 };
 
+/** A binary tool-result part shipped to the surface (audio, blob) — never inlined into model text. */
+export type EngineToolFile = { name: string; mime: string; dataUrl: string; bytes?: number };
+
+/** A persisted tool-result file as the surface shows it (a media ref or URL, not the bytes). */
+export type EngineToolFileRef = { name: string; mime: string; url: string; bytes?: number };
+
 export type EngineToolRecord = {
   id: string;
   name: string;
   arguments: string;
   status: "running" | "done" | "error";
   result?: string;
+  /** Images the tool returned, as persisted media refs (thumbnails on the record). */
+  images?: string[];
+  /** Audio / blob parts the tool returned, as persisted media refs (Save affordance). */
+  files?: EngineToolFileRef[];
 };
 
 export type EngineToolOutcome = {
@@ -107,7 +117,15 @@ export type EngineToolOutcome = {
   images?: string[];
   videos?: string[];
   audios?: string[];
+  /** Audio / blob parts as data URLs (bounded by the toolset). */
+  files?: EngineToolFile[];
 };
+
+/** One persisted media item: what the surface stores for a data URL and hands back as a ref. */
+export type EngineMediaItem = { kind: "image" | "video" | "audio" | "file"; data: string };
+
+/** Images shown to a vision model per tool round; anything beyond stays text-only. */
+export const VISION_IMAGES_PER_ROUND = 8;
 
 export type EngineSteerItem = {
   id: string;
@@ -680,9 +698,75 @@ export type EngineTurnParams = {
   onUsage?: (modelId: string, usage: unknown) => void;
   /** Called after steering items were injected into the live context. */
   onSteered?: (items: EngineSteerItem[]) => void;
+  /**
+   * The picked model accepts image input. Images a tool returns are then shown
+   * to it in a separate user message (OpenAI-shaped tool messages cannot carry
+   * image parts); otherwise the model only sees the text stub in the result.
+   */
+  acceptsImages?: boolean;
+  /**
+   * Persists tool-result media (data URLs) and returns refs the surface can
+   * resolve later. Without it, records carry no media and images stay inline.
+   */
+  persistMedia?: (items: EngineMediaItem[]) => string[];
 };
 
 type FinalizeReason = "loop" | "budget" | "time";
+
+/** Label for the vision message: the tool, or the MCP server · tool behind the meta function. */
+function describeToolForVision(name: string, argumentsJson: string): string {
+  if (name !== "mcp_call_tool") {
+    return name;
+  }
+  try {
+    const args = JSON.parse(argumentsJson || "{}") as { serverId?: unknown; toolName?: unknown };
+    const server = typeof args.serverId === "string" ? args.serverId : "?";
+    const tool = typeof args.toolName === "string" ? args.toolName : "?";
+    return `${server}/${tool}`;
+  } catch {
+    return name;
+  }
+}
+
+/**
+ * Attaches a tool outcome's binary parts to its record and the turn's media:
+ * persisted (refs) when the surface can store them, inline data URLs
+ * otherwise. Returns the image data URLs a vision model should see.
+ */
+function attachToolMedia(
+  params: Pick<EngineTurnParams, "persistMedia">,
+  record: EngineToolRecord,
+  outcome: EngineToolOutcome,
+  images: string[],
+): string[] {
+  const outImages = outcome.images ?? [];
+  const outFiles = outcome.files ?? [];
+  if (outImages.length === 0 && outFiles.length === 0) {
+    return [];
+  }
+  if (!params.persistMedia) {
+    images.push(...outImages);
+    return outImages;
+  }
+  const refs = params.persistMedia([
+    ...outImages.map((data): EngineMediaItem => ({ kind: "image", data })),
+    ...outFiles.map((file): EngineMediaItem => ({ kind: file.mime.startsWith("audio/") ? "audio" : "file", data: file.dataUrl })),
+  ]);
+  const imageRefs = refs.slice(0, outImages.length);
+  if (imageRefs.length > 0) {
+    record.images = imageRefs;
+    images.push(...imageRefs);
+  }
+  if (outFiles.length > 0) {
+    record.files = outFiles.map((file, index) => ({
+      name: file.name,
+      mime: file.mime,
+      url: refs[outImages.length + index] ?? file.dataUrl,
+      ...(typeof file.bytes === "number" ? { bytes: file.bytes } : {}),
+    }));
+  }
+  return outImages;
+}
 
 export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTurnResult> {
   const images: string[] = [];
@@ -939,6 +1023,8 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
           })
         : null;
     let stoppedInTools = false;
+    /** Images tools returned this round that a vision model should see. */
+    const visionQueue: Array<{ label: string; dataUrls: string[] }> = [];
 
     for (const record of records) {
       if (stoppedInTools || params.isStopped?.()) {
@@ -985,8 +1071,9 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         }
         if (outcome.kind === "done") {
           record.result = outcome.result.text;
-          if (outcome.result.images) {
-            images.push(...outcome.result.images);
+          const shown = attachToolMedia(params, record, outcome.result, images);
+          if (shown.length > 0 && params.acceptsImages) {
+            visionQueue.push({ label: describeToolForVision(record.name, record.arguments), dataUrls: shown });
           }
           if (outcome.result.videos) {
             videos.push(...outcome.result.videos);
@@ -1013,6 +1100,26 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         tool_call_id: record.id,
         content: record.result ?? "",
       });
+    }
+    // Tool messages cannot carry image parts on OpenAI-shaped APIs: a vision
+    // model gets the pictures a tool returned as one user message per round.
+    if (visionQueue.length > 0) {
+      const parts: EngineContentPart[] = [];
+      let shown = 0;
+      for (const entry of visionQueue) {
+        const urls = entry.dataUrls.slice(0, Math.max(0, VISION_IMAGES_PER_ROUND - shown));
+        if (urls.length === 0) {
+          break;
+        }
+        shown += urls.length;
+        parts.push({ type: "text", text: `Images returned by ${entry.label} (${urls.length}):` });
+        for (const url of urls) {
+          parts.push({ type: "image_url", image_url: { url } });
+        }
+      }
+      if (parts.length > 0) {
+        apiMessages.push({ role: "user", content: parts });
+      }
     }
     unwatchToolStop?.();
     if (stoppedInTools) {

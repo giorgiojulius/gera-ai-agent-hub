@@ -174,6 +174,7 @@ import {
   tallySealed,
   type SealedTally,
 } from "./secret-vault";
+import { CredentialScope, ensureVaultScope } from "./vault-scope";
 
 /** Worker env as visible inside this Durable Object (same bindings). */
 type ChatStoreEnv = {
@@ -181,6 +182,8 @@ type ChatStoreEnv = {
   RORK_TOOLKIT_SECRET_KEY?: string;
   EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID?: string;
   STAGING_VERSION?: string;
+  /** Durable Object namespace binding — the shard asks the AccessRegistry for its account id through it. */
+  DO?: { fetch(request: Request): Promise<Response> };
 };
 
 function sameOAuthEndpoint(left: string, right: string): boolean {
@@ -280,6 +283,8 @@ export class ChatStore extends DurableObject {
   private readonly workerEnv: ChatStoreEnv;
   /** Encrypts every credential row in this shard; keyed by the Worker secret. */
   private readonly vault: SecretVault;
+  /** Which subject (storage owner → Rork Auth account) the vault scopes are bound to. */
+  private readonly scope = new CredentialScope();
   /** Interactive server-side agent runs (chat / research / Julius). */
   private readonly runs: RunManager;
   /** Automation occurrences executing in this isolate; absent after a deploy. */
@@ -290,7 +295,7 @@ export class ChatStore extends DurableObject {
     super(ctx, env);
     this.workerEnv = (env ?? {}) as ChatStoreEnv;
     this.vault = SecretVault.fromEnv(env);
-    this.runs = new RunManager(ctx, env);
+    this.runs = new RunManager(ctx, env, this.scope);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS chats (
         owner_email TEXT NOT NULL,
@@ -498,6 +503,7 @@ export class ChatStore extends DurableObject {
     // first request; a failure here must never brick the shard.
     this.ctx.blockConcurrencyWhile(async () => {
       try {
+        await this.scope.load(this.ctx.storage);
         await this.sealLegacySecrets();
       } catch (error) {
         console.error("account secret sweep failed", error instanceof SecretVaultError ? error.code : "error");
@@ -553,7 +559,7 @@ export class ChatStore extends DurableObject {
           "UPDATE mcp_oauth_grants SET payload = ? WHERE owner_email = ? AND server_id = ?",
           await sealGrantPayload(
             this.vault,
-            row.owner_email,
+            this.scope.subject(row.owner_email),
             row.server_id,
             parsed as CloudOAuthToken & Record<string, unknown>,
           ),
@@ -575,7 +581,7 @@ export class ChatStore extends DurableObject {
         }
         sql.exec(
           "UPDATE mcp_server_secrets SET payload = ? WHERE owner_email = ? AND server_id = ?",
-          await sealServerSecret(this.vault, row.owner_email, row.server_id, stored),
+          await sealServerSecret(this.vault, this.scope.subject(row.owner_email), row.server_id, stored),
           row.owner_email,
           row.server_id,
         );
@@ -593,7 +599,7 @@ export class ChatStore extends DurableObject {
         if (!(await fieldsNeedReseal(this.vault, row, OAUTH_PENDING_SECRET_FIELDS))) {
           return false;
         }
-        const next = await sealFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(row.owner_email, row.state));
+        const next = await sealFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(this.scope.subject(row.owner_email), row.state));
         sql.exec(
           `UPDATE mcp_oauth_pending
            SET verifier = ?, authorization_code = ?, browser_nonce = ?, callback_challenge = ?
@@ -619,7 +625,7 @@ export class ChatStore extends DurableObject {
         }
         sql.exec(
           "UPDATE mcp_github_device_pending SET device_code = ? WHERE owner_email = ? AND flow_id = ?",
-          await this.vault.reseal(row.device_code, deviceCodeScope(row.owner_email, row.flow_id)),
+          await this.vault.reseal(row.device_code, deviceCodeScope(this.scope.subject(row.owner_email), row.flow_id)),
           row.owner_email,
           row.flow_id,
         );
@@ -639,7 +645,7 @@ export class ChatStore extends DurableObject {
         if (isSealedEnvelope(value) && (await this.vault.isCurrent(value.sealed))) {
           return false;
         }
-        await this.ctx.storage.put(key, await sealRotationValue(this.vault, owner, serverId, value));
+        await this.ctx.storage.put(key, await sealRotationValue(this.vault, this.scope.subject(owner), serverId, value));
         return true;
       });
     }
@@ -695,7 +701,7 @@ export class ChatStore extends DurableObject {
       deviceCodes: await tallySealed(this.vault, deviceCodes),
       escrow: await tallySealed(this.vault, escrow),
     };
-    return json({ vault: this.vault.enabled ? "enabled" : this.vault.disabledReason, swept, rows });
+    return json({ vault: this.vault.enabled ? "enabled" : this.vault.disabledReason, swept, rows, ...this.scope.describe() });
   }
 
   /**
@@ -735,7 +741,7 @@ export class ChatStore extends DurableObject {
       return null;
     }
     try {
-      return normalizeOAuthOverride(serverId, await openRotationValue(this.vault, owner, serverId, raw));
+      return normalizeOAuthOverride(serverId, await openRotationValue(this.vault, this.scope.subject(owner), serverId, raw));
     } catch (error) {
       if (error instanceof SecretVaultError) {
         console.error("oauth rotation escrow unreadable", serverId, error.code);
@@ -808,6 +814,22 @@ export class ChatStore extends DurableObject {
     }
     if (shardOwner !== email) {
       return json({ error: "wrong_shard" }, 409);
+    }
+    // Bind the credential vault to the Rork Auth account on first sight (one-time sweep).
+    const scopeGate = await ensureVaultScope(
+      {
+        sql: this.ctx.storage.sql,
+        storage: this.ctx.storage,
+        vault: this.vault,
+        scope: this.scope,
+        blockConcurrencyWhile: (work) => this.ctx.blockConcurrencyWhile(work),
+        registry: this.workerEnv.DO,
+      },
+      request,
+      email,
+    );
+    if (scopeGate) {
+      return scopeGate;
     }
     if (request.method === "GET" && url.pathname === "/staging/version" && this.workerEnv.STAGING_VERSION) {
       return json({ version: this.workerEnv.STAGING_VERSION, instanceId: this.instanceId });
@@ -1323,6 +1345,11 @@ export class ChatStore extends DurableObject {
           (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
           (id) => this.markOAuthRefreshStarted(owner, id),
           createSqlMcpCatalogStore(this.ctx.storage.sql, owner),
+          // Per-request credential lease: the grant/key row is opened for each MCP request.
+          async (id, { force }) =>
+            (await this.resolveOwnerMcpServers(owner, [id], force ? new Set([id]) : new Set()))?.servers.find(
+              (server) => server.id === id,
+            ) ?? null,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown error";
@@ -1440,7 +1467,7 @@ export class ChatStore extends DurableObject {
           "INSERT OR IGNORE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
           owner,
           serverId,
-          await sealGrantPayload(this.vault, owner, serverId, canonical),
+          await sealGrantPayload(this.vault, this.scope.subject(owner), serverId, canonical),
           Date.now(),
         );
         this.markOAuthReady(owner, serverId);
@@ -1481,7 +1508,7 @@ export class ChatStore extends DurableObject {
               "INSERT OR IGNORE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
               owner,
               serverId,
-              await sealServerSecret(this.vault, owner, serverId, {
+              await sealServerSecret(this.vault, this.scope.subject(owner), serverId, {
                 ...(token ? { token } : {}),
                 ...(headersJson ? { headersJson } : {}),
               }),
@@ -1556,7 +1583,7 @@ export class ChatStore extends DurableObject {
     if (!stored) {
       return {};
     }
-    return openServerSecret(this.vault, owner, serverId, stored);
+    return openServerSecret(this.vault, this.scope.subject(owner), serverId, stored);
   }
 
   /**
@@ -1620,7 +1647,7 @@ export class ChatStore extends DurableObject {
     if (!row) {
       return null;
     }
-    return openGrantPayload(this.vault, owner, serverId, row.payload);
+    return openGrantPayload(this.vault, this.scope.subject(owner), serverId, row.payload);
   }
 
   /**
@@ -1755,7 +1782,7 @@ export class ChatStore extends DurableObject {
       // Sealed at rest; a row this key cannot open authenticates nothing and
       // surfaces as a missing grant rather than a failed request.
       try {
-        const token = await openGrantPayload(this.vault, owner, row.server_id, row.payload);
+        const token = await openGrantPayload(this.vault, this.scope.subject(owner), row.server_id, row.payload);
         if (token) {
           tokens[row.server_id] = token;
         }
@@ -1836,7 +1863,7 @@ export class ChatStore extends DurableObject {
        VALUES (?, ?, 'github', ?, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)`,
       owner,
       flowId,
-      await this.vault.seal(deviceCode, deviceCodeScope(owner, flowId)),
+      await this.vault.seal(deviceCode, deviceCodeScope(this.scope.subject(owner), flowId)),
       userCode,
       verificationUri,
       clientId,
@@ -1891,7 +1918,7 @@ export class ChatStore extends DurableObject {
       owner,
       flowId,
     );
-    const deviceCode = await this.vault.open(row.device_code, deviceCodeScope(owner, flowId));
+    const deviceCode = await this.vault.open(row.device_code, deviceCodeScope(this.scope.subject(owner), flowId));
     let response: Response;
     try {
       response = await fetchPublicHttps("https://github.com/login/oauth/access_token", {
@@ -1930,7 +1957,7 @@ export class ChatStore extends DurableObject {
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, 'github', ?, ?)",
         owner,
-        await sealGrantPayload(this.vault, owner, "github", token),
+        await sealGrantPayload(this.vault, this.scope.subject(owner), "github", token),
         Date.now(),
       );
       // Latest credential wins: a fresh sign-in supersedes any pasted PAT or
@@ -1995,7 +2022,7 @@ export class ChatStore extends DurableObject {
 
   /** The pending row with its proofs (verifier, code, browser nonce, callback challenge) decrypted. */
   private revealOAuthPending(owner: string, row: OAuthPendingRow): Promise<OAuthPendingRow> {
-    return openFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(owner, row.state));
+    return openFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(this.scope.subject(owner), row.state));
   }
 
   /**
@@ -2136,8 +2163,8 @@ export class ChatStore extends DurableObject {
       `UPDATE mcp_oauth_pending
        SET status = 'awaiting_confirmation', authorization_code = ?, callback_challenge = ?, updated_at = ?
        WHERE owner_email = ? AND state = ? AND status = 'pending'`,
-      await this.vault.seal(code, oauthPendingFieldScope(owner, state, "authorization_code")),
-      await this.vault.seal(callbackChallenge, oauthPendingFieldScope(owner, state, "callback_challenge")),
+      await this.vault.seal(code, oauthPendingFieldScope(this.scope.subject(owner), state, "authorization_code")),
+      await this.vault.seal(callbackChallenge, oauthPendingFieldScope(this.scope.subject(owner), state, "callback_challenge")),
       Date.now(),
       owner,
       state,
@@ -2210,7 +2237,7 @@ export class ChatStore extends DurableObject {
       });
       const committedAt = Date.now();
       // Sealed before the synchronous transaction — no await inside it.
-      const sealedGrant = await sealGrantPayload(this.vault, owner, row.server_id, {
+      const sealedGrant = await sealGrantPayload(this.vault, this.scope.subject(owner), row.server_id, {
         ...token,
         authorizationState: state,
       });
@@ -2488,7 +2515,7 @@ export class ChatStore extends DurableObject {
         "INSERT OR REPLACE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
         owner,
         serverId,
-        await sealServerSecret(this.vault, owner, serverId, secret),
+        await sealServerSecret(this.vault, this.scope.subject(owner), serverId, secret),
         Date.now(),
       );
     }
@@ -2699,7 +2726,7 @@ export class ChatStore extends DurableObject {
       "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
       owner,
       rotated.serverId,
-      await sealGrantPayload(this.vault, owner, rotated.serverId, rotated.token),
+      await sealGrantPayload(this.vault, this.scope.subject(owner), rotated.serverId, rotated.token),
       Date.now(),
     );
     this.ctx.storage.sql.exec(
@@ -3003,6 +3030,7 @@ export class ChatStore extends DurableObject {
       sql: this.ctx.storage.sql,
       resolveServers: async (owner, ids) => (await this.resolveOwnerMcpServers(owner, ids, new Set()))?.servers ?? [],
       seal: (plain, scope) => this.vault.seal(plain, scope),
+      subject: (owner) => this.scope.subject(owner),
     };
   }
 
@@ -3401,7 +3429,7 @@ export class ChatStore extends DurableObject {
             // and server id, so the same key opens them); a keyless shard
             // keeps the row exactly as exported — a move, not a new secret.
             const value = this.vault.enabled
-              ? await sealRotationValue(this.vault, owner, row.serverId, row.value)
+              ? await sealRotationValue(this.vault, this.scope.subject(owner), row.serverId, row.value)
               : row.value;
             await this.ctx.storage.put(key, value);
           }

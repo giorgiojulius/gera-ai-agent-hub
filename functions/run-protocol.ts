@@ -36,12 +36,19 @@ export type WireMessage = {
 
 export type ToolRecordStatus = "running" | "done" | "error";
 
+/** A binary tool-result part persisted as run media: the surface resolves `url` (a gera-cloud ref) on demand. */
+export type RunToolFile = { name: string; mime: string; url: string; bytes?: number };
+
 export type RunToolRecord = {
   id: string;
   name: string;
   arguments: string;
   status: ToolRecordStatus;
   result?: string;
+  /** Images the tool returned (cloud media refs) — thumbnails on the record. */
+  images?: string[];
+  /** Audio / blob parts the tool returned (cloud media refs) — Save affordance. */
+  files?: RunToolFile[];
 };
 
 /** One file mutation captured from a repository tool call for the chat workbench. */
@@ -930,6 +937,8 @@ export type StartRunConfig = {
   mcpApproved?: Array<{ serverId: string; toolName: string }>;
   /** Context window (tokens) of the picked model from the gateway catalog; unknown → 128k assumed. */
   contextWindow?: number;
+  /** The picked model accepts image input (gateway catalog `modalities.input`); absent → the server consults the catalog. */
+  vision?: boolean;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */
   githubRepo?: string;
   grounding?: { block: string; sources: RunSource[] };

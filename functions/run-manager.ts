@@ -38,17 +38,22 @@ import {
   chainRotationBases,
   cloudMcpServersForAutomation,
   cloudOAuthTokens,
+  ensureFreshCloudOAuth,
+  forceRefreshCloudOAuthOutcome,
   normalizeOAuthOverride,
   overlayOAuthRotations,
   unlockGithubChatWrites,
+  type CloudMcpServer,
   type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
 } from "./mcp-cloud";
+import { modelAcceptsImages } from "./model-catalog";
 import { recordRequiredScopes } from "./mcp-oauth-scopes";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
 import { openGrantPayload, openRotationValue, sealGrantPayload } from "./secret-rows";
+import { CredentialScope } from "./vault-scope";
 import { SecretVault, SecretVaultError } from "./secret-vault";
 import { runServerJulius } from "./julius-runner";
 import { callGitHubNativeTool, fetchGitHubRepoMeta, githubRunRepoRefs } from "./native-github";
@@ -182,6 +187,8 @@ type LiveRun = {
   pauses: RunPauseBoard;
   /** Closes the run's MCP notification streams when it settles. */
   closeToolset?: () => void;
+  /** Media items persisted for this run so far (`agent_run_media.idx` allocator). */
+  mediaCount: number;
   // Throttles.
   textTimer: ReturnType<typeof setTimeout> | null;
   toolsTimer: ReturnType<typeof setTimeout> | null;
@@ -250,12 +257,15 @@ export class RunManager {
   private readonly env: ManagerEnv;
   /** Same key as the owning ChatStore — grants it rotates stay readable there. */
   private readonly vault: SecretVault;
+  /** Shared with the owning ChatStore: which subject the vault scopes are bound to. */
+  private readonly scope: CredentialScope;
   private readonly live = new Map<string, LiveRun>();
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: unknown, scope: CredentialScope = new CredentialScope()) {
     this.ctx = ctx;
     this.env = (env ?? {}) as ManagerEnv;
     this.vault = SecretVault.fromEnv(env);
+    this.scope = scope;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_runs (
         owner_email TEXT NOT NULL,
@@ -513,6 +523,7 @@ export class RunManager {
       subscribers: new Set(),
       done: false,
       pauses: createRunPauseBoard(),
+      mediaCount: 0,
       textTimer: null,
       toolsTimer: null,
       flushTimer: null,
@@ -1087,6 +1098,9 @@ export class RunManager {
               persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
               reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
               beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+              // Per-request credential lease: the vault row is opened for each MCP
+              // request and forgotten after it; nothing is retained on the session.
+              credentials: (id, { force }) => this.leaseServerCredential(run.owner, config.mcpServers, id, force, appliedChains),
               // Interactive: an MCP server asking for input pauses the run on a
               // card in the thread; the board cancels honestly after 5 minutes.
               elicit: async (request) => {
@@ -1213,6 +1227,11 @@ export class RunManager {
       ...(isAutomation ? [executionOutcomeToolDefinition()] : []),
     ];
 
+    // Vision: the tab's catalog fact wins; otherwise the gateway catalog (10-minute cache); unknown → text stubs only.
+    const acceptsImages =
+      typeof config.vision === "boolean"
+        ? config.vision
+        : await modelAcceptsImages(run.body.modelId, this.env.STAGING_GATEWAY_URL ? { url: `${this.env.STAGING_GATEWAY_URL.replace(/\/chat\/completions$/, "")}/models` } : {});
     const apiMessages = buildApiMessages(config.history, systemPrompt);
     if (mcp.promptNote) {
       apiMessages.push({ role: "system", content: mcp.promptNote });
@@ -1244,6 +1263,8 @@ export class RunManager {
         gatewayUrl: this.env.STAGING_GATEWAY_URL,
         apiMessages,
         tools,
+        acceptsImages,
+        persistMedia: (items) => this.storeMedia(run, items),
         executeTool: async (name, argsJson) => {
           if (isAutomation && name === executionOutcomeToolDefinition().function.name) {
             run.executionClaim = parseExecutionOutcomeClaim(argsJson) ?? undefined;
@@ -1473,16 +1494,17 @@ export class RunManager {
   // -------------------------------------------------------------------------
   // Finalization
 
-  private storeMedia(run: LiveRun, items: Array<{ kind: "image" | "video" | "audio"; data: string }>): string[] {
+  private storeMedia(run: LiveRun, items: Array<{ kind: "image" | "video" | "audio" | "file"; data: string }>): string[] {
     const refs: string[] = [];
     const now = Date.now();
     for (const item of items) {
-      // Provider URLs stay as-is (nothing to store); data URLs get chunked.
+      // Provider URLs (and refs persisted earlier in this run) stay as-is; data URLs get chunked.
       if (!item.data.startsWith("data:")) {
         refs.push(item.data);
         continue;
       }
-      const idx = refs.length;
+      const idx = run.mediaCount;
+      run.mediaCount += 1;
       for (let chunk = 0; chunk * MEDIA_CHUNK_CHARS < item.data.length; chunk += 1) {
         this.ctx.storage.sql.exec(
           "INSERT OR REPLACE INTO agent_run_media (owner_email, run_id, idx, chunk, kind, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2103,6 +2125,7 @@ export class RunManager {
         subscribers: new Set(),
         done: false,
         pauses: createRunPauseBoard(),
+        mediaCount: 0,
         textTimer: null,
         toolsTimer: null,
       flushTimer: null,
@@ -2218,6 +2241,42 @@ export class RunManager {
     }
   }
 
+  /**
+   * Per-request credential for one MCP server: re-reads the profile config,
+   * the pasted key/headers and the grant rows now (vault opened per call),
+   * refreshes an expiring grant (or re-redeems it on `force`) and persists the
+   * rotation. Null when the server can no longer authenticate.
+   */
+  private async leaseServerCredential(
+    owner: string,
+    requested: Array<Record<string, unknown>>,
+    serverId: string,
+    force: boolean,
+    appliedChains: Map<string, string[]>,
+  ): Promise<CloudMcpServer | null> {
+    const configs = this.profileMcpConfigsForRun(owner, requested);
+    const { tokens } = await this.oauthTokensFor(owner);
+    const server = cloudMcpServersForAutomation(configs, [serverId], tokens).find((item) => item.id === serverId) ?? null;
+    if (!server || server.kind !== "mcp") {
+      return null;
+    }
+    if (server.oauth) {
+      const refreshed: RefreshedOAuth[] = [];
+      const persist = (rotated: RefreshedOAuth): Promise<void> => this.persistRefreshedGrant(owner, rotated, appliedChains);
+      const begin = (id: string): Promise<void> => this.markOAuthRefreshStarted(owner, id);
+      const outcome = force
+        ? await forceRefreshCloudOAuthOutcome(server, refreshed, persist, begin)
+        : await ensureFreshCloudOAuth(server, refreshed, persist, begin);
+      if (outcome?.ok === false) {
+        await this.recordOAuthFailure(owner, serverId, outcome);
+        if (force || !outcome.transient) {
+          return null;
+        }
+      }
+    }
+    return server;
+  }
+
   private async markOAuthRefreshStarted(owner: string, serverId: string): Promise<void> {
     const now = Date.now();
     this.ctx.storage.sql.exec(
@@ -2321,7 +2380,7 @@ export class RunManager {
       // Sealed at rest; a row this key cannot open authenticates nothing and
       // surfaces as a missing grant rather than a crashed run.
       try {
-        const token = await openGrantPayload(this.vault, owner, row.server_id, row.payload);
+        const token = await openGrantPayload(this.vault, this.scope.subject(owner), row.server_id, row.payload);
         if (token) tokens[row.server_id] = token;
       } catch (error) {
         if (!(error instanceof SecretVaultError)) throw error;
@@ -2355,7 +2414,7 @@ export class RunManager {
       const serverId = key.slice(prefix.length);
       let opened: unknown = null;
       try {
-        opened = await openRotationValue(this.vault, owner, serverId, value);
+        opened = await openRotationValue(this.vault, this.scope.subject(owner), serverId, value);
       } catch (error) {
         if (!(error instanceof SecretVaultError)) throw error;
       }
@@ -2398,7 +2457,7 @@ export class RunManager {
       "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
       owner,
       rotated.serverId,
-      await sealGrantPayload(this.vault, owner, rotated.serverId, rotated.token),
+      await sealGrantPayload(this.vault, this.scope.subject(owner), rotated.serverId, rotated.token),
       Date.now(),
     );
     this.ctx.storage.sql.exec(

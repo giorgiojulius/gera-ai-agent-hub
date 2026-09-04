@@ -27,6 +27,7 @@ import type {
   ResearchState,
   ResearchSource,
   RunPauseRequest,
+  ToolCallFile,
   ToolCallRecord,
 } from "@/lib/types";
 
@@ -70,6 +71,8 @@ export type ServerRunConfig = {
   mcpApproved?: McpToolApproval[];
   /** Context window (tokens) of the picked model from the gateway catalog, when known. */
   contextWindow?: number;
+  /** The picked model accepts image input (gateway catalog `modalities.input`); absent → the server consults the catalog. */
+  vision?: boolean;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */
   githubRepo?: string;
   grounding?: { block: string; sources: ResearchSource[] };
@@ -426,13 +429,61 @@ export async function resolveCloudMediaRefs(
   return { resolved, failed: refs.length - resolved.length };
 }
 
+/** True when a tool record still points at cloud media (images or files). */
+function toolCallHasCloudMedia(call: ToolCallRecord): boolean {
+  return (
+    (call.images ?? []).some((ref) => ref.startsWith(CLOUD_MEDIA_PREFIX)) ||
+    (call.files ?? []).some((file) => file.url.startsWith(CLOUD_MEDIA_PREFIX))
+  );
+}
+
+/**
+ * Resolves the cloud media refs on a tool record (thumbnails, saveable files)
+ * to data URLs; refs that expired are dropped rather than left dangling.
+ * `store` (e.g. the media vault) receives every resolved data URL.
+ */
+export async function resolveToolCallMedia(
+  call: ToolCallRecord,
+  store: (dataUrl: string) => Promise<string> = async (value) => value,
+): Promise<ToolCallRecord> {
+  if (!toolCallHasCloudMedia(call)) {
+    return call;
+  }
+  const next: ToolCallRecord = { ...call };
+  if (call.images && call.images.length > 0) {
+    const { resolved } = await resolveCloudMediaRefs(call.images);
+    const stored = await Promise.all(resolved.map(store));
+    if (stored.length > 0) {
+      next.images = stored;
+    } else {
+      delete next.images;
+    }
+  }
+  if (call.files && call.files.length > 0) {
+    const files: ToolCallFile[] = [];
+    for (const file of call.files) {
+      const { resolved } = await resolveCloudMediaRefs([file.url]);
+      if (resolved[0]) {
+        files.push({ ...file, url: await store(resolved[0]) });
+      }
+    }
+    if (files.length > 0) {
+      next.files = files;
+    } else {
+      delete next.files;
+    }
+  }
+  return next;
+}
+
 /** Pulled chats may carry cloud media refs — resolve them before vaulting. */
 export async function resolveCloudMediaInConversation(conversation: Conversation): Promise<Conversation> {
   const needs = conversation.messages.some(
     (message) =>
       (message.images ?? []).some((ref) => ref.startsWith(CLOUD_MEDIA_PREFIX)) ||
       (message.videos ?? []).some((ref) => ref.startsWith(CLOUD_MEDIA_PREFIX)) ||
-      (message.audioUrl?.startsWith(CLOUD_MEDIA_PREFIX) ?? false),
+      (message.audioUrl?.startsWith(CLOUD_MEDIA_PREFIX) ?? false) ||
+      (message.toolCalls ?? []).some(toolCallHasCloudMedia),
   );
   if (!needs) {
     return conversation;
@@ -446,11 +497,15 @@ export async function resolveCloudMediaInConversation(conversation: Conversation
         const { resolved } = await resolveCloudMediaRefs([audioUrl]);
         audioUrl = resolved[0];
       }
+      const toolCalls = message.toolCalls
+        ? await Promise.all(message.toolCalls.map((call) => resolveToolCallMedia(call)))
+        : undefined;
       return {
         ...message,
         images: images && images.length > 0 ? images : images ? undefined : message.images,
         videos: videos && videos.length > 0 ? videos : videos ? undefined : message.videos,
         audioUrl,
+        ...(toolCalls ? { toolCalls } : {}),
       };
     }),
   );

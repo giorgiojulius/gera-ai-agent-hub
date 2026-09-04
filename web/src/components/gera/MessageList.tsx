@@ -27,6 +27,7 @@ import { RunPauseCard } from "@/components/gera/RunPauseCard";
 import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { JuliusPanel } from "@/components/gera/JuliusPanel";
 import { MediaAudioCard, MediaImageCard, MediaImageGrid, MediaVideoCard } from "@/components/gera/VaultMedia";
+import { ToolCallMedia } from "@/components/gera/ToolCallMedia";
 import { MarkdownBody } from "@/components/gera/Markdown";
 import { SparkMark } from "@/components/gera/Spark";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -218,12 +219,17 @@ function MessageBubble({
           <div className="mb-3 flex flex-col gap-1.5">
             {ordinaryToolCalls.map((call) => {
               const view = describeToolCall(call);
+              const hasMedia = (call.images?.length ?? 0) > 0 || (call.files?.length ?? 0) > 0;
               return (
                 <div
                   key={call.id}
                   data-testid={TID.messageToolCall}
-                  className="flex items-center gap-2 rounded-xl border border-border/70 bg-card px-3 py-2 text-xs shadow-sm"
+                  className={cn(
+                    "flex gap-2 rounded-xl border border-border/70 bg-card px-3 py-2 text-xs shadow-sm",
+                    hasMedia ? "flex-col" : "items-center",
+                  )}
                 >
+                  <div className="flex min-w-0 items-center gap-2">
                   {call.status === "running" ? (
                     <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-ember" />
                   ) : call.status === "error" ? (
@@ -244,6 +250,8 @@ function MessageBubble({
                   >
                     {call.status === "running" ? "running" : call.status === "error" ? "failed" : "done"}
                   </span>
+                  </div>
+                  {hasMedia ? <ToolCallMedia images={call.images} files={call.files} /> : null}
                 </div>
               );
             })}

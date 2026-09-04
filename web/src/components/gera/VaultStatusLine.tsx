@@ -16,9 +16,11 @@ export function vaultStatusLabel(status: VaultStatus): { text: string; warn: boo
   const plain = sum.plaintext > 0 ? ` · ${sum.plaintext} plaintext` : "";
   const stale = sum.sealed - sum.current > 0 ? ` · ${sum.sealed - sum.current} under a previous key` : "";
   const sweep = status.swept ? "swept under current key" : "sweep pending";
+  const scope = status.scope === "account" ? " · bound to account" : status.scope === "owner" ? " · bound to owner (account binding pending)" : "";
+  const unreadable = (status.unreadable ?? 0) > 0 ? ` · ${status.unreadable} unreadable — reconnect those servers` : "";
   return {
-    text: `Credential vault · key active · ${sum.sealed}/${sum.total} sealed${plain}${stale} · ${sweep}`,
-    warn: sum.plaintext > 0 || !status.swept,
+    text: `Credential vault · key active · ${sum.sealed}/${sum.total} sealed${plain}${stale} · ${sweep}${scope}${unreadable}`,
+    warn: sum.plaintext > 0 || !status.swept || (status.unreadable ?? 0) > 0,
   };
 }
 

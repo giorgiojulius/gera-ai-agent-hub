@@ -278,6 +278,13 @@ export class AccessRegistry extends DurableObject {
     ) {
       return this.handlePrincipalBind(request);
     }
+    if (
+      request.headers.get("X-Gera-Internal-Route") === "principal-lookup" &&
+      request.method === "POST" &&
+      url.pathname === "/principal/lookup"
+    ) {
+      return this.handlePrincipalLookup(request);
+    }
     const email = readIdentity(request, "X-Gera-Email").toLowerCase();
     if (!email) {
       return json({ error: "sign_in_required" }, 401);
@@ -419,6 +426,33 @@ export class AccessRegistry extends DurableObject {
       return json({ ok: true });
     }
     return json({ error: "not_found" }, 404);
+  }
+
+  /**
+   * Internal (account shards only — the public relay strips the routing
+   * marker): which immutable subject owns a storage owner's shard. Lets a
+   * shard bind its vault scope to the account even when its first request
+   * after rollout is an internal call that carries no account id.
+   */
+  private async handlePrincipalLookup(request: Request): Promise<Response> {
+    let storageOwner = "";
+    try {
+      const body = (await request.json()) as { storageOwner?: unknown };
+      storageOwner = typeof body.storageOwner === "string" ? body.storageOwner.trim().toLowerCase() : "";
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    if (!EMAIL_PATTERN.test(storageOwner)) {
+      return json({ error: "invalid_owner" }, 400);
+    }
+    const rows = this.ctx.storage.sql
+      .exec<{ user_id: string }>("SELECT user_id FROM principal_subjects WHERE storage_owner = ? LIMIT 2", storageOwner)
+      .toArray();
+    if (rows.length !== 1) {
+      // Unknown, or (never expected) ambiguous — the shard keeps its owner scope.
+      return json({ error: "principal_unknown" }, 404);
+    }
+    return json({ userId: rows[0].user_id });
   }
 
   private handleStatus(displayEmail: string, accessEmail: string): Response {

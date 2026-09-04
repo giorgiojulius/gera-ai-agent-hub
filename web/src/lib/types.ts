@@ -75,12 +75,19 @@ export type QueuedMessage = {
 
 export type ToolCallStatus = "running" | "done" | "error";
 
+/** A binary tool-result part (audio, blob) the run persisted; `url` is a media ref or data URL. */
+export type ToolCallFile = { name: string; mime: string; url: string; bytes?: number };
+
 export type ToolCallRecord = {
   id: string;
   name: string;
   arguments: string;
   status: ToolCallStatus;
   result?: string;
+  /** Images the tool returned (vault refs / data URLs) — thumbnails on the record. */
+  images?: string[];
+  /** Audio / blob parts the tool returned — saveable into the media vault. */
+  files?: ToolCallFile[];
 };
 
 /** One repository file mutation rendered inside a chat turn's code workbench. */

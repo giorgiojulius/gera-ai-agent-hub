@@ -41,6 +41,8 @@ export type McpRouteContext = {
   resolveServers(owner: string, ids: string[]): Promise<CloudMcpServer[]>;
   /** Seals one secret column for the account vault (PKCE verifier, browser nonce). */
   seal?(plain: string, scope: string): Promise<string>;
+  /** Vault scope subject for `owner`'s rows (the Rork Auth account once migrated); defaults to the owner. */
+  subject?(owner: string): string;
   /** Injected transport for tests; production keeps the public-HTTPS guard. */
   fetch?: McpFetch;
   now?: () => number;
@@ -289,12 +291,12 @@ export async function handleMcpOAuthStart(ctx: McpRouteContext, request: Request
       mcpUrl,
       discovery.tokenEndpoint,
       clientId,
-      await ctx.seal(verifier, oauthPendingFieldScope(owner, state, "verifier")),
+      await ctx.seal(verifier, oauthPendingFieldScope(ctx.subject?.(owner) ?? owner, state, "verifier")),
       callbackUrl,
       discovery.resource ?? "",
       discovery.issuer,
       normalizedReturnOrigin,
-      await ctx.seal(browserNonce, oauthPendingFieldScope(owner, state, "browser_nonce")),
+      await ctx.seal(browserNonce, oauthPendingFieldScope(ctx.subject?.(owner) ?? owner, state, "browser_nonce")),
       expiresAt,
       now(),
       now(),

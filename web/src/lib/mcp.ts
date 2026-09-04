@@ -28,19 +28,26 @@ import {
   verifySlackToken,
 } from "@/lib/slack-native";
 import type { McpAuthMode, McpServerConfig, McpStepUp, McpToolInfo, OpenAiTool } from "@/lib/types";
+// One protocol core for both transports (Phase 6): the Worker feeds it
+// `fetchPublicHttps`, this browser transport the authenticated relay. Parser
+// and result flattening live there; only session/auth handling stays here.
+import {
+  isRecord,
+  MCP_DEFAULT_PROTOCOL_VERSION,
+  MCP_MAX_RESPONSE_CHARS,
+  mcpResourceLinks,
+  parseJsonRpcPayload,
+  selectRpcResponse,
+  stringifyMcpResourceRead,
+  stringifyMcpToolResult,
+  type JsonRpcMessage,
+} from "../../../functions/mcp-protocol";
 
 type JsonRpcRequest = {
   jsonrpc: "2.0";
   id: number;
   method: string;
   params?: unknown;
-};
-
-type JsonRpcResponse = {
-  jsonrpc: "2.0";
-  id?: number | string;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
 };
 
 type McpSession = {
@@ -73,8 +80,6 @@ export function clearMcpSessionCache(): void {
 export function clearMcpServerSession(serverId: string): void {
   sessions.delete(serverId);
 }
-
-const MCP_PROTOCOL_VERSION = "2025-06-18";
 
 function shortHash(value: string): string {
   let hash = 2_166_136_261;
@@ -245,61 +250,27 @@ function mcpProtocolHeaders(session: McpSession): Record<string, string> {
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function jsonRpcMessages(payload: string): JsonRpcResponse[] {
-  const parsed = JSON.parse(payload) as unknown;
-  const values = Array.isArray(parsed) ? parsed : [parsed];
-  return values.filter(isRecord).map((value) => value as JsonRpcResponse);
-}
-
 /**
  * Streamable HTTP may emit progress/log notifications before the response.
  * Read every SSE event and select the response for this request id instead of
  * accidentally treating the first notification as an empty tool result.
+ * (Parser and id selection are the protocol core's; this adds the throw.)
  */
-export function parseMcpRpcResponse(body: string, expectedId: number): JsonRpcResponse {
-  const trimmed = body.trim();
-  let messages: JsonRpcResponse[] = [];
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-    messages = jsonRpcMessages(trimmed);
-  } else {
-    for (const event of body.split(/\r?\n\r?\n/)) {
-      const payload = event
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n")
-        .trim();
-      if (!payload || payload === "[DONE]") {
-        continue;
-      }
-      messages.push(...jsonRpcMessages(payload));
-    }
+export function parseMcpRpcResponse(body: string, expectedId: number): JsonRpcMessage {
+  const response = selectRpcResponse(parseJsonRpcPayload(body), expectedId);
+  if (!response) {
+    throw new Error(`no JSON-RPC response for request ${expectedId}`);
   }
-  const responses = messages.filter((message) => "result" in message || "error" in message);
-  const exact = responses.find((message) => String(message.id) === String(expectedId));
-  if (exact) {
-    return exact;
-  }
-  // Keep compatibility with a few non-conforming stateless servers that omit
-  // an id, but never accept a mismatched id from another request.
-  if (responses.length === 1 && responses[0].id === undefined) {
-    return responses[0];
-  }
-  throw new Error(`no JSON-RPC response for request ${expectedId}`);
+  return response;
 }
 
-const MAX_MCP_RESPONSE_CHARS = 2_000_000;
 const MCP_CONNECT_TIMEOUT_MS = 15_000;
 const MCP_CALL_TIMEOUT_MS = 45_000;
 
 async function readLimitedResponseText(response: Response): Promise<string> {
   if (!response.body) {
     const text = await response.text();
-    if (text.length > MAX_MCP_RESPONSE_CHARS) {
+    if (text.length > MCP_MAX_RESPONSE_CHARS) {
       throw new Error("MCP response was too large.");
     }
     return text;
@@ -315,7 +286,7 @@ async function readLimitedResponseText(response: Response): Promise<string> {
         return text;
       }
       text += decoder.decode(chunk.value, { stream: true });
-      if (text.length > MAX_MCP_RESPONSE_CHARS) {
+      if (text.length > MCP_MAX_RESPONSE_CHARS) {
         throw new Error("MCP response was too large.");
       }
     }
@@ -325,7 +296,7 @@ async function readLimitedResponseText(response: Response): Promise<string> {
 }
 
 /** Stops reading a long-lived SSE connection as soon as our JSON-RPC result arrives. */
-async function readMcpRpcResponse(response: Response, expectedId: number): Promise<JsonRpcResponse> {
+async function readMcpRpcResponse(response: Response, expectedId: number): Promise<JsonRpcMessage> {
   if (!response.body) {
     return parseMcpRpcResponse(await readLimitedResponseText(response), expectedId);
   }
@@ -340,7 +311,7 @@ async function readMcpRpcResponse(response: Response, expectedId: number): Promi
         return parseMcpRpcResponse(text, expectedId);
       }
       text += decoder.decode(chunk.value, { stream: true });
-      if (text.length > MAX_MCP_RESPONSE_CHARS) {
+      if (text.length > MCP_MAX_RESPONSE_CHARS) {
         throw new Error("MCP response was too large.");
       }
       try {
@@ -445,7 +416,7 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
       );
     }
 
-    let parsed: JsonRpcResponse;
+    let parsed: JsonRpcMessage;
     try {
       parsed = await readMcpRpcResponse(response, request.id);
     } catch (error) {
@@ -758,13 +729,13 @@ export async function connectMcpServerLegacy(config: McpServerConfig): Promise<M
     headers: auth.headers,
     usedOAuth: auth.usedOAuth,
     oauthFingerprint: auth.usedOAuth ? oauthTokenFingerprint(config.id) : undefined,
-    protocolVersion: MCP_PROTOCOL_VERSION,
+    protocolVersion: MCP_DEFAULT_PROTOCOL_VERSION,
     omitMcpHeaders: auth.omitMcpHeaders,
     nextId: 0,
   };
 
   const initResult = (await rpc(session, "initialize", {
-    protocolVersion: MCP_PROTOCOL_VERSION,
+    protocolVersion: MCP_DEFAULT_PROTOCOL_VERSION,
     capabilities: {},
     clientInfo: { name: "Gera AI", version: "1.0.0" },
   })) as { protocolVersion?: unknown; serverInfo?: { name?: unknown; version?: unknown } } | null;
@@ -981,107 +952,21 @@ function safeName(value: string, fallback: string): string {
 
 const MAX_RESOURCE_LINK_READS = 4;
 
-function jsonText(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function resourceHeading(resource: Record<string, unknown>): string {
-  const uri = typeof resource.uri === "string" ? resource.uri : "resource";
-  const mime = typeof resource.mimeType === "string" && resource.mimeType ? ` · ${resource.mimeType}` : "";
-  return `[Resource ${uri}${mime}]`;
-}
-
-function stringifyResource(resource: Record<string, unknown>): string {
-  const heading = resourceHeading(resource);
-  if (typeof resource.text === "string") {
-    return `${heading}\n${resource.text}`;
-  }
-  if (typeof resource.blob === "string") {
-    return `${heading}\n[Binary data omitted · ${resource.blob.length} base64 chars]`;
-  }
-  return heading;
-}
-
-function stringifyContentPart(part: unknown): string {
-  if (!isRecord(part)) {
-    return jsonText(part);
-  }
-  if (typeof part.text === "string") {
-    return part.text;
-  }
-  if (part.type === "resource" && isRecord(part.resource)) {
-    return stringifyResource(part.resource);
-  }
-  if (part.type === "resource_link" && typeof part.uri === "string") {
-    const label = typeof part.name === "string" && part.name ? `${part.name} · ` : "";
-    return `[Resource link ${label}${part.uri}]`;
-  }
-  if ((part.type === "image" || part.type === "audio") && typeof part.data === "string") {
-    const mime = typeof part.mimeType === "string" && part.mimeType ? ` · ${part.mimeType}` : "";
-    return `[${part.type} content omitted${mime} · ${part.data.length} base64 chars]`;
-  }
-  return jsonText(part);
-}
-
-/** Flattens text, embedded resources, and structured MCP results for the model. */
-export function stringifyMcpResult(result: unknown): string {
-  if (typeof result === "string") {
-    return result;
-  }
-  if (!isRecord(result)) {
-    return jsonText(result);
-  }
-  const pieces = Array.isArray(result.content)
-    ? result.content.map(stringifyContentPart).filter((part) => part.length > 0)
-    : [];
-  if (result.structuredContent !== undefined) {
-    pieces.push(`[Structured content]\n${jsonText(result.structuredContent)}`);
-  }
-  const text = pieces.join("\n");
-  return result.isError === true ? `Tool reported an error${text ? `:\n${text}` : "."}` : text;
-}
-
-function resourceLinks(result: unknown): string[] {
-  if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) {
-    return [];
-  }
-  const links: string[] = [];
-  for (const part of result.content) {
-    if (isRecord(part) && part.type === "resource_link" && typeof part.uri === "string" && part.uri) {
-      if (!links.includes(part.uri)) {
-        links.push(part.uri);
-      }
-    }
-  }
-  return links.slice(0, MAX_RESOURCE_LINK_READS);
-}
-
-function stringifyResourceReadResult(result: unknown): string {
-  if (!isRecord(result) || !Array.isArray(result.contents)) {
-    return jsonText(result);
-  }
-  return result.contents
-    .map((content) => (isRecord(content) ? stringifyResource(content) : jsonText(content)))
-    .filter((content) => content.length > 0)
-    .join("\n");
-}
+/** Flattens text, embedded resources, and structured MCP results for the model (protocol core). */
+export const stringifyMcpResult: (result: unknown) => string = stringifyMcpToolResult;
 
 const MAX_MCP_RENDER_CHARS = 300_000;
 
 async function renderMcpResultWithResources(session: McpSession, result: unknown): Promise<string> {
-  const rendered = stringifyMcpResult(result);
+  const rendered = stringifyMcpToolResult(result);
   if (isRecord(result) && result.isError === true) {
     throw new Error(rendered || "MCP tool reported an error.");
   }
   const pieces = [rendered];
-  for (const uri of resourceLinks(result)) {
+  for (const uri of mcpResourceLinks(result, MAX_RESOURCE_LINK_READS)) {
     try {
       const resource = await rpc(session, "resources/read", { uri });
-      const text = stringifyResourceReadResult(resource);
+      const text = stringifyMcpResourceRead(resource);
       if (text) {
         pieces.push(text);
       }

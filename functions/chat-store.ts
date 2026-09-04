@@ -112,62 +112,70 @@ import {
   type PushEntry,
   type TombstoneRow,
 } from "./chat-shared";
-import { handleMcpInventory, handleMcpOAuthStart, handleMcpPromptGet, handleMcpResourceRead, type McpRouteContext } from "./mcp-routes";
 import {
-  clearOAuthScopes,
-  ensureOAuthScopeTable,
-  pendingStepUp,
-  recordGrantedScopes,
-  recordRequiredScopes,
-} from "./mcp-oauth-scopes";
+  handleMcpAuthLease,
+  handleMcpCheck,
+  handleMcpInventory,
+  handleMcpOAuthStart,
+  handleMcpPromptGet,
+  handleMcpResolve,
+  handleMcpResourceRead,
+  type McpRouteContext,
+} from "./mcp-routes";
 import {
-  createSqlMcpCatalogStore,
-  normalizeMcpToolLoading,
-  resolveMcpToolset,
-  type McpToolLoadingMode,
-} from "./mcp-toolset";
-import { githubOAuthFormHeaders } from "./native-github";
+  handleBrowserOAuthRefresh,
+  handleGitHubDeviceStart,
+  handleGitHubDeviceStatus,
+  handleOAuthCallback,
+  handleOAuthClear,
+  handleOAuthComplete,
+  handleOAuthRotations,
+  handleOAuthStatus,
+  handleOAuthStore,
+  type McpOAuthRouteContext,
+  type OAuthPendingRow,
+} from "./mcp-oauth-routes";
+import {
+  hasMcpServerSecret,
+  markOAuthReady,
+  markOAuthRefreshStarted,
+  mcpConfigsWithSecrets,
+  oauthGrantState,
+  parseServerSecretRow,
+  persistCanonicalOAuthGrant,
+  profileOAuthTokens,
+  readRotation,
+  recordOAuthFailure,
+  resolveOwnerMcpServers,
+  type OAuthStoreContext,
+} from "./mcp-oauth-store";
+import { ensureOAuthScopeTable } from "./mcp-oauth-scopes";
+import { createSqlMcpCatalogStore, normalizeMcpToolLoading } from "./mcp-toolset";
 import {
   chainRotationBases,
   cloudMcpServersForAutomation,
   cloudOAuthToken,
-  cloudOAuthTokens,
-  ensureFreshCloudOAuth,
-  forceRefreshCloudOAuthOutcome,
   intersectMcpAllowIds,
-  normalizeOAuthOverride,
   overlayOAuthRotations,
-  redactCloudMcpText,
-  refreshCloudOAuthGrant,
-  type CloudMcpServer,
-  type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
   type RefreshedOAuth,
 } from "./mcp-cloud";
-import { exchangeAuthorizationCode, newOAuthState, OAuthCodeExchangeError } from "./mcp-oauth-flow";
-import { fetchPublicHttps } from "./network-safety";
 import { RunManager } from "./run-manager";
 import {
   deviceCodeScope,
   GRANT_SECRET_FIELDS,
   OAUTH_PENDING_SECRET_FIELDS,
-  oauthPendingFieldScope,
   oauthPendingScope,
-  openGrantPayload,
-  openRotationValue,
-  openServerSecret,
   sealGrantPayload,
   sealRotationValue,
   sealServerSecret,
   SERVER_SECRET_FIELDS,
-  type ServerSecret,
 } from "./secret-rows";
 import {
   describeSecretVaultError,
   fieldsNeedReseal,
   isSealedEnvelope,
-  openFields,
   sealFields,
   SecretVault,
   SecretVaultError,
@@ -186,34 +194,6 @@ type ChatStoreEnv = {
   DO?: { fetch(request: Request): Promise<Response> };
 };
 
-function sameOAuthEndpoint(left: string, right: string): boolean {
-  try {
-    const a = new URL(left);
-    const b = new URL(right);
-    a.hash = "";
-    b.hash = "";
-    return a.toString().replace(/\/$/, "") === b.toString().replace(/\/$/, "");
-  } catch {
-    return false;
-  }
-}
-
-type GitHubDeviceRow = {
-  owner_email: string;
-  flow_id: string;
-  server_id: string;
-  device_code: string;
-  user_code: string;
-  verification_uri: string;
-  client_id: string;
-  expires_at: number;
-  interval_ms: number;
-  next_poll_at: number;
-  status: string;
-  error: string;
-  updated_at: number;
-};
-
 type AutomationReceiptRow = {
   owner_email: string;
   id: string;
@@ -227,28 +207,6 @@ type AutomationReceiptRow = {
   started_at: number;
   finished_at: number;
   error: string;
-};
-
-type OAuthPendingRow = {
-  owner_email: string;
-  state: string;
-  server_id: string;
-  mcp_url: string;
-  token_endpoint: string;
-  client_id: string;
-  verifier: string;
-  redirect_uri: string;
-  resource: string;
-  issuer: string;
-  return_origin: string;
-  browser_nonce: string;
-  callback_challenge: string;
-  authorization_code: string;
-  expires_at: number;
-  status: string;
-  error: string;
-  created_at: number;
-  updated_at: number;
 };
 
 /** KV key remembering which vault key the last sweep sealed this shard under. */
@@ -268,17 +226,6 @@ function credentialStrings(payload: string, fields: readonly string[]): string[]
   return fields.map((field) => (typeof parsed[field] === "string" ? (parsed[field] as string) : ""));
 }
 
-/** Length-independent string equality for proof comparison (no early exit on the first mismatch). */
-function constantTimeEqual(a: string, b: string): boolean {
-  const left = new TextEncoder().encode(a);
-  const right = new TextEncoder().encode(b);
-  let diff = left.length ^ right.length;
-  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
-    diff |= (left[index] ?? 0) ^ (right[index] ?? 0);
-  }
-  return diff === 0;
-}
-
 export class ChatStore extends DurableObject {
   private readonly workerEnv: ChatStoreEnv;
   /** Encrypts every credential row in this shard; keyed by the Worker secret. */
@@ -287,6 +234,8 @@ export class ChatStore extends DurableObject {
   private readonly scope = new CredentialScope();
   /** Interactive server-side agent runs (chat / research / Julius). */
   private readonly runs: RunManager;
+  /** Credential store seam (mcp-oauth-store.ts): grants, keys, state markers, rotation escrow. */
+  private readonly oauthStore: OAuthStoreContext;
   /** Automation occurrences executing in this isolate; absent after a deploy. */
   private readonly liveAutomationRuns = new Set<string>();
   private readonly instanceId = crypto.randomUUID();
@@ -296,6 +245,12 @@ export class ChatStore extends DurableObject {
     this.workerEnv = (env ?? {}) as ChatStoreEnv;
     this.vault = SecretVault.fromEnv(env);
     this.runs = new RunManager(ctx, env, this.scope);
+    this.oauthStore = {
+      sql: this.ctx.storage.sql,
+      storage: this.ctx.storage,
+      vault: this.vault,
+      subject: (owner) => this.scope.subject(owner),
+    };
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS chats (
         owner_email TEXT NOT NULL,
@@ -575,7 +530,7 @@ export class ChatStore extends DurableObject {
       )
       .toArray()) {
       await attempt(async () => {
-        const stored = this.parseServerSecretRow(row.owner_email, row.server_id, row.payload);
+        const stored = parseServerSecretRow(this.oauthStore, row.owner_email, row.server_id, row.payload);
         if (!stored || !(await fieldsNeedReseal(this.vault, stored, SERVER_SECRET_FIELDS))) {
           return false; // absent, or a poisoned placeholder row already deleted by the parser
         }
@@ -704,53 +659,6 @@ export class ChatStore extends DurableObject {
     return json({ vault: this.vault.enabled ? "enabled" : this.vault.disabledReason, swept, rows, ...this.scope.describe() });
   }
 
-  /**
-   * Parses one `mcp_server_secrets` row as stored (fields still sealed).
-   * Returns null — after deleting the row — for a poisoned legacy row where
-   * the browser's `gera-account:` marker was stored as a manual token and
-   * shadowed the real OAuth grant on every call.
-   */
-  private parseServerSecretRow(owner: string, serverId: string, payload: string): ServerSecret | null {
-    let value: Record<string, unknown>;
-    try {
-      const parsed = JSON.parse(payload) as unknown;
-      value = isRecord(parsed) ? parsed : {};
-    } catch {
-      return null;
-    }
-    const rawToken = typeof value.token === "string" ? value.token : "";
-    const headersJson = typeof value.headersJson === "string" && value.headersJson ? value.headersJson : "";
-    const token = rawToken && (this.vault.isSealed(rawToken) || !isPlaceholderCredential(rawToken)) ? rawToken : "";
-    if (rawToken && !token && !headersJson) {
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      );
-      return null;
-    }
-    if (!token && !headersJson) {
-      return null;
-    }
-    return { ...(token ? { token } : {}), ...(headersJson ? { headersJson } : {}) };
-  }
-
-  /** Reads a legacy rotation escrow entry; unreadable envelopes count as absent. */
-  private async readRotation(owner: string, serverId: string, raw: unknown): Promise<OAuthRotation | null> {
-    if (raw === undefined || raw === null) {
-      return null;
-    }
-    try {
-      return normalizeOAuthOverride(serverId, await openRotationValue(this.vault, this.scope.subject(owner), serverId, raw));
-    } catch (error) {
-      if (error instanceof SecretVaultError) {
-        console.error("oauth rotation escrow unreadable", serverId, error.code);
-        return null;
-      }
-      throw error;
-    }
-  }
-
   override async fetch(request: Request): Promise<Response> {
     try {
       return await this.route(request);
@@ -842,55 +750,13 @@ export class ChatStore extends DurableObject {
     if (request.method === "POST" && url.pathname === "/sync") {
       return this.handleSync(request, email);
     }
-    if (request.method === "GET" && url.pathname === "/mcp/oauth-rotations") {
-      return this.handleOAuthRotations(email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/oauth-start") {
-      return handleMcpOAuthStart(this.mcpRouteContext(), request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/github-device-start") {
-      return this.handleGitHubDeviceStart(email);
-    }
-    if (request.method === "GET" && url.pathname === "/mcp/github-device-status") {
-      return this.handleGitHubDeviceStatus(request, email);
-    }
-    if (request.method === "GET" && url.pathname === "/mcp/oauth-status") {
-      return this.handleOAuthStatus(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/oauth-complete") {
-      return this.handleOAuthComplete(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/oauth-callback") {
-      return this.handleOAuthCallback(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/oauth-store") {
-      return this.handleOAuthStore(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/oauth-clear") {
-      return this.handleOAuthClear(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/check") {
-      return this.handleMcpCheck(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/inventory") {
-      return handleMcpInventory(this.mcpRouteContext(), request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/prompt-get") {
-      return handleMcpPromptGet(this.mcpRouteContext(), request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/resource-read") {
-      return handleMcpResourceRead(this.mcpRouteContext(), request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/oauth-refresh") {
-      return this.handleBrowserOAuthRefresh(request, email);
-    }
-    // Internal (worker-only — no public relay forwards this path): project
-    // agents resolve their linked MCP servers through this account.
-    if (request.method === "POST" && url.pathname === "/mcp/resolve") {
-      return this.handleMcpResolve(request, email);
-    }
-    if (request.method === "POST" && url.pathname === "/mcp/auth-lease") {
-      return this.handleMcpAuthLease(request, email);
+    // MCP connection, credential and sign-in routes (mcp-routes.ts /
+    // mcp-oauth-routes.ts); the state and grant store is mcp-oauth-store.ts.
+    if (url.pathname.startsWith("/mcp/")) {
+      const mcpResponse = await this.routeMcp(request, url.pathname, email);
+      if (mcpResponse) {
+        return mcpResponse;
+      }
     }
     if (request.method === "POST" && url.pathname === "/run-now") {
       return this.handleRunNow(request, email);
@@ -1211,12 +1077,12 @@ export class ChatStore extends DurableObject {
     // Synced browser sign-ins, overlaid with grants this shard rotated
     // server-side. An override applies while the blob's token is anywhere on
     // its rotation chain; a caught-up blob or a fresh sign-in retires it.
-    const oauthTokens = await this.profileOAuthTokens(owner);
+    const oauthTokens = await profileOAuthTokens(this.oauthStore, owner);
     const oauthRefPrefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const overrideRows = await this.ctx.storage.list<unknown>({ prefix: oauthRefPrefix });
     const rotations: OAuthRotation[] = [];
     for (const [key, value] of overrideRows) {
-      const rotation = await this.readRotation(owner, key.slice(oauthRefPrefix.length), value);
+      const rotation = await readRotation(this.oauthStore, owner, key.slice(oauthRefPrefix.length), value);
       if (rotation) {
         rotations.push(rotation);
       } else {
@@ -1228,7 +1094,7 @@ export class ChatStore extends DurableObject {
       await this.ctx.storage.delete(`${oauthRefPrefix}${id}`);
     }
     const persistOAuth = async (rotated: RefreshedOAuth): Promise<void> => {
-      await this.persistCanonicalOAuthGrant(owner, rotated);
+      await persistCanonicalOAuthGrant(this.oauthStore, owner, rotated);
       const bases = chainRotationBases(appliedChains, rotated);
       appliedChains.set(rotated.serverId, bases);
       oauthTokens[rotated.serverId] = rotated.token;
@@ -1342,12 +1208,12 @@ export class ChatStore extends DurableObject {
           authKey,
           deadlineAt,
           persistOAuth,
-          (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
-          (id) => this.markOAuthRefreshStarted(owner, id),
+          (id, outcome) => recordOAuthFailure(this.oauthStore, owner, id, outcome),
+          (id) => markOAuthRefreshStarted(this.oauthStore, owner, id),
           createSqlMcpCatalogStore(this.ctx.storage.sql, owner),
           // Per-request credential lease: the grant/key row is opened for each MCP request.
           async (id, { force }) =>
-            (await this.resolveOwnerMcpServers(owner, [id], force ? new Set([id]) : new Set()))?.servers.find(
+            (await resolveOwnerMcpServers(this.oauthStore, owner, [id], force ? new Set([id]) : new Set()))?.servers.find(
               (server) => server.id === id,
             ) ?? null,
         );
@@ -1459,7 +1325,7 @@ export class ChatStore extends DurableObject {
         }
         let canonical = token;
         const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-        const rotation = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(rotationKey));
+        const rotation = await readRotation(this.oauthStore, owner, serverId, await this.ctx.storage.get<unknown>(rotationKey));
         if (rotation?.bases.includes(token.accessToken)) {
           canonical = rotation.token;
         }
@@ -1470,7 +1336,7 @@ export class ChatStore extends DurableObject {
           await sealGrantPayload(this.vault, this.scope.subject(owner), serverId, canonical),
           Date.now(),
         );
-        this.markOAuthReady(owner, serverId);
+        markOAuthReady(this.oauthStore, owner, serverId);
         await this.ctx.storage.delete(rotationKey);
       }
       delete profile.mcpOAuth;
@@ -1518,7 +1384,7 @@ export class ChatStore extends DurableObject {
         }
         const ids = [...new Set([serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])])]
           .filter(Boolean);
-        const hasSecret = ids.some((id) => this.hasMcpServerSecret(owner, id));
+        const hasSecret = ids.some((id) => hasMcpServerSecret(this.oauthStore, owner, id));
         const hasGrant = ids.some((id) => {
           const grant = this.ctx.storage.sql
             .exec<{ present: number }>(
@@ -1534,7 +1400,7 @@ export class ChatStore extends DurableObject {
               id,
             )
             .toArray()[0];
-          const state = this.oauthGrantState(owner, id);
+          const state = oauthGrantState(this.oauthStore, owner, id);
           return Boolean(grant && !revoked && state !== "reauth_required" && state !== "step_up_required");
         });
         server.credentialStored = hasSecret || hasGrant;
@@ -1544,1622 +1410,6 @@ export class ChatStore extends DurableObject {
       profile.settings = settings;
     }
     return JSON.stringify(profile);
-  }
-
-  /** Overlays server-only keys/headers onto redacted profile connector rows. */
-  private async mcpConfigsWithSecrets(owner: string, raw: unknown): Promise<unknown[]> {
-    if (!Array.isArray(raw)) return [];
-    const out: unknown[] = [];
-    for (const item of raw) {
-      if (!isRecord(item) || typeof item.id !== "string") {
-        out.push(item);
-        continue;
-      }
-      out.push({ ...item, ...(await this.mcpServerSecret(owner, item.id)) });
-    }
-    return out;
-  }
-
-  /** The stored (still sealed) key/header row, healing poisoned legacy rows. */
-  private storedMcpServerSecret(owner: string, serverId: string): ServerSecret | null {
-    const row = this.ctx.storage.sql
-      .exec<{ payload: string }>(
-        "SELECT payload FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    return row ? this.parseServerSecretRow(owner, serverId, row.payload) : null;
-  }
-
-  /** Presence only — no key needed, safe inside synchronous profile shaping. */
-  private hasMcpServerSecret(owner: string, serverId: string): boolean {
-    return this.storedMcpServerSecret(owner, serverId) !== null;
-  }
-
-  /** Reads one saved API-key/header pair decrypted; it never leaves the account shard. */
-  private async mcpServerSecret(owner: string, serverId: string): Promise<ServerSecret> {
-    const stored = this.storedMcpServerSecret(owner, serverId);
-    if (!stored) {
-      return {};
-    }
-    return openServerSecret(this.vault, this.scope.subject(owner), serverId, stored);
-  }
-
-  /**
-   * All connector ids that resolve to the native GitHub integration for this
-   * account: the canonical "github" id plus any profile card whose catalogId
-   * points at it. Used to clear stale pasted/legacy tokens after a fresh
-   * device-flow sign-in — the auth lease prefers manual secrets, so leaving
-   * one behind would shadow the new grant forever.
-   */
-  private githubConnectorIds(owner: string): string[] {
-    const ids = new Set<string>(["github"]);
-    const row = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
-    if (row) {
-      try {
-        const profile = JSON.parse(row.payload) as Record<string, unknown>;
-        const settings = isRecord(profile.settings) ? profile.settings : {};
-        const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
-        for (const item of servers) {
-          if (!isRecord(item) || typeof item.id !== "string" || !isValidId(item.id)) {
-            continue;
-          }
-          const catalogId = typeof item.catalogId === "string" ? item.catalogId : "";
-          if (item.id === "github" || catalogId === "github") {
-            ids.add(item.id);
-          }
-        }
-      } catch {
-        // Malformed legacy profile: fall back to the canonical id only.
-      }
-    }
-    return [...ids];
-  }
-
-  /**
-   * Reads the physically stored OAuth grant for one connector id, honoring
-   * revocation tombstones but IGNORING blocked `mcp_oauth_states` rows. A
-   * user-initiated health check must be able to try a freshly committed grant
-   * even when an older failure left a stale reauth/step-up marker behind —
-   * otherwise a successful re-sign-in stays invisible forever.
-   */
-  private async rawOAuthGrant(owner: string, serverId: string): Promise<CloudOAuthToken | null> {
-    const revoked = this.ctx.storage.sql
-      .exec<{ present: number }>(
-        "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    if (revoked) {
-      return null;
-    }
-    const row = this.ctx.storage.sql
-      .exec<{ payload: string }>(
-        "SELECT payload FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    if (!row) {
-      return null;
-    }
-    return openGrantPayload(this.vault, this.scope.subject(owner), serverId, row.payload);
-  }
-
-  /**
-   * Non-secret snapshot of everything that decides whether one id can
-   * authenticate: usable grant, raw grant row (even when tombstoned), an
-   * active revocation tombstone, a stored manual secret, and the state
-   * marker. Powers `server_auth_missing` detail — never token material.
-   */
-  private oauthDiagnostic(
-    owner: string,
-    serverId: string,
-  ): { id: string; grantPresent: boolean; grantRow: boolean; revoked: boolean; secret: boolean; state: string } {
-    const grantRow = this.ctx.storage.sql
-      .exec<{ present: number }>(
-        "SELECT 1 AS present FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ? LIMIT 1",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    const revoked = this.ctx.storage.sql
-      .exec<{ present: number }>(
-        "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    return {
-      id: serverId,
-      grantPresent: Boolean(grantRow && !revoked),
-      grantRow: Boolean(grantRow),
-      revoked: Boolean(revoked),
-      secret: this.hasMcpServerSecret(owner, serverId),
-      state: this.oauthGrantState(owner, serverId),
-    };
-  }
-
-  private oauthGrantState(owner: string, serverId: string): string {
-    return this.ctx.storage.sql
-      .exec<{ state: string }>(
-        "SELECT state FROM mcp_oauth_states WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      )
-      .toArray()[0]?.state ?? "ready";
-  }
-
-  private markOAuthReady(owner: string, serverId: string): void {
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO mcp_oauth_states
-        (owner_email, server_id, state, error_code, retry_after, updated_at)
-       VALUES (?, ?, 'ready', '', 0, ?)`,
-      owner,
-      serverId,
-      Date.now(),
-    );
-  }
-
-  private async markOAuthRefreshStarted(owner: string, serverId: string): Promise<void> {
-    const now = Date.now();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO mcp_oauth_states
-        (owner_email, server_id, state, error_code, retry_after, updated_at)
-       VALUES (?, ?, 'refreshing', '', 0, ?)
-       ON CONFLICT(owner_email, server_id) DO UPDATE SET
-         state = CASE
-           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN 'refresh_unknown'
-           ELSE 'refreshing'
-         END,
-         error_code = CASE
-           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN mcp_oauth_states.error_code
-           ELSE ''
-         END,
-         retry_after = 0,
-         updated_at = excluded.updated_at`,
-      owner,
-      serverId,
-      now,
-    );
-  }
-
-  private async recordOAuthFailure(
-    owner: string,
-    serverId: string,
-    outcome: CloudOAuthRefreshFailure,
-  ): Promise<void> {
-    const previousState = this.oauthGrantState(owner, serverId);
-    const stepUpCodes = new Set(["interaction_required", "consent_required", "insufficient_scope", "invalid_scope"]);
-    const followsUnknownRotation = previousState === "refresh_unknown" && outcome.code === "invalid_grant";
-    const state = outcome.transient
-      ? outcome.ambiguous ? "refresh_unknown" : "retryable_error"
-      : followsUnknownRotation || stepUpCodes.has(outcome.code)
-        ? "step_up_required"
-        : "reauth_required";
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO mcp_oauth_states
-        (owner_email, server_id, state, error_code, retry_after, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      owner,
-      serverId,
-      state,
-      capStr(outcome.code, 120),
-      outcome.transient ? Date.now() + 30_000 : 0,
-      Date.now(),
-    );
-    if (state === "step_up_required" && outcome.requiredScopes) {
-      // The next sign-in widens its request by these; only a completed sign-in clears them.
-      recordRequiredScopes(this.ctx.storage.sql, owner, serverId, outcome.requiredScopes, outcome.code);
-    }
-  }
-
-  /** Reads OAuth grants from the account shard; legacy profile grants migrate once. */
-  private async profileOAuthTokens(owner: string): Promise<Record<string, CloudOAuthToken>> {
-    const tokens: Record<string, CloudOAuthToken> = {};
-    const profileRow = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
-    if (profileRow) {
-      try {
-        const parsed = JSON.parse(profileRow.payload) as unknown;
-        Object.assign(tokens, cloudOAuthTokens(isRecord(parsed) ? parsed.mcpOAuth : undefined));
-      } catch {
-        // A malformed legacy profile cannot authenticate any connector.
-      }
-    }
-    const rows = this.ctx.storage.sql
-      .exec<{ server_id: string; payload: string }>(
-        "SELECT server_id, payload FROM mcp_oauth_grants WHERE owner_email = ?",
-        owner,
-      )
-      .toArray();
-    for (const row of rows) {
-      // Sealed at rest; a row this key cannot open authenticates nothing and
-      // surfaces as a missing grant rather than a failed request.
-      try {
-        const token = await openGrantPayload(this.vault, this.scope.subject(owner), row.server_id, row.payload);
-        if (token) {
-          tokens[row.server_id] = token;
-        }
-      } catch (error) {
-        if (!(error instanceof SecretVaultError)) throw error;
-        console.error("oauth grant unreadable", row.server_id, error.code);
-      }
-    }
-    const revoked = this.ctx.storage.sql
-      .exec<{ server_id: string }>(
-        "SELECT server_id FROM mcp_oauth_revocations WHERE owner_email = ?",
-        owner,
-      )
-      .toArray();
-    for (const row of revoked) {
-      delete tokens[row.server_id];
-    }
-    const blocked = this.ctx.storage.sql
-      .exec<{ server_id: string }>(
-        "SELECT server_id FROM mcp_oauth_states WHERE owner_email = ? AND state IN ('reauth_required', 'step_up_required')",
-        owner,
-      )
-      .toArray();
-    for (const row of blocked) {
-      delete tokens[row.server_id];
-    }
-    return tokens;
-  }
-
-  private githubDeviceRow(owner: string, flowId: string): GitHubDeviceRow | undefined {
-    return this.ctx.storage.sql
-      .exec<GitHubDeviceRow>(
-        "SELECT * FROM mcp_github_device_pending WHERE owner_email = ? AND flow_id = ?",
-        owner,
-        flowId,
-      )
-      .toArray()[0];
-  }
-
-  /** Starts GitHub device authorization while keeping device_code in the shard. */
-  private async handleGitHubDeviceStart(owner: string): Promise<Response> {
-    const clientId = this.workerEnv.EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID?.trim() ?? "";
-    if (!clientId) {
-      return json({ error: "github_oauth_not_configured" }, 503);
-    }
-    const response = await fetchPublicHttps("https://github.com/login/device/code", {
-      method: "POST",
-      headers: githubOAuthFormHeaders(),
-      body: new URLSearchParams({
-        client_id: clientId,
-        scope: "repo read:org read:user user:email gist notifications workflow read:project",
-      }).toString(),
-      signal: AbortSignal.timeout(12_000),
-    });
-    const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-    const deviceCode = typeof data?.device_code === "string" ? data.device_code : "";
-    const userCode = typeof data?.user_code === "string" ? data.user_code : "";
-    if (!response.ok || !deviceCode || !userCode) {
-      const error = typeof data?.error === "string" ? data.error : `github_device_http_${response.status}`;
-      return json({ error }, response.status >= 500 ? 503 : 400);
-    }
-    const intervalMs = Math.max(5_000, Number(data?.interval ?? 5) * 1_000);
-    const expiresAt = Date.now() + Math.max(60, Number(data?.expires_in ?? 900)) * 1_000;
-    const verificationUri =
-      typeof data?.verification_uri === "string" && data.verification_uri
-        ? data.verification_uri
-        : "https://github.com/login/device";
-    const flowId = newOAuthState();
-    this.ctx.storage.sql.exec(
-      "DELETE FROM mcp_github_device_pending WHERE owner_email = ? AND (server_id = 'github' OR expires_at < ?)",
-      owner,
-      Date.now(),
-    );
-    this.ctx.storage.sql.exec(
-      `INSERT INTO mcp_github_device_pending
-        (owner_email, flow_id, server_id, device_code, user_code, verification_uri, client_id,
-         expires_at, interval_ms, next_poll_at, status, error, created_at, updated_at)
-       VALUES (?, ?, 'github', ?, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)`,
-      owner,
-      flowId,
-      await this.vault.seal(deviceCode, deviceCodeScope(this.scope.subject(owner), flowId)),
-      userCode,
-      verificationUri,
-      clientId,
-      expiresAt,
-      intervalMs,
-      Date.now() + intervalMs,
-      Date.now(),
-      Date.now(),
-    );
-    return json({ flowId, userCode, verificationUri, intervalMs, expiresAt });
-  }
-
-  /** Polls GitHub server-side and commits the resulting grant before success. */
-  private async handleGitHubDeviceStatus(request: Request, owner: string): Promise<Response> {
-    const flowId = new URL(request.url).searchParams.get("flowId") ?? "";
-    const row = this.githubDeviceRow(owner, flowId);
-    if (!row) {
-      return json({ status: "missing" }, 404);
-    }
-    if (row.status === "completed") {
-      return json({ status: "completed" });
-    }
-    if (row.status === "polling" && row.updated_at < Date.now() - 30_000) {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_github_device_pending SET status = 'failed', error = 'step_up_required', updated_at = ? WHERE owner_email = ? AND flow_id = ?",
-        Date.now(),
-        owner,
-        flowId,
-      );
-      return json({ status: "failed", error: "step_up_required" });
-    }
-    if (row.status === "failed") {
-      return json({ status: "failed", error: row.error });
-    }
-    const now = Date.now();
-    if (row.expires_at <= now) {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_github_device_pending SET status = 'failed', error = 'expired_token', updated_at = ? WHERE owner_email = ? AND flow_id = ?",
-        now,
-        owner,
-        flowId,
-      );
-      return json({ status: "failed", error: "expired_token" });
-    }
-    if (row.next_poll_at > now || row.status === "polling") {
-      return json({ status: "pending", retryAfterMs: Math.max(250, row.next_poll_at - now) });
-    }
-    this.ctx.storage.sql.exec(
-      "UPDATE mcp_github_device_pending SET status = 'polling', next_poll_at = ?, updated_at = ? WHERE owner_email = ? AND flow_id = ? AND status = 'pending'",
-      now + row.interval_ms,
-      now,
-      owner,
-      flowId,
-    );
-    const deviceCode = await this.vault.open(row.device_code, deviceCodeScope(this.scope.subject(owner), flowId));
-    let response: Response;
-    try {
-      response = await fetchPublicHttps("https://github.com/login/oauth/access_token", {
-        method: "POST",
-        headers: githubOAuthFormHeaders(),
-        body: new URLSearchParams({
-          client_id: row.client_id,
-          device_code: deviceCode,
-          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-        }).toString(),
-        signal: AbortSignal.timeout(12_000),
-      });
-    } catch {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_github_device_pending SET status = 'pending', error = 'temporarily_unavailable', updated_at = ? WHERE owner_email = ? AND flow_id = ?",
-        Date.now(),
-        owner,
-        flowId,
-      );
-      return json({ status: "pending", retryAfterMs: row.interval_ms }, 503);
-    }
-    const data = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-    if (response.ok && typeof data?.access_token === "string" && data.access_token) {
-      const expiresIn = Number(data.expires_in ?? 0);
-      const token: CloudOAuthToken = {
-        accessToken: data.access_token,
-        refreshToken:
-          typeof data.refresh_token === "string" && data.refresh_token
-            ? data.refresh_token
-            : undefined,
-        expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1_000 : undefined,
-        tokenEndpoint: "https://github.com/login/oauth/access_token",
-        clientId: row.client_id,
-        mcpUrl: "https://api.github.com",
-      };
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, 'github', ?, ?)",
-        owner,
-        await sealGrantPayload(this.vault, this.scope.subject(owner), "github", token),
-        Date.now(),
-      );
-      // Latest credential wins: a fresh sign-in supersedes any pasted PAT or
-      // legacy-migrated token, which the auth lease would otherwise prefer
-      // forever (stale read-only/dead tokens made GitHub look read-only).
-      // Clear tombstones and blocked markers for EVERY id this account's
-      // GitHub connector can resolve through — an instance-id tombstone or a
-      // stale reauth marker must never outlive a successful re-sign-in.
-      for (const staleId of this.githubConnectorIds(owner)) {
-        this.ctx.storage.sql.exec(
-          "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-          owner,
-          staleId,
-        );
-        this.ctx.storage.sql.exec(
-          "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
-          owner,
-          staleId,
-        );
-        this.markOAuthReady(owner, staleId);
-      }
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_github_device_pending SET status = 'completed', error = '', updated_at = ? WHERE owner_email = ? AND flow_id = ?",
-        Date.now(),
-        owner,
-        flowId,
-      );
-      return json({ status: "completed" });
-    }
-    const code = typeof data?.error === "string" ? data.error : `github_device_http_${response.status}`;
-    if (code === "authorization_pending" || code === "slow_down") {
-      const intervalMs = code === "slow_down" ? row.interval_ms + 5_000 : row.interval_ms;
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_github_device_pending SET status = 'pending', interval_ms = ?, next_poll_at = ?, error = '', updated_at = ? WHERE owner_email = ? AND flow_id = ?",
-        intervalMs,
-        Date.now() + intervalMs,
-        Date.now(),
-        owner,
-        flowId,
-      );
-      return json({ status: "pending", retryAfterMs: intervalMs });
-    }
-    this.ctx.storage.sql.exec(
-      "UPDATE mcp_github_device_pending SET status = 'failed', error = ?, updated_at = ? WHERE owner_email = ? AND flow_id = ?",
-      capStr(code, 180),
-      Date.now(),
-      owner,
-      flowId,
-    );
-    return json({ status: "failed", error: code }, 400);
-  }
-
-  private oauthPending(owner: string, state: string): OAuthPendingRow | undefined {
-    return this.ctx.storage.sql
-      .exec<OAuthPendingRow>(
-        "SELECT * FROM mcp_oauth_pending WHERE owner_email = ? AND state = ?",
-        owner,
-        state,
-      )
-      .toArray()[0];
-  }
-
-  /** The pending row with its proofs (verifier, code, browser nonce, callback challenge) decrypted. */
-  private revealOAuthPending(owner: string, row: OAuthPendingRow): Promise<OAuthPendingRow> {
-    return openFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(this.scope.subject(owner), row.state));
-  }
-
-  /**
-   * The popup's return URL. For `confirm` the row must already be revealed
-   * (`revealOAuthPending`) — the challenge travels to the popup in the clear,
-   * but it sits sealed in storage like every other proof of the flow.
-   */
-  private oauthReturnUrl(
-    row: OAuthPendingRow,
-    status: "confirm" | "complete" | "error" | "replayed",
-  ): string {
-    const target = new URL("/oauth/callback", row.return_origin);
-    target.searchParams.set("state", row.state);
-    target.searchParams.set("serverId", row.server_id);
-    target.searchParams.set("status", status);
-    if (status === "confirm" && row.callback_challenge && !this.vault.isSealed(row.callback_challenge)) {
-      target.searchParams.set("challenge", row.callback_challenge);
-    }
-    if (status === "error" && row.error) {
-      target.searchParams.set("error", capStr(row.error, 180));
-    }
-    return target.toString();
-  }
-
-  /** Browser polling surface: status only, never a provider token or verifier. */
-  private handleOAuthStatus(request: Request, owner: string): Response {
-    const url = new URL(request.url);
-    const state = url.searchParams.get("state") ?? "";
-    const row = this.oauthPending(owner, state);
-    if (!row) {
-      return json({ status: "missing" }, 404);
-    }
-    if (row.status === "exchanging" && row.updated_at < Date.now() - 30_000) {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_oauth_pending SET status = 'exchange_unknown', error = 'oauth_exchange_interrupted', updated_at = ? WHERE owner_email = ? AND state = ? AND status = 'exchanging'",
-        Date.now(),
-        owner,
-        state,
-      );
-      return json({ status: "pending", retryable: true, error: "oauth_exchange_interrupted" });
-    }
-    if (row.expires_at < Date.now() && row.status !== "completed" && row.status !== "failed") {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_oauth_pending SET status = 'failed', error = 'oauth_state_expired', updated_at = ? WHERE owner_email = ? AND state = ?",
-        Date.now(),
-        owner,
-        state,
-      );
-      return json({ status: "failed", error: "oauth_state_expired" });
-    }
-    const retryable = row.status === "exchange_retryable" || row.status === "exchange_unknown";
-    return json({
-      status: row.status === "completed" ? "completed" : row.status === "failed" ? "failed" : "pending",
-      ...(row.error && (row.status === "failed" || retryable) ? { error: row.error } : {}),
-      ...(retryable ? { retryable: true } : {}),
-    });
-  }
-
-  /** Provider callback: one-time code exchange + durable grant commit in this actor. */
-  private async handleOAuthCallback(request: Request, owner: string): Promise<Response> {
-    let body: { state?: unknown; code?: unknown; error?: unknown; issuer?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const state = typeof body.state === "string" ? body.state : "";
-    const providerError = typeof body.error === "string" ? capStr(body.error, 180) : "";
-    const issuer = typeof body.issuer === "string" ? body.issuer : "";
-    const code = typeof body.code === "string" ? body.code : "";
-    const row = this.oauthPending(owner, state);
-    if (!row) {
-      return json({ error: "oauth_state_unknown" }, 404);
-    }
-    if (row.status === "completed") {
-      return json({ ok: true, replayed: true, redirectUrl: this.oauthReturnUrl(row, "complete") });
-    }
-    if (row.status === "failed") {
-      return json({ error: row.error || "oauth_failed", redirectUrl: this.oauthReturnUrl(row, "error") }, 409);
-    }
-    if (row.expires_at < Date.now()) {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_oauth_pending SET status = 'failed', error = 'oauth_state_expired', updated_at = ? WHERE owner_email = ? AND state = ?",
-        Date.now(),
-        owner,
-        state,
-      );
-      const expired = this.oauthPending(owner, state) ?? row;
-      return json({ error: "oauth_state_expired", redirectUrl: this.oauthReturnUrl(expired, "error") }, 400);
-    }
-    const replayable = ["awaiting_confirmation", "exchanging", "exchange_retryable", "exchange_unknown"].includes(row.status);
-    if (replayable) {
-      const stored = await this.revealOAuthPending(owner, row);
-      if (
-        !providerError &&
-        code &&
-        code === stored.authorization_code &&
-        (!issuer || sameOAuthEndpoint(issuer, row.issuer)) &&
-        stored.callback_challenge
-      ) {
-        return json({ ok: true, replayed: true, redirectUrl: this.oauthReturnUrl(stored, "confirm") });
-      }
-      return json({ error: "oauth_callback_replayed", redirectUrl: this.oauthReturnUrl(row, "replayed") }, 409);
-    }
-    if (row.status !== "pending") {
-      return json({ error: "oauth_callback_replayed", redirectUrl: this.oauthReturnUrl(row, "replayed") }, 409);
-    }
-    if (issuer && !sameOAuthEndpoint(issuer, row.issuer)) {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_oauth_pending SET status = 'failed', error = 'oauth_issuer_mismatch', updated_at = ? WHERE owner_email = ? AND state = ?",
-        Date.now(),
-        owner,
-        state,
-      );
-      const failed = this.oauthPending(owner, state) ?? row;
-      return json({ error: "oauth_issuer_mismatch", redirectUrl: this.oauthReturnUrl(failed, "error") }, 400);
-    }
-    if (providerError) {
-      this.ctx.storage.sql.exec(
-        "UPDATE mcp_oauth_pending SET status = 'failed', error = ?, updated_at = ? WHERE owner_email = ? AND state = ?",
-        providerError,
-        Date.now(),
-        owner,
-        state,
-      );
-      const failed = this.oauthPending(owner, state) ?? row;
-      return json({ error: "oauth_denied", redirectUrl: this.oauthReturnUrl(failed, "error") }, 400);
-    }
-    if (!code || code.length > 8_000) {
-      return json({ error: "oauth_code_missing" }, 400);
-    }
-    // The public callback stores the one-time code but does not redeem it.
-    // Completion requires two proofs that never travel in the authorization
-    // URL together: browserNonce from the initiating app storage and this
-    // callback challenge delivered only to the provider-returned popup.
-    const callbackChallenge = newOAuthState();
-    this.ctx.storage.sql.exec(
-      `UPDATE mcp_oauth_pending
-       SET status = 'awaiting_confirmation', authorization_code = ?, callback_challenge = ?, updated_at = ?
-       WHERE owner_email = ? AND state = ? AND status = 'pending'`,
-      await this.vault.seal(code, oauthPendingFieldScope(this.scope.subject(owner), state, "authorization_code")),
-      await this.vault.seal(callbackChallenge, oauthPendingFieldScope(this.scope.subject(owner), state, "callback_challenge")),
-      Date.now(),
-      owner,
-      state,
-    );
-    const awaiting = this.oauthPending(owner, state) ?? row;
-    return json({
-      ok: true,
-      redirectUrl: this.oauthReturnUrl(await this.revealOAuthPending(owner, awaiting), "confirm"),
-    });
-  }
-
-  /** Authenticated popup confirmation performs the only provider code exchange. */
-  private async handleOAuthComplete(request: Request, owner: string): Promise<Response> {
-    let body: { state?: unknown; browserNonce?: unknown; callbackChallenge?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const state = typeof body.state === "string" ? body.state : "";
-    const browserNonce = typeof body.browserNonce === "string" ? body.browserNonce : "";
-    const callbackChallenge =
-      typeof body.callbackChallenge === "string" ? body.callbackChallenge : "";
-    const row = this.oauthPending(owner, state);
-    if (!row) {
-      return json({ error: "oauth_state_unknown" }, 404);
-    }
-    if (row.status === "completed") {
-      return json({ ok: true, status: "completed", replayed: true });
-    }
-    if (row.status === "failed") {
-      return json({ error: row.error || "oauth_failed" }, 409);
-    }
-    const retryableStatus = row.status === "exchange_retryable" || row.status === "exchange_unknown";
-    if (row.status === "exchanging" && row.updated_at >= Date.now() - 30_000) {
-      return json({ error: "oauth_exchange_busy", retryable: true }, 409);
-    }
-    if (row.status !== "awaiting_confirmation" && row.status !== "exchanging" && !retryableStatus) {
-      return json({ error: "oauth_not_ready" }, 409);
-    }
-    // Both proofs sit sealed in storage; they are compared only after the
-    // shard itself has opened them for exactly this state.
-    const pending = await this.revealOAuthPending(owner, row);
-    if (
-      row.expires_at < Date.now() ||
-      !browserNonce ||
-      !callbackChallenge ||
-      !constantTimeEqual(browserNonce, pending.browser_nonce) ||
-      !constantTimeEqual(callbackChallenge, pending.callback_challenge)
-    ) {
-      return json({ error: row.expires_at < Date.now() ? "oauth_state_expired" : "oauth_confirmation_mismatch" }, 403);
-    }
-    const priorWasUnknown = row.status === "exchange_unknown" || row.status === "exchanging";
-    this.ctx.storage.sql.exec(
-      `UPDATE mcp_oauth_pending SET status = 'exchanging', error = '', updated_at = ?
-       WHERE owner_email = ? AND state = ? AND status IN ('awaiting_confirmation', 'exchange_retryable', 'exchange_unknown', 'exchanging')`,
-      Date.now(),
-      owner,
-      state,
-    );
-    try {
-      const { grantedScopes, ...token } = await exchangeAuthorizationCode({
-        tokenEndpoint: row.token_endpoint,
-        clientId: row.client_id,
-        code: pending.authorization_code,
-        verifier: pending.verifier,
-        redirectUri: row.redirect_uri,
-        resource: row.resource || undefined,
-        mcpUrl: row.mcp_url,
-      });
-      const committedAt = Date.now();
-      // Sealed before the synchronous transaction — no await inside it.
-      const sealedGrant = await sealGrantPayload(this.vault, this.scope.subject(owner), row.server_id, {
-        ...token,
-        authorizationState: state,
-      });
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-          owner,
-          row.server_id,
-          sealedGrant,
-          committedAt,
-        );
-        this.ctx.storage.sql.exec(
-          "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-          owner,
-          row.server_id,
-        );
-        this.markOAuthReady(owner, row.server_id);
-        // The user just consented: whatever a step-up demanded is now granted.
-        recordGrantedScopes(this.ctx.storage.sql, owner, row.server_id, grantedScopes ?? null, committedAt);
-        this.ctx.storage.sql.exec(
-          `UPDATE mcp_oauth_pending
-           SET status = 'completed', error = '', verifier = '', browser_nonce = '',
-               callback_challenge = '', authorization_code = '', updated_at = ?
-           WHERE owner_email = ? AND state = ?`,
-          committedAt,
-          owner,
-          state,
-        );
-      });
-      await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${row.server_id}`);
-      return json({ ok: true, status: "completed" });
-    } catch (error) {
-      const exchangeError = error instanceof OAuthCodeExchangeError ? error : null;
-      if (!exchangeError || exchangeError.transient) {
-        const status = exchangeError?.ambiguous === false ? "exchange_retryable" : "exchange_unknown";
-        const code = exchangeError?.code ?? "oauth_exchange_interrupted";
-        this.ctx.storage.sql.exec(
-          "UPDATE mcp_oauth_pending SET status = ?, error = ?, updated_at = ? WHERE owner_email = ? AND state = ? AND status = 'exchanging'",
-          status,
-          capStr(code, 180),
-          Date.now(),
-          owner,
-          state,
-        );
-        return json({ error: code, retryable: true }, 503);
-      }
-      const code = priorWasUnknown && exchangeError.code === "invalid_grant"
-        ? "step_up_required"
-        : exchangeError.code;
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec(
-          `UPDATE mcp_oauth_pending
-           SET status = 'failed', error = ?, verifier = '', browser_nonce = '',
-               callback_challenge = '', authorization_code = '', updated_at = ?
-           WHERE owner_email = ? AND state = ?`,
-          capStr(code, 180),
-          Date.now(),
-          owner,
-          state,
-        );
-      });
-      return json({ error: code }, 400);
-    }
-  }
-
-  /** Stores a newly authorized or legacy-migrated grant only in the account shard. */
-  private async handleOAuthStore(request: Request, owner: string): Promise<Response> {
-    let body: { serverId?: unknown; token?: unknown; grants?: unknown; mode?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    if (body.mode === "replace") {
-      return json(
-        {
-          error: "server_owned_oauth_required",
-          error_description:
-            "Gera was updated — reload this page (Cmd/Ctrl+Shift+R) and start the sign-in again.",
-        },
-        410,
-      );
-    }
-    const entries: Array<[string, unknown]> = [];
-    if (typeof body.serverId === "string") {
-      entries.push([body.serverId, body.token]);
-    }
-    if (isRecord(body.grants)) {
-      entries.push(...Object.entries(body.grants));
-    }
-    let stored = 0;
-    const settledIds: string[] = [];
-    for (const [serverId, raw] of entries.slice(0, 20)) {
-      const token = cloudOAuthToken(raw);
-      if (!isValidId(serverId) || !token) {
-        continue;
-      }
-      const revoked = this.ctx.storage.sql
-        .exec<{ revoked_at: number }>(
-          "SELECT revoked_at FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-          owner,
-          serverId,
-        )
-        .toArray()[0];
-      const existing = this.ctx.storage.sql
-        .exec<{ payload: string }>(
-          "SELECT payload FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ?",
-          owner,
-          serverId,
-        )
-        .toArray()[0];
-      if (revoked || existing) {
-        settledIds.push(serverId);
-        continue;
-      }
-      let canonical = token;
-      const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-      const rotation = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(rotationKey));
-      if (rotation?.bases.includes(token.accessToken)) {
-        canonical = rotation.token;
-      }
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-        owner,
-        serverId,
-        await sealGrantPayload(this.vault, owner, serverId, canonical),
-        Date.now(),
-      );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      );
-      this.markOAuthReady(owner, serverId);
-      await this.ctx.storage.delete(rotationKey);
-      settledIds.push(serverId);
-      stored += 1;
-    }
-    if (settledIds.length > 0) {
-      const row = this.ctx.storage.sql
-        .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-        .toArray()[0];
-      if (row) {
-        try {
-          const profile = JSON.parse(row.payload) as Record<string, unknown>;
-          if (isRecord(profile.mcpOAuth)) {
-            const legacy = { ...profile.mcpOAuth };
-            for (const serverId of settledIds) {
-              delete legacy[serverId];
-            }
-            if (Object.keys(legacy).length > 0) {
-              profile.mcpOAuth = legacy;
-            } else {
-              delete profile.mcpOAuth;
-            }
-            this.ctx.storage.sql.exec(
-              "UPDATE profiles SET payload = ?, updated_at = ? WHERE owner_email = ?",
-              JSON.stringify(profile),
-              Date.now(),
-              owner,
-            );
-          }
-        } catch {
-          // Keep a malformed profile untouched; canonical rows are already safe.
-        }
-      }
-      return json({ ok: true, stored, settledIds });
-    }
-    return json({ error: "invalid_grant" }, 400);
-  }
-
-  /** Removes a grant from the server; no browser credential can resurrect it. */
-  private async handleOAuthClear(request: Request, owner: string): Promise<Response> {
-    let body: { serverId?: unknown; catalogId?: unknown; reason?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const serverId = typeof body.serverId === "string" ? body.serverId : "";
-    const catalogId = typeof body.catalogId === "string" ? body.catalogId : "";
-    if (!isValidId(serverId) || (catalogId && !isValidId(catalogId))) {
-      return json({ error: "invalid_server" }, 400);
-    }
-    if (body.reason !== "disconnect") {
-      // Only an explicit user disconnect may create a durable revocation.
-      // Older bundles auto-cleared on a stale/expired BROWSER copy, which
-      // tombstoned and destroyed a perfectly fresh server-owned grant — every
-      // new GitHub sign-in was poisoned minutes later (server_auth_missing).
-      // Automatic housekeeping is a browser-local concern; ack without damage.
-      return json({ ok: true, ignored: true });
-    }
-    const ids = [...new Set([serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])])];
-    for (const id of ids) {
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO mcp_oauth_revocations (owner_email, server_id, revoked_at) VALUES (?, ?, ?)",
-        owner,
-        id,
-        Date.now(),
-      );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ?",
-        owner,
-        id,
-      );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
-        owner,
-        id,
-      );
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_oauth_states WHERE owner_email = ? AND server_id = ?",
-        owner,
-        id,
-      );
-      clearOAuthScopes(this.ctx.storage.sql, owner, id);
-      await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${id}`);
-    }
-    const row = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
-    if (row) {
-      try {
-        const profile = JSON.parse(row.payload) as Record<string, unknown>;
-        if (isRecord(profile.mcpOAuth) && ids.some((id) => id in profile.mcpOAuth)) {
-          const oauth = { ...profile.mcpOAuth };
-          for (const id of ids) {
-            delete oauth[id];
-          }
-          profile.mcpOAuth = oauth;
-          this.ctx.storage.sql.exec(
-            "UPDATE profiles SET payload = ?, updated_at = ? WHERE owner_email = ?",
-            JSON.stringify(profile),
-            Date.now(),
-            owner,
-          );
-        }
-      } catch {
-        // Malformed legacy profile remains unusable.
-      }
-    }
-    return json({ ok: true });
-  }
-
-  /** Server-side connection check; credentials, refresh and MCP session stay in this shard. */
-  private async handleMcpCheck(request: Request, owner: string): Promise<Response> {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const rawServer = isRecord(body) && isRecord(body.server) ? body.server : null;
-    const serverId = rawServer && typeof rawServer.id === "string" ? rawServer.id : "";
-    if (!rawServer || !isValidId(serverId)) {
-      return json({ error: "invalid_server" }, 400);
-    }
-    const secret = {
-      token:
-        typeof rawServer.token === "string" && !isPlaceholderCredential(rawServer.token)
-          ? rawServer.token
-          : "",
-      headersJson: typeof rawServer.headersJson === "string" ? rawServer.headersJson : "",
-    };
-    const catalogId = typeof rawServer.catalogId === "string" ? rawServer.catalogId : "";
-    if (rawServer.credentialStored === false && !secret.token && !secret.headersJson) {
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      );
-    }
-    if (secret.token || secret.headersJson) {
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-        owner,
-        serverId,
-        await sealServerSecret(this.vault, this.scope.subject(owner), serverId, secret),
-        Date.now(),
-      );
-    }
-    const storedSecret = await this.mcpServerSecret(owner, serverId);
-    const legacyCatalogSecret: ServerSecret =
-      catalogId && catalogId !== serverId ? await this.mcpServerSecret(owner, catalogId) : {};
-    let resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
-    const nativeGithub = (catalogId || serverId) === "github";
-    if (nativeGithub && !resolvedSecret.token) {
-      // Native GitHub talks REST with a bearer token only. A leftover
-      // headers-style secret can neither authenticate it nor should it mask
-      // the OAuth grant path.
-      resolvedSecret = {};
-    }
-    const authMode =
-      rawServer.authMode === "none" ||
-      rawServer.authMode === "bearer" ||
-      rawServer.authMode === "headers" ||
-      rawServer.authMode === "oauth"
-        ? rawServer.authMode
-        : "auto";
-    const reliesOnOAuth =
-      (authMode === "oauth" || authMode === "auto") &&
-      !resolvedSecret.token &&
-      !resolvedSecret.headersJson;
-    // Every id whose grant row can authenticate this card. Device-flow GitHub
-    // always commits under the canonical "github" id, so github-native cards
-    // resolve it even when their own instance id differs.
-    const grantIds = [
-      ...new Set([
-        serverId,
-        ...(catalogId ? [catalogId] : []),
-        ...(nativeGithub ? ["github"] : []),
-      ]),
-    ];
-    const storedGrants = new Map<string, CloudOAuthToken>();
-    for (const id of grantIds) {
-      const grant = await this.rawOAuthGrant(owner, id);
-      if (grant) {
-        storedGrants.set(id, grant);
-      }
-    }
-    // Fail closed on blocked states only when no grant physically exists. A
-    // user-initiated check with a fresh grant must try it: success below
-    // clears the stale marker, failure re-records an accurate one.
-    const blockedState = reliesOnOAuth && storedGrants.size === 0
-      ? grantIds
-          .map((id) => this.oauthGrantState(owner, id))
-          .find((state) => state === "reauth_required" || state === "step_up_required")
-      : undefined;
-    // A run's insufficient_scope challenge, pending until a new sign-in consents to it.
-    const stepUp = grantIds.map((id) => pendingStepUp(this.ctx.storage.sql, owner, id)).find(Boolean) ?? null;
-    if (blockedState) {
-      return json({ error: blockedState, ...(stepUp ? { stepUp } : {}) }, blockedState === "step_up_required" ? 403 : 401);
-    }
-    const oauthTokens = await this.profileOAuthTokens(owner);
-    for (const [id, grant] of storedGrants) {
-      if (!oauthTokens[id]) {
-        oauthTokens[id] = grant;
-      }
-    }
-    if (!oauthTokens[serverId]) {
-      const donor = grantIds.find((id) => Boolean(oauthTokens[id]));
-      if (donor) {
-        oauthTokens[serverId] = oauthTokens[donor];
-      }
-    }
-    // A health check must always return the complete remote tool table. The
-    // account's disabled-tool preferences stay in the profile and are applied
-    // when a run arms; filtering here made disabled tools disappear forever.
-    const candidate = {
-      ...rawServer,
-      // Only shard-resolved secrets may authenticate the arm. The browser's
-      // raw `token` is either already stored above or a non-credential
-      // (`gera-account:*` marker) that would otherwise ride into the request
-      // as a fake PAT, shadow the OAuth grant, and fail with GitHub 401.
-      token: resolvedSecret.token ?? "",
-      headersJson: resolvedSecret.headersJson ?? "",
-      disabledTools: [],
-      enabled: true,
-      status: "connected",
-    };
-    const servers = cloudMcpServersForAutomation([candidate], [serverId], oauthTokens);
-    if (servers.length === 0) {
-      // Metadata only — which ids were consulted and why they cannot arm.
-      // Never any token material.
-      const detail = grantIds.map((id) => this.oauthDiagnostic(owner, id));
-      return json({ error: "server_auth_missing", detail }, 400);
-    }
-    const appliedChains = new Map<string, string[]>();
-    const persist = async (rotated: RefreshedOAuth): Promise<void> => {
-      await this.persistCanonicalOAuthGrant(owner, rotated);
-      const bases = chainRotationBases(appliedChains, rotated);
-      appliedChains.set(rotated.serverId, bases);
-    };
-    try {
-      // Uncapped: a health check returns the complete remote table (with
-      // annotations and UI-only markers), lists prompts/resources, and the
-      // handshake refreshes the account's catalog cache (deferred runs and the
-      // composer menus read it without reconnecting). No notification stream:
-      // a check has no run to keep it alive.
-      const runtime = await resolveMcpToolset({
-        servers,
-        mode: "native",
-        uncapped: true,
-        inventory: true,
-        notificationStreams: false,
-        catalog: createSqlMcpCatalogStore(this.ctx.storage.sql, owner),
-        persist,
-        reportFailure: (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
-        beginRefresh: (id) => this.markOAuthRefreshStarted(owner, id),
-      });
-      if (runtime.failures.length > 0 || runtime.routes.size === 0) {
-        // Only a failed arm may surface an auth state — a stale pre-existing
-        // marker must never veto a verification that just succeeded.
-        const authState = grantIds
-          .map((id) => this.oauthGrantState(owner, id))
-          .find((state) => state === "reauth_required" || state === "step_up_required");
-        if (authState) {
-          return json({ error: authState, ...(stepUp ? { stepUp } : {}) }, authState === "step_up_required" ? 403 : 401);
-        }
-        const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
-        return json({ error: failure }, 502);
-      }
-      if (servers[0]?.oauth) {
-        // The grant just proved itself against the live provider: clear any
-        // stuck reauth/step-up markers so leases and relays use it again. A
-        // pending insufficient_scope step-up is the exception — the handshake
-        // only proves the token, not the scopes a tool demanded; only a new
-        // sign-in (which asks for the union) clears that one.
-        for (const id of grantIds) {
-          if (storedGrants.has(id) && !pendingStepUp(this.ctx.storage.sql, owner, id)) {
-            this.markOAuthReady(owner, id);
-          }
-        }
-      }
-      const info = runtime.servers[0];
-      // Generic MCP servers: the complete remote table straight from the
-      // handshake (titles, annotations, UI-only). Native connectors: their
-      // static tables as armed.
-      const tools = info?.tools
-        ? info.tools.map((tool) => ({
-            name: tool.name,
-            description: tool.description,
-            inputSchema: tool.inputSchema,
-            ...(tool.title ? { title: tool.title } : {}),
-            ...(tool.annotations ? { annotations: tool.annotations } : {}),
-            ...(tool.uiOnly ? { uiOnly: true } : {}),
-          }))
-        : [...runtime.routes.entries()].map(([functionName, route]) => {
-            const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
-            return {
-              name: route.toolName,
-              description: definition?.function.description ?? route.toolName,
-              inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
-            };
-          });
-      const credentialStored = Boolean(
-        resolvedSecret.token ||
-        resolvedSecret.headersJson ||
-        oauthTokens[serverId],
-      );
-      return json({
-        tools,
-        identity: `${servers[0].name} · server verified`,
-        credentialStored,
-        promptCount: info?.promptCount ?? 0,
-        resourceCount: info?.resourceCount ?? 0,
-        ...(stepUp ? { stepUp } : {}),
-      });
-    } catch (error) {
-      // An unexpected fault inside the check (a refresh race, a storage error)
-      // must not escape as a Durable Object exception: the Worker would report
-      // Gera's backend as unavailable and the real cause would never reach the
-      // journal. Every credential in scope is redacted first; a health probe
-      // is idempotent, so one retry is always safe.
-      const armed = servers[0];
-      const secrets = [
-        ...Object.values(armed?.headers ?? {}),
-        armed?.token ?? "",
-        resolvedSecret.token ?? "",
-        ...Object.values(oauthTokens).flatMap((grant) => [grant.accessToken, grant.refreshToken ?? ""]),
-      ];
-      const detail = redactCloudMcpText(error instanceof Error ? error.message : "check failed", secrets).slice(0, 300);
-      console.error("mcp check failed", serverId, detail);
-      return json({ error: "mcp_check_failed", detail, retryable: true }, 502);
-    }
-  }
-
-  /** Rejects a late refresh when the canonical grant changed while the provider request awaited. */
-  private async assertOAuthRotationCurrent(owner: string, rotated: RefreshedOAuth): Promise<void> {
-    const tokens = await this.profileOAuthTokens(owner);
-    const key = `${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`;
-    const existing = await this.readRotation(owner, rotated.serverId, await this.ctx.storage.get<unknown>(key));
-    if (existing) {
-      overlayOAuthRotations(tokens, [existing]);
-    }
-    const currentAccess = tokens[rotated.serverId]?.accessToken;
-    if (currentAccess !== rotated.baseAccessToken && currentAccess !== rotated.token.accessToken) {
-      throw new Error("stale OAuth refresh result");
-    }
-  }
-
-  /** Atomically promotes one provider rotation into the SQL source of truth. */
-  private async persistCanonicalOAuthGrant(owner: string, rotated: RefreshedOAuth): Promise<void> {
-    await this.assertOAuthRotationCurrent(owner, rotated);
-    this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-      owner,
-      rotated.serverId,
-      await sealGrantPayload(this.vault, this.scope.subject(owner), rotated.serverId, rotated.token),
-      Date.now(),
-    );
-    this.ctx.storage.sql.exec(
-      "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-      owner,
-      rotated.serverId,
-    );
-    this.markOAuthReady(owner, rotated.serverId);
-    await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`);
-  }
-
-  /**
-   * POST /mcp/oauth-refresh — deployment-safe browser refresh. The provider's
-   * rotating response is committed to this account shard before it is returned
-   * to the tab. If a publish reload loses that response, the next bundle sends
-   * the old base again and receives the durable tip without redeeming twice.
-   */
-  private async handleBrowserOAuthRefresh(request: Request, owner: string): Promise<Response> {
-    let body: { serverId?: unknown; token?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const serverId = typeof body.serverId === "string" ? body.serverId : "";
-    const incoming = cloudOAuthToken(body.token);
-    if (!isValidId(serverId) || !incoming?.refreshToken || !incoming.tokenEndpoint || !incoming.clientId) {
-      return json({ error: "invalid_grant" }, 400);
-    }
-    const blockedState = this.oauthGrantState(owner, serverId);
-    if (blockedState === "reauth_required" || blockedState === "step_up_required") {
-      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
-    }
-
-    const key = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-    let existing = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(key));
-    const profileGrant = (await this.profileOAuthTokens(owner))[serverId];
-    if (existing?.bases.includes(incoming.accessToken)) {
-      const profileStillOnChain =
-        Boolean(profileGrant) &&
-        (profileGrant?.accessToken === existing.token.accessToken || existing.bases.includes(profileGrant?.accessToken ?? ""));
-      if (!profileStillOnChain) {
-        // A sign-out or fresh sign-in in the durable profile outranks a stale
-        // tab. Escrow repairs deploy loss, never resurrects a removed account grant.
-        return json({ error: "stale_grant" }, 409);
-      }
-      this.markOAuthReady(owner, serverId);
-      return json({ ok: true, credentialStored: true, replayed: true });
-    }
-
-    if (
-      existing &&
-      existing.token.accessToken !== incoming.accessToken &&
-      profileGrant?.accessToken === incoming.accessToken
-    ) {
-      // The durable profile proves this is a fresh sign-in outside the old
-      // chain. Retire the obsolete escrow before refreshing the new grant.
-      await this.ctx.storage.delete(key);
-      existing = null;
-    }
-    if (profileGrant && profileGrant.accessToken !== incoming.accessToken) {
-      return json({ error: "stale_grant" }, 409);
-    }
-
-    const appliedChains = new Map<string, string[]>();
-    const grant = existing?.token.accessToken === incoming.accessToken ? existing.token : incoming;
-    if (existing?.token.accessToken === grant.accessToken) {
-      appliedChains.set(serverId, existing.bases);
-    }
-    const profileAnchor = profileGrant?.accessToken ?? null;
-    const server = {
-      id: serverId,
-      name: serverId,
-      kind: "mcp" as const,
-      url: grant.mcpUrl ?? grant.tokenEndpoint,
-      headers: {},
-      omitMcpHeaders: false,
-      disabledTools: [],
-      oauth: grant,
-    };
-    const persist = async (rotated: RefreshedOAuth): Promise<void> => {
-      const latestProfile = (await this.profileOAuthTokens(owner))[serverId];
-      if (
-        (profileAnchor !== null && latestProfile?.accessToken !== profileAnchor && latestProfile?.accessToken !== rotated.token.accessToken) ||
-        (profileAnchor === null && latestProfile && latestProfile.accessToken !== rotated.baseAccessToken && latestProfile.accessToken !== rotated.token.accessToken)
-      ) {
-        throw new Error("stale OAuth refresh result");
-      }
-      const latestOverride = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(key));
-      if (latestOverride?.bases.includes(rotated.baseAccessToken)) {
-        throw new Error("OAuth refresh already committed");
-      }
-      if (
-        latestOverride &&
-        latestOverride.token.accessToken !== rotated.baseAccessToken &&
-        latestOverride.token.accessToken !== rotated.token.accessToken
-      ) {
-        throw new Error("stale OAuth refresh result");
-      }
-      if (latestOverride) {
-        appliedChains.set(serverId, latestOverride.bases);
-      }
-      const bases = chainRotationBases(appliedChains, rotated);
-      await this.persistCanonicalOAuthGrant(owner, rotated);
-      appliedChains.set(serverId, bases);
-    };
-
-    try {
-      const outcome = await refreshCloudOAuthGrant(
-        server,
-        persist,
-        (id) => this.markOAuthRefreshStarted(owner, id),
-      );
-      if (outcome.ok === false) {
-        await this.recordOAuthFailure(owner, serverId, outcome);
-        const status = outcome.transient ? (outcome.status === 429 ? 429 : 503) : 400;
-        return json(
-          { error: outcome.code, transient: outcome.transient },
-          status,
-        );
-      }
-      return json({ ok: true, credentialStored: true, replayed: false });
-    } catch {
-      // A sibling request may have durably committed the shared provider
-      // response first. Return that winner; otherwise keep the caller's local
-      // grant untouched and let a later retry reconcile it.
-      const winner = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(key));
-      if (winner?.bases.includes(incoming.accessToken)) {
-        this.markOAuthReady(owner, serverId);
-        return json({ ok: true, credentialStored: true, replayed: true });
-      }
-      return json({ error: "refresh_commit_unavailable", transient: true }, 503);
-    }
-  }
-
-  /**
-   * GET /mcp/oauth-rotations — raw rotation overrides for this account. The
-   * browser calls this as a last resort before dropping a sign-in whose
-   * refresh was rejected: when a server run already rotated the grant while
-   * the browser slept, the browser adopts the fresh pair instead of forcing
-   * a new sign-in.
-   */
-  private async handleOAuthRotations(_email: string): Promise<Response> {
-    // Compatibility endpoint intentionally returns proof only. Provider grants
-    // never leave the account shard in browser-facing responses.
-    return json({ rotations: [], serverOwned: true });
-  }
-
-  /** Internal Worker-only lease; provider credentials never cross the public response. */
-  private async handleMcpAuthLease(request: Request, owner: string): Promise<Response> {
-    let body: { serverId?: unknown; catalogId?: unknown; force?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const serverId = typeof body.serverId === "string" ? body.serverId : "";
-    const catalogId = typeof body.catalogId === "string" ? body.catalogId : "";
-    if (!isValidId(serverId) || (catalogId && !isValidId(catalogId))) {
-      return json({ error: "invalid_server" }, 400);
-    }
-    const nativeGithub = (catalogId || serverId) === "github";
-    const ids = [
-      ...new Set([
-        serverId,
-        ...(catalogId && catalogId !== serverId ? [catalogId] : []),
-        // Device-flow GitHub commits its grant under the canonical "github"
-        // id; instance cards must resolve it regardless of their own id.
-        ...(nativeGithub ? ["github"] : []),
-      ]),
-    ];
-    for (const id of ids) {
-      const secret = await this.mcpServerSecret(owner, id);
-      if (secret.token) {
-        const authorization = /^Bearer\s/i.test(secret.token) ? secret.token : `Bearer ${secret.token}`;
-        return json({ authorization });
-      }
-    }
-    const storedGrants = new Map<string, CloudOAuthToken>();
-    for (const id of ids) {
-      const stored = await this.rawOAuthGrant(owner, id);
-      if (stored) {
-        storedGrants.set(id, stored);
-      }
-    }
-    // A stale blocked marker must never hide a physically present grant: a
-    // fresh sign-in is the recovery path and has to be tried. Fail closed on
-    // the marker only when no grant exists at all.
-    const blockedState = storedGrants.size === 0
-      ? ids
-          .map((id) => this.oauthGrantState(owner, id))
-          .find((state) => state === "reauth_required" || state === "step_up_required")
-      : undefined;
-    if (blockedState) {
-      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
-    }
-    const tokens = await this.profileOAuthTokens(owner);
-    for (const [id, stored] of storedGrants) {
-      if (!tokens[id]) {
-        tokens[id] = stored;
-      }
-    }
-    const grantId = ids.find((id) => Boolean(tokens[id]));
-    if (!grantId) {
-      // Metadata only — never token material. Tells the caller exactly which
-      // ids were consulted and why each one cannot authenticate.
-      const detail = ids.map((id) => this.oauthDiagnostic(owner, id));
-      return json({ error: "server_auth_missing", detail }, 404);
-    }
-    const grant = tokens[grantId];
-    const server = {
-      id: grantId,
-      name: grantId,
-      kind: "mcp" as const,
-      url: grant.mcpUrl ?? grant.tokenEndpoint,
-      headers: {},
-      omitMcpHeaders: false,
-      disabledTools: [],
-      oauth: grant,
-    };
-    const refreshed: RefreshedOAuth[] = [];
-    if (body.force === true) {
-      const outcome = await forceRefreshCloudOAuthOutcome(
-        server,
-        refreshed,
-        (rotated) => this.persistCanonicalOAuthGrant(owner, rotated),
-        (id) => this.markOAuthRefreshStarted(owner, id),
-      );
-      if (outcome.ok === false) {
-        await this.recordOAuthFailure(owner, grantId, outcome);
-        return json({ error: outcome.transient ? "retryable_error" : this.oauthGrantState(owner, grantId) }, outcome.transient ? 503 : 401);
-      }
-    } else {
-      const outcome = await ensureFreshCloudOAuth(
-        server,
-        refreshed,
-        (rotated) => this.persistCanonicalOAuthGrant(owner, rotated),
-        (id) => this.markOAuthRefreshStarted(owner, id),
-      );
-      if (outcome?.ok === false) {
-        await this.recordOAuthFailure(owner, grantId, outcome);
-        return json({ error: outcome.transient ? "retryable_error" : this.oauthGrantState(owner, grantId) }, outcome.transient ? 503 : 401);
-      }
-    }
-    if (storedGrants.has(grantId) && !pendingStepUp(this.ctx.storage.sql, owner, grantId)) {
-      // The grant is durable and just leased successfully — clear any stale
-      // reauth/step-up marker so later leases stop tripping over it (a pending
-      // insufficient_scope step-up waits for the wider sign-in instead).
-      this.markOAuthReady(owner, grantId);
-    }
-    return json({ authorization: `Bearer ${server.oauth?.accessToken ?? grant.accessToken}` });
-  }
-
-  /**
-   * POST /mcp/resolve — internal: resolves this account's connected MCP
-   * servers for a project agent run. Body: `{ ids, force? }`. Reuses the
-   * exact cloud-automation pipeline (profile blob + rotation overlays);
-   * expiring — or force-listed — sign-ins are refreshed here and the rotated
-   * pairs persist to this shard, so browsers and later runs adopt them.
-   * Returns fully resolved servers; credentials never leave the backend.
-   */
-  private async handleMcpResolve(request: Request, owner: string): Promise<Response> {
-    let body: unknown = null;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "bad_json" }, 400);
-    }
-    const ids =
-      isRecord(body) && Array.isArray(body.ids)
-        ? body.ids.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
-        : [];
-    const force = new Set(
-      isRecord(body) && Array.isArray(body.force)
-        ? body.force.filter((item): item is string => typeof item === "string")
-        : [],
-    );
-    if (ids.length === 0) {
-      return json({ servers: [] });
-    }
-    const resolved = await this.resolveOwnerMcpServers(owner, ids, force);
-    if (!resolved) {
-      return json({ servers: [] });
-    }
-    // Project agents inherit the linking account's loading mode and its
-    // catalog cache, so their runs can defer without a fresh handshake.
-    const catalog = createSqlMcpCatalogStore(this.ctx.storage.sql, owner);
-    return json({
-      servers: resolved.servers,
-      toolLoading: resolved.toolLoading,
-      catalog: resolved.servers.flatMap((server) => {
-        const entry = catalog.read(server.id);
-        return entry ? [entry] : [];
-      }),
-    });
-  }
-
-  /** Seam for the prompt/resource routes (mcp-routes.ts): storage plus server resolution. */
-  private mcpRouteContext(): McpRouteContext {
-    return {
-      sql: this.ctx.storage.sql,
-      resolveServers: async (owner, ids) => (await this.resolveOwnerMcpServers(owner, ids, new Set()))?.servers ?? [],
-      seal: (plain, scope) => this.vault.seal(plain, scope),
-      subject: (owner) => this.scope.subject(owner),
-    };
-  }
-
-  /**
-   * The owner's connected generic MCP servers for the given ids with auth
-   * attached and expiring grants refreshed (forced for ids in `force`).
-   * Null when the account has no profile yet.
-   */
-  private async resolveOwnerMcpServers(
-    owner: string,
-    ids: string[],
-    force: Set<string>,
-  ): Promise<{ servers: CloudMcpServer[]; toolLoading: McpToolLoadingMode } | null> {
-    const profileRow = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
-    let parsed: unknown = null;
-    if (profileRow) {
-      try {
-        parsed = JSON.parse(profileRow.payload);
-      } catch {
-        parsed = null;
-      }
-    }
-    if (!isRecord(parsed) || !isRecord(parsed.settings)) {
-      return null;
-    }
-    const oauthTokens = await this.profileOAuthTokens(owner);
-    const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
-    const overrideRows = await this.ctx.storage.list<unknown>({ prefix });
-    const rotations: OAuthRotation[] = [];
-    for (const [key, value] of overrideRows) {
-      const rotation = await this.readRotation(owner, key.slice(prefix.length), value);
-      if (rotation) {
-        rotations.push(rotation);
-      }
-    }
-    const { appliedChains } = overlayOAuthRotations(oauthTokens, rotations);
-    const servers = cloudMcpServersForAutomation(
-      await this.mcpConfigsWithSecrets(owner, parsed.settings.mcpServers),
-      ids,
-      oauthTokens,
-    ).filter(
-      (server) => server.kind === "mcp",
-    );
-    const refreshed: RefreshedOAuth[] = [];
-    const unavailable = new Set<string>();
-    const persistOAuth = async (rotated: RefreshedOAuth): Promise<void> => {
-      await this.persistCanonicalOAuthGrant(owner, rotated);
-      const bases = chainRotationBases(appliedChains, rotated);
-      appliedChains.set(rotated.serverId, bases);
-    };
-    for (const server of servers) {
-      if (!server.oauth) {
-        continue;
-      }
-      const outcome = force.has(server.id)
-        ? await forceRefreshCloudOAuthOutcome(
-            server,
-            refreshed,
-            persistOAuth,
-            (id) => this.markOAuthRefreshStarted(owner, id),
-          )
-        : await ensureFreshCloudOAuth(
-            server,
-            refreshed,
-            persistOAuth,
-            (id) => this.markOAuthRefreshStarted(owner, id),
-          );
-      if (outcome?.ok === false) {
-        await this.recordOAuthFailure(owner, server.id, outcome);
-        if (!outcome.transient || force.has(server.id)) {
-          unavailable.add(server.id);
-        }
-      }
-    }
-    return {
-      servers: servers.filter((server) => !unavailable.has(server.id)),
-      toolLoading: normalizeMcpToolLoading(parsed.settings.mcpToolLoading),
-    };
-  }
-
-  /**
-   * Rotation overrides that still apply to the stored profile blob — the
-   * sync response carries them so connected browsers adopt server-rotated
-   * grants. Dead overrides (blob caught up, server signed out, or replaced
-   * by a fresh sign-in) are pruned here, so the common case stays empty and
-   * costs one storage list.
-   */
-  private async pendingOAuthRotations(
-    owner: string,
-    blobPayload: string | null,
-  ): Promise<OAuthRotation[] | undefined> {
-    const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
-    const rows = await this.ctx.storage.list<unknown>({ prefix });
-    if (rows.size === 0) {
-      return undefined;
-    }
-    let payload = blobPayload;
-    if (payload === null) {
-      const row = this.ctx.storage.sql
-        .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-        .toArray()[0];
-      payload = row?.payload ?? null;
-    }
-    let parsed: unknown = null;
-    if (payload) {
-      try {
-        parsed = JSON.parse(payload);
-      } catch {
-        parsed = null;
-      }
-    }
-    const tokens = cloudOAuthTokens(isRecord(parsed) ? parsed.mcpOAuth : undefined);
-    const rotations: OAuthRotation[] = [];
-    for (const [key, value] of rows) {
-      const rotation = await this.readRotation(owner, key.slice(prefix.length), value);
-      if (rotation) {
-        rotations.push(rotation);
-      } else {
-        await this.ctx.storage.delete(key);
-      }
-    }
-    const { appliedChains, staleIds } = overlayOAuthRotations(tokens, rotations);
-    for (const id of staleIds) {
-      await this.ctx.storage.delete(`${prefix}${id}`);
-    }
-    const live = rotations.filter((rotation) => appliedChains.has(rotation.serverId));
-    return live.length > 0 ? live : undefined;
   }
 
   /**
@@ -3396,6 +1646,72 @@ export class ChatStore extends DurableObject {
    * receives — those handlers live in chat-migration-routes.ts and must not
    * see the rest of the Durable Object.
    */
+  /**
+   * `/mcp/*` dispatch: connection check, worker-internal credential routes,
+   * composer menus, the browser sign-in state machine and the GitHub device
+   * flow. Null for paths this family does not own.
+   */
+  private routeMcp(request: Request, pathname: string, email: string): Promise<Response> | Response | null {
+    const method = request.method;
+    switch (pathname) {
+      case "/mcp/oauth-rotations":
+        return method === "GET" ? handleOAuthRotations() : null;
+      case "/mcp/oauth-start":
+        return method === "POST" ? handleMcpOAuthStart(this.mcpRouteContext(), request, email) : null;
+      case "/mcp/github-device-start":
+        return method === "POST" ? handleGitHubDeviceStart(this.oauthRouteContext(), email) : null;
+      case "/mcp/github-device-status":
+        return method === "GET" ? handleGitHubDeviceStatus(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/oauth-status":
+        return method === "GET" ? handleOAuthStatus(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/oauth-complete":
+        return method === "POST" ? handleOAuthComplete(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/oauth-callback":
+        return method === "POST" ? handleOAuthCallback(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/oauth-store":
+        return method === "POST" ? handleOAuthStore(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/oauth-clear":
+        return method === "POST" ? handleOAuthClear(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/oauth-refresh":
+        return method === "POST" ? handleBrowserOAuthRefresh(this.oauthRouteContext(), request, email) : null;
+      case "/mcp/check":
+        return method === "POST" ? handleMcpCheck(this.oauthStore, request, email) : null;
+      case "/mcp/inventory":
+        return method === "POST" ? handleMcpInventory(this.mcpRouteContext(), request, email) : null;
+      case "/mcp/prompt-get":
+        return method === "POST" ? handleMcpPromptGet(this.mcpRouteContext(), request, email) : null;
+      case "/mcp/resource-read":
+        return method === "POST" ? handleMcpResourceRead(this.mcpRouteContext(), request, email) : null;
+      // Internal (worker-only — no public relay forwards these paths): project
+      // agents resolve their linked MCP servers through this account.
+      case "/mcp/resolve":
+        return method === "POST" ? handleMcpResolve(this.oauthStore, request, email) : null;
+      case "/mcp/auth-lease":
+        return method === "POST" ? handleMcpAuthLease(this.oauthStore, request, email) : null;
+      default:
+        return null;
+    }
+  }
+
+  /** Seam for the menu / oauth-start routes (mcp-routes.ts): storage plus server resolution. */
+  private mcpRouteContext(): McpRouteContext {
+    return {
+      sql: this.ctx.storage.sql,
+      resolveServers: async (owner, ids) => (await resolveOwnerMcpServers(this.oauthStore, owner, ids, new Set()))?.servers ?? [],
+      seal: (plain, scope) => this.vault.seal(plain, scope),
+      subject: (owner) => this.scope.subject(owner),
+    };
+  }
+
+  /** Seam for the sign-in state machine and device flow (mcp-oauth-routes.ts). */
+  private oauthRouteContext(): McpOAuthRouteContext {
+    return {
+      ...this.oauthStore,
+      transactionSync: (closure) => this.ctx.storage.transactionSync(closure),
+      githubClientId: this.workerEnv.EXPO_PUBLIC_GITHUB_OAUTH_CLIENT_ID ?? "",
+    };
+  }
+
   private routeContext(): ChatStoreRouteContext {
     return {
       sql: this.ctx.storage.sql,
@@ -3549,7 +1865,7 @@ export class ChatStore extends DurableObject {
       // Profile and automation allow-lists intersect exactly like browser
       // runs; a cloud schedule can never resurrect GitHub excluded by its profile.
       mcpServers: cloudMcpServersForAutomation(
-        await this.mcpConfigsWithSecrets(owner, settings.mcpServers),
+        await mcpConfigsWithSecrets(this.oauthStore, owner, settings.mcpServers),
         intersectMcpAllowIds(settings.mcpServers, agent?.mcpServerIds, auto.mcpServerIds),
         oauthTokens,
       ),

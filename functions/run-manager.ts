@@ -35,26 +35,24 @@ import { createRunPauseBoard, type RunPauseBoard } from "./run-pause";
 import { deriveCodeChangeFlow, finalizeCodeChangeFlow, mergeRunCodeChangeStates } from "./code-change-flow";
 import {
   blockedCloudServerFailures,
-  chainRotationBases,
   cloudMcpServersForAutomation,
-  cloudOAuthTokens,
   ensureFreshCloudOAuth,
   forceRefreshCloudOAuthOutcome,
-  normalizeOAuthOverride,
-  overlayOAuthRotations,
   unlockGithubChatWrites,
   type CloudMcpServer,
-  type CloudOAuthRefreshFailure,
-  type CloudOAuthToken,
-  type OAuthRotation,
   type RefreshedOAuth,
 } from "./mcp-cloud";
 import { modelAcceptsImages } from "./model-catalog";
-import { recordRequiredScopes } from "./mcp-oauth-scopes";
+import {
+  markOAuthRefreshStarted,
+  oauthTokensWithRotations,
+  persistRefreshedGrant,
+  recordOAuthFailure,
+  type OAuthStoreContext,
+} from "./mcp-oauth-store";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
-import { openGrantPayload, openRotationValue, sealGrantPayload } from "./secret-rows";
 import { CredentialScope } from "./vault-scope";
-import { SecretVault, SecretVaultError } from "./secret-vault";
+import { SecretVault } from "./secret-vault";
 import { runServerJulius } from "./julius-runner";
 import { callGitHubNativeTool, fetchGitHubRepoMeta, githubRunRepoRefs } from "./native-github";
 import {
@@ -92,7 +90,6 @@ const CHAT_PAYLOAD_LIMIT = 900_000;
 const TITLE_LIMIT = 160;
 const ID_LIMIT = 80;
 const MAX_CHATS_PER_OWNER = 500;
-const OAUTH_REF_PREFIX = "oauthref:";
 
 /** Finished, unacked results stay listable this long for reopened tabs. */
 const RESULT_RETENTION_MS = 30 * 60_000;
@@ -259,6 +256,8 @@ export class RunManager {
   private readonly vault: SecretVault;
   /** Shared with the owning ChatStore: which subject the vault scopes are bound to. */
   private readonly scope: CredentialScope;
+  /** Credential store seam (mcp-oauth-store.ts) shared with ChatStore — same tables, one state machine. */
+  private readonly oauthStore: OAuthStoreContext;
   private readonly live = new Map<string, LiveRun>();
 
   constructor(ctx: DurableObjectState, env: unknown, scope: CredentialScope = new CredentialScope()) {
@@ -266,6 +265,12 @@ export class RunManager {
     this.env = (env ?? {}) as ManagerEnv;
     this.vault = SecretVault.fromEnv(env);
     this.scope = scope;
+    this.oauthStore = {
+      sql: this.ctx.storage.sql,
+      storage: this.ctx.storage,
+      vault: this.vault,
+      subject: (owner) => this.scope.subject(owner),
+    };
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_runs (
         owner_email TEXT NOT NULL,
@@ -895,7 +900,7 @@ export class RunManager {
 
     if (run.kind === "research") {
       try {
-        const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
+        const { tokens: oauthTokens, appliedChains } = await oauthTokensWithRotations(this.oauthStore, run.owner);
         // Research keeps GitHub native (its deterministic repo preload reads
         // the route directly) and reaches every other connected server
         // through the deferred meta functions — never one function per tool.
@@ -911,9 +916,9 @@ export class RunManager {
               // honestly instead of pausing a research run.
               policy,
               onJournal,
-              persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
-              reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
-              beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+              persist: (rotated) => persistRefreshedGrant(this.oauthStore, run.owner, rotated, appliedChains),
+              reportFailure: (id, outcome) => recordOAuthFailure(this.oauthStore, run.owner, id, outcome),
+              beginRefresh: (id) => markOAuthRefreshStarted(this.oauthStore, run.owner, id),
             })
           : idleToolset();
         run.closeToolset = () => researchToolset.close();
@@ -986,7 +991,7 @@ export class RunManager {
         // the same route to independently check their repository claims.
         let juliusMcp: McpToolset = idleToolset();
         if (durableMcpConfigs.length > 0) {
-          const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
+          const { tokens: oauthTokens, appliedChains } = await oauthTokensWithRotations(this.oauthStore, run.owner);
           const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens).filter(
             (server) => server.kind === "github",
           );
@@ -996,9 +1001,9 @@ export class RunManager {
                 mode: "native",
                 surface: "interactive",
                 catalog,
-                persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
-                reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
-                beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+                persist: (rotated) => persistRefreshedGrant(this.oauthStore, run.owner, rotated, appliedChains),
+                reportFailure: (id, outcome) => recordOAuthFailure(this.oauthStore, run.owner, id, outcome),
+                beginRefresh: (id) => markOAuthRefreshStarted(this.oauthStore, run.owner, id),
               })
             : idleToolset();
         }
@@ -1084,7 +1089,7 @@ export class RunManager {
     let mcp: McpToolset = idleToolset();
     if (durableMcpConfigs.length > 0) {
       try {
-        const { tokens: oauthTokens, appliedChains, blocked } = await this.oauthTokensFor(run.owner);
+        const { tokens: oauthTokens, appliedChains, blocked } = await oauthTokensWithRotations(this.oauthStore, run.owner);
         const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens);
         mcp = servers.length > 0
           ? await resolveMcpToolset({
@@ -1095,9 +1100,9 @@ export class RunManager {
               catalog,
               policy,
               onJournal,
-              persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
-              reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
-              beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+              persist: (rotated) => persistRefreshedGrant(this.oauthStore, run.owner, rotated, appliedChains),
+              reportFailure: (id, outcome) => recordOAuthFailure(this.oauthStore, run.owner, id, outcome),
+              beginRefresh: (id) => markOAuthRefreshStarted(this.oauthStore, run.owner, id),
               // Per-request credential lease: the vault row is opened for each MCP
               // request and forgotten after it; nothing is retained on the session.
               credentials: (id, { force }) => this.leaseServerCredential(run.owner, config.mcpServers, id, force, appliedChains),
@@ -2255,218 +2260,25 @@ export class RunManager {
     appliedChains: Map<string, string[]>,
   ): Promise<CloudMcpServer | null> {
     const configs = this.profileMcpConfigsForRun(owner, requested);
-    const { tokens } = await this.oauthTokensFor(owner);
+    const { tokens } = await oauthTokensWithRotations(this.oauthStore, owner);
     const server = cloudMcpServersForAutomation(configs, [serverId], tokens).find((item) => item.id === serverId) ?? null;
     if (!server || server.kind !== "mcp") {
       return null;
     }
     if (server.oauth) {
       const refreshed: RefreshedOAuth[] = [];
-      const persist = (rotated: RefreshedOAuth): Promise<void> => this.persistRefreshedGrant(owner, rotated, appliedChains);
-      const begin = (id: string): Promise<void> => this.markOAuthRefreshStarted(owner, id);
+      const persist = (rotated: RefreshedOAuth): Promise<void> => persistRefreshedGrant(this.oauthStore, owner, rotated, appliedChains);
+      const begin = (id: string): Promise<void> => markOAuthRefreshStarted(this.oauthStore, owner, id);
       const outcome = force
         ? await forceRefreshCloudOAuthOutcome(server, refreshed, persist, begin)
         : await ensureFreshCloudOAuth(server, refreshed, persist, begin);
       if (outcome?.ok === false) {
-        await this.recordOAuthFailure(owner, serverId, outcome);
+        await recordOAuthFailure(this.oauthStore, owner, serverId, outcome);
         if (force || !outcome.transient) {
           return null;
         }
       }
     }
     return server;
-  }
-
-  private async markOAuthRefreshStarted(owner: string, serverId: string): Promise<void> {
-    const now = Date.now();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO mcp_oauth_states
-        (owner_email, server_id, state, error_code, retry_after, updated_at)
-       VALUES (?, ?, 'refreshing', '', 0, ?)
-       ON CONFLICT(owner_email, server_id) DO UPDATE SET
-         state = CASE
-           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN 'refresh_unknown'
-           ELSE 'refreshing'
-         END,
-         error_code = CASE
-           WHEN mcp_oauth_states.state = 'refresh_unknown' THEN mcp_oauth_states.error_code
-           ELSE ''
-         END,
-         retry_after = 0,
-         updated_at = excluded.updated_at`,
-      owner,
-      serverId,
-      now,
-    );
-  }
-
-  private oauthGrantState(owner: string, serverId: string): string {
-    return this.ctx.storage.sql
-      .exec<{ state: string }>(
-        "SELECT state FROM mcp_oauth_states WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      )
-      .toArray()[0]?.state ?? "ready";
-  }
-
-  private async recordOAuthFailure(
-    owner: string,
-    serverId: string,
-    outcome: CloudOAuthRefreshFailure,
-  ): Promise<void> {
-    const previousState = this.oauthGrantState(owner, serverId);
-    const stepUpCodes = new Set(["interaction_required", "consent_required", "insufficient_scope", "invalid_scope"]);
-    const followsUnknownRotation = previousState === "refresh_unknown" && outcome.code === "invalid_grant";
-    const state = outcome.transient
-      ? outcome.ambiguous ? "refresh_unknown" : "retryable_error"
-      : followsUnknownRotation || stepUpCodes.has(outcome.code)
-        ? "step_up_required"
-        : "reauth_required";
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO mcp_oauth_states
-        (owner_email, server_id, state, error_code, retry_after, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      owner,
-      serverId,
-      state,
-      capStr(outcome.code, 120),
-      outcome.transient ? Date.now() + 30_000 : 0,
-      Date.now(),
-    );
-    if (state === "step_up_required" && outcome.requiredScopes) {
-      // The next sign-in widens its request by these; only a completed sign-in clears them.
-      recordRequiredScopes(this.ctx.storage.sql, owner, serverId, outcome.requiredScopes, outcome.code);
-    }
-  }
-
-  private markOAuthReady(owner: string, serverId: string): void {
-    this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO mcp_oauth_states
-        (owner_email, server_id, state, error_code, retry_after, updated_at)
-       VALUES (?, ?, 'ready', '', 0, ?)`,
-      owner,
-      serverId,
-      Date.now(),
-    );
-  }
-
-  private async oauthTokensFor(
-    owner: string,
-  ): Promise<{ tokens: Record<string, CloudOAuthToken>; appliedChains: Map<string, string[]>; blocked: Map<string, string> }> {
-    const profileRow = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
-    let parsed: unknown = null;
-    if (profileRow) {
-      try {
-        parsed = JSON.parse(profileRow.payload);
-      } catch {
-        parsed = null;
-      }
-    }
-    const raw =
-      parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>).mcpOAuth
-        : undefined;
-    const tokens = cloudOAuthTokens(raw);
-    const durableRows = this.ctx.storage.sql
-      .exec<{ server_id: string; payload: string }>(
-        "SELECT server_id, payload FROM mcp_oauth_grants WHERE owner_email = ?",
-        owner,
-      )
-      .toArray();
-    for (const row of durableRows) {
-      // Sealed at rest; a row this key cannot open authenticates nothing and
-      // surfaces as a missing grant rather than a crashed run.
-      try {
-        const token = await openGrantPayload(this.vault, this.scope.subject(owner), row.server_id, row.payload);
-        if (token) tokens[row.server_id] = token;
-      } catch (error) {
-        if (!(error instanceof SecretVaultError)) throw error;
-        console.error("oauth grant unreadable", row.server_id, error.code);
-      }
-    }
-    const revoked = this.ctx.storage.sql
-      .exec<{ server_id: string }>(
-        "SELECT server_id FROM mcp_oauth_revocations WHERE owner_email = ?",
-        owner,
-      )
-      .toArray();
-    for (const row of revoked) {
-      delete tokens[row.server_id];
-    }
-    const blockedRows = this.ctx.storage.sql
-      .exec<{ server_id: string; state: string }>(
-        "SELECT server_id, state FROM mcp_oauth_states WHERE owner_email = ? AND state IN ('reauth_required', 'step_up_required')",
-        owner,
-      )
-      .toArray();
-    const blocked = new Map<string, string>();
-    for (const row of blockedRows) {
-      delete tokens[row.server_id];
-      blocked.set(row.server_id, row.state);
-    }
-    const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
-    const rows = await this.ctx.storage.list<unknown>({ prefix });
-    const rotations: OAuthRotation[] = [];
-    for (const [key, value] of rows) {
-      const serverId = key.slice(prefix.length);
-      let opened: unknown = null;
-      try {
-        opened = await openRotationValue(this.vault, this.scope.subject(owner), serverId, value);
-      } catch (error) {
-        if (!(error instanceof SecretVaultError)) throw error;
-      }
-      const rotation = normalizeOAuthOverride(serverId, opened);
-      if (rotation) {
-        rotations.push(rotation);
-      } else {
-        await this.ctx.storage.delete(key); // malformed or unreadable — cannot authenticate anything
-      }
-    }
-    const { appliedChains, staleIds } = overlayOAuthRotations(tokens, rotations);
-    for (const id of staleIds) {
-      await this.ctx.storage.delete(`${prefix}${id}`); // caught up or replaced by a fresh sign-in
-    }
-    return { tokens, appliedChains, blocked };
-  }
-
-  /**
-   * Persists grants rotated during the run — losing them would strand later
-   * runs AND the browser's synced copy. The chain stays anchored to the
-   * browser-synced token, so sync (and the browser's rescue call) can
-   * recognize the rotation and hand the fresh pair back.
-   */
-  private async persistRefreshedGrant(
-    owner: string,
-    rotated: RefreshedOAuth,
-    appliedChains: Map<string, string[]>,
-  ): Promise<void> {
-    // SQL is the canonical grant source. Calling the same resolver used by
-    // run arming also overlays a still-live legacy rotation, so old accounts
-    // migrate safely without letting the deleted profile.mcpOAuth field make
-    // every new server-owned grant look stale.
-    const { tokens: currentTokens } = await this.oauthTokensFor(owner);
-    const currentAccess = currentTokens[rotated.serverId]?.accessToken;
-    if (currentAccess !== rotated.baseAccessToken && currentAccess !== rotated.token.accessToken) {
-      throw new Error("stale OAuth refresh result");
-    }
-    const bases = chainRotationBases(appliedChains, rotated);
-    this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-      owner,
-      rotated.serverId,
-      await sealGrantPayload(this.vault, this.scope.subject(owner), rotated.serverId, rotated.token),
-      Date.now(),
-    );
-    this.ctx.storage.sql.exec(
-      "DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-      owner,
-      rotated.serverId,
-    );
-    this.markOAuthReady(owner, rotated.serverId);
-    await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`);
-    appliedChains.set(rotated.serverId, bases);
   }
 }

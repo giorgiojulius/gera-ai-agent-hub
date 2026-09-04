@@ -1,23 +1,33 @@
-// Account-shard MCP routes that go beyond tools: the composer's prompt (`/`)
-// and resource (`@`) menus. Connection and credentials stay server-side — the
-// browser only names a server id, a prompt name / resource URI, and
-// arguments. Handlers are plain functions over a small seam (`McpRouteContext`)
-// so ChatStore's dispatch stays a few lines and the logic is unit-testable.
+// Account-shard MCP routes: the connection check (`/mcp/check`), the
+// worker-internal credential routes project agents use (`/mcp/resolve`,
+// `/mcp/auth-lease`), the composer's prompt (`/`) and resource (`@`) menus
+// and `/mcp/oauth-start` (discovery with pinned scopes / metadata override,
+// dynamic registration, the PKCE pending row). Connection and credentials
+// stay server-side — the browser only names a server id, a prompt name /
+// resource URI, and arguments.
 //
-// `/mcp/oauth-start` (Phase 3) lives here too: discovery with pinned scopes /
-// metadata override, dynamic registration, the PKCE pending row. Phase 6 moves
-// the remaining `/mcp/*` handlers (check, resolve, auth-lease, the rest of the
-// OAuth state machine) here through the same seam.
+// Handlers are plain functions over small seams so ChatStore's dispatch stays
+// one line per route and the logic is unit-testable with SQL stubs:
+// `McpRouteContext` for the menu/oauth-start routes (storage + server
+// resolution) and the credential store's `OAuthStoreContext` for check /
+// resolve / auth-lease. The browser sign-in state machine lives in
+// mcp-oauth-routes.ts, the grant/state store in mcp-oauth-store.ts.
 
-import { capStr, isValidId, type ChatSql } from "./chat-shared";
+import { capStr, isPlaceholderCredential, isValidId, type ChatSql } from "./chat-shared";
 import { parseScopeString } from "./mcp-auth-challenge";
 import {
+  chainRotationBases,
+  cloudMcpServersForAutomation,
   connectCloudMcp,
+  ensureFreshCloudOAuth,
+  forceRefreshCloudOAuthOutcome,
   getCloudMcpPrompt,
   readCloudMcpResource,
   redactCloudMcpText,
   cloudServerRedactions,
   type CloudMcpServer,
+  type CloudOAuthToken,
+  type RefreshedOAuth,
 } from "./mcp-cloud";
 import {
   buildAuthorizationUrl,
@@ -27,10 +37,30 @@ import {
   pkceChallenge,
   registerDynamicOAuthClient,
 } from "./mcp-oauth-flow";
-import { planAuthorizationScopes, readOAuthScopes, recordRequestedScopes } from "./mcp-oauth-scopes";
-import { DEFERRED_TOOLS_PER_SERVER, CATALOG_TTL_MS, catalogHasInventory, createSqlMcpCatalogStore } from "./mcp-toolset";
+import { pendingStepUp, planAuthorizationScopes, readOAuthScopes, recordRequestedScopes } from "./mcp-oauth-scopes";
+import {
+  isBlockedOAuthState,
+  markOAuthReady,
+  markOAuthRefreshStarted,
+  mcpServerSecret,
+  oauthDiagnostic,
+  oauthGrantState,
+  persistCanonicalOAuthGrant,
+  profileOAuthTokens,
+  rawOAuthGrant,
+  recordOAuthFailure,
+  resolveOwnerMcpServers,
+  type OAuthStoreContext,
+} from "./mcp-oauth-store";
+import {
+  DEFERRED_TOOLS_PER_SERVER,
+  CATALOG_TTL_MS,
+  catalogHasInventory,
+  createSqlMcpCatalogStore,
+  resolveMcpToolset,
+} from "./mcp-toolset";
 import type { McpFetch } from "./mcp-protocol";
-import { oauthPendingFieldScope } from "./secret-rows";
+import { oauthPendingFieldScope, sealServerSecret, type ServerSecret } from "./secret-rows";
 
 export type McpRouteContext = {
   sql: ChatSql;
@@ -314,6 +344,368 @@ export async function handleMcpOAuthStart(ctx: McpRouteContext, request: Request
   } catch (error) {
     return json({ error: capStr(error instanceof Error ? error.message : "oauth_start_failed", 300) }, 502);
   }
+}
+
+/**
+ * POST /mcp/check { server } — server-side connection check; credentials,
+ * refresh and the MCP session stay in this shard. A pasted key/header pair
+ * is sealed into `mcp_server_secrets` first; the arm then uses only
+ * shard-resolved secrets or the account's OAuth grant and returns the
+ * complete remote tool table (disabled-tool preferences apply at run time).
+ */
+export async function handleMcpCheck(ctx: OAuthStoreContext, request: Request, owner: string): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid_body" }, 400);
+  }
+  const rawServer = isRecord(body) && isRecord(body.server) ? body.server : null;
+  const serverId = rawServer && typeof rawServer.id === "string" ? rawServer.id : "";
+  if (!rawServer || !isValidId(serverId)) {
+    return json({ error: "invalid_server" }, 400);
+  }
+  const secret = {
+    token:
+      typeof rawServer.token === "string" && !isPlaceholderCredential(rawServer.token)
+        ? rawServer.token
+        : "",
+    headersJson: typeof rawServer.headersJson === "string" ? rawServer.headersJson : "",
+  };
+  const catalogId = typeof rawServer.catalogId === "string" ? rawServer.catalogId : "";
+  if (rawServer.credentialStored === false && !secret.token && !secret.headersJson) {
+    ctx.sql.exec("DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?", owner, serverId);
+  }
+  if (secret.token || secret.headersJson) {
+    ctx.sql.exec(
+      "INSERT OR REPLACE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+      owner,
+      serverId,
+      await sealServerSecret(ctx.vault, ctx.subject(owner), serverId, secret),
+      Date.now(),
+    );
+  }
+  const storedSecret = await mcpServerSecret(ctx, owner, serverId);
+  const legacyCatalogSecret: ServerSecret =
+    catalogId && catalogId !== serverId ? await mcpServerSecret(ctx, owner, catalogId) : {};
+  let resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
+  const nativeGithub = (catalogId || serverId) === "github";
+  if (nativeGithub && !resolvedSecret.token) {
+    // Native GitHub talks REST with a bearer token only. A leftover
+    // headers-style secret can neither authenticate it nor should it mask
+    // the OAuth grant path.
+    resolvedSecret = {};
+  }
+  const authMode =
+    rawServer.authMode === "none" ||
+    rawServer.authMode === "bearer" ||
+    rawServer.authMode === "headers" ||
+    rawServer.authMode === "oauth"
+      ? rawServer.authMode
+      : "auto";
+  const reliesOnOAuth =
+    (authMode === "oauth" || authMode === "auto") &&
+    !resolvedSecret.token &&
+    !resolvedSecret.headersJson;
+  // Every id whose grant row can authenticate this card. Device-flow GitHub
+  // always commits under the canonical "github" id, so github-native cards
+  // resolve it even when their own instance id differs.
+  const grantIds = [
+    ...new Set([
+      serverId,
+      ...(catalogId ? [catalogId] : []),
+      ...(nativeGithub ? ["github"] : []),
+    ]),
+  ];
+  const storedGrants = new Map<string, CloudOAuthToken>();
+  for (const id of grantIds) {
+    const grant = await rawOAuthGrant(ctx, owner, id);
+    if (grant) {
+      storedGrants.set(id, grant);
+    }
+  }
+  // Fail closed on blocked states only when no grant physically exists. A
+  // user-initiated check with a fresh grant must try it: success below
+  // clears the stale marker, failure re-records an accurate one.
+  const blockedState = reliesOnOAuth && storedGrants.size === 0
+    ? grantIds.map((id) => oauthGrantState(ctx, owner, id)).find(isBlockedOAuthState)
+    : undefined;
+  // A run's insufficient_scope challenge, pending until a new sign-in consents to it.
+  const stepUp = grantIds.map((id) => pendingStepUp(ctx.sql, owner, id)).find(Boolean) ?? null;
+  if (blockedState) {
+    return json({ error: blockedState, ...(stepUp ? { stepUp } : {}) }, blockedState === "step_up_required" ? 403 : 401);
+  }
+  const oauthTokens = await profileOAuthTokens(ctx, owner);
+  for (const [id, grant] of storedGrants) {
+    if (!oauthTokens[id]) {
+      oauthTokens[id] = grant;
+    }
+  }
+  if (!oauthTokens[serverId]) {
+    const donor = grantIds.find((id) => Boolean(oauthTokens[id]));
+    if (donor) {
+      oauthTokens[serverId] = oauthTokens[donor];
+    }
+  }
+  // A health check must always return the complete remote tool table. The
+  // account's disabled-tool preferences stay in the profile and are applied
+  // when a run arms; filtering here made disabled tools disappear forever.
+  const candidate = {
+    ...rawServer,
+    // Only shard-resolved secrets may authenticate the arm. The browser's
+    // raw `token` is either already stored above or a non-credential
+    // (`gera-account:*` marker) that would otherwise ride into the request
+    // as a fake PAT, shadow the OAuth grant, and fail with GitHub 401.
+    token: resolvedSecret.token ?? "",
+    headersJson: resolvedSecret.headersJson ?? "",
+    disabledTools: [],
+    enabled: true,
+    status: "connected",
+  };
+  const servers = cloudMcpServersForAutomation([candidate], [serverId], oauthTokens);
+  if (servers.length === 0) {
+    // Metadata only — which ids were consulted and why they cannot arm.
+    // Never any token material.
+    const detail = grantIds.map((id) => oauthDiagnostic(ctx, owner, id));
+    return json({ error: "server_auth_missing", detail }, 400);
+  }
+  const appliedChains = new Map<string, string[]>();
+  const persist = async (rotated: RefreshedOAuth): Promise<void> => {
+    await persistCanonicalOAuthGrant(ctx, owner, rotated);
+    const bases = chainRotationBases(appliedChains, rotated);
+    appliedChains.set(rotated.serverId, bases);
+  };
+  try {
+    // Uncapped: a health check returns the complete remote table (with
+    // annotations and UI-only markers), lists prompts/resources, and the
+    // handshake refreshes the account's catalog cache (deferred runs and the
+    // composer menus read it without reconnecting). No notification stream:
+    // a check has no run to keep it alive.
+    const runtime = await resolveMcpToolset({
+      servers,
+      mode: "native",
+      uncapped: true,
+      inventory: true,
+      notificationStreams: false,
+      catalog: createSqlMcpCatalogStore(ctx.sql, owner),
+      persist,
+      reportFailure: (id, outcome) => recordOAuthFailure(ctx, owner, id, outcome),
+      beginRefresh: (id) => markOAuthRefreshStarted(ctx, owner, id),
+    });
+    if (runtime.failures.length > 0 || runtime.routes.size === 0) {
+      // Only a failed arm may surface an auth state — a stale pre-existing
+      // marker must never veto a verification that just succeeded.
+      const authState = grantIds.map((id) => oauthGrantState(ctx, owner, id)).find(isBlockedOAuthState);
+      if (authState) {
+        return json({ error: authState, ...(stepUp ? { stepUp } : {}) }, authState === "step_up_required" ? 403 : 401);
+      }
+      const armFailure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
+      return json({ error: armFailure }, 502);
+    }
+    if (servers[0]?.oauth) {
+      // The grant just proved itself against the live provider: clear any
+      // stuck reauth/step-up markers so leases and relays use it again. A
+      // pending insufficient_scope step-up is the exception — the handshake
+      // only proves the token, not the scopes a tool demanded; only a new
+      // sign-in (which asks for the union) clears that one.
+      for (const id of grantIds) {
+        if (storedGrants.has(id) && !pendingStepUp(ctx.sql, owner, id)) {
+          markOAuthReady(ctx, owner, id);
+        }
+      }
+    }
+    const info = runtime.servers[0];
+    // Generic MCP servers: the complete remote table straight from the
+    // handshake (titles, annotations, UI-only). Native connectors: their
+    // static tables as armed.
+    const tools = info?.tools
+      ? info.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          ...(tool.title ? { title: tool.title } : {}),
+          ...(tool.annotations ? { annotations: tool.annotations } : {}),
+          ...(tool.uiOnly ? { uiOnly: true } : {}),
+        }))
+      : [...runtime.routes.entries()].map(([functionName, route]) => {
+          const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
+          return {
+            name: route.toolName,
+            description: definition?.function.description ?? route.toolName,
+            inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
+          };
+        });
+    const credentialStored = Boolean(
+      resolvedSecret.token ||
+      resolvedSecret.headersJson ||
+      oauthTokens[serverId],
+    );
+    return json({
+      tools,
+      identity: `${servers[0].name} · server verified`,
+      credentialStored,
+      promptCount: info?.promptCount ?? 0,
+      resourceCount: info?.resourceCount ?? 0,
+      ...(stepUp ? { stepUp } : {}),
+    });
+  } catch (error) {
+    // An unexpected fault inside the check (a refresh race, a storage error)
+    // must not escape as a Durable Object exception: the Worker would report
+    // Gera's backend as unavailable and the real cause would never reach the
+    // journal. Every credential in scope is redacted first; a health probe
+    // is idempotent, so one retry is always safe.
+    const armed = servers[0];
+    const secrets = [
+      ...Object.values(armed?.headers ?? {}),
+      armed?.token ?? "",
+      resolvedSecret.token ?? "",
+      ...Object.values(oauthTokens).flatMap((grant) => [grant.accessToken, grant.refreshToken ?? ""]),
+    ];
+    const detail = redactCloudMcpText(error instanceof Error ? error.message : "check failed", secrets).slice(0, 300);
+    console.error("mcp check failed", serverId, detail);
+    return json({ error: "mcp_check_failed", detail, retryable: true }, 502);
+  }
+}
+
+/**
+ * POST /mcp/auth-lease { serverId, catalogId?, force? } — internal,
+ * Worker-only: one `Authorization` value for a native connector (pasted key
+ * first, then the account's OAuth grant, refreshed or force-redeemed here).
+ * Provider credentials never cross a public response.
+ */
+export async function handleMcpAuthLease(ctx: OAuthStoreContext, request: Request, owner: string): Promise<Response> {
+  let body: { serverId?: unknown; catalogId?: unknown; force?: unknown };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: "invalid_body" }, 400);
+  }
+  const serverId = typeof body.serverId === "string" ? body.serverId : "";
+  const catalogId = typeof body.catalogId === "string" ? body.catalogId : "";
+  if (!isValidId(serverId) || (catalogId && !isValidId(catalogId))) {
+    return json({ error: "invalid_server" }, 400);
+  }
+  const nativeGithub = (catalogId || serverId) === "github";
+  const ids = [
+    ...new Set([
+      serverId,
+      ...(catalogId && catalogId !== serverId ? [catalogId] : []),
+      // Device-flow GitHub commits its grant under the canonical "github"
+      // id; instance cards must resolve it regardless of their own id.
+      ...(nativeGithub ? ["github"] : []),
+    ]),
+  ];
+  for (const id of ids) {
+    const secret = await mcpServerSecret(ctx, owner, id);
+    if (secret.token) {
+      const authorization = /^Bearer\s/i.test(secret.token) ? secret.token : `Bearer ${secret.token}`;
+      return json({ authorization });
+    }
+  }
+  const storedGrants = new Map<string, CloudOAuthToken>();
+  for (const id of ids) {
+    const stored = await rawOAuthGrant(ctx, owner, id);
+    if (stored) {
+      storedGrants.set(id, stored);
+    }
+  }
+  // A stale blocked marker must never hide a physically present grant: a
+  // fresh sign-in is the recovery path and has to be tried. Fail closed on
+  // the marker only when no grant exists at all.
+  const blockedState = storedGrants.size === 0
+    ? ids.map((id) => oauthGrantState(ctx, owner, id)).find(isBlockedOAuthState)
+    : undefined;
+  if (blockedState) {
+    return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
+  }
+  const tokens = await profileOAuthTokens(ctx, owner);
+  for (const [id, stored] of storedGrants) {
+    if (!tokens[id]) {
+      tokens[id] = stored;
+    }
+  }
+  const grantId = ids.find((id) => Boolean(tokens[id]));
+  if (!grantId) {
+    // Metadata only — never token material. Tells the caller exactly which
+    // ids were consulted and why each one cannot authenticate.
+    const detail = ids.map((id) => oauthDiagnostic(ctx, owner, id));
+    return json({ error: "server_auth_missing", detail }, 404);
+  }
+  const grant = tokens[grantId];
+  const server = {
+    id: grantId,
+    name: grantId,
+    kind: "mcp" as const,
+    url: grant.mcpUrl ?? grant.tokenEndpoint,
+    headers: {},
+    omitMcpHeaders: false,
+    disabledTools: [],
+    oauth: grant,
+  };
+  const refreshed: RefreshedOAuth[] = [];
+  const persist = (rotated: RefreshedOAuth): Promise<void> => persistCanonicalOAuthGrant(ctx, owner, rotated);
+  const begin = (id: string): Promise<void> => markOAuthRefreshStarted(ctx, owner, id);
+  const outcome = body.force === true
+    ? await forceRefreshCloudOAuthOutcome(server, refreshed, persist, begin)
+    : await ensureFreshCloudOAuth(server, refreshed, persist, begin);
+  if (outcome?.ok === false) {
+    await recordOAuthFailure(ctx, owner, grantId, outcome);
+    return json(
+      { error: outcome.transient ? "retryable_error" : oauthGrantState(ctx, owner, grantId) },
+      outcome.transient ? 503 : 401,
+    );
+  }
+  if (storedGrants.has(grantId) && !pendingStepUp(ctx.sql, owner, grantId)) {
+    // The grant is durable and just leased successfully — clear any stale
+    // reauth/step-up marker so later leases stop tripping over it (a pending
+    // insufficient_scope step-up waits for the wider sign-in instead).
+    markOAuthReady(ctx, owner, grantId);
+  }
+  return json({ authorization: `Bearer ${server.oauth?.accessToken ?? grant.accessToken}` });
+}
+
+/**
+ * POST /mcp/resolve { ids, force? } — internal: resolves this account's
+ * connected MCP servers for a project agent run. Reuses the exact
+ * cloud-automation pipeline (profile blob + rotation overlays); expiring —
+ * or force-listed — sign-ins are refreshed here and the rotated pairs
+ * persist to this shard, so browsers and later runs adopt them. Project
+ * agents inherit the account's loading mode and catalog cache, so their
+ * runs can defer without a fresh handshake. Credentials never leave the
+ * backend.
+ */
+export async function handleMcpResolve(ctx: OAuthStoreContext, request: Request, owner: string): Promise<Response> {
+  let body: unknown = null;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad_json" }, 400);
+  }
+  const ids =
+    isRecord(body) && Array.isArray(body.ids)
+      ? body.ids.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
+      : [];
+  const force = new Set(
+    isRecord(body) && Array.isArray(body.force)
+      ? body.force.filter((item): item is string => typeof item === "string")
+      : [],
+  );
+  if (ids.length === 0) {
+    return json({ servers: [] });
+  }
+  const resolved = await resolveOwnerMcpServers(ctx, owner, ids, force);
+  if (!resolved) {
+    return json({ servers: [] });
+  }
+  const catalog = createSqlMcpCatalogStore(ctx.sql, owner);
+  return json({
+    servers: resolved.servers,
+    toolLoading: resolved.toolLoading,
+    catalog: resolved.servers.flatMap((server) => {
+      const entry = catalog.read(server.id);
+      return entry ? [entry] : [];
+    }),
+  });
 }
 
 /** POST /mcp/resource-read { serverId, uri } → { contents }. */

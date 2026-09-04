@@ -102,7 +102,22 @@ top-level landing exchanges with this tab’s verifier as before. Deploy note:
 landing at `gera-ai-agent-hub.rork.app` ships with Rork’s Publish, and a
 sandboxed build’s sign-in depends on that landing carrying the relay. A callback that
 brought a refusal instead of a code is worded by `describeAuthCallbackRefusal`
-(“Sign in was cancelled…”). Browser: `auth-callback.browser.test.tsx`,
+(“Sign in was cancelled…”). Production landing (2026-09-04): the sign-in
+landings `/auth/callback` and `/oauth/callback` are routed *outside* the
+account boundary (`AppRoutes` in `App.tsx`; `AccountProviders` re-keys
+`AgentProvider` + the query cache on “loading” → “signed-out” → account —
+the very transition a landing causes). Inside that boundary the landing was
+torn down and remounted mid-exchange, redeemed its one-time code a second
+time, and when Rork Auth’s “Invalid or expired code” for the duplicate landed
+first it cancelled the sign-in that had just succeeded — the gate showed that
+error in a normal browser while the preview popup flow (listener lives in
+`AuthProvider`, unaffected by the re-key) kept working. Belt and braces:
+`exchangeCode` is single-flight per code (`codeExchangesInFlight`, cleared
+when settled), boot’s rejected refresh grant removes only the access/refresh
+tokens (never this tab’s PKCE attempt), and a token refusal is worded by
+`describeTokenExchangeRefusal` (“… rejected as invalid or expired. Please try
+again.”). Browser: `auth-callback.browser.test.tsx` (real `AppRoutes` under a
+held-open boot; concurrent redeem shares one request),
 `repo-preview.browser.test.tsx` (window name). E2E bypasses
 the gate: fake JWT in `localStorage` + stubbed `/access/status` → `invited`.
 

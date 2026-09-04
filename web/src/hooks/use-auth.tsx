@@ -32,6 +32,19 @@ const ACCOUNT_OWNER_KEY = "rork:gera_account_owner";
  */
 export const POPUP_CLOSE_GRACE_MS = 1_500;
 
+/**
+ * Plain words for a `/oauth/token` refusal. Rork Auth answers a code that was
+ * already redeemed, timed out, or never matched this tab's verifier with
+ * "Invalid or expired code" — the fix is always the same: start over.
+ */
+export function describeTokenExchangeRefusal(error: unknown, status: number): string {
+  const detail = typeof error === "string" ? error.trim().slice(0, 200) : "";
+  if (/expired|invalid|already/i.test(detail)) {
+    return "Sign in didn’t complete — the sign-in code was rejected as invalid or expired. Please try again.";
+  }
+  return detail ? `Sign in failed — ${detail}` : `Sign in failed (${status})`;
+}
+
 /** Plain words for a callback that brought a refusal instead of a code. */
 export function describeAuthCallbackRefusal(error: unknown): string {
   const detail = typeof error === "string" ? error.trim().slice(0, 200) : "";
@@ -151,6 +164,14 @@ type AuthContextType = {
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
+/**
+ * One-time codes in flight, by code. A callback page may ask to redeem the
+ * same code more than once while the first request is still out (a remount,
+ * StrictMode's double effect); both callers share the request. The entry
+ * clears once settled so a genuinely new attempt is never served a stale one.
+ */
+const codeExchangesInFlight = new Map<string, Promise<void>>();
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -208,7 +229,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             } else if (result.status === "rejected") {
               // Only an explicit invalid/revoked refresh grant signs out. A
               // deploy-time network/5xx gap keeps both tokens and retries.
-              clearTokens();
+              // Tokens only: a PKCE attempt this tab is completing right now
+              // (`/auth/callback`) belongs to the sign-in that replaces them.
+              localStorage.removeItem(ACCESS_TOKEN_KEY);
+              localStorage.removeItem(REFRESH_TOKEN_KEY);
               setUser(null);
             } else {
               if (staleIdentity) {
@@ -263,7 +287,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const exchangeCode = useCallback(async (code: string, expectedAttemptId?: string) => {
+  const redeemCode = useCallback(async (code: string, expectedAttemptId?: string): Promise<void> => {
     const verifier = sessionStorage.getItem(CODE_VERIFIER_KEY);
     const flowNonce = sessionStorage.getItem(AUTH_FLOW_NONCE_KEY) ?? "";
     const attemptId = sessionStorage.getItem(AUTH_FLOW_ATTEMPT_KEY) ?? "";
@@ -285,9 +309,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     if (!response.ok) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      const body = (await response.json().catch(() => ({}))) as { error?: unknown };
       if (isAuthFlowCurrent(attemptId, flowNonce)) {
-        setError(body.error ?? `Sign in failed (${response.status})`);
+        setError(describeTokenExchangeRefusal(body.error, response.status));
         clearAuthFlowIfCurrent(attemptId);
       }
       return;
@@ -322,6 +346,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
     setUser(nextUser);
   }, []);
+
+  const exchangeCode = useCallback(
+    (code: string, expectedAttemptId?: string): Promise<void> => {
+      const inFlight = codeExchangesInFlight.get(code);
+      if (inFlight) {
+        return inFlight;
+      }
+      const task = redeemCode(code, expectedAttemptId);
+      codeExchangesInFlight.set(code, task);
+      void task.finally(() => {
+        if (codeExchangesInFlight.get(code) === task) {
+          codeExchangesInFlight.delete(code);
+        }
+      });
+      return task;
+    },
+    [redeemCode],
+  );
 
   const signIn = useCallback(
     async (provider: "google" | "apple") => {

@@ -112,12 +112,19 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
   const updateMcp = useCallback((id: string, patch: Partial<McpServerConfig>) => {
     const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);
     const urlChanged = typeof patch.url === "string" && patch.url.trim() !== current?.url.trim();
+    // OAuth Advanced (pinned scopes, metadata URL) shapes the grant itself: a
+    // change retires the stored sign-in and asks for a fresh one.
+    const oauthSettingsChanged =
+      (patch.oauthScopes !== undefined && (patch.oauthScopes ?? "").trim() !== (current?.oauthScopes ?? "").trim()) ||
+      (patch.authServerMetadataUrl !== undefined &&
+        (patch.authServerMetadataUrl ?? "").trim() !== (current?.authServerMetadataUrl ?? "").trim());
     const connectionChanged =
       urlChanged ||
+      oauthSettingsChanged ||
       patch.authMode !== undefined ||
       patch.token !== undefined ||
       patch.headersJson !== undefined;
-    if (urlChanged) {
+    if (urlChanged || oauthSettingsChanged) {
       clearOAuthToken(id, current?.catalogId);
     }
     if (connectionChanged) {
@@ -131,6 +138,9 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
               ...item,
               ...patch,
               ...(connectionChanged ? { credentialStored: false } : {}),
+              ...(oauthSettingsChanged
+                ? { status: "idle" as const, error: undefined, identity: undefined, verifiedAt: undefined, stepUp: undefined }
+                : {}),
             }
           : item,
       ),
@@ -234,6 +244,20 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
     void reconnectMcp(server, setSettings);
   }, [setSettings, stateRef]);
 
+  /**
+   * Forces the browser sign-in even while the card is green — the step-up
+   * path ("Sign in again with wider access"): the account shard widens the
+   * authorize request to pin ∪ granted ∪ required scopes.
+   */
+  const signInMcp = useCallback((id: string) => {
+    const server = stateRef.current.settings.mcpServers.find((item) => item.id === id);
+    if (!server) {
+      return;
+    }
+    const popup = openOAuthPopup();
+    void oauthConnectMcp(server, popup, setSettings);
+  }, [setSettings, stateRef]);
+
   const toggleMcpTool = useCallback((serverId: string, toolName: string) => {
     setSettings((prev) => ({
       ...prev,
@@ -257,6 +281,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
     addCustomMcp,
     removeMcp,
     connectMcp,
+    signInMcp,
     toggleMcpTool,
   };
 }

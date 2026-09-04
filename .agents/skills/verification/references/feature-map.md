@@ -1,6 +1,10 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-04 · commit `b4f7bca` (+ MCP spec coverage: one protocol
+Last synced: 2026-09-04 · commit `462816a` (+ MCP OAuth parity: pinned scopes
+  and a metadata-URL override behind "Advanced" on the server card, scope order
+  challenge → resource → authorization server, `offline_access` only when
+  declared, `insufficient_scope` step-up that parks the server for the run and
+  widens the next sign-in — MCP spec coverage: one protocol
   core (`functions/mcp-protocol.ts`, 2025-11-25 negotiation, injectable fetch),
   composer `/` prompts and `@` resources menus, elicitation cards that pause a
   run, tool annotation badges + UI-only markers, list_changed over the GET
@@ -1183,6 +1187,54 @@ bodies over 2M chars refused.
   lost session, oversized body, unsupported revision, 405 GET, in-stream
   ping/notification dispatch, elicitation validation, URI templates, pause
   board, composer trigger parsing).
+- **OAuth parity** (2026-09-04, `functions/mcp-oauth-flow.ts` discovery,
+  `functions/mcp-auth-challenge.ts` — WWW-Authenticate / scope-string parsing
+  + rejection classification, `functions/mcp-oauth-scopes.ts` — the
+  `mcp_oauth_scopes` table (requested / granted / required / step_up_code per
+  connector, metadata only), `/mcp/oauth-start` now served by
+  `functions/mcp-routes.ts` through the same seam as the menus). Server card
+  → "Advanced · OAuth" (collapsed; testid `mcp-advanced-toggle`; shown for
+  OAuth servers and custom "auto" servers) holds **Scopes**
+  (`mcp-scopes-input`, RFC 6749 §3.3, commas/newlines tolerated, illegal
+  tokens dropped) and **Authorization-server metadata URL**
+  (`mcp-metadata-url-input`); committing a changed value (blur / Enter) signs
+  the server out (`/mcp/oauth-clear` disconnect, card back to idle,
+  `credentialStored` false) — press Sign in afterwards. Both sync in the
+  profile as `oauthScopes` / `authServerMetadataUrl` and ride in the
+  `/mcp/oauth-start` body. Scope decision on the shard: pinned scopes go into
+  the authorize URL as-is (`scopeSource: explicit`); without a pin, an
+  unauthenticated `initialize` probe of the MCP URL reads the 401 challenge's
+  `scope` (and its `resource_metadata` becomes the first PRM candidate, RFC
+  9728 §5.1), then the protected resource's `scopes_supported`, then the
+  authorization server's; `offline_access` is appended only when the
+  authorization server declares it. Metadata URL override: public HTTPS only
+  (http:// / private hosts refused before any request: "OAuth metadata URL
+  must be a public HTTPS URL"), the document replaces the well-known walk, and
+  its `issuer` must match a server the protected-resource metadata named (or,
+  when none was named, the issuer its own well-known path encodes / its
+  origin) — mismatch is refused. The token response's `scope` is recorded as
+  granted (silence = as requested). **Step-up**: a 403 (or 401) whose Bearer
+  challenge says `error="insufficient_scope"` — or a 403 naming scopes — on
+  tools/call or the handshake parks the server for the rest of the run (no
+  retry with the same token; native routes and `mcp_call_tool` answer from
+  the parked state, `mcp_search_tools` lists it as unavailable), journals
+  `step_up_required`, and reports through `reportFailure` with
+  `requiredScopes` → `mcp_oauth_states` = `step_up_required` +
+  `mcp_oauth_scopes.required`. The tool result names the fix ("Sign in again
+  with wider access"). While pending: `/mcp/check` still handshakes and lists
+  tools but returns `stepUp: { scopes, code }` and does NOT clear the marker
+  (nor does `/mcp/auth-lease`); the card shows the amber hint
+  (`mcp-step-up-hint`) with the button `mcp-step-up-sign-in`, which forces the
+  popup (`signInMcp`) even though the card is green; chat runs record an
+  honest `mcp_auth` row for the parked server instead of silently dropping
+  it. The next `/mcp/oauth-start` asks for pin ∪ granted ∪ required;
+  `/mcp/oauth-complete` records the grant and clears required/code → `ready`.
+  Check failures `step_up_required` / `reauth_required` render in plain words
+  on the card. Unit: `mcp-oauth-scopes.test.ts` (challenge parser, scope
+  order, pin in the authorize URL, offline_access rule, override used /
+  http refused / issuer mismatch, route with an in-memory shard, step-up
+  union + clearing, toolset parking in deferred and native mode, blocked-run
+  records); browser: `oauth-step-up`.
 
 Server ownership (2026-09-01): OAuth access/refresh grants, pasted API keys,
 custom headers, refresh single-flight, connection checks, protocol sessions and
@@ -1467,6 +1519,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | prompt-slash | Connected DeepWiki → type `/expl` → prompts menu → pick `explain_repo` → required-argument dialog → submit → `/mcp/prompt-get` text lands in the composer input, dialog gone |
 | resource-mention | Type `@READ` → resources menu → pick the README → `/mcp/resource-read` becomes an attachment chip, `@deepwiki/wiki://…` mention stays in the input |
 | elicitation-accept | Send → stream pauses with a `pause` event → card with the `region` field → fill + Accept → `/runs/answer` carries `{action:"accept", content:{region:"eu"}}` → card clears, reply streams |
+| oauth-step-up | `/mcp?server=scoped` (custom OAuth server, signed in) → boot re-check's `/mcp/check` reports `stepUp` → amber hint names `things:write` + “Sign in again with wider access” → Advanced collapsed → toggle → Scopes + Metadata URL fields |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
@@ -1501,7 +1554,9 @@ It also proves a rollout-time Gera refresh failure keeps the stored identity and
 that a new bundle adopts the MCP pair escrowed before the old response vanished.
 
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
-Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
+Admin tabs, the MCP OAuth popup itself and API-key/custom-header setup (open
+connect, the step-up hint and the Advanced OAuth fields are covered; editing
+Scopes / Metadata URL and the sign-out it triggers are unit-level only),
 elicitation Decline/Cancel and enum/boolean fields (accept with a text field
 is covered; validation is unit-tested), resource-template variable dialog
 (prompt-argument dialog is covered), Share dialog, Settings toggles other
@@ -1532,7 +1587,9 @@ catalog cache, native soft caps with honest records), `mcp-conformance` (the
 real `@modelcontextprotocol/sdk` server in-process: negotiation, headers,
 pagination, prompts/resources, routes, elicitation, UI-only, list_changed),
 `mcp-protocol` (transport failures, frames, annotations, templates,
-elicitation validation, run pause board, composer triggers), `auth-boundary` +
+elicitation validation, run pause board, composer triggers), `mcp-oauth-scopes`
+(WWW-Authenticate parsing, scope order, pinned scopes, offline_access rule,
+metadata override, step-up parking/union, blocked-run records), `auth-boundary` +
 `mcp-oauth-refresh` + `mcp-session` (staggered expired-Gera 401s, provider-token
 rotation rescue, deploy-response escrow/replay, transient health recovery),
 `code-change-flow` (diff capture,

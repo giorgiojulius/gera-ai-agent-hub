@@ -38,6 +38,8 @@ import {
   STUB_MCP_RESOURCE_URI,
   STUB_MCP_SERVER_ID,
   STUB_REPLY_SNIPPET,
+  STUB_STEP_UP_SCOPE,
+  STUB_STEP_UP_SERVER_ID,
   SWITCH_TARGET_MODEL_ID,
   SWITCH_TARGET_MODEL_NAME,
 } from "../../e2e/scenarios";
@@ -432,6 +434,16 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
           identity: "GitHub · server verified",
         });
       }
+      if (body.server?.id === STUB_STEP_UP_SERVER_ID) {
+        // The grant still handshakes, but a run's tools/call was refused with
+        // insufficient_scope — the shard reports the pending step-up.
+        return jsonResponse({
+          tools: [{ name: "write_thing", description: "Writes a thing", inputSchema: { type: "object", properties: {} } }],
+          identity: "Scoped Things · server verified",
+          credentialStored: true,
+          stepUp: { scopes: [STUB_STEP_UP_SCOPE], code: "insufficient_scope" },
+        });
+      }
       return jsonResponse({
         tools: [{
           name: "ask_question",
@@ -816,6 +828,30 @@ for (const scenario of E2E_SCENARIOS) {
               verifiedAt: Date.now(),
               promptCount: 1,
               resourceCount: 1,
+            },
+          ],
+        }),
+      );
+    }
+    if (scenario.id === "oauth-step-up") {
+      // A custom OAuth server signed in earlier; the shard now reports a step-up.
+      localStorage.setItem(
+        "gera.settings.v1",
+        JSON.stringify({
+          mcpServers: [
+            {
+              id: STUB_STEP_UP_SERVER_ID,
+              name: "Scoped Things",
+              url: "https://mcp.scoped-provider.dev/mcp",
+              headersJson: "",
+              authMode: "oauth",
+              enabled: true,
+              status: "connected",
+              credentialStored: true,
+              tools: [{ name: "write_thing", description: "Writes a thing" }],
+              disabledTools: [],
+              identity: "Scoped Things · server verified",
+              verifiedAt: Date.now(),
             },
           ],
         }),

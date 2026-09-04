@@ -75,6 +75,8 @@ export type CloudOAuthRefreshFailure = {
   transient: boolean;
   /** The provider may have consumed the rotating token before the response vanished. */
   ambiguous: boolean;
+  /** `insufficient_scope`: the scopes the server's WWW-Authenticate challenge demanded. */
+  requiredScopes?: string[];
 };
 
 /** Provider refresh result with a typed durable-failure branch. */
@@ -308,6 +310,55 @@ export function cloudMcpServersForAutomation(
     if (server) {
       out.push(server);
     }
+  }
+  return out;
+}
+
+/**
+ * Honest records for connected OAuth servers a run had to leave out because
+ * their grant is blocked (`reauth_required` / `step_up_required`). Without
+ * these the server would simply vanish from the run — the model could not
+ * say why a tool is missing, and the user would not learn what to press.
+ * `blocked` maps server id → state; the wording names the fix per state.
+ */
+export function blockedCloudServerFailures(
+  rawServers: unknown,
+  blocked: ReadonlyMap<string, string>,
+): Array<{ name: string; arguments: string; result: string }> {
+  if (!Array.isArray(rawServers) || blocked.size === 0) {
+    return [];
+  }
+  const out: Array<{ name: string; arguments: string; result: string }> = [];
+  for (const raw of rawServers) {
+    if (!isRecord(raw) || raw.enabled === false || raw.status !== "connected") {
+      continue;
+    }
+    const id = typeof raw.id === "string" ? raw.id : "";
+    const catalogId = typeof raw.catalogId === "string" && raw.catalogId ? raw.catalogId : "";
+    const catalogKey = catalogId || id;
+    if (!id || NATIVE_IDS.has(catalogKey) || BLOCKED_IDS.has(catalogKey)) {
+      continue;
+    }
+    const state = blocked.get(id) ?? (catalogId ? blocked.get(catalogId) : undefined);
+    if (!state) {
+      continue;
+    }
+    const token = typeof raw.token === "string" ? raw.token.trim() : "";
+    const headers = parseCloudHeaders(raw.headersJson) ?? {};
+    const reliesOnOAuth =
+      raw.authMode === "oauth" || ((raw.authMode === "auto" || raw.authMode === undefined) && !token && !headers.Authorization);
+    if (!reliesOnOAuth) {
+      continue;
+    }
+    const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : catalogKey;
+    out.push({
+      name: "mcp_auth",
+      arguments: name,
+      result:
+        state === "step_up_required"
+          ? `MCP server "${name}" is parked: it needs a sign-in with wider access. Open Settings → MCP and press "Sign in again with wider access"; its tools are unavailable this run.`
+          : `Could not authenticate MCP server "${name}": sign-in must be renewed (Settings → MCP → Sign in); its tools are unavailable this run.`,
+    });
   }
   return out;
 }

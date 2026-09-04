@@ -68,6 +68,7 @@ export function McpStudio() {
     removeMcp,
     updateMcp,
     connectMcp,
+    signInMcp,
     toggleMcpTool,
   } = useAgent();
   const [query, setQuery] = useState<string>("");
@@ -249,6 +250,7 @@ export function McpStudio() {
                 onRemove={() => removeMcp(server.id)}
                 onUpdate={(patch) => updateMcp(server.id, patch)}
                 onConnect={() => connectMcp(server.id)}
+                onSignIn={() => signInMcp(server.id)}
                 onToggleTool={(name) => toggleMcpTool(server.id, name)}
                 onDeviceSignIn={
                   findCatalogEntry(server.catalogId ?? server.id)?.deviceFlow && githubReady
@@ -598,6 +600,7 @@ function ConnectedCard({
   onRemove,
   onUpdate,
   onConnect,
+  onSignIn,
   onToggleTool,
   onDeviceSignIn,
 }: {
@@ -607,12 +610,33 @@ function ConnectedCard({
   onRemove: () => void;
   onUpdate: (patch: Partial<McpServerConfig>) => void;
   onConnect: () => void;
+  /** Forces the OAuth popup (step-up: wider scopes) even while connected. */
+  onSignIn: () => void;
   onToggleTool: (name: string) => void;
   onDeviceSignIn?: () => void;
 }) {
   const entry = findCatalogEntry(server.catalogId ?? server.id);
   const authMode: McpAuthMode = server.authMode ?? "auto";
   const isOAuth = entry?.auth === "oauth" || (!entry && authMode === "oauth");
+  // Advanced OAuth settings apply wherever a browser sign-in can happen:
+  // explicit OAuth servers and custom "auto" servers (which fall back to it).
+  const showAdvanced = !entry?.deviceFlow && (isOAuth || (!entry && authMode === "auto"));
+  const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
+  const [scopesDraft, setScopesDraft] = useState<string>(server.oauthScopes ?? "");
+  const [metadataDraft, setMetadataDraft] = useState<string>(server.authServerMetadataUrl ?? "");
+  const commitScopes = () => {
+    const next = scopesDraft.trim();
+    if (next !== (server.oauthScopes ?? "").trim()) {
+      onUpdate({ oauthScopes: next || undefined });
+    }
+  };
+  const commitMetadataUrl = () => {
+    const next = metadataDraft.trim();
+    if (next !== (server.authServerMetadataUrl ?? "").trim()) {
+      onUpdate({ authServerMetadataUrl: next || undefined });
+    }
+  };
+  const metadataUrlInvalid = metadataDraft.trim().length > 0 && !/^https:\/\/\S+$/i.test(metadataDraft.trim());
   const signedIn = (isOAuth || Boolean(entry?.deviceFlow)) && server.status === "connected";
   const showSignIn =
     (isOAuth || Boolean(onDeviceSignIn)) &&
@@ -712,6 +736,36 @@ function ConnectedCard({
               Verified {verifiedTime(server.verifiedAt)} — handshake and tool listing succeeded
               {server.identity ? ` · ${server.identity}` : ""}.
             </p>
+          ) : null}
+          {server.stepUp ? (
+            <div
+              data-testid={TID.mcpStepUpHint}
+              className="space-y-2 rounded-xl border border-amber-300/70 bg-amber-50/70 px-3 py-2"
+            >
+              <p className="text-[11px] leading-relaxed text-amber-800">
+                A run was refused with <code className="font-mono">{server.stepUp.code}</code>: this server needs a
+                sign-in with wider access
+                {server.stepUp.scopes.length > 0 ? (
+                  <>
+                    {" — scopes "}
+                    <code className="font-mono">{server.stepUp.scopes.join(" ")}</code>
+                  </>
+                ) : null}
+                . Until then its tools stay parked. Signing in again asks for everything already granted plus
+                what the server demanded.
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid={TID.mcpStepUpSignIn}
+                className="h-8 gap-1 rounded-full border-amber-400/70 bg-white text-amber-900 hover:bg-amber-100"
+                onClick={onSignIn}
+                disabled={server.status === "connecting"}
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                Sign in again with wider access
+              </Button>
+            </div>
           ) : null}
           {entry ? (
             <p className="text-[11px] text-muted-foreground">
@@ -828,6 +882,72 @@ function ConnectedCard({
               }
               className="h-8 border-border bg-white text-xs"
             />
+          ) : null}
+          {showAdvanced ? (
+            <div className="rounded-xl border border-border/70">
+              <button
+                type="button"
+                data-testid={TID.mcpAdvancedToggle}
+                aria-expanded={advancedOpen}
+                onClick={() => setAdvancedOpen((open) => !open)}
+                className="flex w-full items-center justify-between px-3 py-2 text-left text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                <span>
+                  Advanced · OAuth
+                  {server.oauthScopes || server.authServerMetadataUrl ? " · customized" : ""}
+                </span>
+                <span aria-hidden="true">{advancedOpen ? "−" : "+"}</span>
+              </button>
+              {advancedOpen ? (
+                <div className="space-y-2 border-t border-border/70 px-3 py-2">
+                  <label className="block space-y-1">
+                    <span className="text-[11px] text-muted-foreground">Scopes (space-separated, RFC 6749)</span>
+                    <Input
+                      data-testid={TID.mcpScopesInput}
+                      value={scopesDraft}
+                      onChange={(event) => setScopesDraft(event.target.value)}
+                      onBlur={commitScopes}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          commitScopes();
+                        }
+                      }}
+                      placeholder="Empty — the server's own hints decide"
+                      className="h-8 border-border bg-white font-mono text-xs"
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="text-[11px] text-muted-foreground">Authorization-server metadata URL</span>
+                    <Input
+                      data-testid={TID.mcpMetadataUrlInput}
+                      value={metadataDraft}
+                      onChange={(event) => setMetadataDraft(event.target.value)}
+                      onBlur={commitMetadataUrl}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          commitMetadataUrl();
+                        }
+                      }}
+                      placeholder="https://auth.example.com/.well-known/oauth-authorization-server"
+                      aria-invalid={metadataUrlInvalid}
+                      className={cn("h-8 border-border bg-white text-xs", metadataUrlInvalid && "border-destructive")}
+                      spellCheck={false}
+                    />
+                  </label>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    Pinned scopes go into the authorize request as-is (<code className="font-mono">offline_access</code> is
+                    added when the server supports it). Without a pin, Gera asks for what the server's
+                    401 challenge, its resource metadata, or its authorization server advertise — in that order.
+                    The metadata URL replaces the well-known lookup; public HTTPS only, and the document's issuer
+                    is still verified. Changing either signs this server out — press Sign in afterwards.
+                    {metadataUrlInvalid ? " The metadata URL must start with https://." : ""}
+                  </p>
+                </div>
+              ) : null}
+            </div>
           ) : null}
           {server.tools.length > 0 ? (
             <div className="space-y-1">

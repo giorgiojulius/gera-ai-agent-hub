@@ -4,10 +4,13 @@
 // arguments. Handlers are plain functions over a small seam (`McpRouteContext`)
 // so ChatStore's dispatch stays a few lines and the logic is unit-testable.
 //
-// Phase 6 moves the remaining `/mcp/*` handlers (check, resolve, auth-lease,
+// `/mcp/oauth-start` (Phase 3) lives here too: discovery with pinned scopes /
+// metadata override, dynamic registration, the PKCE pending row. Phase 6 moves
+// the remaining `/mcp/*` handlers (check, resolve, auth-lease, the rest of the
 // OAuth state machine) here through the same seam.
 
-import type { ChatSql } from "./chat-shared";
+import { capStr, isValidId, type ChatSql } from "./chat-shared";
+import { parseScopeString } from "./mcp-auth-challenge";
 import {
   connectCloudMcp,
   getCloudMcpPrompt,
@@ -16,8 +19,18 @@ import {
   cloudServerRedactions,
   type CloudMcpServer,
 } from "./mcp-cloud";
+import {
+  buildAuthorizationUrl,
+  discoverMcpOAuth,
+  newOAuthState,
+  newPkceVerifier,
+  pkceChallenge,
+  registerDynamicOAuthClient,
+} from "./mcp-oauth-flow";
+import { planAuthorizationScopes, readOAuthScopes, recordRequestedScopes } from "./mcp-oauth-scopes";
 import { DEFERRED_TOOLS_PER_SERVER, CATALOG_TTL_MS, catalogHasInventory, createSqlMcpCatalogStore } from "./mcp-toolset";
 import type { McpFetch } from "./mcp-protocol";
+import { oauthPendingFieldScope } from "./secret-rows";
 
 export type McpRouteContext = {
   sql: ChatSql;
@@ -26,6 +39,8 @@ export type McpRouteContext = {
    * grants refreshed) for the given ids — the same path `/mcp/resolve` uses.
    */
   resolveServers(owner: string, ids: string[]): Promise<CloudMcpServer[]>;
+  /** Seals one secret column for the account vault (PKCE verifier, browser nonce). */
+  seal?(plain: string, scope: string): Promise<string>;
   /** Injected transport for tests; production keeps the public-HTTPS guard. */
   fetch?: McpFetch;
   now?: () => number;
@@ -162,6 +177,140 @@ export async function handleMcpPromptGet(ctx: McpRouteContext, request: Request,
     return json(prompt);
   } catch (error) {
     return json({ error: failure(server, error, "prompts/get failed") }, 502);
+  }
+}
+
+/** How long a started sign-in may wait for the provider's callback. */
+const OAUTH_PENDING_TTL_MS = 10 * 60_000;
+const MCP_URL_CHARS = 4_000;
+
+/**
+ * POST /mcp/oauth-start { server: { id, url, oauthScopes?, authServerMetadataUrl? },
+ * returnOrigin } → { authorizationUrl, state, browserNonce, expiresAt, scopes,
+ * scopeSource }.
+ *
+ * Discovery honors the card's Advanced settings: a pinned scope string goes
+ * into the authorize URL as-is (plus `offline_access` when the authorization
+ * server declares it); a metadata URL replaces the well-known walk (public
+ * HTTPS only, issuer still verified). A pending step-up (a run hit
+ * `insufficient_scope`) widens the request to pin ∪ granted ∪ required so the
+ * new consent never loses tools that already worked. PKCE verifier and the
+ * browser nonce are sealed into the pending row; the browser only ever sees
+ * the authorize URL, the opaque state and its own nonce.
+ */
+export async function handleMcpOAuthStart(ctx: McpRouteContext, request: Request, owner: string): Promise<Response> {
+  const body = await readBody(request);
+  if (!body) {
+    return json({ error: "invalid_body" }, 400);
+  }
+  const server = isRecord(body.server) ? body.server : null;
+  const serverId = server && typeof server.id === "string" ? server.id : "";
+  const mcpUrl = server && typeof server.url === "string" ? server.url.trim() : "";
+  const pinnedScopes = server ? parseScopeString(server.oauthScopes) : [];
+  const authServerMetadataUrl =
+    server && typeof server.authServerMetadataUrl === "string" ? server.authServerMetadataUrl.trim().slice(0, MCP_URL_CHARS) : "";
+  const returnOrigin = typeof body.returnOrigin === "string" ? body.returnOrigin : "";
+  let normalizedReturnOrigin = "";
+  try {
+    const parsed = new URL(returnOrigin);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      throw new Error("unsafe origin");
+    }
+    normalizedReturnOrigin = parsed.origin;
+  } catch {
+    return json({ error: "invalid_return_origin" }, 400);
+  }
+  if (!isValidId(serverId) || !mcpUrl || mcpUrl.length > MCP_URL_CHARS) {
+    return json({ error: "invalid_server" }, 400);
+  }
+  if (!ctx.seal) {
+    return json({ error: "oauth_unavailable" }, 503);
+  }
+  const now = ctx.now ?? (() => Date.now());
+  const callbackUrl = new URL("/mcp/oauth/callback", request.url).toString();
+  try {
+    const explicitScopes = planAuthorizationScopes({
+      pinned: pinnedScopes,
+      record: readOAuthScopes(ctx.sql, owner, serverId),
+    });
+    const discovery = await discoverMcpOAuth(mcpUrl, {
+      ...(explicitScopes ? { scopes: explicitScopes } : {}),
+      ...(authServerMetadataUrl ? { authServerMetadataUrl } : {}),
+    });
+    if (!discovery.registrationEndpoint) {
+      return json({ error: "oauth_registration_unsupported" }, 400);
+    }
+    const cached = ctx.sql
+      .exec<{ client_id: string; expires_at: number }>(
+        `SELECT client_id, expires_at FROM mcp_oauth_clients
+         WHERE owner_email = ? AND registration_endpoint = ? AND redirect_uri = ?`,
+        owner,
+        discovery.registrationEndpoint,
+        callbackUrl,
+      )
+      .toArray()[0];
+    let clientId = cached?.client_id ?? "";
+    if (!clientId || (cached.expires_at > 0 && cached.expires_at <= now() + 60_000)) {
+      const registered = await registerDynamicOAuthClient(discovery.registrationEndpoint, callbackUrl);
+      clientId = registered.clientId;
+      ctx.sql.exec(
+        `INSERT OR REPLACE INTO mcp_oauth_clients
+          (owner_email, registration_endpoint, redirect_uri, client_id, expires_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        owner,
+        discovery.registrationEndpoint,
+        callbackUrl,
+        clientId,
+        registered.expiresAt ?? 0,
+        now(),
+      );
+    }
+    const state = newOAuthState();
+    const browserNonce = newOAuthState();
+    const verifier = newPkceVerifier();
+    const challenge = await pkceChallenge(verifier);
+    const expiresAt = now() + OAUTH_PENDING_TTL_MS;
+    // A newer attempt supersedes every older callback for this connector.
+    ctx.sql.exec(
+      "DELETE FROM mcp_oauth_pending WHERE owner_email = ? AND (server_id = ? OR expires_at < ?)",
+      owner,
+      serverId,
+      now(),
+    );
+    ctx.sql.exec(
+      `INSERT INTO mcp_oauth_pending
+        (owner_email, state, server_id, mcp_url, token_endpoint, client_id, verifier,
+         redirect_uri, resource, issuer, return_origin, browser_nonce, callback_challenge,
+         authorization_code, expires_at, status, error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, 'pending', '', ?, ?)`,
+      owner,
+      state,
+      serverId,
+      mcpUrl,
+      discovery.tokenEndpoint,
+      clientId,
+      await ctx.seal(verifier, oauthPendingFieldScope(owner, state, "verifier")),
+      callbackUrl,
+      discovery.resource ?? "",
+      discovery.issuer,
+      normalizedReturnOrigin,
+      await ctx.seal(browserNonce, oauthPendingFieldScope(owner, state, "browser_nonce")),
+      expiresAt,
+      now(),
+      now(),
+    );
+    const scopes = discovery.scopes ?? [];
+    recordRequestedScopes(ctx.sql, owner, serverId, scopes, now());
+    const authorizationUrl = buildAuthorizationUrl({
+      discovery,
+      clientId,
+      redirectUri: callbackUrl,
+      state,
+      challenge,
+    });
+    return json({ authorizationUrl, state, browserNonce, expiresAt, scopes, scopeSource: discovery.scopeSource });
+  } catch (error) {
+    return json({ error: capStr(error instanceof Error ? error.message : "oauth_start_failed", 300) }, 502);
   }
 }
 

@@ -2049,6 +2049,9 @@ async function revalidateQuietly(
           credentialStored: connection.credentialStored === true,
           promptCount: connection.promptCount ?? 0,
           resourceCount: connection.resourceCount ?? 0,
+          // The server reports a pending insufficient_scope step-up on every
+          // check until a wider sign-in completes; absence means cleared.
+          stepUp: connection.stepUp,
           error: undefined,
         };
       });
@@ -2117,7 +2120,16 @@ export async function oauthConnectMcp(
     };
   });
   try {
-    await runOAuthSignIn({ id: server.id, url: server.url, name: server.name }, popup);
+    await runOAuthSignIn(
+      {
+        id: server.id,
+        url: server.url,
+        name: server.name,
+        oauthScopes: server.oauthScopes,
+        authServerMetadataUrl: server.authServerMetadataUrl,
+      },
+      popup,
+    );
   } catch (error) {
     if (oauthAttempts.get(server.id) !== attempt) {
       return;

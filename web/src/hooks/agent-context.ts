@@ -101,6 +101,8 @@ export type AgentContextValue = {
   }) => void;
   removeMcp: (id: string) => void;
   connectMcp: (id: string) => void;
+  /** Forces the OAuth popup even for a connected server (step-up: wider scopes). */
+  signInMcp: (id: string) => void;
   toggleMcpTool: (serverId: string, toolName: string) => void;
 };
 

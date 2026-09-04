@@ -54,6 +54,7 @@ const MIGRATION_TABLES: readonly MigrationTable[] = [
   { wireName: "mcpOAuthRevocations", tableName: "mcp_oauth_revocations", columns: ["server_id", "revoked_at"] },
   { wireName: "mcpOAuthStates", tableName: "mcp_oauth_states", columns: ["server_id", "state", "error_code", "retry_after", "updated_at"] },
   { wireName: "mcpOAuthClients", tableName: "mcp_oauth_clients", columns: ["registration_endpoint", "redirect_uri", "client_id", "expires_at", "updated_at"] },
+  { wireName: "mcpOAuthScopes", tableName: "mcp_oauth_scopes", columns: ["server_id", "requested", "granted", "required", "step_up_code", "updated_at"] },
   {
     wireName: "mcpOAuthPending",
     tableName: "mcp_oauth_pending",
@@ -123,6 +124,7 @@ const OWNER_DATA_TABLES = [
   "mcp_oauth_revocations",
   "mcp_oauth_states",
   "mcp_oauth_clients",
+  "mcp_oauth_scopes",
   "mcp_oauth_pending",
   "mcp_github_device_pending",
   "automation_run_receipts",

@@ -31,6 +31,7 @@ import {
 import { createRunPauseBoard, type RunPauseBoard } from "./run-pause";
 import { deriveCodeChangeFlow, finalizeCodeChangeFlow, mergeRunCodeChangeStates } from "./code-change-flow";
 import {
+  blockedCloudServerFailures,
   chainRotationBases,
   cloudMcpServersForAutomation,
   cloudOAuthTokens,
@@ -42,6 +43,7 @@ import {
   type OAuthRotation,
   type RefreshedOAuth,
 } from "./mcp-cloud";
+import { recordRequiredScopes } from "./mcp-oauth-scopes";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
 import { openGrantPayload, openRotationValue, sealGrantPayload } from "./secret-rows";
 import { SecretVault, SecretVaultError } from "./secret-vault";
@@ -1050,7 +1052,7 @@ export class RunManager {
     let mcp: McpToolset = idleToolset();
     if (durableMcpConfigs.length > 0) {
       try {
-        const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
+        const { tokens: oauthTokens, appliedChains, blocked } = await this.oauthTokensFor(run.owner);
         const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens);
         mcp = servers.length > 0
           ? await resolveMcpToolset({
@@ -1077,6 +1079,9 @@ export class RunManager {
                 ),
             })
           : idleToolset();
+        // Servers left out because their sign-in is blocked (renew / wider
+        // access) get an honest record instead of silently disappearing.
+        mcp.failures.push(...blockedCloudServerFailures(durableMcpConfigs, blocked));
         run.closeToolset = () => mcp.close();
       } catch (error) {
         console.error("mcp arming failed:", error instanceof Error ? error.message : "unknown");
@@ -2223,6 +2228,10 @@ export class RunManager {
       outcome.transient ? Date.now() + 30_000 : 0,
       Date.now(),
     );
+    if (state === "step_up_required" && outcome.requiredScopes) {
+      // The next sign-in widens its request by these; only a completed sign-in clears them.
+      recordRequiredScopes(this.ctx.storage.sql, owner, serverId, outcome.requiredScopes, outcome.code);
+    }
   }
 
   private markOAuthReady(owner: string, serverId: string): void {
@@ -2238,7 +2247,7 @@ export class RunManager {
 
   private async oauthTokensFor(
     owner: string,
-  ): Promise<{ tokens: Record<string, CloudOAuthToken>; appliedChains: Map<string, string[]> }> {
+  ): Promise<{ tokens: Record<string, CloudOAuthToken>; appliedChains: Map<string, string[]>; blocked: Map<string, string> }> {
     const profileRow = this.ctx.storage.sql
       .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
       .toArray()[0];
@@ -2281,14 +2290,16 @@ export class RunManager {
     for (const row of revoked) {
       delete tokens[row.server_id];
     }
-    const blocked = this.ctx.storage.sql
-      .exec<{ server_id: string }>(
-        "SELECT server_id FROM mcp_oauth_states WHERE owner_email = ? AND state IN ('reauth_required', 'step_up_required')",
+    const blockedRows = this.ctx.storage.sql
+      .exec<{ server_id: string; state: string }>(
+        "SELECT server_id, state FROM mcp_oauth_states WHERE owner_email = ? AND state IN ('reauth_required', 'step_up_required')",
         owner,
       )
       .toArray();
-    for (const row of blocked) {
+    const blocked = new Map<string, string>();
+    for (const row of blockedRows) {
       delete tokens[row.server_id];
+      blocked.set(row.server_id, row.state);
     }
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const rows = await this.ctx.storage.list<unknown>({ prefix });
@@ -2312,7 +2323,7 @@ export class RunManager {
     for (const id of staleIds) {
       await this.ctx.storage.delete(`${prefix}${id}`); // caught up or replaced by a fresh sign-in
     }
-    return { tokens, appliedChains };
+    return { tokens, appliedChains, blocked };
   }
 
   /**

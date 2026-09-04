@@ -22,6 +22,7 @@
 // tool tables are already redacted by the transport (mcp-cloud.ts).
 
 import type { ChatSql } from "./chat-shared";
+import { classifyMcpAuthRejection, describeStepUp } from "./mcp-auth-challenge";
 import {
   callCloudMcpTool,
   cloudMcpFunctionName,
@@ -42,6 +43,7 @@ import {
 import {
   JSON_RPC_INVALID_PARAMS,
   JSON_RPC_METHOD_NOT_FOUND,
+  McpAuthRejectedError,
   normalizeElicitationRequest,
   normalizeServerCapabilities,
   normalizeToolAnnotations,
@@ -75,7 +77,7 @@ export type ToolRecord = { name: string; arguments: string; result: string };
 
 /** Dispatch route for one namespaced MCP or native-connector tool. */
 export type McpRoute =
-  | { type: "mcp"; session: CloudMcpSession; toolName: string; serverName: string }
+  | { type: "mcp"; session: CloudMcpSession; toolName: string; serverName: string; serverId?: string }
   | {
       type: "native";
       kind: "github" | "slack" | "intercom";
@@ -625,9 +627,9 @@ export type McpToolsetServerInfo = {
 /** An elicitation the toolset asks the surface to answer (interactive runs pause on it). */
 export type McpToolsetElicitation = McpElicitationRequest & { serverId: string; serverName: string };
 
-/** Mid-run honest record (elicitation declined, catalog refreshed…) for surfaces that keep a journal. */
+/** Mid-run honest record (elicitation declined, catalog refreshed, step-up…) for surfaces that keep a journal. */
 export type McpToolsetJournalEntry = {
-  kind: "elicitation_declined" | "elicitation_timeout" | "elicitation_invalid" | "catalog_refreshed";
+  kind: "elicitation_declined" | "elicitation_timeout" | "elicitation_invalid" | "catalog_refreshed" | "step_up_required";
   serverId: string;
   serverName: string;
   detail: string;
@@ -699,6 +701,8 @@ type ServerState = {
   /** A list_changed notification arrived — the next search/call re-lists tools. */
   stale: boolean;
   stream: McpNotificationStream | null;
+  /** insufficient_scope arrived: the server is not contacted again this run. */
+  stepUp: { scopes: string[]; code: string } | null;
   promptCount?: number;
   resourceCount?: number;
 };
@@ -809,6 +813,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         failure: null,
         stale: false,
         stream: null,
+        stepUp: null,
         ...(fresh && cached.prompts ? { promptCount: cached.prompts.length, resourceCount: cached.resources?.length ?? 0 } : {}),
       };
     });
@@ -817,6 +822,42 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const note = (entry: McpToolsetJournalEntry): void => {
     journal.push(entry);
     options.onJournal?.(entry);
+  };
+
+  /**
+   * 403 `insufficient_scope` (RFC 6750 §3.1): the grant works but is too
+   * narrow for this tool. The server is parked for the rest of the run (no
+   * retries with the same token), the account records the demanded scopes so
+   * the next sign-in asks for pin ∪ granted ∪ required, and the tool result
+   * tells the model exactly what to do. Returns the honest text, or null when
+   * the error was not a step-up.
+   */
+  const parkForStepUp = async (state: ServerState, error: unknown): Promise<string | null> => {
+    if (!(error instanceof McpAuthRejectedError)) {
+      return null;
+    }
+    const rejection = classifyMcpAuthRejection(error.status, error.wwwAuthenticate);
+    if (rejection.kind !== "step_up") {
+      return null;
+    }
+    const server = state.server;
+    const text = describeStepUp(server.name, rejection.scopes);
+    state.stepUp = { scopes: rejection.scopes, code: rejection.code };
+    state.failure = text;
+    state.session = null;
+    state.stream?.close();
+    state.stream = null;
+    note({ kind: "step_up_required", serverId: server.id, serverName: server.name, detail: text });
+    await options.reportFailure?.(server.id, {
+      ok: false,
+      status: error.status,
+      code: rejection.code,
+      ...(rejection.description ? { detail: rejection.description.slice(0, 300) } : {}),
+      transient: false,
+      ambiguous: false,
+      requiredScopes: rejection.scopes,
+    });
+    return text;
   };
 
   /**
@@ -917,6 +958,12 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
           const message = error instanceof Error ? error.message : "connect failed";
           if (!/auth rejected/i.test(message)) {
             throw error;
+          }
+          // A scope challenge on the handshake itself: no refresh or re-resolve
+          // can widen a grant — park the server and say so.
+          const stepUp = await parkForStepUp(state, error);
+          if (stepUp) {
+            throw new Error(stepUp);
           }
           if (options.reconnect) {
             const fresh = await options.reconnect(state.server.id).catch(() => null);
@@ -1062,6 +1109,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
           session: state.session,
           toolName: tool.name,
           serverName: server.name,
+          serverId: server.id,
         });
         runtime.toolDefs.push({
           type: "function",
@@ -1270,6 +1318,10 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       const output = await callCloudMcpTool(state.session, toolName, callArgs);
       return { text: output.trim().length > 0 ? output : "(empty result)" };
     } catch (error) {
+      const stepUp = await parkForStepUp(state, error);
+      if (stepUp) {
+        return { text: stepUp, isError: true };
+      }
       return {
         text: `MCP tool failed (${server.name}): ${error instanceof Error ? error.message : "unknown error"}`,
         isError: true,
@@ -1295,6 +1347,11 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     async execute(name, args) {
       const route = runtime.routes.get(name);
       if (route) {
+        const state = route.type === "mcp" ? states.find((item) => item.server.id === route.serverId) : undefined;
+        if (state?.stepUp) {
+          // Parked after insufficient_scope — the same token would fail again.
+          return { text: state.failure ?? describeStepUp(route.serverName, state.stepUp.scopes), isError: true };
+        }
         try {
           const output =
             route.type === "native"
@@ -1302,6 +1359,10 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
               : await callCloudMcpTool(route.session, route.toolName, args);
           return { text: output.trim().length > 0 ? output : "(empty result)" };
         } catch (error) {
+          const stepUp = state ? await parkForStepUp(state, error) : null;
+          if (stepUp) {
+            return { text: stepUp, isError: true };
+          }
           return {
             text: `MCP tool failed (${route.serverName}): ${error instanceof Error ? error.message : "unknown error"}`,
             isError: true,

@@ -790,6 +790,16 @@ const LEGACY_CATALOG_URLS: Record<string, string[]> = {
   datadog: ["https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"],
 };
 
+function normalizeStepUp(value: unknown): McpServerConfig["stepUp"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as { scopes?: unknown; code?: unknown };
+  const scopes = Array.isArray(raw.scopes) ? raw.scopes.filter((item): item is string => typeof item === "string").slice(0, 64) : [];
+  const code = typeof raw.code === "string" ? raw.code.slice(0, 80) : "";
+  return scopes.length > 0 || code ? { scopes, code: code || "insufficient_scope" } : undefined;
+}
+
 function normalizeServer(server: McpServerConfig): McpServerConfig {
   const catalogId = typeof server.catalogId === "string" ? server.catalogId : undefined;
   const entry = findCatalogEntry(catalogId ?? server.id);
@@ -816,6 +826,12 @@ function normalizeServer(server: McpServerConfig): McpServerConfig {
     verifiedAt: typeof server.verifiedAt === "number" ? server.verifiedAt : undefined,
     credentialStored:
       typeof server.credentialStored === "boolean" ? server.credentialStored : undefined,
+    oauthScopes: typeof server.oauthScopes === "string" && server.oauthScopes.trim() ? server.oauthScopes.trim().slice(0, 2_000) : undefined,
+    authServerMetadataUrl:
+      typeof server.authServerMetadataUrl === "string" && server.authServerMetadataUrl.trim()
+        ? server.authServerMetadataUrl.trim().slice(0, 2_000)
+        : undefined,
+    stepUp: normalizeStepUp(server.stepUp),
     tools: Array.isArray(server.tools) ? server.tools : [],
     disabledTools: unlockGithubChatWrites(
       catalogId ?? (typeof server.id === "string" ? server.id : ""),

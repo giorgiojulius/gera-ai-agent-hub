@@ -110,7 +110,14 @@ import {
   type PushEntry,
   type TombstoneRow,
 } from "./chat-shared";
-import { handleMcpInventory, handleMcpPromptGet, handleMcpResourceRead, type McpRouteContext } from "./mcp-routes";
+import { handleMcpInventory, handleMcpOAuthStart, handleMcpPromptGet, handleMcpResourceRead, type McpRouteContext } from "./mcp-routes";
+import {
+  clearOAuthScopes,
+  ensureOAuthScopeTable,
+  pendingStepUp,
+  recordGrantedScopes,
+  recordRequiredScopes,
+} from "./mcp-oauth-scopes";
 import {
   createSqlMcpCatalogStore,
   normalizeMcpToolLoading,
@@ -136,16 +143,7 @@ import {
   type OAuthRotation,
   type RefreshedOAuth,
 } from "./mcp-cloud";
-import {
-  buildAuthorizationUrl,
-  discoverMcpOAuth,
-  exchangeAuthorizationCode,
-  newOAuthState,
-  OAuthCodeExchangeError,
-  newPkceVerifier,
-  pkceChallenge,
-  registerDynamicOAuthClient,
-} from "./mcp-oauth-flow";
+import { exchangeAuthorizationCode, newOAuthState, OAuthCodeExchangeError } from "./mcp-oauth-flow";
 import { fetchPublicHttps } from "./network-safety";
 import { RunManager } from "./run-manager";
 import {
@@ -397,6 +395,7 @@ export class ChatStore extends DurableObject {
     this.ctx.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_oauth_pending_server ON mcp_oauth_pending (owner_email, server_id)",
     );
+    ensureOAuthScopeTable(this.ctx.storage.sql);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS mcp_github_device_pending (
         owner_email TEXT NOT NULL,
@@ -823,7 +822,7 @@ export class ChatStore extends DurableObject {
       return this.handleOAuthRotations(email);
     }
     if (request.method === "POST" && url.pathname === "/mcp/oauth-start") {
-      return this.handleOAuthStart(request, email);
+      return handleMcpOAuthStart(this.mcpRouteContext(), request, email);
     }
     if (request.method === "POST" && url.pathname === "/mcp/github-device-start") {
       return this.handleGitHubDeviceStart(email);
@@ -1717,6 +1716,10 @@ export class ChatStore extends DurableObject {
       outcome.transient ? Date.now() + 30_000 : 0,
       Date.now(),
     );
+    if (state === "step_up_required" && outcome.requiredScopes) {
+      // The next sign-in widens its request by these; only a completed sign-in clears them.
+      recordRequiredScopes(this.ctx.storage.sql, owner, serverId, outcome.requiredScopes, outcome.code);
+    }
   }
 
   /** Reads OAuth grants from the account shard; legacy profile grants migrate once. */
@@ -2008,109 +2011,6 @@ export class ChatStore extends DurableObject {
     return target.toString();
   }
 
-  /** Starts OAuth with PKCE metadata and verifier stored only in this shard. */
-  private async handleOAuthStart(request: Request, owner: string): Promise<Response> {
-    let body: { server?: unknown; returnOrigin?: unknown };
-    try {
-      body = (await request.json()) as typeof body;
-    } catch {
-      return json({ error: "invalid_body" }, 400);
-    }
-    const server = isRecord(body.server) ? body.server : null;
-    const serverId = server && typeof server.id === "string" ? server.id : "";
-    const mcpUrl = server && typeof server.url === "string" ? server.url.trim() : "";
-    const returnOrigin = typeof body.returnOrigin === "string" ? body.returnOrigin : "";
-    let normalizedReturnOrigin = "";
-    try {
-      const parsed = new URL(returnOrigin);
-      if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
-        throw new Error("unsafe origin");
-      }
-      normalizedReturnOrigin = parsed.origin;
-    } catch {
-      return json({ error: "invalid_return_origin" }, 400);
-    }
-    if (!isValidId(serverId) || !mcpUrl || mcpUrl.length > 4_000) {
-      return json({ error: "invalid_server" }, 400);
-    }
-    const callbackUrl = new URL("/mcp/oauth/callback", request.url).toString();
-    try {
-      const discovery = await discoverMcpOAuth(mcpUrl);
-      if (!discovery.registrationEndpoint) {
-        return json({ error: "oauth_registration_unsupported" }, 400);
-      }
-      const cached = this.ctx.storage.sql
-        .exec<{ client_id: string; expires_at: number }>(
-          `SELECT client_id, expires_at FROM mcp_oauth_clients
-           WHERE owner_email = ? AND registration_endpoint = ? AND redirect_uri = ?`,
-          owner,
-          discovery.registrationEndpoint,
-          callbackUrl,
-        )
-        .toArray()[0];
-      let clientId = cached?.client_id ?? "";
-      if (!clientId || (cached.expires_at > 0 && cached.expires_at <= Date.now() + 60_000)) {
-        const registered = await registerDynamicOAuthClient(discovery.registrationEndpoint, callbackUrl);
-        clientId = registered.clientId;
-        this.ctx.storage.sql.exec(
-          `INSERT OR REPLACE INTO mcp_oauth_clients
-            (owner_email, registration_endpoint, redirect_uri, client_id, expires_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          owner,
-          discovery.registrationEndpoint,
-          callbackUrl,
-          clientId,
-          registered.expiresAt ?? 0,
-          Date.now(),
-        );
-      }
-      const state = newOAuthState();
-      const browserNonce = newOAuthState();
-      const verifier = newPkceVerifier();
-      const challenge = await pkceChallenge(verifier);
-      const expiresAt = Date.now() + 10 * 60_000;
-      // A newer attempt supersedes every older callback for this connector.
-      this.ctx.storage.sql.exec(
-        "DELETE FROM mcp_oauth_pending WHERE owner_email = ? AND (server_id = ? OR expires_at < ?)",
-        owner,
-        serverId,
-        Date.now(),
-      );
-      this.ctx.storage.sql.exec(
-        `INSERT INTO mcp_oauth_pending
-          (owner_email, state, server_id, mcp_url, token_endpoint, client_id, verifier,
-           redirect_uri, resource, issuer, return_origin, browser_nonce, callback_challenge,
-           authorization_code, expires_at, status, error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, 'pending', '', ?, ?)`,
-        owner,
-        state,
-        serverId,
-        mcpUrl,
-        discovery.tokenEndpoint,
-        clientId,
-        await this.vault.seal(verifier, oauthPendingFieldScope(owner, state, "verifier")),
-        callbackUrl,
-        discovery.resource ?? "",
-        discovery.issuer,
-        normalizedReturnOrigin,
-        await this.vault.seal(browserNonce, oauthPendingFieldScope(owner, state, "browser_nonce")),
-        expiresAt,
-        Date.now(),
-        Date.now(),
-      );
-      const authorizationUrl = buildAuthorizationUrl({
-        discovery,
-        clientId,
-        redirectUri: callbackUrl,
-        state,
-        challenge,
-      });
-      return json({ authorizationUrl, state, browserNonce, expiresAt });
-    } catch (error) {
-      return json({ error: capStr(error instanceof Error ? error.message : "oauth_start_failed", 300) }, 502);
-    }
-  }
-
   /** Browser polling surface: status only, never a provider token or verifier. */
   private handleOAuthStatus(request: Request, owner: string): Response {
     const url = new URL(request.url);
@@ -2290,7 +2190,7 @@ export class ChatStore extends DurableObject {
       state,
     );
     try {
-      const token = await exchangeAuthorizationCode({
+      const { grantedScopes, ...token } = await exchangeAuthorizationCode({
         tokenEndpoint: row.token_endpoint,
         clientId: row.client_id,
         code: pending.authorization_code,
@@ -2319,6 +2219,8 @@ export class ChatStore extends DurableObject {
           row.server_id,
         );
         this.markOAuthReady(owner, row.server_id);
+        // The user just consented: whatever a step-up demanded is now granted.
+        recordGrantedScopes(this.ctx.storage.sql, owner, row.server_id, grantedScopes ?? null, committedAt);
         this.ctx.storage.sql.exec(
           `UPDATE mcp_oauth_pending
            SET status = 'completed', error = '', verifier = '', browser_nonce = '',
@@ -2515,6 +2417,7 @@ export class ChatStore extends DurableObject {
         owner,
         id,
       );
+      clearOAuthScopes(this.ctx.storage.sql, owner, id);
       await this.ctx.storage.delete(`${OAUTH_REF_PREFIX}${owner}:${id}`);
     }
     const row = this.ctx.storage.sql
@@ -2627,8 +2530,10 @@ export class ChatStore extends DurableObject {
           .map((id) => this.oauthGrantState(owner, id))
           .find((state) => state === "reauth_required" || state === "step_up_required")
       : undefined;
+    // A run's insufficient_scope challenge, pending until a new sign-in consents to it.
+    const stepUp = grantIds.map((id) => pendingStepUp(this.ctx.storage.sql, owner, id)).find(Boolean) ?? null;
     if (blockedState) {
-      return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
+      return json({ error: blockedState, ...(stepUp ? { stepUp } : {}) }, blockedState === "step_up_required" ? 403 : 401);
     }
     const oauthTokens = await this.profileOAuthTokens(owner);
     for (const [id, grant] of storedGrants) {
@@ -2694,16 +2599,19 @@ export class ChatStore extends DurableObject {
           .map((id) => this.oauthGrantState(owner, id))
           .find((state) => state === "reauth_required" || state === "step_up_required");
         if (authState) {
-          return json({ error: authState }, authState === "step_up_required" ? 403 : 401);
+          return json({ error: authState, ...(stepUp ? { stepUp } : {}) }, authState === "step_up_required" ? 403 : 401);
         }
         const failure = runtime.failures[0]?.result ?? "MCP server returned no tools.";
         return json({ error: failure }, 502);
       }
       if (servers[0]?.oauth) {
         // The grant just proved itself against the live provider: clear any
-        // stuck reauth/step-up markers so leases and relays use it again.
+        // stuck reauth/step-up markers so leases and relays use it again. A
+        // pending insufficient_scope step-up is the exception — the handshake
+        // only proves the token, not the scopes a tool demanded; only a new
+        // sign-in (which asks for the union) clears that one.
         for (const id of grantIds) {
-          if (storedGrants.has(id)) {
+          if (storedGrants.has(id) && !pendingStepUp(this.ctx.storage.sql, owner, id)) {
             this.markOAuthReady(owner, id);
           }
         }
@@ -2740,6 +2648,7 @@ export class ChatStore extends DurableObject {
         credentialStored,
         promptCount: info?.promptCount ?? 0,
         resourceCount: info?.resourceCount ?? 0,
+        ...(stepUp ? { stepUp } : {}),
       });
     } catch (error) {
       // An unexpected fault inside the check (a refresh race, a storage error)
@@ -3026,9 +2935,10 @@ export class ChatStore extends DurableObject {
         return json({ error: outcome.transient ? "retryable_error" : this.oauthGrantState(owner, grantId) }, outcome.transient ? 503 : 401);
       }
     }
-    if (storedGrants.has(grantId)) {
+    if (storedGrants.has(grantId) && !pendingStepUp(this.ctx.storage.sql, owner, grantId)) {
       // The grant is durable and just leased successfully — clear any stale
-      // reauth/step-up marker so later leases stop tripping over it.
+      // reauth/step-up marker so later leases stop tripping over it (a pending
+      // insufficient_scope step-up waits for the wider sign-in instead).
       this.markOAuthReady(owner, grantId);
     }
     return json({ authorization: `Bearer ${server.oauth?.accessToken ?? grant.accessToken}` });
@@ -3083,6 +2993,7 @@ export class ChatStore extends DurableObject {
     return {
       sql: this.ctx.storage.sql,
       resolveServers: async (owner, ids) => (await this.resolveOwnerMcpServers(owner, ids, new Set()))?.servers ?? [],
+      seal: (plain, scope) => this.vault.seal(plain, scope),
     };
   }
 

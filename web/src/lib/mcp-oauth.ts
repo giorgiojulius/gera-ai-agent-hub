@@ -871,9 +871,20 @@ export async function completeServerOAuthSignIn(state: string, callbackChallenge
   }
 }
 
+/** What the browser tells the account shard about a sign-in: ids and Advanced metadata, never credentials. */
+export type OAuthSignInServer = {
+  id: string;
+  url: string;
+  name: string;
+  /** Pinned scopes (RFC 6749 §3.3); empty/undefined lets the server's hints decide. */
+  oauthScopes?: string;
+  /** Authorization-server metadata document override (public HTTPS). */
+  authServerMetadataUrl?: string;
+};
+
 /** Runs OAuth without letting the browser receive a code exchange or provider token. */
 export async function runOAuthSignIn(
-  server: { id: string; url: string; name: string },
+  server: OAuthSignInServer,
   popup: Window | null,
 ): Promise<void> {
   if (!popup) {
@@ -890,7 +901,15 @@ export async function runOAuthSignIn(
     const response = await authedFetch("/mcp/oauth-start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ server: { id: server.id, url: server.url, name: server.name } }),
+      body: JSON.stringify({
+        server: {
+          id: server.id,
+          url: server.url,
+          name: server.name,
+          ...(server.oauthScopes?.trim() ? { oauthScopes: server.oauthScopes.trim() } : {}),
+          ...(server.authServerMetadataUrl?.trim() ? { authServerMetadataUrl: server.authServerMetadataUrl.trim() } : {}),
+        },
+      }),
     });
     const start = (await response.json().catch(() => ({}))) as {
       authorizationUrl?: unknown;

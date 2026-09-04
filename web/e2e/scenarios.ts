@@ -57,6 +57,11 @@ export const STUB_MCP_RESOURCE_LABEL = "README";
 /** Field the stubbed elicitation asks for. */
 export const STUB_ELICIT_FIELD = "region";
 
+/** Custom OAuth server whose stubbed /mcp/check reports a pending scope step-up. */
+export const STUB_STEP_UP_SERVER_ID = "scoped";
+/** Scope the stubbed insufficient_scope challenge demanded. */
+export const STUB_STEP_UP_SCOPE = "things:write";
+
 /** Curated chat model every platform's picker must offer. */
 export const SWITCH_TARGET_MODEL_ID = "anthropic/claude-opus-5";
 export const SWITCH_TARGET_MODEL_NAME = "Claude Opus 5";
@@ -323,6 +328,24 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "tap", target: TID.runPauseAccept },
       { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
       { do: "notSee", target: TID.runPauseCard },
+    ],
+  },
+  {
+    id: "oauth-step-up",
+    title: "A scope challenge shows “Sign in again with wider access” and the Advanced OAuth fields",
+    steps: [
+      // The card is focused by address; the boot re-check hits the stubbed
+      // /mcp/check, which reports the step-up a run recorded.
+      { do: "goto", path: `/mcp?server=${STUB_STEP_UP_SERVER_ID}` },
+      { do: "see", target: studioPageTid("mcp"), timeoutMs: 20_000 },
+      { do: "see", target: mcpServerCardTid(STUB_STEP_UP_SERVER_ID) },
+      { do: "seeText", target: TID.mcpStepUpHint, text: STUB_STEP_UP_SCOPE, timeoutMs: 20_000 },
+      { do: "see", target: TID.mcpStepUpSignIn },
+      // Advanced stays collapsed until asked; both fields live behind it.
+      { do: "notSee", target: TID.mcpScopesInput },
+      { do: "tap", target: TID.mcpAdvancedToggle },
+      { do: "see", target: TID.mcpScopesInput },
+      { do: "see", target: TID.mcpMetadataUrlInput },
     ],
   },
   {

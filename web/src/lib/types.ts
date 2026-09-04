@@ -657,6 +657,27 @@ export type McpServerConfig = {
   /** Prompts / resources the last health check listed (composer `/` and `@` menus). */
   promptCount?: number;
   resourceCount?: number;
+  /**
+   * OAuth Advanced: pinned scopes for the authorize request (RFC 6749 §3.3,
+   * space-separated). Empty = the server's own hints decide. Metadata only.
+   */
+  oauthScopes?: string;
+  /**
+   * OAuth Advanced: authorization-server metadata document (RFC 8414 / OIDC)
+   * used instead of the well-known walk. Public HTTPS only. Metadata only.
+   */
+  authServerMetadataUrl?: string;
+  /**
+   * A run hit `insufficient_scope` on this server: the next sign-in must ask
+   * for wider access. Reported by the server-side check; cleared by a sign-in.
+   */
+  stepUp?: McpStepUp;
+};
+
+/** Pending OAuth step-up: what the server demanded and why. */
+export type McpStepUp = {
+  scopes: string[];
+  code: string;
 };
 
 /** Spec tool annotations as the server declared them (hints, never guarantees). */

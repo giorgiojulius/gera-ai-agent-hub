@@ -178,6 +178,13 @@ export const TID = {
   runPauseDecline: "run-pause-decline",
   /** One annotation badge on an MCP tool row in McpStudio (read-only, destructive, UI-only…). */
   mcpToolBadge: "mcp-tool-badge",
+  /** McpStudio server card: the collapsed "Advanced" OAuth section toggle and its fields. */
+  mcpAdvancedToggle: "mcp-advanced-toggle",
+  mcpScopesInput: "mcp-scopes-input",
+  mcpMetadataUrlInput: "mcp-metadata-url-input",
+  /** Step-up hint + "Sign in again with wider access" button on a server card. */
+  mcpStepUpHint: "mcp-step-up-hint",
+  mcpStepUpSignIn: "mcp-step-up-sign-in",
 } as const;
 
 /** All registry values, for uniqueness checks in tests. */

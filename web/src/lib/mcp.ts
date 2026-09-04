@@ -27,7 +27,7 @@ import {
   isSlackCredentialError,
   verifySlackToken,
 } from "@/lib/slack-native";
-import type { McpAuthMode, McpServerConfig, McpToolInfo, OpenAiTool } from "@/lib/types";
+import type { McpAuthMode, McpServerConfig, McpStepUp, McpToolInfo, OpenAiTool } from "@/lib/types";
 
 type JsonRpcRequest = {
   jsonrpc: "2.0";
@@ -473,7 +473,28 @@ export type McpConnection = {
   /** Prompts / resources the handshake listed (generic MCP servers only). */
   promptCount?: number;
   resourceCount?: number;
+  /** A run hit `insufficient_scope`: the next sign-in must ask for wider access. */
+  stepUp?: McpStepUp;
 };
+
+/** The server's `stepUp` payload, validated; undefined when absent or malformed. */
+export function parseMcpStepUp(value: unknown): McpStepUp | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as { scopes?: unknown; code?: unknown };
+  const scopes = Array.isArray(raw.scopes)
+    ? raw.scopes.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 64)
+    : [];
+  const code = typeof raw.code === "string" && raw.code ? raw.code.slice(0, 80) : "insufficient_scope";
+  return { scopes, code };
+}
+
+/** Plain words for a step-up: what the server wants and the one action that fixes it. */
+export function describeMcpStepUp(stepUp: McpStepUp | undefined): string {
+  const wanted = stepUp && stepUp.scopes.length > 0 ? ` (scopes: ${stepUp.scopes.join(" ")})` : "";
+  return `This server needs a sign-in with wider access${wanted} — press “Sign in again with wider access” to grant it.`;
+}
 
 /**
  * Minimal server-check wire shape. Remote tool schemas can be hundreds of KB;
@@ -514,6 +535,7 @@ type McpCheckBody = {
   credentialStored?: unknown;
   promptCount?: unknown;
   resourceCount?: unknown;
+  stepUp?: unknown;
   error?: unknown;
   detail?: unknown;
   reason?: unknown;
@@ -528,8 +550,14 @@ type McpCheckBody = {
  * wording stays inside `isRecoverableMcpHealthError` ("temporary", "retry")
  * so a background check keeps the connector armed.
  */
-export function describeMcpCheckFailure(code: string, body: Pick<McpCheckBody, "reason" | "detail">): string | null {
+export function describeMcpCheckFailure(code: string, body: Pick<McpCheckBody, "reason" | "detail" | "stepUp">): string | null {
   switch (code) {
+    case "step_up_required":
+      // A run's insufficient_scope challenge (or a consent-required refresh):
+      // the stored sign-in is too narrow; only a wider sign-in helps.
+      return describeMcpStepUp(parseMcpStepUp(body.stepUp));
+    case "reauth_required":
+      return "The saved sign-in was rejected by the provider — press “Sign in” to authorize again.";
     case "account_shard_unavailable": {
       const why =
         body.reason === "redeploy"
@@ -627,12 +655,14 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
         Boolean(tool && typeof tool === "object" && typeof (tool as McpToolInfo).name === "string"),
       )
     : [];
+  const stepUp = parseMcpStepUp(data.stepUp);
   return {
     tools: serverTools,
     identity: typeof data.identity === "string" && data.identity ? data.identity : "Server verified",
     credentialStored: data.credentialStored === true,
     promptCount: typeof data.promptCount === "number" && data.promptCount >= 0 ? data.promptCount : 0,
     resourceCount: typeof data.resourceCount === "number" && data.resourceCount >= 0 ? data.resourceCount : 0,
+    ...(stepUp ? { stepUp } : {}),
   };
 }
 

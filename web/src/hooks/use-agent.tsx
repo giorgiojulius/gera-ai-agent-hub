@@ -191,6 +191,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     addCustomMcp,
     removeMcp,
     connectMcp,
+    signInMcp,
     toggleMcpTool,
   } = useMcpActions({
     stateRef,
@@ -1503,6 +1504,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       addCustomMcp,
       removeMcp,
       connectMcp,
+      signInMcp,
       toggleMcpTool,
     };
   }, [
@@ -1557,6 +1559,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     addCustomMcp,
     removeMcp,
     connectMcp,
+    signInMcp,
     toggleMcpTool,
   ]);
 

@@ -91,7 +91,8 @@ type Env = {
   /**
    * Key material for encrypting stored credentials at rest (OAuth grants,
    * pasted keys, bot tokens) inside the Durable Objects — see secret-vault.ts.
-   * Without it, credential writes fail closed with `secrets_key_unavailable`.
+   * Base64 or hex of at least 32 random bytes; without a valid key every
+   * credential read and write fails closed with `secrets_key_unavailable`.
    */
   SECRETS_ENCRYPTION_KEY?: string;
   /** Comma-separated previous keys, decrypt-only, while a rotation completes. */
@@ -2151,7 +2152,8 @@ async function relayDiagnostics(request: Request, url: URL, env: Env): Promise<R
       return account;
     }
     const sub = url.pathname.slice("/diag".length) || "/";
-    const isList = request.method === "GET" && sub === "/list";
+    // /vault is the account's secret-free self-check: sealed-row counts only.
+    const isList = request.method === "GET" && (sub === "/list" || sub === "/vault");
     const isWrite =
       request.method === "POST" && (sub === "/append" || sub === "/seen" || sub === "/clear");
     if (!isList && !isWrite) {
@@ -2888,8 +2890,9 @@ export default {
     }
     if (url.pathname === "/ping") {
       // Secret-free: reports only whether the credential vault has a usable
-      // key — the first thing to check when a save returns
-      // secrets_key_unavailable. Never the key, its id, or its length.
+      // key ("enabled" implies base64/hex of ≥ 32 random bytes) — the first
+      // thing to check when a save returns secrets_key_unavailable. Never the
+      // key, its id, or its length.
       const vault = SecretVault.fromEnv(env);
       return corsJson(
         { ok: true, now: new Date().toISOString(), secretVault: vault.enabled ? "enabled" : vault.disabledReason },

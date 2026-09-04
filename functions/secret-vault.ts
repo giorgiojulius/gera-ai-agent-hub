@@ -1,6 +1,7 @@
-// Encryption at rest for the credentials Gera's Durable Objects keep: OAuth
+// Encryption at rest for every credential the Durable Objects store: OAuth
 // grants and refresh tokens, pasted API keys and custom headers, bot tokens,
-// signing secrets, client secrets, PKCE verifiers and device codes.
+// signing secrets, client secrets, PKCE verifiers, browser/callback proofs and
+// device codes.
 //
 // AES-256-GCM under a data key derived (HKDF-SHA-256) from the
 // SECRETS_ENCRYPTION_KEY Worker secret. Every ciphertext is bound to the row it
@@ -8,20 +9,27 @@
 // copied from one row into another — or one field into another — fails to
 // open. The key never touches storage; a storage dump alone yields nothing.
 //
+// Key material must be base64 / base64url / hex of at least 32 random bytes
+// (`openssl rand -base64 32`). The key id stored in every envelope is a hash
+// of the material, and an AES-GCM tag is itself an offline brute-force
+// oracle — only genuine entropy protects a dump, so passphrases are refused.
+//
 // Envelope: `enc1:<kid>:<iv>:<ciphertext+tag>` (base64url). `kid` names the
 // key the value was sealed under, so SECRETS_ENCRYPTION_KEY can rotate with
 // the previous key kept in SECRETS_ENCRYPTION_KEY_PREVIOUS (comma-separated)
 // for decrypt-only use until the next store sweep has re-sealed every row.
 //
-// Fail-closed: without a usable key nothing new is sealed (writers surface
-// `secrets_key_unavailable`), and sealed rows cannot be read. Legacy plaintext
-// rows still open (passthrough) so a deploy never locks anyone out; the store
-// sweeps seal them the first time the object wakes with a key.
+// Fail-closed: without a usable key nothing is sealed or opened (callers
+// surface `secrets_key_unavailable`). `open` accepts only sealed envelopes —
+// a plaintext value found where a credential should be is refused
+// (`secret_unreadable`), so a row swapped for plaintext in storage never
+// authenticates. The only reader of plaintext is `reseal`, which the stores
+// call from their one-time sweep before serving the first request.
 
 export const SEALED_PREFIX = "enc1:";
 
-/** Minimum characters for the key material — 32 random bytes in base64 are 44. */
-export const MIN_KEY_CHARS = 32;
+/** Minimum decoded bytes of key material — 256 bits of randomness. */
+export const MIN_KEY_BYTES = 32;
 
 const HKDF_SALT = "gera.secret-vault.v1";
 const HKDF_INFO = "aes-256-gcm/data-key";
@@ -35,6 +43,13 @@ export type SecretVaultEnv = {
 };
 
 export type SecretVaultErrorCode = "secrets_key_unavailable" | "secret_unreadable";
+
+/** Why a vault refuses to work; "" when it is enabled. Coarse, safe to log and to show. */
+export type SecretVaultDisabledReason =
+  | ""
+  | "secrets_key_missing"
+  | "secrets_key_malformed"
+  | "secrets_key_too_short";
 
 /** A typed vault failure — callers map it to a 503 with an honest message. */
 export class SecretVaultError extends Error {
@@ -50,7 +65,7 @@ export class SecretVaultError extends Error {
 /** User-facing copy for a vault failure; never includes key material. */
 export function describeSecretVaultError(error: SecretVaultError): string {
   return error.code === "secrets_key_unavailable"
-    ? "Server-side encryption is not configured — set SECRETS_ENCRYPTION_KEY on the backend before storing credentials."
+    ? "Server-side encryption is not configured — SECRETS_ENCRYPTION_KEY must be base64 or hex of at least 32 random bytes."
     : "A stored credential could not be decrypted with the current encryption key — reconnect it, or restore the previous key.";
 }
 
@@ -68,11 +83,13 @@ function toBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function fromBase64Url(text: string): Uint8Array<ArrayBuffer> | null {
-  if (!/^[A-Za-z0-9_-]*$/.test(text)) {
+function decodeBase64(text: string): Uint8Array<ArrayBuffer> | null {
+  const stripped = text.replace(/=+$/, "");
+  if (!/^[A-Za-z0-9+/_-]*$/.test(stripped) || stripped.length % 4 === 1) {
     return null;
   }
-  const padded = text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (text.length % 4)) % 4);
+  const standard = stripped.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = standard + "=".repeat((4 - (standard.length % 4)) % 4);
   try {
     const binary = atob(padded);
     const bytes = new Uint8Array(binary.length);
@@ -83,6 +100,41 @@ function fromBase64Url(text: string): Uint8Array<ArrayBuffer> | null {
   } catch {
     return null;
   }
+}
+
+function fromBase64Url(text: string): Uint8Array<ArrayBuffer> | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) {
+    return null;
+  }
+  return decodeBase64(text);
+}
+
+/**
+ * How many random bytes a key string encodes: hex or base64/base64url with
+ * optional padding; whitespace (line breaks from a wrapped `openssl rand
+ * -base64`, spaces from a paste) is ignored. Null when it is neither — a
+ * passphrase with punctuation, or copy-paste damage. Validation only: the
+ * data key is always derived from the string as given, so accepting a wrapped
+ * key never changes what it decrypts.
+ */
+export function keyMaterialBytes(material: string): number | null {
+  const compact = material.replace(/\s+/g, "");
+  if (/^[0-9a-fA-F]+$/.test(compact) && compact.length % 2 === 0) {
+    return compact.length / 2;
+  }
+  return decodeBase64(compact)?.length ?? null;
+}
+
+/** Classifies one key string the way `SecretVault.fromEnv` does: only random bytes pass. */
+export function keyMaterialProblem(material: string): SecretVaultDisabledReason {
+  if (!material) {
+    return "secrets_key_missing";
+  }
+  const bytes = keyMaterialBytes(material);
+  if (bytes === null) {
+    return "secrets_key_malformed";
+  }
+  return bytes < MIN_KEY_BYTES ? "secrets_key_too_short" : "";
 }
 
 async function keyIdFor(material: string): Promise<string> {
@@ -101,13 +153,13 @@ async function deriveDataKey(material: string): Promise<CryptoKey> {
   );
 }
 
-/** Splits the comma-separated previous-key list, dropping blanks and duplicates. */
+/** Splits the comma-separated previous-key list, dropping blanks, weak keys and duplicates. */
 function previousMaterials(raw: string | undefined, current: string): string[] {
   const seen = new Set<string>([current]);
   const out: string[] = [];
   for (const part of (raw ?? "").split(",")) {
     const material = part.trim();
-    if (material.length >= MIN_KEY_CHARS && !seen.has(material)) {
+    if (keyMaterialProblem(material) === "" && !seen.has(material)) {
       seen.add(material);
       out.push(material);
     }
@@ -145,10 +197,10 @@ export class SecretVault {
   /** False when no usable SECRETS_ENCRYPTION_KEY is configured. */
   readonly enabled: boolean;
   /** Why the vault is disabled ("" when enabled) — coarse, safe to log. */
-  readonly disabledReason: string;
+  readonly disabledReason: SecretVaultDisabledReason;
   private readonly keyring: Promise<Keyring> | null;
 
-  private constructor(material: string, previous: string[], disabledReason: string) {
+  private constructor(material: string, previous: string[], disabledReason: SecretVaultDisabledReason) {
     this.disabledReason = disabledReason;
     this.enabled = disabledReason === "";
     if (!this.enabled) {
@@ -168,11 +220,9 @@ export class SecretVault {
   static fromEnv(env: unknown): SecretVault {
     const record = env && typeof env === "object" ? (env as SecretVaultEnv) : {};
     const material = (record.SECRETS_ENCRYPTION_KEY ?? "").trim();
-    if (!material) {
-      return new SecretVault("", [], "secrets_key_missing");
-    }
-    if (material.length < MIN_KEY_CHARS) {
-      return new SecretVault("", [], "secrets_key_too_short");
+    const problem = keyMaterialProblem(material);
+    if (problem !== "") {
+      return new SecretVault("", [], problem);
     }
     return new SecretVault(material, previousMaterials(record.SECRETS_ENCRYPTION_KEY_PREVIOUS, material), "");
   }
@@ -219,13 +269,37 @@ export class SecretVault {
   }
 
   /**
-   * Decrypts a sealed value for `scope`. Plaintext (pre-vault) values pass
-   * through untouched so a deploy never strands existing connections.
+   * Decrypts a sealed value for `scope`. Only envelopes are accepted: a
+   * plaintext string where a credential should be is refused, so a value
+   * planted in storage never authenticates. Empty stays empty (absent).
    */
   async open(stored: string, scope: string): Promise<string> {
+    if (stored === "") {
+      return "";
+    }
+    if (!this.keyring) {
+      throw new SecretVaultError("secrets_key_unavailable", this.disabledReason);
+    }
     if (!this.isSealed(stored)) {
+      throw new SecretVaultError("secret_unreadable", "plaintext rejected");
+    }
+    return this.decrypt(stored, scope);
+  }
+
+  /**
+   * Migration-only: seals a pre-vault plaintext value, or re-seals one sealed
+   * under a previous key; values already under the current key are returned
+   * as-is. The store sweeps are the only callers that should meet plaintext.
+   */
+  async reseal(stored: string, scope: string): Promise<string> {
+    if (stored === "" || (await this.isCurrent(stored))) {
       return stored;
     }
+    const plain = this.isSealed(stored) ? await this.decrypt(stored, scope) : stored;
+    return this.seal(plain, scope);
+  }
+
+  private async decrypt(stored: string, scope: string): Promise<string> {
     const parts = stored.slice(SEALED_PREFIX.length).split(":");
     if (parts.length !== 3) {
       throw new SecretVaultError("secret_unreadable", "malformed envelope");
@@ -251,17 +325,6 @@ export class SecretVault {
     } catch {
       throw new SecretVaultError("secret_unreadable", "authentication failed");
     }
-  }
-
-  /**
-   * Seals a plaintext value, or re-seals one sealed under a previous key;
-   * values already under the current key are returned as-is.
-   */
-  async reseal(stored: string, scope: string): Promise<string> {
-    if (stored === "" || (await this.isCurrent(stored))) {
-      return stored;
-    }
-    return this.seal(await this.open(stored, scope), scope);
   }
 
   private ring(): Promise<Keyring> {
@@ -301,7 +364,7 @@ export async function sealFields<T extends object>(
   return out as T;
 }
 
-/** Returns a copy of `value` with the listed string fields decrypted. */
+/** Returns a copy of `value` with the listed string fields decrypted (envelopes only). */
 export async function openFields<T extends object>(
   vault: SecretVault,
   value: T,
@@ -354,10 +417,10 @@ export async function sealJson(vault: SecretVault, value: unknown, scope: string
   return { sealed: await vault.seal(JSON.stringify(value), scope) };
 }
 
-/** Opens `{ sealed }` back into its JSON value; non-envelopes (legacy) pass through. */
+/** Opens `{ sealed }` back into its JSON value; anything that is not an envelope is refused. */
 export async function openJson(vault: SecretVault, value: unknown, scope: string): Promise<unknown> {
   if (!isSealedEnvelope(value)) {
-    return value;
+    throw new SecretVaultError("secret_unreadable", "plaintext rejected");
   }
   try {
     return JSON.parse(await vault.open(value.sealed, scope)) as unknown;
@@ -367,4 +430,40 @@ export async function openJson(vault: SecretVault, value: unknown, scope: string
     }
     throw new SecretVaultError("secret_unreadable", "malformed sealed json");
   }
+}
+
+/** Counts only — how many stored credential values are sealed, and under which key. */
+export type SealedTally = {
+  /** Non-empty values inspected. */
+  total: number;
+  /** Values carrying the envelope (any key id). */
+  sealed: number;
+  /** Envelopes under the current key. */
+  current: number;
+  /** Non-empty values without an envelope — must be zero after the sweep. */
+  plaintext: number;
+};
+
+/**
+ * Tallies stored values without opening any of them, for the account's
+ * self-check surface. Empty strings are absent credentials, not plaintext.
+ */
+export async function tallySealed(vault: SecretVault, values: readonly string[]): Promise<SealedTally> {
+  const tally: SealedTally = { total: 0, sealed: 0, current: 0, plaintext: 0 };
+  const kid = vault.enabled ? await vault.currentKid() : "";
+  for (const value of values) {
+    if (value === "") {
+      continue;
+    }
+    tally.total += 1;
+    if (!vault.isSealed(value)) {
+      tally.plaintext += 1;
+      continue;
+    }
+    tally.sealed += 1;
+    if (kid && value.split(":")[1] === kid) {
+      tally.current += 1;
+    }
+  }
+  return tally;
 }

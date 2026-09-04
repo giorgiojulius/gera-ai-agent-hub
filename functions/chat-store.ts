@@ -160,8 +160,11 @@ import {
   fieldsNeedReseal,
   isSealedEnvelope,
   openFields,
+  sealFields,
   SecretVault,
   SecretVaultError,
+  tallySealed,
+  type SealedTally,
 } from "./secret-vault";
 
 /** Worker env as visible inside this Durable Object (same bindings). */
@@ -239,6 +242,31 @@ type OAuthPendingRow = {
 
 /** KV key remembering which vault key the last sweep sealed this shard under. */
 const VAULT_SWEEP_KEY = "secretVaultKid";
+
+/** The listed string fields of a JSON payload, as stored — for tallying, never opened. */
+function credentialStrings(payload: string, fields: readonly string[]): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return [];
+  }
+  if (!isRecord(parsed)) {
+    return [];
+  }
+  return fields.map((field) => (typeof parsed[field] === "string" ? (parsed[field] as string) : ""));
+}
+
+/** Length-independent string equality for proof comparison (no early exit on the first mismatch). */
+function constantTimeEqual(a: string, b: string): boolean {
+  const left = new TextEncoder().encode(a);
+  const right = new TextEncoder().encode(b);
+  let diff = left.length ^ right.length;
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    diff |= (left[index] ?? 0) ^ (right[index] ?? 0);
+  }
+  return diff === 0;
+}
 
 export class ChatStore extends DurableObject {
   private readonly workerEnv: ChatStoreEnv;
@@ -470,10 +498,15 @@ export class ChatStore extends DurableObject {
 
   /**
    * One-time (per vault key) pass over every credential row in this shard:
-   * OAuth grants, pasted keys/headers, PKCE verifiers and authorization
-   * codes, GitHub device codes, and the legacy rotation escrow in KV.
-   * Plaintext rows from before the vault and rows sealed under a previous
-   * key are re-sealed; poisoned legacy placeholder rows are dropped.
+   * OAuth grants, pasted keys/headers, the pending-flow proofs (PKCE
+   * verifier, authorization code, browser nonce, callback challenge), GitHub
+   * device codes, and the legacy rotation escrow in KV. Plaintext rows from
+   * before the vault and rows sealed under a previous key are re-sealed;
+   * poisoned legacy placeholder rows are dropped. Runs under
+   * blockConcurrencyWhile, so no request ever observes a plaintext row —
+   * which is what lets `open` refuse plaintext outright. A row this key set
+   * cannot re-seal is skipped (logged coarse) and stays unreadable rather
+   * than aborting the sweep for its neighbours.
    */
   private async sealLegacySecrets(): Promise<void> {
     if (!this.vault.enabled) {
@@ -485,81 +518,104 @@ export class ChatStore extends DurableObject {
     }
     const sql = this.ctx.storage.sql;
     let sealed = 0;
+    let skipped = 0;
+    const attempt = async (work: () => Promise<boolean>): Promise<void> => {
+      try {
+        if (await work()) {
+          sealed += 1;
+        }
+      } catch (error) {
+        skipped += 1;
+        console.error("account secret row skipped", error instanceof SecretVaultError ? error.code : "error");
+      }
+    };
     for (const row of sql
       .exec<{ owner_email: string; server_id: string; payload: string }>(
         "SELECT owner_email, server_id, payload FROM mcp_oauth_grants",
       )
       .toArray()) {
-      const token = await openGrantPayload(this.vault, row.owner_email, row.server_id, row.payload);
-      if (!token || !(await fieldsNeedReseal(this.vault, cloudOAuthToken(JSON.parse(row.payload)) ?? {}, GRANT_SECRET_FIELDS))) {
-        continue;
-      }
-      sql.exec(
-        "UPDATE mcp_oauth_grants SET payload = ? WHERE owner_email = ? AND server_id = ?",
-        await sealGrantPayload(this.vault, row.owner_email, row.server_id, {
-          ...(JSON.parse(row.payload) as Record<string, unknown>),
-          ...token,
-        }),
-        row.owner_email,
-        row.server_id,
-      );
-      sealed += 1;
+      await attempt(async () => {
+        const parsed = JSON.parse(row.payload) as unknown;
+        const stored = cloudOAuthToken(parsed);
+        if (!stored || !(await fieldsNeedReseal(this.vault, stored, GRANT_SECRET_FIELDS))) {
+          return false;
+        }
+        sql.exec(
+          "UPDATE mcp_oauth_grants SET payload = ? WHERE owner_email = ? AND server_id = ?",
+          await sealGrantPayload(
+            this.vault,
+            row.owner_email,
+            row.server_id,
+            parsed as CloudOAuthToken & Record<string, unknown>,
+          ),
+          row.owner_email,
+          row.server_id,
+        );
+        return true;
+      });
     }
     for (const row of sql
       .exec<{ owner_email: string; server_id: string; payload: string }>(
         "SELECT owner_email, server_id, payload FROM mcp_server_secrets",
       )
       .toArray()) {
-      const stored = this.parseServerSecretRow(row.owner_email, row.server_id, row.payload);
-      if (!stored) {
-        continue; // poisoned placeholder row — already deleted by the parser
-      }
-      if (!(await fieldsNeedReseal(this.vault, stored, SERVER_SECRET_FIELDS))) {
-        continue;
-      }
-      sql.exec(
-        "UPDATE mcp_server_secrets SET payload = ? WHERE owner_email = ? AND server_id = ?",
-        await sealServerSecret(this.vault, row.owner_email, row.server_id, stored),
-        row.owner_email,
-        row.server_id,
-      );
-      sealed += 1;
+      await attempt(async () => {
+        const stored = this.parseServerSecretRow(row.owner_email, row.server_id, row.payload);
+        if (!stored || !(await fieldsNeedReseal(this.vault, stored, SERVER_SECRET_FIELDS))) {
+          return false; // absent, or a poisoned placeholder row already deleted by the parser
+        }
+        sql.exec(
+          "UPDATE mcp_server_secrets SET payload = ? WHERE owner_email = ? AND server_id = ?",
+          await sealServerSecret(this.vault, row.owner_email, row.server_id, stored),
+          row.owner_email,
+          row.server_id,
+        );
+        return true;
+      });
     }
     for (const row of sql
-      .exec<{ owner_email: string; state: string; verifier: string; authorization_code: string }>(
-        "SELECT owner_email, state, verifier, authorization_code FROM mcp_oauth_pending WHERE verifier != '' OR authorization_code != ''",
+      .exec<Pick<OAuthPendingRow, "owner_email" | "state" | "verifier" | "authorization_code" | "browser_nonce" | "callback_challenge">>(
+        `SELECT owner_email, state, verifier, authorization_code, browser_nonce, callback_challenge
+         FROM mcp_oauth_pending
+         WHERE verifier != '' OR authorization_code != '' OR browser_nonce != '' OR callback_challenge != ''`,
       )
       .toArray()) {
-      if (!(await fieldsNeedReseal(this.vault, row, OAUTH_PENDING_SECRET_FIELDS))) {
-        continue;
-      }
-      sql.exec(
-        "UPDATE mcp_oauth_pending SET verifier = ?, authorization_code = ? WHERE owner_email = ? AND state = ?",
-        await this.vault.reseal(row.verifier, oauthPendingFieldScope(row.owner_email, row.state, "verifier")),
-        await this.vault.reseal(
-          row.authorization_code,
-          oauthPendingFieldScope(row.owner_email, row.state, "authorization_code"),
-        ),
-        row.owner_email,
-        row.state,
-      );
-      sealed += 1;
+      await attempt(async () => {
+        if (!(await fieldsNeedReseal(this.vault, row, OAUTH_PENDING_SECRET_FIELDS))) {
+          return false;
+        }
+        const next = await sealFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(row.owner_email, row.state));
+        sql.exec(
+          `UPDATE mcp_oauth_pending
+           SET verifier = ?, authorization_code = ?, browser_nonce = ?, callback_challenge = ?
+           WHERE owner_email = ? AND state = ?`,
+          next.verifier,
+          next.authorization_code,
+          next.browser_nonce,
+          next.callback_challenge,
+          row.owner_email,
+          row.state,
+        );
+        return true;
+      });
     }
     for (const row of sql
       .exec<{ owner_email: string; flow_id: string; device_code: string }>(
         "SELECT owner_email, flow_id, device_code FROM mcp_github_device_pending WHERE device_code != ''",
       )
       .toArray()) {
-      if (await this.vault.isCurrent(row.device_code)) {
-        continue;
-      }
-      sql.exec(
-        "UPDATE mcp_github_device_pending SET device_code = ? WHERE owner_email = ? AND flow_id = ?",
-        await this.vault.reseal(row.device_code, deviceCodeScope(row.owner_email, row.flow_id)),
-        row.owner_email,
-        row.flow_id,
-      );
-      sealed += 1;
+      await attempt(async () => {
+        if (await this.vault.isCurrent(row.device_code)) {
+          return false;
+        }
+        sql.exec(
+          "UPDATE mcp_github_device_pending SET device_code = ? WHERE owner_email = ? AND flow_id = ?",
+          await this.vault.reseal(row.device_code, deviceCodeScope(row.owner_email, row.flow_id)),
+          row.owner_email,
+          row.flow_id,
+        );
+        return true;
+      });
     }
     const escrow = await this.ctx.storage.list<unknown>({ prefix: OAUTH_REF_PREFIX });
     for (const [key, value] of escrow) {
@@ -570,16 +626,67 @@ export class ChatStore extends DurableObject {
       }
       const owner = rest.slice(0, split);
       const serverId = rest.slice(split + 1);
-      if (isSealedEnvelope(value) && (await this.vault.isCurrent(value.sealed))) {
-        continue;
-      }
-      await this.ctx.storage.put(key, await sealRotationValue(this.vault, owner, serverId, value));
-      sealed += 1;
+      await attempt(async () => {
+        if (isSealedEnvelope(value) && (await this.vault.isCurrent(value.sealed))) {
+          return false;
+        }
+        await this.ctx.storage.put(key, await sealRotationValue(this.vault, owner, serverId, value));
+        return true;
+      });
     }
     await this.ctx.storage.put(VAULT_SWEEP_KEY, kid);
-    if (sealed > 0) {
-      console.log("account secrets sealed", sealed);
+    if (sealed > 0 || skipped > 0) {
+      console.log("account secrets sealed", sealed, "skipped", skipped);
     }
+  }
+
+  /**
+   * Counts only — the account's own view of its vault: is the key active,
+   * has this shard been swept under it, and how many stored credential values
+   * are sealed / under the current key / still plaintext. No value is opened
+   * and nothing about the key beyond its enabled state leaves the shard.
+   */
+  private async handleDiagVault(email: string): Promise<Response> {
+    const sql = this.ctx.storage.sql;
+    const grants: string[] = [];
+    for (const row of sql
+      .exec<{ payload: string }>("SELECT payload FROM mcp_oauth_grants WHERE owner_email = ?", email)
+      .toArray()) {
+      grants.push(...credentialStrings(row.payload, GRANT_SECRET_FIELDS));
+    }
+    const serverSecrets: string[] = [];
+    for (const row of sql
+      .exec<{ payload: string }>("SELECT payload FROM mcp_server_secrets WHERE owner_email = ?", email)
+      .toArray()) {
+      serverSecrets.push(...credentialStrings(row.payload, SERVER_SECRET_FIELDS));
+    }
+    const pending: string[] = [];
+    for (const row of sql
+      .exec<Pick<OAuthPendingRow, "verifier" | "authorization_code" | "browser_nonce" | "callback_challenge">>(
+        "SELECT verifier, authorization_code, browser_nonce, callback_challenge FROM mcp_oauth_pending WHERE owner_email = ?",
+        email,
+      )
+      .toArray()) {
+      pending.push(row.verifier, row.authorization_code, row.browser_nonce, row.callback_challenge);
+    }
+    const deviceCodes = sql
+      .exec<{ device_code: string }>("SELECT device_code FROM mcp_github_device_pending WHERE owner_email = ?", email)
+      .toArray()
+      .map((row) => row.device_code);
+    const escrow: string[] = [];
+    for (const value of (await this.ctx.storage.list<unknown>({ prefix: `${OAUTH_REF_PREFIX}${email}:` })).values()) {
+      escrow.push(isSealedEnvelope(value) ? value.sealed : "plaintext");
+    }
+    const swept =
+      this.vault.enabled && (await this.ctx.storage.get<string>(VAULT_SWEEP_KEY)) === (await this.vault.currentKid());
+    const rows: Record<string, SealedTally> = {
+      grants: await tallySealed(this.vault, grants),
+      serverSecrets: await tallySealed(this.vault, serverSecrets),
+      pending: await tallySealed(this.vault, pending),
+      deviceCodes: await tallySealed(this.vault, deviceCodes),
+      escrow: await tallySealed(this.vault, escrow),
+    };
+    return json({ vault: this.vault.enabled ? "enabled" : this.vault.disabledReason, swept, rows });
   }
 
   /**
@@ -759,6 +866,9 @@ export class ChatStore extends DurableObject {
     }
     if (request.method === "GET" && url.pathname === "/diag/list") {
       return this.handleDiagList(email);
+    }
+    if (request.method === "GET" && url.pathname === "/diag/vault") {
+      return this.handleDiagVault(email);
     }
     if (request.method === "POST" && url.pathname === "/diag/seen") {
       return this.handleDiagSeen(request, email);
@@ -1853,11 +1963,16 @@ export class ChatStore extends DurableObject {
       .toArray()[0];
   }
 
-  /** The pending row with its PKCE verifier and authorization code decrypted. */
+  /** The pending row with its proofs (verifier, code, browser nonce, callback challenge) decrypted. */
   private revealOAuthPending(owner: string, row: OAuthPendingRow): Promise<OAuthPendingRow> {
     return openFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(owner, row.state));
   }
 
+  /**
+   * The popup's return URL. For `confirm` the row must already be revealed
+   * (`revealOAuthPending`) — the challenge travels to the popup in the clear,
+   * but it sits sealed in storage like every other proof of the flow.
+   */
   private oauthReturnUrl(
     row: OAuthPendingRow,
     status: "confirm" | "complete" | "error" | "replayed",
@@ -1866,7 +1981,7 @@ export class ChatStore extends DurableObject {
     target.searchParams.set("state", row.state);
     target.searchParams.set("serverId", row.server_id);
     target.searchParams.set("status", status);
-    if (status === "confirm" && row.callback_challenge) {
+    if (status === "confirm" && row.callback_challenge && !this.vault.isSealed(row.callback_challenge)) {
       target.searchParams.set("challenge", row.callback_challenge);
     }
     if (status === "error" && row.error) {
@@ -1960,7 +2075,7 @@ export class ChatStore extends DurableObject {
         discovery.resource ?? "",
         discovery.issuer,
         normalizedReturnOrigin,
-        browserNonce,
+        await this.vault.seal(browserNonce, oauthPendingFieldScope(owner, state, "browser_nonce")),
         expiresAt,
         Date.now(),
         Date.now(),
@@ -2052,9 +2167,9 @@ export class ChatStore extends DurableObject {
         code &&
         code === stored.authorization_code &&
         (!issuer || sameOAuthEndpoint(issuer, row.issuer)) &&
-        row.callback_challenge
+        stored.callback_challenge
       ) {
-        return json({ ok: true, replayed: true, redirectUrl: this.oauthReturnUrl(row, "confirm") });
+        return json({ ok: true, replayed: true, redirectUrl: this.oauthReturnUrl(stored, "confirm") });
       }
       return json({ error: "oauth_callback_replayed", redirectUrl: this.oauthReturnUrl(row, "replayed") }, 409);
     }
@@ -2095,13 +2210,16 @@ export class ChatStore extends DurableObject {
        SET status = 'awaiting_confirmation', authorization_code = ?, callback_challenge = ?, updated_at = ?
        WHERE owner_email = ? AND state = ? AND status = 'pending'`,
       await this.vault.seal(code, oauthPendingFieldScope(owner, state, "authorization_code")),
-      callbackChallenge,
+      await this.vault.seal(callbackChallenge, oauthPendingFieldScope(owner, state, "callback_challenge")),
       Date.now(),
       owner,
       state,
     );
     const awaiting = this.oauthPending(owner, state) ?? row;
-    return json({ ok: true, redirectUrl: this.oauthReturnUrl(awaiting, "confirm") });
+    return json({
+      ok: true,
+      redirectUrl: this.oauthReturnUrl(await this.revealOAuthPending(owner, awaiting), "confirm"),
+    });
   }
 
   /** Authenticated popup confirmation performs the only provider code exchange. */
@@ -2133,12 +2251,15 @@ export class ChatStore extends DurableObject {
     if (row.status !== "awaiting_confirmation" && row.status !== "exchanging" && !retryableStatus) {
       return json({ error: "oauth_not_ready" }, 409);
     }
+    // Both proofs sit sealed in storage; they are compared only after the
+    // shard itself has opened them for exactly this state.
+    const pending = await this.revealOAuthPending(owner, row);
     if (
       row.expires_at < Date.now() ||
       !browserNonce ||
       !callbackChallenge ||
-      browserNonce !== row.browser_nonce ||
-      callbackChallenge !== row.callback_challenge
+      !constantTimeEqual(browserNonce, pending.browser_nonce) ||
+      !constantTimeEqual(callbackChallenge, pending.callback_challenge)
     ) {
       return json({ error: row.expires_at < Date.now() ? "oauth_state_expired" : "oauth_confirmation_mismatch" }, 403);
     }
@@ -2151,7 +2272,6 @@ export class ChatStore extends DurableObject {
       state,
     );
     try {
-      const pending = await this.revealOAuthPending(owner, row);
       const token = await exchangeAuthorizationCode({
         tokenEndpoint: row.token_endpoint,
         clientId: row.client_id,

@@ -11,6 +11,7 @@ import {
   syncDiagnostics,
   type DiagnosticEntry,
 } from "@/lib/diagnostics";
+import { VaultStatusLine } from "@/components/gera/VaultStatusLine";
 import { cn } from "@/lib/utils";
 
 const SCOPE_STYLE: Record<string, string> = {
@@ -77,18 +78,22 @@ export function DiagnosticsJournal({ frame }: { frame: "dialog" | "page" }) {
 
   if (entries.length === 0) {
     return (
-      <div className={cn("flex flex-col items-center gap-2 py-14 text-center", padX)}>
-        <CheckCircle2 className="h-9 w-9 text-gold" />
-        <p className="text-sm font-medium">All clear</p>
-        <p className="max-w-xs text-xs leading-relaxed text-muted-foreground">
-          No errors recorded. If something breaks, it shows up here the moment it happens.
-        </p>
-      </div>
+      <>
+        <VaultStatusLine className={cn("border-b border-border/50 py-2.5", padX)} />
+        <div className={cn("flex flex-col items-center gap-2 py-14 text-center", padX)}>
+          <CheckCircle2 className="h-9 w-9 text-gold" />
+          <p className="text-sm font-medium">All clear</p>
+          <p className="max-w-xs text-xs leading-relaxed text-muted-foreground">
+            No errors recorded. If something breaks, it shows up here the moment it happens.
+          </p>
+        </div>
+      </>
     );
   }
 
   return (
     <>
+      <VaultStatusLine className={cn("border-b border-border/50 py-2.5", padX)} />
       <div className={cn("overflow-y-auto", frame === "dialog" ? "max-h-[55vh]" : "max-h-[65vh]")}>
         {entries.map((entry) => (
           <div key={entry.id} className={cn("border-b border-border/50 py-3 last:border-b-0", padX)}>

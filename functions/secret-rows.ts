@@ -90,8 +90,18 @@ export function openRotationValue(vault: SecretVault, owner: string, serverId: s
   return openJson(vault, value, rotationScope(owner, serverId));
 }
 
-/** `mcp_oauth_pending` — the PKCE verifier and the one-time authorization code. */
-export const OAUTH_PENDING_SECRET_FIELDS = ["verifier", "authorization_code"] as const;
+/**
+ * `mcp_oauth_pending` — every proof the flow relies on: the PKCE verifier,
+ * the one-time authorization code, the nonce held by the initiating browser
+ * and the challenge delivered only to the provider-returned popup. A live
+ * storage read must not be enough to complete someone else's sign-in.
+ */
+export const OAUTH_PENDING_SECRET_FIELDS = [
+  "verifier",
+  "authorization_code",
+  "browser_nonce",
+  "callback_challenge",
+] as const;
 
 export function oauthPendingScope(owner: string, state: string): string {
   return `mcp-oauth-pending:${owner}:${state}`;

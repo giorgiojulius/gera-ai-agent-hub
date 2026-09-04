@@ -4,6 +4,7 @@ import {
   deviceCodeScope,
   GRANT_SECRET_FIELDS,
   grantScope,
+  OAUTH_PENDING_SECRET_FIELDS,
   oauthPendingFieldScope,
   openGrantPayload,
   openRotationValue,
@@ -15,7 +16,9 @@ import {
 import {
   fieldsNeedReseal,
   isSealedEnvelope,
-  MIN_KEY_CHARS,
+  keyMaterialBytes,
+  keyMaterialProblem,
+  MIN_KEY_BYTES,
   openFields,
   openJson,
   SEALED_PREFIX,
@@ -23,10 +26,14 @@ import {
   sealJson,
   SecretVault,
   SecretVaultError,
+  tallySealed,
 } from "../../../functions/secret-vault";
 
-const KEY_A = "a".repeat(20) + "ROTATION-KEY-A-0123456789";
-const KEY_B = "b".repeat(20) + "ROTATION-KEY-B-0123456789";
+// `openssl rand -base64 32` / `-hex 32` / `-base64 48` — the formats operators paste.
+const KEY_A = "XWtIHN16zXsdcxtMZnNBsL6qQxVqG45bVMb1llWkYtg=";
+const KEY_B = "FZXHZFktqlW7bDR/KrNvi1ygqUNc4H+TSmsE4JV9238=";
+const KEY_HEX = "fd2b2eeb06164105e55b90d5753d15a8768e1b6303cb0232843bfe2ac318012c";
+const KEY_48 = "+B56yeb8TLv++x0/Xfyy442fuRnxOPAaL7k5B9wepL6qbLUpY1Ytjl72h9FJ50Vq";
 
 async function vaultError(run: () => Promise<unknown>): Promise<SecretVaultError> {
   try {
@@ -39,6 +46,57 @@ async function vaultError(run: () => Promise<unknown>): Promise<SecretVaultError
   }
   throw new Error("expected a SecretVaultError");
 }
+
+describe("key material", () => {
+  it("accepts base64, base64url and hex encodings of at least 32 random bytes", () => {
+    expect(keyMaterialBytes(KEY_A)).toBe(32);
+    expect(keyMaterialBytes(KEY_A.replace(/=+$/, ""))).toBe(32);
+    // `openssl rand -base64 48` and longer wrap at 76 columns; a pasted key keeps the breaks.
+    expect(keyMaterialBytes(`${KEY_48.slice(0, 40)}\n${KEY_48.slice(40)}\n`)).toBe(48);
+    expect(keyMaterialProblem(`${KEY_48.slice(0, 40)}\r\n${KEY_48.slice(40)}`)).toBe("");
+    expect(keyMaterialBytes(KEY_B.replace(/\+/g, "-").replace(/\//g, "_"))).toBe(32);
+    expect(keyMaterialBytes(KEY_HEX)).toBe(32);
+    expect(keyMaterialBytes(KEY_48)).toBe(48);
+    for (const key of [KEY_A, KEY_B, KEY_HEX, KEY_48]) {
+      expect(keyMaterialProblem(key)).toBe("");
+      expect(SecretVault.forTesting(key).enabled).toBe(true);
+    }
+  });
+
+  it("refuses passphrases and short keys — a dump must not become an offline guessing game", () => {
+    expect(keyMaterialProblem("")).toBe("secrets_key_missing");
+    expect(keyMaterialProblem("correct horse battery staple, correct horse!")).toBe("secrets_key_malformed");
+    expect(keyMaterialProblem("this-is-not-random-but-it-is-quite-long!")).toBe("secrets_key_malformed");
+    // Letters alone can look like base64 — a short sentence still comes out under 32 bytes.
+    expect(keyMaterialProblem("please do not use a sentence as the key")).toBe("secrets_key_too_short");
+    // Valid base64 alphabet, but only 24 bytes of it.
+    expect(keyMaterialProblem("MySuperSecretPassphrase2026abcd0")).toBe("secrets_key_too_short");
+    expect(keyMaterialProblem("a".repeat(MIN_KEY_BYTES * 2 - 2))).toBe("secrets_key_too_short");
+    const short = SecretVault.fromEnv({ SECRETS_ENCRYPTION_KEY: KEY_A.slice(0, 24) });
+    expect(short.enabled).toBe(false);
+    expect(short.disabledReason).toBe("secrets_key_too_short");
+    const phrase = SecretVault.fromEnv({ SECRETS_ENCRYPTION_KEY: "please, do not use a sentence as the key." });
+    expect(phrase.disabledReason).toBe("secrets_key_malformed");
+  });
+
+  it("derives from the key exactly as given — line breaks are tolerated, not normalized away", async () => {
+    const wrapped = `${KEY_48.slice(0, 40)}\n${KEY_48.slice(40)}`;
+    const sealed = await SecretVault.forTesting(wrapped).seal("v", "s");
+    expect(await SecretVault.forTesting(wrapped).open(sealed, "s")).toBe("v");
+    // The same bytes pasted without the break are a different key: rotate, do not "clean up".
+    expect((await vaultError(() => SecretVault.forTesting(KEY_48).open(sealed, "s"))).code).toBe("secret_unreadable");
+  });
+
+  it("ignores weak entries in the previous-key list", async () => {
+    const sealedByA = await SecretVault.forTesting(KEY_A).seal("v", "s");
+    const rotated = SecretVault.fromEnv({
+      SECRETS_ENCRYPTION_KEY: KEY_B,
+      SECRETS_ENCRYPTION_KEY_PREVIOUS: `not a key, ${KEY_A} , `,
+    });
+    expect(rotated.enabled).toBe(true);
+    expect(await rotated.open(sealedByA, "s")).toBe("v");
+  });
+});
 
 describe("SecretVault", () => {
   const vault = SecretVault.forTesting(KEY_A);
@@ -65,11 +123,23 @@ describe("SecretVault", () => {
     expect((await vaultError(() => vault.open("enc1:garbage", "s"))).code).toBe("secret_unreadable");
   });
 
-  it("passes pre-vault plaintext through and keeps empties empty", async () => {
-    expect(await vault.open("xoxb-legacy-plaintext", "any")).toBe("xoxb-legacy-plaintext");
-    expect(await vault.seal("", "any")).toBe("");
+  it("refuses plaintext where a credential should be — no passthrough", async () => {
+    const planted = await vaultError(() => vault.open("xoxb-planted-plaintext", "any"));
+    expect(planted.code).toBe("secret_unreadable");
+    expect(planted.message).toContain("plaintext rejected");
     expect(vault.isSealed("xoxb-legacy")).toBe(false);
     expect(await vault.isCurrent("xoxb-legacy")).toBe(false);
+    // Empty is "absent", never plaintext.
+    expect(await vault.open("", "any")).toBe("");
+    expect(await vault.seal("", "any")).toBe("");
+  });
+
+  it("reseal is the only reader of plaintext, and it produces a current envelope", async () => {
+    const migrated = await vault.reseal("legacy-plaintext", "s");
+    expect(migrated.startsWith(SEALED_PREFIX)).toBe(true);
+    expect(await vault.isCurrent(migrated)).toBe(true);
+    expect(await vault.open(migrated, "s")).toBe("legacy-plaintext");
+    expect(await vault.reseal("", "s")).toBe("");
   });
 
   it("fails closed without a usable key", async () => {
@@ -77,14 +147,10 @@ describe("SecretVault", () => {
     expect(missing.enabled).toBe(false);
     expect(missing.disabledReason).toBe("secrets_key_missing");
     expect((await vaultError(() => missing.seal("x", "s"))).code).toBe("secrets_key_unavailable");
-    // Legacy plaintext still opens — a deploy never locks anyone out.
-    expect(await missing.open("plain", "s")).toBe("plain");
+    expect((await vaultError(() => missing.open("plain", "s"))).code).toBe("secrets_key_unavailable");
     const sealed = await vault.seal("x", "s");
     expect((await vaultError(() => missing.open(sealed, "s"))).code).toBe("secrets_key_unavailable");
-
-    const short = SecretVault.fromEnv({ SECRETS_ENCRYPTION_KEY: "x".repeat(MIN_KEY_CHARS - 1) });
-    expect(short.enabled).toBe(false);
-    expect(short.disabledReason).toBe("secrets_key_too_short");
+    expect((await vaultError(() => missing.reseal("plain", "s"))).code).toBe("secrets_key_unavailable");
   });
 
   it("rotates: the previous key opens old rows, reseal moves them to the new key", async () => {
@@ -124,16 +190,30 @@ describe("field helpers", () => {
     expect((await vaultError(() => openFields(vault, swapped, ["slackToken"], "agent:a1"))).code).toBe(
       "secret_unreadable",
     );
+    // A plaintext field planted next to sealed ones is refused too.
+    expect((await vaultError(() => openFields(vault, plain, ["githubToken"], "agent:a1"))).code).toBe(
+      "secret_unreadable",
+    );
   });
 
-  it("sealJson wraps whole values and openJson passes legacy values through", async () => {
+  it("sealJson wraps whole values and openJson refuses anything that is not an envelope", async () => {
     const value = { bases: ["tok-1"], token: { accessToken: "tok-2" } };
     const envelope = await sealJson(vault, value, "rot");
     expect(isSealedEnvelope(envelope)).toBe(true);
     expect(JSON.stringify(envelope)).not.toContain("tok-");
     expect(await openJson(vault, envelope, "rot")).toEqual(value);
-    expect(await openJson(vault, value, "rot")).toEqual(value);
+    expect((await vaultError(() => openJson(vault, value, "rot"))).code).toBe("secret_unreadable");
     expect(isSealedEnvelope({ sealed: "not-an-envelope" })).toBe(false);
+  });
+
+  it("tallySealed counts without opening: sealed, current-key, plaintext", async () => {
+    const rotated = SecretVault.forTesting(KEY_B, [KEY_A]);
+    const oldRow = await vault.seal("a", "s");
+    const newRow = await rotated.seal("b", "s");
+    const tally = await tallySealed(rotated, [oldRow, newRow, "planted", "", newRow]);
+    expect(tally).toEqual({ total: 4, sealed: 3, current: 2, plaintext: 1 });
+    const disabled = await tallySealed(SecretVault.fromEnv({}), [oldRow, "x"]);
+    expect(disabled).toEqual({ total: 2, sealed: 1, current: 0, plaintext: 1 });
   });
 });
 
@@ -176,10 +256,14 @@ describe("credential rows", () => {
     expect(grantScope("o@x", "linear")).toBe("mcp-oauth-grant:o@x:linear");
   });
 
-  it("pre-vault grant rows still open, so existing sign-ins survive the deploy", async () => {
-    const legacy = JSON.stringify({ accessToken: "legacy-access", tokenEndpoint: "https://idp.test/token", clientId: "c" });
-    const opened = await openGrantPayload(vault, "o@x", "linear", legacy);
-    expect(opened?.accessToken).toBe("legacy-access");
+  it("a pre-vault plaintext grant is refused on read and sealed by the sweep path", async () => {
+    const legacy = { accessToken: "legacy-access", tokenEndpoint: "https://idp.test/token", clientId: "c" };
+    const refused = await vaultError(() => openGrantPayload(vault, "o@x", "linear", JSON.stringify(legacy)));
+    expect(refused.code).toBe("secret_unreadable");
+    // The sweep re-serializes through sealGrantPayload, which reseals plaintext.
+    const swept = await sealGrantPayload(vault, "o@x", "linear", legacy);
+    expect(swept).not.toContain("legacy-access");
+    expect((await openGrantPayload(vault, "o@x", "linear", swept))?.accessToken).toBe("legacy-access");
   });
 
   it("seals pasted keys and headers, and the rotation escrow as a whole", async () => {
@@ -193,13 +277,18 @@ describe("credential rows", () => {
     const escrow = await sealRotationValue(vault, "o@x", "srv", rotation);
     expect(JSON.stringify(escrow)).not.toContain("access");
     expect(await openRotationValue(vault, "o@x", "srv", escrow)).toEqual(rotation);
-    expect(await openRotationValue(vault, "o@x", "srv", rotation)).toEqual(rotation);
+    expect((await vaultError(() => openRotationValue(vault, "o@x", "srv", rotation))).code).toBe("secret_unreadable");
   });
 
-  it("names distinct scopes for the pending-flow columns", () => {
+  it("names every pending-flow proof and gives each column its own scope", () => {
+    expect(OAUTH_PENDING_SECRET_FIELDS).toEqual(["verifier", "authorization_code", "browser_nonce", "callback_challenge"]);
     expect(oauthPendingFieldScope("o@x", "st", "verifier")).toBe("mcp-oauth-pending:o@x:st#verifier");
     expect(oauthPendingFieldScope("o@x", "st", "authorization_code")).toBe(
       "mcp-oauth-pending:o@x:st#authorization_code",
+    );
+    expect(oauthPendingFieldScope("o@x", "st", "browser_nonce")).toBe("mcp-oauth-pending:o@x:st#browser_nonce");
+    expect(oauthPendingFieldScope("o@x", "st", "callback_challenge")).toBe(
+      "mcp-oauth-pending:o@x:st#callback_challenge",
     );
     expect(deviceCodeScope("o@x", "flow")).toBe("mcp-github-device:o@x:flow#device_code");
   });

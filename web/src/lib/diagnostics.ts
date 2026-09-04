@@ -1,4 +1,4 @@
-import { authedFetch, setBackendFailureObserver, type BackendFailure } from "@/lib/backend";
+import { authedFetch, parseOrThrow, setBackendFailureObserver, type BackendFailure } from "@/lib/backend";
 import {
   diagnosticContextOf,
   formatContextValue,
@@ -231,6 +231,62 @@ export async function syncDiagnostics(): Promise<void> {
     pulling = false;
   }
   void flushPending();
+}
+
+/** Counts only — how many stored credential values are sealed, under the current key, or still plaintext. */
+export type VaultTally = { total: number; sealed: number; current: number; plaintext: number };
+
+/**
+ * The account's secret-free view of its credential vault: whether the server
+ * key is active, whether this account's storage has been swept under it, and
+ * per-table sealed-row counts. Never a value, a key, or a key id.
+ */
+export type VaultStatus = {
+  /** "enabled", or the coarse reason the server key is unusable. */
+  vault: string;
+  swept: boolean;
+  rows: Record<string, VaultTally>;
+};
+
+function isTally(value: unknown): value is VaultTally {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const tally = value as Record<string, unknown>;
+  return ["total", "sealed", "current", "plaintext"].every((key) => typeof tally[key] === "number");
+}
+
+export async function fetchVaultStatus(): Promise<VaultStatus> {
+  const response = await authedFetch("/diag/vault");
+  const data = await parseOrThrow<{ vault?: unknown; swept?: unknown; rows?: unknown }>(
+    response,
+    "Could not check the credential vault",
+  );
+  const rows: Record<string, VaultTally> = {};
+  if (typeof data.rows === "object" && data.rows !== null) {
+    for (const [name, tally] of Object.entries(data.rows as Record<string, unknown>)) {
+      if (isTally(tally)) {
+        rows[name] = tally;
+      }
+    }
+  }
+  return {
+    vault: typeof data.vault === "string" && data.vault ? data.vault : "unknown",
+    swept: data.swept === true,
+    rows,
+  };
+}
+
+/** Sums the per-table tallies into one line's worth of numbers. */
+export function summarizeVault(status: VaultStatus): VaultTally {
+  const sum: VaultTally = { total: 0, sealed: 0, current: 0, plaintext: 0 };
+  for (const tally of Object.values(status.rows)) {
+    sum.total += tally.total;
+    sum.sealed += tally.sealed;
+    sum.current += tally.current;
+    sum.plaintext += tally.plaintext;
+  }
+  return sum;
 }
 
 function messageOf(error: unknown): string {

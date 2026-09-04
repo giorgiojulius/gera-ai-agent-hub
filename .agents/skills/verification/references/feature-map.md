@@ -1032,10 +1032,22 @@ to the shard and are deleted only after its durable acknowledgement.
 Encryption at rest (2026-09-04, `functions/secret-vault.ts`, `secret-rows.ts`).
 Every credential a Durable Object stores is sealed with AES-256-GCM under a
 data key derived (HKDF-SHA-256) from the `SECRETS_ENCRYPTION_KEY` Worker
-secret; the key never touches storage. Sealed rows: account shard
-`mcp_oauth_grants` (accessToken/refreshToken; endpoint, expiry and ids stay
-readable), `mcp_server_secrets` (token/headersJson), `mcp_oauth_pending`
-(PKCE verifier + authorization code), `mcp_github_device_pending`
+secret; the key never touches storage. Key material must be base64 /
+base64url / hex of at least 32 random bytes (`openssl rand -base64 32`);
+whitespace inside the value (line-wrapped `openssl` output, paste artefacts)
+is ignored for validation only — the data key is derived from the string
+exactly as configured, so the production value must never be "cleaned up"
+in place (that is a rotation: new value in `SECRETS_ENCRYPTION_KEY`, old one
+in `SECRETS_ENCRYPTION_KEY_PREVIOUS`). Anything else disables the vault with
+`secrets_key_missing` / `secrets_key_malformed` / `secrets_key_too_short`
+(`GET /ping` reports `secretVault: enabled | <reason>`, nothing else about
+the key). Sealed rows:
+account shard `mcp_oauth_grants` (accessToken/refreshToken; endpoint, expiry
+and ids stay readable), `mcp_server_secrets` (token/headersJson),
+`mcp_oauth_pending` (all four proofs: PKCE verifier, authorization code,
+browser_nonce, callback_challenge — the challenge is opened only to build the
+popup's `confirm` redirect, and `/mcp/oauth-complete` compares both proofs
+constant-time after the shard opens them), `mcp_github_device_pending`
 (device_code) and the legacy KV `oauthref:*` rotation escrow (whole value,
 `{ sealed }`); project shard `agents.secrets` (githubToken, intercomToken,
 slackToken, slackSigningSecret, slackClientSecret — metadata such as
@@ -1045,24 +1057,39 @@ slackAppId/team/mcpSelection stays readable so the agent list and
 authenticated data binds each value to its row and field
 (`mcp-oauth-grant:<owner>:<serverId>#accessToken`,
 `project-agent:<agentId>#slackToken`, …), so a ciphertext copied into another
-row or field fails to open. RunManager seals/opens grants through the same
-`secret-rows` helpers as ChatStore. Migration export/import moves envelopes
-as-is (same owner + server id ⇒ same scope). On wake each object runs a
-one-time-per-key sweep under `blockConcurrencyWhile` that seals pre-vault
-plaintext and rows under a rotated-out key (marker `secretVaultKid` in KV /
-`meta.secret_vault_kid`); poisoned placeholder rows are dropped. Rotation:
+row or field fails to open. `<owner>` is the account's `storageOwner` — the
+alias AccessRegistry freezes at first claim and binds to the Rork user id; a
+changed email becomes an alias, so neither the shard nor the scope moves.
+RunManager seals/opens grants through the same `secret-rows` helpers as
+ChatStore. Migration export/import moves envelopes as-is (same owner + server
+id ⇒ same scope). No plaintext passthrough: `open` accepts only envelopes and
+refuses a plaintext value where a credential should be (`secret_unreadable`,
+"plaintext rejected"), so a row swapped for plaintext in storage never
+authenticates. The only reader of plaintext is `reseal`, used by the
+one-time-per-key sweep each object runs on wake under `blockConcurrencyWhile`
+(marker `secretVaultKid` in KV / `meta.secret_vault_kid`) — no request ever
+sees an unswept shard, which is why no global "all shards woke" flag is
+needed. The sweep continues past a row it cannot re-seal (logged coarse;
+that row stays unreadable) and drops poisoned placeholder rows. Rotation:
 set the new `SECRETS_ENCRYPTION_KEY`, keep the old in
-`SECRETS_ENCRYPTION_KEY_PREVIOUS` (comma-separated, decrypt-only) until every
-shard has woken once. Fail-closed: without a usable key (missing or under 32
-chars) any credential write returns 503 `secrets_key_unavailable` with a
-plain message (agent save, Slack app-manager token, OAuth store/complete,
-`/mcp/check` with a pasted key, device start); reads of sealed rows fail the
-same way while pre-vault plaintext still opens, so a deploy never locks an
-account out. A row the key set cannot open is logged coarse and treated as a
-missing grant (never a crashed run). Unit `secret-vault.test.ts` (roundtrip,
-AAD/row binding, tamper, IV freshness, legacy passthrough, disabled/short
-key, rotation with previous key, field helpers, grant/server-secret/escrow
-rows, pending-flow scopes).
+`SECRETS_ENCRYPTION_KEY_PREVIOUS` (comma-separated, decrypt-only) until
+every shard has woken once. Fail-closed: without a usable key every
+credential read and write returns 503 `secrets_key_unavailable` with a plain
+message (agent save, Slack app-manager token, OAuth store/complete,
+`/mcp/check` with a pasted key, device start, sync of a profile carrying
+keys). A row the key set cannot open is logged coarse and treated as a
+missing grant (never a crashed run). Self-check: `GET /diag/vault` (identity
++ invite, same relay as the journal) returns counts only — `vault`, `swept`
+(marker equals current key id) and per-table `{ total, sealed, current,
+plaintext }` for grants, serverSecrets, pending, deviceCodes, escrow; the
+Diagnostics dialog/tab renders it as the "Credential vault · …" line
+(`data-testid="vault-status"`, ember-tinted when anything is plaintext, under
+a previous key, unswept, or the server key is unusable). Unit
+`secret-vault.test.ts` (key-format acceptance/refusal incl. previous-key
+list, roundtrip, AAD/row binding, tamper, IV freshness, plaintext refusal,
+reseal as the sole plaintext reader, disabled key, rotation, field helpers,
+tallySealed, grant/server-secret/escrow rows, all pending-flow scopes) and
+`vault-status.test.ts` (summary + label copy).
 
 Every interactive, scheduled, project and Slack run resolves its connector
 configuration and credential again from durable server state. Run-start requests

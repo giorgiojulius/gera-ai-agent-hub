@@ -16,14 +16,18 @@ export function grantScope(owner: string, serverId: string): string {
   return `mcp-oauth-grant:${owner}:${serverId}`;
 }
 
-/** Serializes a grant for `mcp_oauth_grants.payload` with its tokens sealed. */
+/**
+ * Serializes a grant for `mcp_oauth_grants.payload` with its tokens sealed.
+ * Extra fields on the grant (e.g. `authorizationState`) are kept verbatim.
+ */
 export async function sealGrantPayload(
   vault: SecretVault,
   owner: string,
   serverId: string,
-  token: CloudOAuthToken & Record<string, unknown>,
+  token: CloudOAuthToken | (CloudOAuthToken & Record<string, unknown>),
 ): Promise<string> {
-  return JSON.stringify(await sealFields(vault, token, GRANT_SECRET_FIELDS, grantScope(owner, serverId)));
+  const grant: CloudOAuthToken = token;
+  return JSON.stringify(await sealFields(vault, grant, GRANT_SECRET_FIELDS, grantScope(owner, serverId)));
 }
 
 /** Parses and decrypts one `mcp_oauth_grants.payload`; null when malformed. */

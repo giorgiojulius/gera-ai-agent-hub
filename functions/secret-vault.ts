@@ -68,7 +68,7 @@ function toBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function fromBase64Url(text: string): Uint8Array | null {
+function fromBase64Url(text: string): Uint8Array<ArrayBuffer> | null {
   if (!/^[A-Za-z0-9_-]*$/.test(text)) {
     return null;
   }
@@ -133,7 +133,7 @@ async function buildKeyring(current: string, previous: string[]): Promise<Keyrin
   return { current: entries[0], byKid };
 }
 
-function aadFor(scope: string): Uint8Array {
+function aadFor(scope: string): Uint8Array<ArrayBuffer> {
   return encoder.encode(AAD_DOMAIN + scope);
 }
 
@@ -290,7 +290,7 @@ export async function sealFields<T extends object>(
   fields: readonly StringFields<T>[],
   scope: string,
 ): Promise<T> {
-  const out: Record<string, unknown> = { ...value };
+  const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
   for (const field of fields) {
     const name = String(field);
     const current = out[name];
@@ -308,7 +308,7 @@ export async function openFields<T extends object>(
   fields: readonly StringFields<T>[],
   scope: string,
 ): Promise<T> {
-  const out: Record<string, unknown> = { ...value };
+  const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
   for (const field of fields) {
     const name = String(field);
     const current = out[name];

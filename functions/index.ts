@@ -61,6 +61,7 @@ import { githubRequestHeaders } from "./native-github";
 import { decodeSlackInstallState } from "./native-slack";
 import { shardFailureReason } from "./chat-shared";
 import { fetchPublicHttps, isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
+import { SecretVault } from "./secret-vault";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
 import { chatShardId, migrateOwnerToShard, sweepGlobalMigrations } from "./shard-migration";
 
@@ -2886,7 +2887,14 @@ export default {
       });
     }
     if (url.pathname === "/ping") {
-      return corsJson({ ok: true, now: new Date().toISOString() }, 200);
+      // Secret-free: reports only whether the credential vault has a usable
+      // key — the first thing to check when a save returns
+      // secrets_key_unavailable. Never the key, its id, or its length.
+      const vault = SecretVault.fromEnv(env);
+      return corsJson(
+        { ok: true, now: new Date().toISOString(), secretVault: vault.enabled ? "enabled" : vault.disabledReason },
+        200,
+      );
     }
     if (url.pathname === "/storage/ping") {
       // Secret-free: reports only whether credentials mint, the bucket, and

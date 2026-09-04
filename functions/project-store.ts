@@ -28,7 +28,6 @@ import {
   type EngineMessage,
   type EngineToolDef,
 } from "./agent-engine";
-import type { McpRoute } from "./automation-runner";
 import { asNum, asStr, isRecord, json, readEmail } from "./chat-shared";
 import {
   buildGradeMessages,
@@ -51,12 +50,17 @@ import {
   slackThreadActive,
   type DeskSlackMessage,
 } from "./desk-slack";
+import { normalizeCloudMcpServer, type CloudMcpServer } from "./mcp-cloud";
 import {
-  cloudMcpFunctionName,
-  connectCloudMcp,
-  normalizeCloudMcpServer,
-  type CloudMcpServer,
-} from "./mcp-cloud";
+  createMemoryMcpCatalogStore,
+  normalizeMcpCatalogEntries,
+  normalizeMcpToolLoading,
+  resolveMcpToolset,
+  type McpCatalogEntry,
+  type McpRoute,
+  type McpToolLoadingMode,
+  type McpToolset,
+} from "./mcp-toolset";
 import {
   describeSecretVaultError,
   fieldsNeedReseal,
@@ -184,15 +188,6 @@ type ProjectStoreEnv = {
   /** Rork DO router — lets this shard reach account shards (agent MCP resolve). */
   DO?: { fetch(request: Request): Promise<Response> };
 };
-
-/** One linked MCP server's connect outcome — a live session or an honest failure. */
-type McpConnectAttempt =
-  | {
-      ref: AgentMcpServerRef;
-      server: CloudMcpServer;
-      connection: Awaited<ReturnType<typeof connectCloudMcp>>;
-    }
-  | { ref: AgentMcpServerRef; server?: CloudMcpServer; failure: string };
 
 /** Agent replies may exceed the human message cap, but stay bounded. */
 const AGENT_REPLY_LIMIT = 24_000;
@@ -3876,6 +3871,8 @@ export class ProjectStore extends DurableObject {
     plan: AgentToolPlan;
     access: AgentAccess;
     mcpNote: string;
+    /** Resolved external-MCP toolset (inline routes or deferred meta functions); null without linked servers. */
+    toolset: McpToolset | null;
   }> {
     const access = accessForAgentSurface(
       normalizeAccess(JSON.parse(agent.access || "{}") as unknown),
@@ -3947,6 +3944,7 @@ export class ProjectStore extends DurableObject {
       requestedSelection && !selection
         ? `\nExternal MCP servers: unavailable — the account that linked them is no longer a project admin. Re-link them in the agent settings.`
         : "";
+    let toolset: McpToolset | null = null;
     if (selection && selectionRefs.length > 0) {
       const noteLines: string[] = [];
       const resolved = await this.resolveOwnerMcp(selection);
@@ -3958,80 +3956,72 @@ export class ProjectStore extends DurableObject {
         }
       } else {
         const byId = new Map(resolved.servers.map((server) => [server.id, server] as const));
-        const tryConnect = async (
-          ref: AgentMcpServerRef,
-          server: CloudMcpServer,
-        ): Promise<McpConnectAttempt> => {
-          try {
-            return { ref, server, connection: await connectCloudMcp(server) };
-          } catch (error) {
-            return { ref, server, failure: error instanceof Error ? error.message : "connect failed" };
-          }
-        };
-        const attempts = await Promise.all(
-          selectionRefs.map(async (ref): Promise<McpConnectAttempt> => {
-            const server = byId.get(ref.id);
-            if (!server) {
-              return {
-                ref,
-                failure: `not among ${selection.owner}'s connected servers anymore — reconnect it on the MCP page`,
-              };
-            }
-            const first = await tryConnect(ref, server);
-            // A rejected sign-in gets one forced refresh through the owner's
-            // account (mirrors cloud automations), then a second attempt.
-            if ("failure" in first && server.oauth && /auth rejected/i.test(first.failure)) {
-              const forced = await this.resolveOwnerMcp(selection, [ref.id]);
-              const fresh = forced.ok
-                ? forced.servers.find((candidate) => candidate.id === ref.id)
-                : undefined;
-              if (fresh) {
-                return tryConnect(ref, fresh);
-              }
-            }
-            return first;
-          }),
-        );
-        for (const attempt of attempts) {
-          if ("failure" in attempt) {
+        const refName = new Map(selectionRefs.map((ref) => [ref.id, ref.name] as const));
+        const servers: CloudMcpServer[] = [];
+        for (const ref of selectionRefs) {
+          const server = byId.get(ref.id);
+          if (!server) {
             noteLines.push(
-              `- "${attempt.ref.name}": connection FAILED (${capText(attempt.failure, 200)}) — its tools are unavailable this run; say so if they are needed.`,
+              `- "${ref.name}": connection FAILED (not among ${selection.owner}'s connected servers anymore — reconnect it on the MCP page) — its tools are unavailable this run; say so if they are needed.`,
             );
             continue;
           }
-          let added = 0;
-          for (const tool of attempt.connection.tools) {
-            if (routes.size >= AGENT_TOOL_CAP) {
-              break;
-            }
-            const fnName = cloudMcpFunctionName(attempt.ref.id, tool.name);
-            if (routes.has(fnName)) {
-              continue;
-            }
-            routes.set(fnName, {
-              type: "mcp",
-              session: attempt.connection.session,
-              toolName: tool.name,
-              serverName: attempt.ref.name,
-            });
-            tools.push({
-              type: "function",
-              function: {
-                name: fnName,
-                description: `[MCP:${attempt.ref.name}] ${tool.description}`.slice(0, 1_000),
-                parameters: tool.inputSchema,
-              },
-            });
-            added += 1;
+          // The agent's stored label names the server for the model, as before.
+          servers.push({ ...server, name: ref.name });
+        }
+        if (servers.length > 0) {
+          // The owner's catalog cache rides along with the resolve response, so
+          // deferred runs search it without a handshake. A rejected sign-in
+          // re-resolves through the owner's shard (which refreshes + persists
+          // the grant) — grants are never rotated inside the project shard.
+          const catalog = createMemoryMcpCatalogStore();
+          for (const entry of resolved.catalog) {
+            catalog.write(entry);
           }
-          noteLines.push(
-            `- "${attempt.ref.name}": connected — ${added} tools available (mcp_* functions).`,
-          );
+          toolset = await resolveMcpToolset({
+            servers,
+            mode: resolved.toolLoading,
+            surface: "background",
+            catalog,
+            nativeCap: Math.max(0, AGENT_TOOL_CAP - routes.size),
+            reconnect: async (serverId) => {
+              const forced = await this.resolveOwnerMcp(selection, [serverId]);
+              const fresh = forced.ok ? forced.servers.find((candidate) => candidate.id === serverId) : undefined;
+              return fresh ? { ...fresh, name: refName.get(serverId) ?? fresh.name } : null;
+            },
+          });
+          for (const [fnName, route] of toolset.routes) {
+            if (!routes.has(fnName)) {
+              routes.set(fnName, route);
+            }
+          }
+          tools.push(...toolset.toolDefs.filter((def) => !tools.some((tool) => tool.function.name === def.function.name)));
+          for (const info of toolset.servers) {
+            if (info.unavailable) {
+              noteLines.push(
+                `- "${info.name}": connection FAILED (${capText(info.unavailable, 200)}) — its tools are unavailable this run; say so if they are needed.`,
+              );
+            } else if (info.deferred) {
+              noteLines.push(
+                `- "${info.name}": connected — ${info.toolCount} tools, loaded on demand (find them with mcp_search_tools, run them with mcp_call_tool).`,
+              );
+            } else {
+              noteLines.push(`- "${info.name}": connected — ${info.toolCount} tools available (mcp_* functions).`);
+            }
+          }
+          for (const failure of toolset.failures) {
+            if (failure.name === "mcp_limit") {
+              noteLines.push(`- ${capText(failure.result, 300)}`);
+            }
+          }
+          if (toolset.promptNote) {
+            noteLines.push(toolset.promptNote);
+          }
         }
       }
       mcpNote = `\nExternal MCP servers (linked through ${selection.owner}'s account):\n${noteLines.join("\n")}`;
     }
-    return { tools, routes, plan, access, mcpNote };
+    return { tools, routes, plan, access, mcpNote, toolset };
   }
 
   /** Resolves one native account credential without copying it into this project. */
@@ -4073,7 +4063,10 @@ export class ProjectStore extends DurableObject {
   private async resolveOwnerMcp(
     selection: AgentMcpSelection,
     force?: string[],
-  ): Promise<{ ok: true; servers: CloudMcpServer[] } | { ok: false; error: string }> {
+  ): Promise<
+    | { ok: true; servers: CloudMcpServer[]; toolLoading: McpToolLoadingMode; catalog: McpCatalogEntry[] }
+    | { ok: false; error: string }
+  > {
     const doBinding = this.workerEnv.DO;
     if (!doBinding) {
       return { ok: false, error: "backend misconfigured — no shard binding" };
@@ -4100,7 +4093,11 @@ export class ProjectStore extends DurableObject {
       if (!response.ok) {
         return { ok: false, error: `${selection.owner}'s account shard answered ${response.status}` };
       }
-      const data = (await response.json().catch(() => null)) as { servers?: unknown } | null;
+      const data = (await response.json().catch(() => null)) as {
+        servers?: unknown;
+        toolLoading?: unknown;
+        catalog?: unknown;
+      } | null;
       const rawList = data && Array.isArray(data.servers) ? data.servers : [];
       const servers: CloudMcpServer[] = [];
       for (const raw of rawList) {
@@ -4109,7 +4106,12 @@ export class ProjectStore extends DurableObject {
           servers.push(server);
         }
       }
-      return { ok: true, servers };
+      return {
+        ok: true,
+        servers,
+        toolLoading: normalizeMcpToolLoading(data?.toolLoading),
+        catalog: normalizeMcpCatalogEntries(data?.catalog),
+      };
     } catch (error) {
       console.error("agent mcp resolve failed:", error instanceof Error ? error.message : "unknown");
       return { ok: false, error: "could not reach the owner's account shard" };
@@ -4152,7 +4154,7 @@ export class ProjectStore extends DurableObject {
       .exec<ChannelRow>("SELECT id, name, topic, created_at FROM channels WHERE id = ?", job.channel_id)
       .toArray()[0];
 
-    const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent);
+    const { tools, routes, plan, access, mcpNote, toolset } = await this.buildAgentToolset(agent);
 
     // Thread transcript: root + settled replies, oldest first, capped.
     const threadRows = sql
@@ -4210,6 +4212,7 @@ export class ProjectStore extends DurableObject {
       ledger,
       surf: createServerSurfSession(),
       mcpRoutes: routes.size > 0 ? routes : null,
+      mcpToolset: toolset,
     };
     let executionClaim: ExecutionOutcomeClaim | null = null;
     const result = await runEngineTurn({
@@ -4335,7 +4338,7 @@ export class ProjectStore extends DurableObject {
     }
     const screen = this.loadScreen(job.screen_id);
 
-    const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent);
+    const { tools, routes, plan, access, mcpNote, toolset } = await this.buildAgentToolset(agent);
 
     // Private desk history — settled rows; the fresh member message is last.
     const historyRows = sql
@@ -4425,6 +4428,7 @@ export class ProjectStore extends DurableObject {
       ledger,
       surf: createServerSurfSession(),
       mcpRoutes: routes.size > 0 ? routes : null,
+      mcpToolset: toolset,
     };
     let executionClaim: ExecutionOutcomeClaim | null = null;
     const result = await runEngineTurn({
@@ -4636,7 +4640,7 @@ export class ProjectStore extends DurableObject {
       );
       return execution;
     }
-    const { tools, routes, plan, access, mcpNote } = await this.buildAgentToolset(agent, "slack");
+    const { tools, routes, plan, access, mcpNote, toolset } = await this.buildAgentToolset(agent, "slack");
 
     // Bot identity — used to strip self-mentions; failures are non-fatal.
     let botUserId = "";
@@ -4694,6 +4698,7 @@ export class ProjectStore extends DurableObject {
       ledger,
       surf: createServerSurfSession(),
       mcpRoutes: routes.size > 0 ? routes : null,
+      mcpToolset: toolset,
     };
     let executionClaim: ExecutionOutcomeClaim | null = null;
     const result = await runEngineTurn({

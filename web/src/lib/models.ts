@@ -408,6 +408,19 @@ function normalizeModel(raw: Record<string, unknown>): GatewayModel {
   };
 }
 
+/** Last catalog the gateway answered with — lets run config read model facts synchronously. */
+let lastGatewayModels: GatewayModel[] = [];
+
+/**
+ * Context window (tokens) of a picked model from the last loaded gateway
+ * catalog; undefined until the catalog loaded or when the gateway omits it.
+ * Server runs use it to decide when MCP tool schemas would crowd the prompt.
+ */
+export function cachedContextWindow(selectionId: string): number | undefined {
+  const model = resolveSelectionModel(lastGatewayModels, selectionId);
+  return typeof model?.context_window === "number" && model.context_window > 0 ? model.context_window : undefined;
+}
+
 export async function fetchGatewayModels(): Promise<GatewayModel[]> {
   const urls = [`${getToolkitUrl()}/v2/vercel/v1/models`, "https://ai-gateway.vercel.sh/v1/models"];
   let lastError: Error | null = null;
@@ -424,6 +437,7 @@ export async function fetchGatewayModels(): Promise<GatewayModel[]> {
         .map(normalizeModel)
         .filter((model) => model.id.length > 0);
       if (models.length > 0) {
+        lastGatewayModels = models;
         return models;
       }
     } catch (error) {

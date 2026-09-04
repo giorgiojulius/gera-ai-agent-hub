@@ -877,6 +877,14 @@ function ResearchConfig() {
   const depth = state.settings.researchDepth;
   const activeOption = RESEARCH_DEPTH_OPTIONS.find((option) => option.value === depth) ?? RESEARCH_DEPTH_OPTIONS[1];
   const profile = RESEARCH_PROFILES[activeOption.value];
+  // Connected generic MCP servers (not the native GitHub connector) reach
+  // research through the deferred meta tools — the panel says so honestly.
+  const mcpServers = state.settings.mcpServers.filter(
+    (server) =>
+      server.enabled &&
+      server.status === "connected" &&
+      !["github", "slack", "intercom"].includes(server.catalogId ?? server.id),
+  );
   return (
     <div className="space-y-4">
       <ConfigHeader
@@ -915,6 +923,11 @@ function ResearchConfig() {
           <DepthStat value={`≤${profile.maxReadsTotal}`} label="page reads" />
           <DepthStat value={`≤${profile.maxBrowseTotal}`} label="live pages" />
         </div>
+        <p className="px-0.5 text-[10px] leading-snug text-muted-foreground">
+          {mcpServers.length > 0
+            ? `MCP: ${mcpServers.map((server) => server.name).join(", ")} — searched on demand (deferred tools, up to 6 reads per run) and cited as sources.`
+            : "MCP: connected servers are searched on demand (deferred tools) and cited as sources — none connected yet."}
+        </p>
         {state.julius ? (
           <p className="px-0.5 text-[10px] leading-snug text-muted-foreground">
             Julius is on — every candidate researches at this depth.

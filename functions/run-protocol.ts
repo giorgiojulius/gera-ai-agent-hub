@@ -909,12 +909,19 @@ export type RunSteerItem = {
 /** MCP server config as the client ships it (mirrors the profile blob shape). */
 export type WireMcpServer = Record<string, unknown>;
 
+/** Account setting: how generic MCP tools reach the model (Settings → Toolkit). */
+export type McpToolLoadingSetting = "auto" | "native" | "deferred";
+
 export type StartRunConfig = {
   systemPrompt?: string;
   history: WireMessage[];
   prompt: string;
   builtins: Record<BuiltinToolId, boolean>;
   mcpServers: WireMcpServer[];
+  /** Snapshot of the account's MCP tool loading setting; absent → the synced profile decides. */
+  mcpToolLoading?: McpToolLoadingSetting;
+  /** Context window (tokens) of the picked model from the gateway catalog; unknown → 128k assumed. */
+  contextWindow?: number;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */
   githubRepo?: string;
   grounding?: { block: string; sources: RunSource[] };

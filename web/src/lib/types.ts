@@ -663,6 +663,13 @@ export type McpToolInfo = {
 /** Completion chime scope: never, only out-of-view finishes, or every finish. */
 export type NotifySoundPref = "off" | "background" | "always";
 
+/**
+ * How generic MCP tools reach the model. "native" registers one function per
+ * tool; "deferred" exposes mcp_search_tools / mcp_call_tool and loads schemas
+ * on demand; "auto" defers once the visible tools or their schemas grow large.
+ */
+export type McpToolLoadingMode = "auto" | "native" | "deferred";
+
 export type AgentSettings = {
   /** Active creation tab in the composer. */
   mode: CreateMode;
@@ -683,6 +690,8 @@ export type AgentSettings = {
   autoTools: boolean;
   builtinTools: Record<BuiltinToolId, boolean>;
   mcpServers: McpServerConfig[];
+  /** MCP tool loading for server runs — synced in the profile so cloud runs honor it too. */
+  mcpToolLoading: McpToolLoadingMode;
   /** Saved agent personas the user can chat with. */
   agents: AgentProfile[];
   /** Reusable instruction packs injected into matching runs (chat / research / Julius). */

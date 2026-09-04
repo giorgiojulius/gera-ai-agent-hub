@@ -163,6 +163,10 @@ export const TID = {
   composerProfiles: "composer-profiles",
   /** Status line of the Rork Auth landing page (/auth/callback): signing in, or handing the code back. */
   authCallbackStatus: "auth-callback-status",
+  /** Settings → Toolkit: the MCP tool loading segmented control (auto / native / deferred). */
+  settingsMcpLoading: "settings-mcp-loading",
+  /** One tool-call row under an assistant reply (repeats; MCP meta calls render as "MCP · server · tool"). */
+  messageToolCall: "message-tool-call",
 } as const;
 
 /** All registry values, for uniqueness checks in tests. */
@@ -186,6 +190,11 @@ export function runModeOptionTid(mode: string): string {
 /** Connect action for one catalog MCP entry. */
 export function mcpCatalogConnectTid(serverId: string): string {
   return `mcp-catalog-connect-${serverId}`;
+}
+
+/** One option of the Settings → Toolkit MCP tool loading control ("auto", "native", "deferred"). */
+export function mcpLoadingOptionTid(mode: string): string {
+  return `mcp-loading-option-${mode}`;
 }
 
 /** Connected/configured MCP card in "Your tools". */

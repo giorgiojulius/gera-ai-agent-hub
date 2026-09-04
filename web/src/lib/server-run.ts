@@ -21,6 +21,7 @@ import type {
   JuliusSettings,
   JuliusState,
   McpServerConfig,
+  McpToolLoadingMode,
   ResearchDepth,
   ResearchState,
   ResearchSource,
@@ -59,6 +60,10 @@ export type ServerRunConfig = {
   prompt: string;
   builtins: Record<BuiltinToolId, boolean>;
   mcpServers: McpServerConfig[];
+  /** Snapshot of Settings → Toolkit → MCP tool loading; the server falls back to the synced profile. */
+  mcpToolLoading?: McpToolLoadingMode;
+  /** Context window (tokens) of the picked model from the gateway catalog, when known. */
+  contextWindow?: number;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */
   githubRepo?: string;
   grounding?: { block: string; sources: ResearchSource[] };

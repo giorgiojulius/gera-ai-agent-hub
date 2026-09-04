@@ -20,7 +20,13 @@ import {
   type EngineSteerItem,
   type EngineToolRecord,
 } from "./agent-engine";
-import { armCloudMcp, emptyMcpRuntime, type McpRuntime } from "./automation-runner";
+import {
+  createSqlMcpCatalogStore,
+  idleToolset,
+  normalizeMcpToolLoading,
+  resolveMcpToolset,
+  type McpToolset,
+} from "./mcp-toolset";
 import { deriveCodeChangeFlow, finalizeCodeChangeFlow, mergeRunCodeChangeStates } from "./code-change-flow";
 import {
   chainRotationBases,
@@ -797,19 +803,37 @@ export class RunManager {
       run.usageEvents.push({ modelId, usage, ...(service ? { service: true } : {}) });
     };
     const isCancelled = (): boolean => run.stopRequested || Date.now() >= deadlineAt;
+    // The account's loading mode: the tab's snapshot wins (it reflects the
+    // switch the user just flipped); otherwise the synced profile decides.
+    const toolLoading = normalizeMcpToolLoading(
+      config.mcpToolLoading ?? this.profileSettings(run.owner)?.mcpToolLoading,
+    );
+    const catalog = createSqlMcpCatalogStore(this.ctx.storage.sql, run.owner);
+    const contextWindowTokens =
+      typeof config.contextWindow === "number" && Number.isFinite(config.contextWindow) && config.contextWindow > 0
+        ? config.contextWindow
+        : undefined;
 
     if (run.kind === "research") {
       try {
         const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
-        const githubRuntime = await armCloudMcp(
-          cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens).filter(
-            (server) => server.kind === "github",
-          ),
-          (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
-          (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
-          (id) => this.markOAuthRefreshStarted(run.owner, id),
-        );
-        const githubRoute = [...githubRuntime.routes.values()].find(
+        // Research keeps GitHub native (its deterministic repo preload reads
+        // the route directly) and reaches every other connected server
+        // through the deferred meta functions — never one function per tool.
+        const researchServers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens);
+        const researchToolset = researchServers.length > 0
+          ? await resolveMcpToolset({
+              servers: researchServers,
+              mode: "deferred",
+              surface: "interactive",
+              contextWindowTokens,
+              catalog,
+              persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+              reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
+              beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+            })
+          : idleToolset();
+        const githubRoute = [...researchToolset.routes.values()].find(
           (route) => route.type === "native" && route.kind === "github",
         );
         const outcome = await runServerDeepResearch({
@@ -823,6 +847,9 @@ export class RunManager {
           githubDisabledTools: unlockGithubChatWrites("github", config.research?.githubDisabledTools ?? []),
           githubRepo: config.githubRepo,
           citations: config.research?.citations ?? "numeric",
+          mcpToolset: researchToolset.servers.some((server) => server.deferred && !server.unavailable)
+            ? researchToolset
+            : undefined,
           isCancelled,
           onUpdate: (research) => {
             run.research = research;
@@ -873,20 +900,23 @@ export class RunManager {
         // Plain candidates can inspect it directly; research candidates use
         // their deterministic preload, while the council Verifier still needs
         // the same route to independently check their repository claims.
-        let juliusMcp: McpRuntime = emptyMcpRuntime();
+        let juliusMcp: McpToolset = idleToolset();
         if (durableMcpConfigs.length > 0) {
           const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
           const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens).filter(
             (server) => server.kind === "github",
           );
           juliusMcp = servers.length > 0
-            ? await armCloudMcp(
+            ? await resolveMcpToolset({
                 servers,
-                (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
-                (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
-                (id) => this.markOAuthRefreshStarted(run.owner, id),
-              )
-            : emptyMcpRuntime();
+                mode: "native",
+                surface: "interactive",
+                catalog,
+                persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+                reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
+                beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+              })
+            : idleToolset();
         }
         const juliusGithubRoute = [...juliusMcp.routes.values()].find(
           (route) => route.type === "native" && route.kind === "github",
@@ -967,19 +997,23 @@ export class RunManager {
       ledger.assign(source.url, source.title);
     }
     // MCP first, so honest failure records are visible from the start.
-    let mcp: McpRuntime = emptyMcpRuntime();
+    let mcp: McpToolset = idleToolset();
     if (durableMcpConfigs.length > 0) {
       try {
         const { tokens: oauthTokens, appliedChains } = await this.oauthTokensFor(run.owner);
         const servers = cloudMcpServersForAutomation(durableMcpConfigs, null, oauthTokens);
         mcp = servers.length > 0
-          ? await armCloudMcp(
+          ? await resolveMcpToolset({
               servers,
-              (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
-              (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
-              (id) => this.markOAuthRefreshStarted(run.owner, id),
-            )
-          : emptyMcpRuntime();
+              mode: toolLoading,
+              surface: "interactive",
+              contextWindowTokens,
+              catalog,
+              persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
+              reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
+              beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+            })
+          : idleToolset();
       } catch (error) {
         console.error("mcp arming failed:", error instanceof Error ? error.message : "unknown");
       }
@@ -1055,6 +1089,7 @@ export class RunManager {
       ledger,
       surf: createServerSurfSession(),
       mcpRoutes: mcp.routes.size > 0 ? mcp.routes : null,
+      mcpToolset: mcp,
     };
     const tools = [
       ...builtinToolDefs(config.builtins),
@@ -1063,6 +1098,9 @@ export class RunManager {
     ];
 
     const apiMessages = buildApiMessages(config.history, systemPrompt);
+    if (mcp.promptNote) {
+      apiMessages.push({ role: "system", content: mcp.promptNote });
+    }
     if (pinnedGitHubBlock) {
       apiMessages.push({ role: "system", content: pinnedGitHubBlock });
     }
@@ -1998,6 +2036,25 @@ export class RunManager {
   // MCP config + OAuth grants. Browser requests carry ids/scopes, never the
   // authoritative connector configuration used by a run.
 
+  /** The synced profile's `settings` object, or null when the account never synced. */
+  private profileSettings(owner: string): Record<string, unknown> | null {
+    const row = this.ctx.storage.sql
+      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
+      .toArray()[0];
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(row.payload) as unknown;
+      const settings = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).settings
+        : null;
+      return settings && typeof settings === "object" && !Array.isArray(settings)
+        ? (settings as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
   private profileMcpConfigsForRun(owner: string, requested: Array<Record<string, unknown>>): unknown[] {
     const ids = new Set<string>();
     for (const item of requested) {
@@ -2005,17 +2062,8 @@ export class RunManager {
       if (typeof item.catalogId === "string" && item.catalogId) ids.add(item.catalogId);
     }
     if (ids.size === 0) return [];
-    const row = this.ctx.storage.sql
-      .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
-      .toArray()[0];
     try {
-      const parsed = row ? JSON.parse(row.payload) as unknown : null;
-      const settings = parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>).settings
-        : null;
-      const servers = settings && typeof settings === "object" && !Array.isArray(settings)
-        ? (settings as Record<string, unknown>).mcpServers
-        : null;
+      const servers = this.profileSettings(owner)?.mcpServers;
       if (!Array.isArray(servers)) return [];
       const secretRows = this.ctx.storage.sql
         .exec<{ server_id: string; payload: string }>(

@@ -20,21 +20,20 @@ import {
   type SurfPage,
 } from "./selfsurf";
 import {
-  callCloudMcpTool,
-  cloudMcpFunctionName,
-  connectCloudMcp,
-  ensureFreshCloudOAuth,
-  forceRefreshCloudOAuthOutcome,
-  redactCloudMcpText,
   type BeginCloudOAuthRefresh,
   type CloudMcpServer,
-  type CloudMcpSession,
   type CloudOAuthRefreshFailure,
   type RefreshedOAuth,
 } from "./mcp-cloud";
-import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
-import { callIntercomNativeTool, INTERCOM_NATIVE_TOOLS } from "./native-intercom";
-import { callSlackNativeTool, SLACK_NATIVE_TOOLS } from "./native-slack";
+import {
+  idleToolset,
+  resolveMcpToolset,
+  type McpCatalogStore,
+  type McpToolLoadingMode,
+  type McpToolset,
+  type ToolDef,
+  type ToolRecord,
+} from "./mcp-toolset";
 import {
   buildExecutionOutcome,
   EXECUTION_OUTCOME_TOOL_NAME,
@@ -61,9 +60,21 @@ export type ClaimJob = {
   prior: Array<{ role: "user" | "assistant"; content: string }>;
   /** MCP servers eligible for this run — auth already resolved server-side. */
   mcpServers: CloudMcpServer[];
+  /** Account setting from the synced profile (Settings → Toolkit); absent → auto. */
+  mcpToolLoading?: McpToolLoadingMode;
 };
 
-export type ToolRecord = { name: string; arguments: string; result: string };
+// Shared tool shapes and the native arming helpers now live in mcp-toolset.ts;
+// re-exported so existing imports (tests, run-tools) keep resolving here.
+export {
+  armCloudMcp,
+  callNativeConnectorTool,
+  emptyMcpRuntime,
+  type McpRoute,
+  type McpRuntime,
+  type ToolDef,
+  type ToolRecord,
+} from "./mcp-toolset";
 
 export type SourceRef = { url: string; title: string };
 
@@ -132,12 +143,6 @@ const RECENCY_WINDOW_MS: Record<string, number> = {
   week: 7 * 86_400_000,
   month: 30 * 86_400_000,
   year: 365 * 86_400_000,
-};
-
-/** OpenAI-shaped function definition sent to the gateway. */
-export type ToolDef = {
-  type: "function";
-  function: { name: string; description: string; parameters: Record<string, unknown> };
 };
 
 const TOOLS: ToolDef[] = [
@@ -227,234 +232,20 @@ const TOOLS: ToolDef[] = [
 /** Per-run SelfSurf session: cookie jar + visited pages (current = last). */
 type SurfState = { jar: SurfJar; pages: SurfPage[] };
 
-/** Dispatch route for one namespaced MCP or native-connector tool. */
-export type McpRoute =
-  | { type: "mcp"; session: CloudMcpSession; toolName: string; serverName: string }
-  | {
-      type: "native";
-      kind: "github" | "slack" | "intercom";
-      /** Ready credential: full Authorization header for GitHub, raw token otherwise. */
-      auth: string;
-      toolName: string;
-      serverName: string;
-    };
-
-export type McpRuntime = {
-  toolDefs: ToolDef[];
-  routes: Map<string, McpRoute>;
-  failures: ToolRecord[];
-  summary: string[];
-  refreshed: RefreshedOAuth[];
-};
-
-const MAX_MCP_TOOLS = 90;
-
-export function emptyMcpRuntime(): McpRuntime {
-  return { toolDefs: [], routes: new Map(), failures: [], summary: [], refreshed: [] };
-}
-
-const NATIVE_TOOL_TABLES = {
-  github: GITHUB_NATIVE_TOOLS,
-  slack: SLACK_NATIVE_TOOLS,
-  intercom: INTERCOM_NATIVE_TOOLS,
-} as const;
-
-/** Arms one native connector from its static tool table — no handshake needed. */
-function armNativeServer(runtime: McpRuntime, server: CloudMcpServer): void {
-  if (server.kind === "mcp") {
-    return;
-  }
-  const credential = server.token ?? server.oauth?.accessToken ?? "";
-  if (!credential) {
-    return;
-  }
-  const auth =
-    server.kind === "github"
-      ? credential.toLowerCase().startsWith("bearer ")
-        ? credential
-        : `Bearer ${credential}`
-      : credential;
-  let added = 0;
-  for (const tool of NATIVE_TOOL_TABLES[server.kind]) {
-    if (runtime.routes.size >= MAX_MCP_TOOLS) {
-      break;
-    }
-    if (server.disabledTools.includes(tool.name)) {
-      continue;
-    }
-    const fnName = cloudMcpFunctionName(server.id, tool.name);
-    if (runtime.routes.has(fnName)) {
-      continue;
-    }
-    runtime.routes.set(fnName, {
-      type: "native",
-      kind: server.kind,
-      auth,
-      toolName: tool.name,
-      serverName: server.name,
-    });
-    runtime.toolDefs.push({
-      type: "function",
-      function: {
-        name: fnName,
-        description: `[${server.name}] ${tool.description ?? tool.name}`.slice(0, 1_000),
-        parameters: tool.inputSchema ?? { type: "object", properties: {} },
-      },
-    });
-    added += 1;
-  }
-  runtime.summary.push(`${server.name} (${added} tools)`);
-}
-
-/**
- * Arms every eligible server: expiring synced sign-ins refresh first, native
- * connectors expose their static tool tables, and MCP servers connect in
- * parallel. Failures never kill the run — they surface as honest tool
- * records in the thread.
- */
-export async function armCloudMcp(
-  servers: CloudMcpServer[],
-  persist?: (rotation: RefreshedOAuth) => Promise<void>,
-  reportFailure?: (serverId: string, outcome: CloudOAuthRefreshFailure) => Promise<void>,
-  beginRefresh?: BeginCloudOAuthRefresh,
-): Promise<McpRuntime> {
-  const runtime = emptyMcpRuntime();
-  const unavailable = new Set<string>();
-  for (const server of servers) {
-    if (server.oauth) {
-      try {
-        const outcome = await ensureFreshCloudOAuth(server, runtime.refreshed, persist, beginRefresh);
-        if (outcome?.ok === false) {
-          await reportFailure?.(server.id, outcome);
-          if (!outcome.transient) {
-            unavailable.add(server.id);
-            runtime.failures.push({
-              name: "mcp_auth",
-              arguments: server.name,
-              result: `Could not authenticate MCP server "${server.name}": sign-in must be renewed.`,
-            });
-          }
-        }
-      } catch {
-        // keep the synced token — a real auth failure surfaces honestly below
-      }
-    }
-  }
-  for (const server of servers) {
-    if (!unavailable.has(server.id)) {
-      armNativeServer(runtime, server);
-    }
-  }
-  const attempts = await Promise.all(
-    servers
-      .filter((server) => server.kind === "mcp" && !unavailable.has(server.id))
-      .map(async (server) => {
-        try {
-          return { server, connection: await connectCloudMcp(server) };
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "connect failed";
-          // Auth rejected with a refresh token in hand: the recorded expiry
-          // may be missing or wrong (no expires_in, revoked early). Redeem
-          // the refresh token once and retry — mirrors the browser's 401
-          // replay, so a sleeping sign-in repairs instead of failing.
-          if (message.includes("auth rejected") && server.oauth?.refreshToken) {
-            const outcome = await forceRefreshCloudOAuthOutcome(
-              server,
-              runtime.refreshed,
-              persist,
-              beginRefresh,
-            ).catch(() => null);
-            if (outcome?.ok === false) {
-              await reportFailure?.(server.id, outcome);
-            }
-            if (outcome?.ok) {
-              try {
-                return { server, connection: await connectCloudMcp(server) };
-              } catch (retryError) {
-                return {
-                  server,
-                  failure: retryError instanceof Error ? retryError.message : "connect failed",
-                };
-              }
-            }
-          }
-          return { server, failure: message };
-        }
-      }),
-  );
-  for (const attempt of attempts) {
-    if ("failure" in attempt) {
-      runtime.failures.push({
-        name: "mcp_connect",
-        arguments: attempt.server.name,
-        result: `Could not connect MCP server "${attempt.server.name}": ${attempt.failure}`,
-      });
-      continue;
-    }
-    let added = 0;
-    for (const tool of attempt.connection.tools) {
-      if (runtime.routes.size >= MAX_MCP_TOOLS) {
-        break;
-      }
-      const fnName = cloudMcpFunctionName(attempt.server.id, tool.name);
-      if (runtime.routes.has(fnName)) {
-        continue;
-      }
-      runtime.routes.set(fnName, {
-        type: "mcp",
-        session: attempt.connection.session,
-        toolName: tool.name,
-        serverName: attempt.server.name,
-      });
-      runtime.toolDefs.push({
-        type: "function",
-        function: {
-          name: fnName,
-          description: `[MCP:${attempt.server.name}] ${tool.description}`.slice(0, 1_000),
-          parameters: tool.inputSchema,
-        },
-      });
-      added += 1;
-    }
-    runtime.summary.push(`${attempt.server.name} (${added} tools)`);
-  }
-  return runtime;
-}
-
-/** Dispatches one native-connector tool call to its server-side REST port. */
-export async function callNativeConnectorTool(
-  route: Extract<McpRoute, { type: "native" }>,
-  args: Record<string, unknown>,
-): Promise<string> {
-  const credentials = [route.auth, /^Bearer\s+(.+)$/i.exec(route.auth)?.[1] ?? ""];
-  try {
-    const output = route.kind === "github"
-      ? await callGitHubNativeTool(route.auth, route.toolName, args)
-      : route.kind === "slack"
-        ? await callSlackNativeTool(route.auth, route.toolName, args)
-        : await callIntercomNativeTool(route.auth, route.toolName, args);
-    return redactCloudMcpText(output, credentials);
-  } catch (error) {
-    throw new Error(redactCloudMcpText(
-      error instanceof Error ? error.message : "native connector failed",
-      credentials,
-    ));
-  }
-}
-
 function cap(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit)}\n… [truncated]` : text;
 }
 
-function buildSystemPrompt(job: ClaimJob, mcpSummary: string[]): string {
+function buildSystemPrompt(job: ClaimJob, mcp: Pick<McpToolset, "summary" | "promptNote">): string {
   const parts: string[] = [
     `You are Gera, executing the scheduled cloud automation "${job.name}". The user is away and will read this reply later in the thread.`,
     [
       "Rules for cloud runs:",
       "- Tools available: web_search (live web), fetch_url (read pages), and SelfSurf — an autonomous text browser (surf_open / surf_follow / surf_submit) that keeps cookies, follows links, and submits real forms. Use SelfSurf when a site must be navigated or its search/filter forms used; it does not execute JavaScript and cannot pass CAPTCHAs.",
-      mcpSummary.length > 0
-        ? `- MCP tools ARE armed this run (names start with "mcp_"): ${mcpSummary.join(", ")}. They act on the user's real accounts — read freely, but only perform writes the automation prompt clearly asks for.`
+      mcp.summary.length > 0
+        ? `- MCP tools ARE armed this run (names start with "mcp_"): ${mcp.summary.join(", ")}. They act on the user's real accounts — read freely, but only perform writes the automation prompt clearly asks for.`
         : "- No MCP servers are armed for this run.",
+      ...(mcp.promptNote ? [`- ${mcp.promptNote}`] : []),
       '- Citations: every web_search / fetch_url result carries a system-assigned citation number like [2]. When a claim comes from a source, put the marker right after the claim: "revenue grew 40% [2]". Several sources: [1][3]. The UI turns markers into clickable chips and shows a sources bar automatically — do not dump plain URL lists, and never use a number that was not shown to you.',
       "- Image/video/audio generation and hub writes are NOT available here. Never emit ```action fences.",
       "- Write the deliverable directly — compact, structured, skimmable. ```chart and ```mermaid fences render fine when they help.",
@@ -487,14 +278,23 @@ export async function runAutomationJob(
   persistOAuth?: (rotation: RefreshedOAuth) => Promise<void>,
   reportOAuthFailure?: (serverId: string, outcome: CloudOAuthRefreshFailure) => Promise<void>,
   beginOAuthRefresh?: BeginCloudOAuthRefresh,
+  catalog?: McpCatalogStore,
 ): Promise<AutomationRunResult> {
   // MCP first, so the system prompt lists what actually connected and the
   // thread shows honest records for servers that did not.
-  const mcp = job.mcpServers.length > 0
-    ? await armCloudMcp(job.mcpServers, persistOAuth, reportOAuthFailure, beginOAuthRefresh)
-    : emptyMcpRuntime();
+  const mcp: McpToolset = job.mcpServers.length > 0
+    ? await resolveMcpToolset({
+        servers: job.mcpServers,
+        mode: job.mcpToolLoading,
+        surface: "background",
+        catalog,
+        persist: persistOAuth,
+        reportFailure: reportOAuthFailure,
+        beginRefresh: beginOAuthRefresh,
+      })
+    : idleToolset();
   const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs, executionOutcomeToolDefinition()];
-  const messages: GatewayMessage[] = [{ role: "system", content: buildSystemPrompt(job, mcp.summary) }];
+  const messages: GatewayMessage[] = [{ role: "system", content: buildSystemPrompt(job, mcp) }];
   for (const item of job.prior) {
     messages.push({ role: item.role, content: item.content });
   }
@@ -549,7 +349,7 @@ export async function runAutomationJob(
         ? executionClaim
           ? "Execution outcome recorded. Do not repeat the deliverable."
           : "Execution outcome was invalid. Submit it again with every required field."
-        : await executeTool(call.function.name, call.function.arguments, authKey, ledger, surf, mcp.routes);
+        : await executeTool(call.function.name, call.function.arguments, authKey, ledger, surf, mcp);
       if (!isOutcome) {
         records.push({
           name: call.function.name,
@@ -718,7 +518,7 @@ async function executeTool(
   authKey: string,
   ledger: SourceLedger,
   surf: SurfState,
-  mcpRoutes: Map<string, McpRoute>,
+  mcp: McpToolset,
 ): Promise<string> {
   let args: Record<string, unknown> = {};
   try {
@@ -727,17 +527,10 @@ async function executeTool(
     args = {};
   }
   try {
-    const route = mcpRoutes.get(name);
-    if (route) {
-      try {
-        const output =
-          route.type === "native"
-            ? await callNativeConnectorTool(route, args)
-            : await callCloudMcpTool(route.session, route.toolName, args);
-        return output.trim().length > 0 ? output : "(empty result)";
-      } catch (error) {
-        return `MCP tool failed (${route.serverName}): ${error instanceof Error ? error.message : "unknown error"}`;
-      }
+    if (mcp.owns(name)) {
+      // Inline routes and the deferred meta functions share one executor;
+      // tool failures come back as honest text, never as thrown errors.
+      return (await mcp.execute(name, args)).text;
     }
     if (name === "web_search") {
       return await execWebSearch(

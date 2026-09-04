@@ -49,6 +49,7 @@ import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerab
 import { McpAccountAuthError, McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
 import { hasOAuthRefreshToken, hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
 import {
+  cachedContextWindow,
   IMAGE_EDIT_MODEL,
   modelIdForMode,
   modelShortName,
@@ -533,6 +534,23 @@ function createSteerBridge(
   });
   void forward();
   return unwatch;
+}
+
+/**
+ * MCP loading facts every server run carries: the account's tool-loading
+ * setting (so a switch flipped moments ago applies before the profile syncs)
+ * and the picked model's context window from the gateway catalog, which the
+ * server's auto mode uses to judge when tool schemas would crowd the prompt.
+ */
+function mcpRunConfig(
+  settings: AgentSettings,
+  selectionId: string,
+): Pick<ServerRunConfig, "mcpToolLoading" | "contextWindow"> {
+  const contextWindow = cachedContextWindow(selectionId);
+  return {
+    mcpToolLoading: settings.mcpToolLoading,
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
 }
 
 type ServerTurnParams = {
@@ -1060,6 +1078,7 @@ export async function sendPrompt(params: {
           // the same credential to check repository claims independently.
           mcpServers:
             wantJulius && githubServer ? injectGitHubRunAuth([githubServer], githubAuth) : [],
+          ...mcpRunConfig(settings, selectionId),
           githubRepo: pinnedRepo || undefined,
           ...(wantResearch
             ? {
@@ -1213,6 +1232,7 @@ export async function sendPrompt(params: {
         prompt,
         builtins: armedBuiltins,
         mcpServers: injectGitHubRunAuth(armedServers, githubAuth),
+        ...mcpRunConfig(settings, selectionId),
         githubRepo: pinnedRepo || undefined,
         grounding: grounding ?? undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
@@ -1472,6 +1492,7 @@ export async function resumePrompt(params: {
         prompt: lastUser?.content ?? "",
         builtins: scoped.builtinTools,
         mcpServers: injectGitHubRunAuth(scoped.mcpServers, resumeGithubAuth),
+        ...mcpRunConfig(settings, selectionId),
         githubRepo: resumeRepo || undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
         resume: { messageId: assistantId, partial },

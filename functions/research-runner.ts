@@ -12,11 +12,18 @@ import {
   CHAT_FALLBACKS,
   FAST_MODEL,
   fallbackServedBy,
+  runEngineTurn,
   streamGatewayCompletion,
   withRetries,
   TOOLKIT_URL,
   type EngineMessage,
 } from "./agent-engine";
+import {
+  isMcpMetaToolName,
+  MCP_CALL_TOOL_NAME,
+  MCP_SEARCH_TOOL_NAME,
+  type McpToolset,
+} from "./mcp-toolset";
 import {
   callGitHubNativeTool,
   fetchGitHubRepoMeta,
@@ -132,6 +139,8 @@ ${repoMode ? `- "files" reads straight from the user's connected GitHub repos: s
 const synthesisPrompt = (citeNumeric: boolean) => `You are Gera in deep research mode. You are given a research dossier of numbered sources — web pages (search notes plus full page texts) and, when the question names a repository, file trees, source files, commit diffs, CI runs, and failure logs pulled from the user's connected GitHub. Write a deep, insight-dense report that answers the user's question. Today's date: ${new Date().toISOString().slice(0, 10)} (UTC) — weigh source freshness accordingly. A source marked "Fetched live" was opened today by the live browser — treat it as today's state.
 
 A <research_log> may follow the dossier: the queries the loop ran, its own notes on what was still missing after each wave, and the pages or tools that failed. Use it to write "Limitations" factually — what was searched for and not found, which pages could not be opened — and to tell "no public data found" apart from "never looked for". The log is not a source: never cite it, and never present a failed fetch as evidence.
+
+Sources whose URL starts with mcp:// are outputs of the user's connected MCP tools (server · tool) — primary data from their own systems, fetched during this run; cite them like any other source and name the server in prose when the fact comes from there.
 
 Citations — dense, Perplexity-style:
 ${citeNumeric
@@ -578,11 +587,39 @@ export type ResearchRunParams = {
   githubRepo?: string;
   citations?: "numeric" | "links";
   fallbacks?: boolean;
+  /**
+   * The run's deferred MCP toolset: research never lists tool schemas — a
+   * bounded scout step searches the connected servers and reads the few
+   * tools whose output bears on the question; results become dossier sources.
+   */
+  mcpToolset?: McpToolset;
   isCancelled?: () => boolean;
   onUpdate: (research: ResearchState) => void;
   onText: (full: string) => void;
   onUsage?: (modelId: string, usage: unknown, service?: boolean) => void;
 };
+
+/** Most MCP tool reads one research run may spend on connected servers. */
+export const MCP_RESEARCH_CALLS = 6;
+/** Wall-clock budget of the connector scout step. */
+const MCP_RESEARCH_BUDGET_MS = 90_000;
+
+/** Pseudo-URL that identifies one MCP tool output in the dossier (unique per call). */
+export function mcpSourceUrl(serverId: string, toolName: string, ordinal: number): string {
+  const base = `mcp://${encodeURIComponent(serverId)}/${encodeURIComponent(toolName)}`;
+  return ordinal > 1 ? `${base}#${ordinal}` : base;
+}
+
+const mcpScoutPrompt = (toolset: McpToolset, calls: number) => `You scout the user's connected MCP servers for a research question — you find and read data, you do not write the report.
+
+${toolset.promptNote}
+
+Procedure:
+1. Call ${MCP_SEARCH_TOOL_NAME} with 1-3 targeted queries derived from the question (topic words, entity names, the kind of data needed).
+2. Call ${MCP_CALL_TOOL_NAME} for at most ${calls} tools whose OUTPUT would contain facts directly useful to the question: internal documents, knowledge bases, tickets, metrics, live systems, catalogs. Pass arguments that match the tool's inputSchema.
+3. Read-only intent: never call tools that create, update, send, post, or delete anything.
+4. If no tool is relevant, stop without calling one.
+Finish with ONE short sentence naming what was fetched, or that nothing relevant exists — no analysis, no answer to the question.`;
 
 /**
  * Grok-style deep research on the server: plan queries, search in waves,
@@ -678,6 +715,87 @@ export async function runServerDeepResearch(
   const browsedUrls = new Set<string>();
   let browsesTotal = 0;
 
+  const scoutMcpConnectors = async (toolset: McpToolset): Promise<void> => {
+    const metaTools = toolset.toolDefs.filter((def) => isMcpMetaToolName(def.function.name));
+    const servers = toolset.servers.filter((server) => server.deferred && !server.unavailable);
+    if (metaTools.length === 0 || servers.length === 0) {
+      return;
+    }
+    const serverName = (id: string): string => servers.find((server) => server.id === id)?.name ?? id;
+    const scoutStep = addStep("plan", "Checking connected MCP servers", servers.map((server) => server.name).join(", ").slice(0, 110));
+    const callOrdinals = new Map<string, number>();
+    let reads = 0;
+    let calls = 0;
+    const parseArgs = (argsJson: string): Record<string, unknown> => {
+      try {
+        const parsed = JSON.parse(argsJson || "{}") as unknown;
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+      } catch {
+        return {};
+      }
+    };
+    try {
+      await runEngineTurn({
+        authKey: params.authKey,
+        modelId: FAST_MODEL,
+        apiMessages: [
+          { role: "system", content: mcpScoutPrompt(toolset, MCP_RESEARCH_CALLS) },
+          { role: "user", content: `Research question:\n"""${params.prompt.slice(0, 2000)}"""` },
+        ],
+        tools: metaTools,
+        fallbacks: params.fallbacks,
+        isStopped: params.isCancelled,
+        deadlineAt: Date.now() + MCP_RESEARCH_BUDGET_MS,
+        handlers: { onText: () => undefined },
+        // Scout calls are helper spend — tagged service so they never pose as model adoption.
+        onUsage: (modelId, usage) => params.onUsage?.(modelId, usage, true),
+        executeTool: async (name, argsJson) => {
+          ensureAlive();
+          const args = parseArgs(argsJson);
+          if (name === MCP_CALL_TOOL_NAME) {
+            if (calls >= MCP_RESEARCH_CALLS) {
+              return { text: `Read budget exhausted (${MCP_RESEARCH_CALLS} tool reads per research run). Stop and summarize.`, isError: true };
+            }
+            calls += 1;
+            const serverId = typeof args.serverId === "string" ? args.serverId : "?";
+            const toolName = typeof args.toolName === "string" ? args.toolName : "?";
+            const step = addStep("read", toolName.slice(0, 90), `MCP · ${serverName(serverId)}`);
+            const outcome = await toolset.execute(name, args);
+            if (outcome.isError || outcome.text.trim().length === 0) {
+              finishStep(step, "error", outcome.isError ? outcome.text.slice(0, 120) : "empty result");
+              return outcome;
+            }
+            const key = `${serverId}\u0000${toolName}`;
+            const ordinal = (callOrdinals.get(key) ?? 0) + 1;
+            callOrdinals.set(key, ordinal);
+            upsertRepoSource(
+              mcpSourceUrl(serverId, toolName, ordinal),
+              `${serverName(serverId)} · ${toolName}`,
+              outcome.text.slice(0, profile.pageChars * 2),
+            );
+            reads += 1;
+            finishStep(step, "done", `MCP · ${serverName(serverId)}`);
+            return outcome;
+          }
+          if (name === MCP_SEARCH_TOOL_NAME) {
+            const query = typeof args.query === "string" ? args.query : "";
+            const step = addStep("search", `MCP tools: ${query || "(all)"}`.slice(0, 90), "connected servers");
+            const outcome = await toolset.execute(name, args);
+            finishStep(step, outcome.isError ? "error" : "done", outcome.isError ? outcome.text.slice(0, 120) : undefined);
+            return outcome;
+          }
+          return { text: `Tool "${name}" is not available in the connector scout.`, isError: true };
+        },
+      });
+      finishStep(scoutStep, "done", reads > 0 ? `${reads} tool read${reads === 1 ? "" : "s"} added as sources` : "nothing relevant found");
+    } catch (error) {
+      if (error instanceof RunStoppedError) {
+        throw error;
+      }
+      finishStep(scoutStep, "error", error instanceof Error ? error.message.slice(0, 120) : "scout failed");
+    }
+  };
+
   const browsePages = async (rawUrls: string[]): Promise<void> => {
     for (const raw of rawUrls) {
       if (browsesTotal >= profile.maxBrowseTotal) {
@@ -760,6 +878,15 @@ export async function runServerDeepResearch(
     const promptUrls = urlsInPrompt(params.prompt);
     if (promptUrls.length > 0) {
       await browsePages(promptUrls);
+      ensureAlive();
+    }
+
+    // Connected MCP servers: a bounded scout step on the fast model searches
+    // their catalogs and reads the few tools whose output bears on the
+    // question. Every successful read becomes a dossier source (mcp://…), so
+    // the writer cites it like any page; failures stay honest in the trail.
+    if (params.mcpToolset) {
+      await scoutMcpConnectors(params.mcpToolset);
       ensureAlive();
     }
 

@@ -660,6 +660,8 @@ export function normalizeStoredSettings(raw: unknown): AgentSettings {
     autoTools: typeof stored.autoTools === "boolean" ? stored.autoTools : true,
     builtinTools: { ...DEFAULT_TOOLS, ...(stored.builtinTools ?? {}) },
     mcpServers: keepUserMcpServers(servers),
+    mcpToolLoading:
+      stored.mcpToolLoading === "native" || stored.mcpToolLoading === "deferred" ? stored.mcpToolLoading : "auto",
     agents,
     skills: normalizeSkills(stored.skills),
     automations,

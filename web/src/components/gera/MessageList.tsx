@@ -39,20 +39,45 @@ import { TID } from "@/lib/testids";
 import type { ChatMessage, ResearchSource, ResearchState, ResearchStep, ResearchStepKind, ToolCallRecord, TurnUsage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+/** Deferred-mode MCP meta functions — the row names the server and tool from the arguments. */
+const MCP_SEARCH_TOOL = "mcp_search_tools";
+const MCP_CALL_TOOL = "mcp_call_tool";
+
+function parseToolArgs(call: ToolCallRecord): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(call.arguments || "{}") as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    // arguments still streaming — show the action without detail
+    return {};
+  }
+}
+
 /**
  * Human-readable label for a tool call row. SelfSurf calls render as a
- * browsing trail ("SelfSurf · open example.com") instead of raw tool names.
+ * browsing trail ("SelfSurf · open example.com") instead of raw tool names;
+ * deferred MCP calls render as "MCP · server · tool" so they read exactly like
+ * a natively armed tool.
  */
-function describeToolCall(call: ToolCallRecord): { name: string; detail?: string; surf: boolean } {
+export function describeToolCall(call: ToolCallRecord): { name: string; detail?: string; surf: boolean } {
+  if (call.name === MCP_SEARCH_TOOL || call.name === MCP_CALL_TOOL) {
+    const args = parseToolArgs(call);
+    const server = typeof args.serverId === "string" && args.serverId ? args.serverId : "";
+    if (call.name === MCP_CALL_TOOL) {
+      const tool = typeof args.toolName === "string" && args.toolName ? args.toolName : "…";
+      return { name: "MCP", detail: `${server || "?"} · ${tool}`, surf: false };
+    }
+    const query = typeof args.query === "string" ? args.query.slice(0, 60) : "";
+    return {
+      name: "MCP",
+      detail: `${server || "all servers"} · search${query ? ` “${query}”` : ""}`,
+      surf: false,
+    };
+  }
   if (!call.name.startsWith("surf_")) {
     return { name: call.name, surf: false };
   }
-  let args: Record<string, unknown> = {};
-  try {
-    args = JSON.parse(call.arguments || "{}") as Record<string, unknown>;
-  } catch {
-    // arguments still streaming — show the action without detail
-  }
+  const args = parseToolArgs(call);
   const host = (value: unknown): string => {
     const raw = String(value ?? "");
     try {
@@ -184,6 +209,7 @@ function MessageBubble({
               return (
                 <div
                   key={call.id}
+                  data-testid={TID.messageToolCall}
                   className="flex items-center gap-2 rounded-xl border border-border/70 bg-card px-3 py-2 text-xs shadow-sm"
                 >
                   {call.status === "running" ? (

@@ -142,6 +142,8 @@ const synthesisPrompt = (citeNumeric: boolean) => `You are Gera in deep research
 
 A <research_log> may follow the dossier: the queries the loop ran, its own notes on what was still missing after each wave, and the pages or tools that failed. Use it to write "Limitations" factually — what was searched for and not found, which pages could not be opened — and to tell "no public data found" apart from "never looked for". The log is not a source: never cite it, and never present a failed fetch as evidence.
 
+Sources whose URL starts with mcp:// are outputs of the user's connected MCP tools (server · tool) — primary data from their own systems, fetched during this run; cite them like any other source and name the server in prose when the fact comes from there.
+
 Citations — dense, Perplexity-style:
 ${citeNumeric
     ? `- Cite with bare numeric markers using the dossier source numbers, placed right after the claim they support: "revenue grew 34% in 2025 [7]". Stack markers when sources corroborate: [3][12].

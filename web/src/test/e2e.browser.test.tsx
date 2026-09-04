@@ -29,6 +29,7 @@ import {
   E2E_SCENARIOS,
   STUB_CODE_PROMPT,
   STUB_HANG_PROMPT,
+  STUB_MCP_PROMPT,
   STUB_REPLY_SNIPPET,
   SWITCH_TARGET_MODEL_ID,
   SWITCH_TARGET_MODEL_NAME,
@@ -135,6 +136,8 @@ type StubRunBody = {
     prompt?: string;
     githubRepo?: string;
     mcpServers?: Array<{ id?: string; catalogId?: string; token?: string }>;
+    mcpToolLoading?: string;
+    contextWindow?: number;
   };
 };
 let lastStubRun: StubRun | null = null;
@@ -142,6 +145,30 @@ let lastStubRunBody: StubRunBody | null = null;
 /** Set by /runs/start when the prompt carries STUB_HANG_PROMPT — the stream then never terminates. */
 let hangStubRun = false;
 let codeStubRun = false;
+/** Set by /runs/start for STUB_MCP_PROMPT — the stream shows a deferred MCP search + call before the reply. */
+let mcpStubRun = false;
+
+/** Tool records a deferred-mode run streams: the meta calls the server executed. */
+const MCP_STUB_TOOL_CALLS = [
+  {
+    id: "mcp-search",
+    name: "mcp_search_tools",
+    arguments: JSON.stringify({ query: "ask a question about a repository" }),
+    status: "done",
+    result: '{"matches":[{"serverId":"deepwiki","toolName":"ask_question"}]}',
+  },
+  {
+    id: "mcp-call",
+    name: "mcp_call_tool",
+    arguments: JSON.stringify({
+      serverId: "deepwiki",
+      toolName: "ask_question",
+      arguments: { repoName: "acme/private-app", question: "What does it do?" },
+    }),
+    status: "done",
+    result: "A fixture repository that renders a greeting.",
+  },
+] as const;
 
 const PREVIEW_STUB_ID = `${"a".repeat(24)}.${"b".repeat(32)}.${"c".repeat(24)}`;
 
@@ -220,16 +247,23 @@ function runStreamResponse(): Response {
           { t: "code", seq: 3, codeChanges },
         ]
       : []),
-    { t: "text", seq: codeStubRun ? 4 : 2, content: REPLY_TEXT.slice(0, 14) },
-    { t: "text", seq: codeStubRun ? 5 : 3, content: REPLY_TEXT },
+    ...(mcpStubRun
+      ? [
+          { t: "tools", seq: 2, toolCalls: [{ ...MCP_STUB_TOOL_CALLS[0], status: "running", result: undefined }] },
+          { t: "tools", seq: 3, toolCalls: [...MCP_STUB_TOOL_CALLS] },
+        ]
+      : []),
+    { t: "text", seq: codeStubRun || mcpStubRun ? 4 : 2, content: REPLY_TEXT.slice(0, 14) },
+    { t: "text", seq: codeStubRun || mcpStubRun ? 5 : 3, content: REPLY_TEXT },
     {
       t: "done",
-      seq: codeStubRun ? 6 : 4,
+      seq: codeStubRun || mcpStubRun ? 6 : 4,
       status: "done",
       message: {
         id: run?.assistantMessageId ?? "e2e-assistant",
         content: REPLY_TEXT,
         ...(codeStubRun ? { codeChanges } : {}),
+        ...(mcpStubRun ? { toolCalls: [...MCP_STUB_TOOL_CALLS] } : {}),
       },
       usageEvents: [
         { modelId: "stub/model", usage: { prompt_tokens: 42, completion_tokens: 12, total_tokens: 54 } },
@@ -416,6 +450,7 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
       };
       hangStubRun = raw.includes(STUB_HANG_PROMPT);
       codeStubRun = body.config?.prompt === STUB_CODE_PROMPT;
+      mcpStubRun = body.config?.prompt === STUB_MCP_PROMPT;
       return jsonResponse({ ok: true, runId: lastStubRun.runId, historyOnServer: true });
     }
     if (url.includes("/runs/stream")) {
@@ -556,6 +591,7 @@ beforeEach(() => {
   lastStubRunBody = null;
   hangStubRun = false;
   codeStubRun = false;
+  mcpStubRun = false;
   localStorage.setItem(ACCESS_TOKEN_KEY, fakeAccessToken());
   installNetworkStub();
 });
@@ -626,6 +662,12 @@ for (const scenario of E2E_SCENARIOS) {
     results.push(result);
     if (!result.ok) {
       expect.fail(`[${result.scenarioId}] ${result.error ?? "scenario did not finish"}`);
+    }
+    if (scenario.id === "connect-open-mcp-deferred") {
+      // The Settings switch rides into the run config as a snapshot, and the
+      // model's context window from the stubbed gateway catalog comes along.
+      expect(lastStubRunBody?.config?.mcpToolLoading).toBe("deferred");
+      expect(lastStubRunBody?.config?.contextWindow).toBe(200_000);
     }
     if (scenario.id === "github-pin-and-send") {
       expect(lastStubRunBody?.config?.githubRepo).toBe("acme/private-app");

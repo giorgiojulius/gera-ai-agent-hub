@@ -7,9 +7,8 @@
 // Server-side toolkit calls MUST send `Authorization: Bearer <key>`.
 
 import { capText, TOOLKIT_URL, type EngineToolDef, type EngineToolOutcome } from "./agent-engine";
-import type { McpRoute } from "./automation-runner";
-import { callNativeConnectorTool } from "./automation-runner";
 import { callCloudMcpTool } from "./mcp-cloud";
+import { callNativeConnectorTool, type McpRoute, type McpToolset } from "./mcp-toolset";
 import {
   formatSurfPage,
   mergeFormFields,
@@ -714,6 +713,8 @@ export type ServerToolContext = {
   surf: ServerSurfSession;
   /** Armed MCP + native-connector routes; null when none are configured. */
   mcpRoutes: Map<string, McpRoute> | null;
+  /** The run's resolved toolset — owns inline routes AND the deferred meta functions. */
+  mcpToolset?: McpToolset | null;
 };
 
 /** Executes one tool call inside a server run — never throws for tool errors. */
@@ -727,6 +728,11 @@ export async function executeServerTool(
     args = JSON.parse(argsJson || "{}") as Record<string, unknown>;
   } catch {
     args = {};
+  }
+
+  if (ctx.mcpToolset?.owns(name)) {
+    const outcome = await ctx.mcpToolset.execute(name, args);
+    return { text: capText(outcome.text, 60_000), ...(outcome.isError ? { isError: true } : {}) };
   }
 
   const route = ctx.mcpRoutes?.get(name);

@@ -135,6 +135,11 @@ export function redactCloudMcpValue(value: unknown, credentials: string[], depth
   return output;
 }
 
+/** Every exact credential value a server carries — for redacting provider-originated text. */
+export function cloudServerRedactions(server: CloudMcpServer): string[] {
+  return serverCredentialValues(server);
+}
+
 function serverCredentialValues(server: CloudMcpServer): string[] {
   const values = [
     ...Object.values(server.headers),
@@ -1018,10 +1023,22 @@ async function rpc(
   return parsed.result;
 }
 
+/** Default page budget for one tools/list walk; deferred loading raises it. */
+const DEFAULT_MAX_TOOLS = 500;
+
+export type ConnectCloudMcpOptions = {
+  /** Stop listing after this many tools (default 500). */
+  maxTools?: number;
+  /** Keep tools the user disabled — catalog caches store the full remote table. */
+  includeDisabled?: boolean;
+};
+
 /** initialize → initialized → tools/list; returns a live session + its tools. */
 export async function connectCloudMcp(
   server: CloudMcpServer,
+  options: ConnectCloudMcpOptions = {},
 ): Promise<{ session: CloudMcpSession; tools: CloudMcpTool[] }> {
+  const maxTools = Math.max(1, Math.floor(options.maxTools ?? DEFAULT_MAX_TOOLS));
   const headers: Record<string, string> = { ...server.headers };
   if (server.oauth && !headers.Authorization) {
     headers.Authorization = `Bearer ${server.oauth.accessToken}`;
@@ -1065,12 +1082,12 @@ export async function connectCloudMcp(
   }
   const rawTools: Array<Record<string, unknown>> = [];
   let cursor: string | undefined;
-  for (let page = 0; page < 20 && rawTools.length < 500; page += 1) {
+  for (let page = 0; page < 20 && rawTools.length < maxTools; page += 1) {
     const listed = (await rpc(session, "tools/list", cursor ? { cursor } : {}, CONNECT_TIMEOUT_MS)) as {
       tools?: Array<Record<string, unknown>>;
       nextCursor?: unknown;
     } | null;
-    rawTools.push(...(listed?.tools ?? []).slice(0, 500 - rawTools.length));
+    rawTools.push(...(listed?.tools ?? []).slice(0, maxTools - rawTools.length));
     cursor = typeof listed?.nextCursor === "string" && listed.nextCursor ? listed.nextCursor : undefined;
     if (!cursor) {
       break;
@@ -1082,7 +1099,7 @@ export async function connectCloudMcp(
     const name = typeof raw.name === "string" ? raw.name : "";
     if (
       !name ||
-      server.disabledTools.includes(name) ||
+      (!options.includeDisabled && server.disabledTools.includes(name)) ||
       redactCloudMcpText(name, providerRedactions) !== name
     ) {
       continue;

@@ -2,6 +2,7 @@ import {
   TID,
   effortOptionTid,
   mcpCatalogConnectTid,
+  mcpLoadingOptionTid,
   mcpServerCardTid,
   modelOptionTid,
   runModeOptionTid,
@@ -31,6 +32,12 @@ export const STUB_HANG_PROMPT = "Hang this run for the stop regression";
 
 /** Prompt marker that makes the platform stub stream a code edit + runnable HTML preview. */
 export const STUB_CODE_PROMPT = "Build a tiny runnable code preview";
+
+/** Prompt marker that makes the platform stub stream a deferred MCP search + call before the reply. */
+export const STUB_MCP_PROMPT = "Ask DeepWiki through the deferred MCP tools";
+
+/** Server · tool label the deferred MCP call row must show. */
+export const STUB_MCP_CALL_LABEL = "deepwiki · ask_question";
 
 /** Curated chat model every platform's picker must offer. */
 export const SWITCH_TARGET_MODEL_ID = "anthropic/claude-opus-5";
@@ -232,6 +239,25 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "see", target: studioPageTid("mcp"), timeoutMs: 20_000 },
       { do: "tap", target: mcpCatalogConnectTid("deepwiki") },
       { do: "seeText", target: mcpServerCardTid("deepwiki"), text: "1 tools", timeoutMs: 20_000 },
+    ],
+  },
+  {
+    id: "connect-open-mcp-deferred",
+    title: "Deferred MCP loading rides into the run and its meta calls read like native tools",
+    steps: [
+      { do: "goto", path: "/settings" },
+      { do: "see", target: studioPageTid("settings"), timeoutMs: 20_000 },
+      { do: "see", target: TID.settingsMcpLoading },
+      { do: "tap", target: mcpLoadingOptionTid("deferred") },
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "fill", target: TID.composerInput, text: STUB_MCP_PROMPT },
+      { do: "tap", target: TID.composerSend },
+      // The search + call rows render as "MCP · server · tool" with the same
+      // status chip a natively armed tool gets.
+      { do: "seeText", target: TID.messageToolCall, text: STUB_MCP_CALL_LABEL, timeoutMs: 20_000 },
+      { do: "seeText", target: TID.messageToolCall, text: "done" },
+      { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
     ],
   },
   {

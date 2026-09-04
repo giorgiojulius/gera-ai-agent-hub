@@ -12,7 +12,8 @@ import {
   requestDesktopPermission,
   type DesktopNotifyState,
 } from "@/lib/notify";
-import type { BuiltinToolId, NotifySoundPref } from "@/lib/types";
+import { mcpLoadingOptionTid, TID } from "@/lib/testids";
+import type { BuiltinToolId, McpToolLoadingMode, NotifySoundPref } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const TOOLKIT_ITEMS: { id: BuiltinToolId; label: string; hint: string }[] = [
@@ -33,6 +34,18 @@ const SOUND_OPTIONS: { value: NotifySoundPref; label: string }[] = [
   { value: "background", label: "In background" },
   { value: "always", label: "Always" },
 ];
+
+const MCP_LOADING_OPTIONS: { value: McpToolLoadingMode; label: string }[] = [
+  { value: "auto", label: "Auto" },
+  { value: "native", label: "Always native" },
+  { value: "deferred", label: "Always deferred" },
+];
+
+const MCP_LOADING_HINT: Record<McpToolLoadingMode, string> = {
+  auto: "Native while the connected servers expose up to 24 tools whose schemas stay under 8% of the model's context window; beyond that the model searches tools on demand.",
+  native: "Every tool is registered as its own function (first 90 per run, 500 per server); servers that do not fit are reported honestly in the thread.",
+  deferred: "The model sees only mcp_search_tools and mcp_call_tool: it searches the connected servers' catalogs, loads a schema when needed, and servers connect on the first call.",
+};
 
 const SECTIONS = [
   { id: "general", label: "General", icon: SlidersHorizontal, blurb: "Behavior applied to every thread." },
@@ -309,6 +322,42 @@ export default function SettingsPage() {
                   />
                 </label>
               ))}
+              <div className="flex flex-wrap items-center justify-between gap-3 py-4 last:pb-1">
+                <div className="min-w-0 flex-1 basis-56">
+                  <p className="text-sm">MCP tool loading</p>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+                    How connected MCP servers reach the model in chat, Deep Research, automations and project agents. Native GitHub, Slack and Intercom connectors always register directly.
+                  </p>
+                  <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground/90">
+                    {MCP_LOADING_HINT[settings.mcpToolLoading]}
+                  </p>
+                </div>
+                <div
+                  role="radiogroup"
+                  aria-label="MCP tool loading"
+                  data-testid={TID.settingsMcpLoading}
+                  className="inline-flex shrink-0 rounded-full border border-border bg-background p-0.5"
+                >
+                  {MCP_LOADING_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={settings.mcpToolLoading === option.value}
+                      data-testid={mcpLoadingOptionTid(option.value)}
+                      onClick={() => patchSettings({ mcpToolLoading: option.value })}
+                      className={cn(
+                        "rounded-full px-2.5 py-1 text-[11px] transition-colors",
+                        settings.mcpToolLoading === option.value
+                          ? "bg-foreground text-background"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           </SettingsCard>
         </div>

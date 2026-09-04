@@ -110,7 +110,7 @@ import {
   type PushEntry,
   type TombstoneRow,
 } from "./chat-shared";
-import { armCloudMcp } from "./automation-runner";
+import { createSqlMcpCatalogStore, normalizeMcpToolLoading, resolveMcpToolset } from "./mcp-toolset";
 import { githubOAuthFormHeaders } from "./native-github";
 import {
   chainRotationBases,
@@ -123,6 +123,7 @@ import {
   normalizeOAuthOverride,
   overlayOAuthRotations,
   redactCloudMcpText,
+  refreshCloudOAuthGrant,
   type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
@@ -1304,6 +1305,7 @@ export class ChatStore extends DurableObject {
           persistOAuth,
           (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
           (id) => this.markOAuthRefreshStarted(owner, id),
+          createSqlMcpCatalogStore(this.ctx.storage.sql, owner),
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown error";
@@ -2653,12 +2655,18 @@ export class ChatStore extends DurableObject {
       appliedChains.set(rotated.serverId, bases);
     };
     try {
-      const runtime = await armCloudMcp(
+      // Uncapped: a health check returns the complete remote table, and the
+      // handshake refreshes the account's tool catalog cache (deferred runs
+      // search it without reconnecting).
+      const runtime = await resolveMcpToolset({
         servers,
+        mode: "native",
+        uncapped: true,
+        catalog: createSqlMcpCatalogStore(this.ctx.storage.sql, owner),
         persist,
-        (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
-        (id) => this.markOAuthRefreshStarted(owner, id),
-      );
+        reportFailure: (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
+        beginRefresh: (id) => this.markOAuthRefreshStarted(owner, id),
+      });
       if (runtime.failures.length > 0 || runtime.routes.size === 0) {
         // Only a failed arm may surface an auth state — a stale pre-existing
         // marker must never veto a verification that just succeeded.
@@ -3077,7 +3085,18 @@ export class ChatStore extends DurableObject {
         }
       }
     }
-    return json({ servers: servers.filter((server) => !unavailable.has(server.id)) });
+    // Project agents inherit the linking account's loading mode and its
+    // catalog cache, so their runs can defer without a fresh handshake.
+    const catalog = createSqlMcpCatalogStore(this.ctx.storage.sql, owner);
+    const available = servers.filter((server) => !unavailable.has(server.id));
+    return json({
+      servers: available,
+      toolLoading: normalizeMcpToolLoading(parsed.settings.mcpToolLoading),
+      catalog: available.flatMap((server) => {
+        const entry = catalog.read(server.id);
+        return entry ? [entry] : [];
+      }),
+    });
   }
 
   /**
@@ -3520,6 +3539,7 @@ export class ChatStore extends DurableObject {
         intersectMcpAllowIds(settings.mcpServers, agent?.mcpServerIds, auto.mcpServerIds),
         oauthTokens,
       ),
+      mcpToolLoading: normalizeMcpToolLoading(settings.mcpToolLoading),
     };
   }
 

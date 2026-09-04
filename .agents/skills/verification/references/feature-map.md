@@ -1,6 +1,9 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-01 · commit `a8167e0` (+ MCP server-owned credential
+Last synced: 2026-09-04 · commit `e141bdb` (+ deferred MCP tools through one
+  toolset resolver — `mcp_search_tools` / `mcp_call_tool`, Settings → Toolkit
+  "MCP tool loading", account tool-catalog cache, Deep Research connector
+  scout — MCP server-owned credential
   recovery and bounded health checks, project Settings tab replaces the ··· menu,
   Diagnostics journals cloud-run
   failures and real MCP disconnects again, Gera-chat GitHub writes on by
@@ -584,6 +587,18 @@ slot instead of two. Both engines carry identical copies; unit
 marker, two-wave run with a failed search) and `research-runner.test.ts`
 (byte-for-byte twin parity).
 
+Connected MCP servers (2026-09-04, server engine only): after planning and
+prompt-URL browsing, a bounded scout step on the fast model gets the run's
+deferred toolset (`mcp_search_tools` / `mcp_call_tool` — never one function
+per tool, regardless of the account's loading setting) and reads at most 6
+tools whose output bears on the question, read-only intent, 90 s budget.
+Every successful read becomes a dossier source `mcp://<server>/<tool>[#n]`
+titled "<Server> · <tool>" (the writer is told these are the user's own
+systems' data); the trail shows "Checking connected MCP servers" plus one
+search/read step per call, errors stay honest. GitHub keeps its native
+deterministic preload. The research gear panel lists the connected generic
+servers with "searched on demand (deferred tools, up to 6 reads per run)".
+
 ## Julius
 
 Composer toggle: parallel candidate answers compete, or the council
@@ -1031,6 +1046,47 @@ sign-in, per-server tool listing and health, and native GitHub / Slack / Interco
 connectors. Connected servers appear in the composer Studio popover, Profiles,
 and Skills.
 
+Deferred tools (2026-09-04, `functions/mcp-toolset.ts` — the ONE resolver
+every run kind uses: chat/resume/Julius in `run-manager.ts`, cloud automations
+in `automation-runner.ts`, project agents in `project-store.ts`
+(`buildAgentToolset`), Deep Research in `research-runner.ts`; Slack agents
+still get no generic MCP via `accessForAgentSurface`). Setting "MCP tool
+loading" (Settings → Toolkit, `settings.mcpToolLoading`, synced in the
+profile, snapshot sent in every `/runs/start` config as `mcpToolLoading` +
+`contextWindow` from the gateway catalog): **auto** registers one
+`mcp_<server>_<tool>` function per tool while the visible generic MCP tools
+are ≤ 24 and their schema JSON stays under 8% of the model's context window
+(unknown window → 128k), otherwise defers; **native** always inlines (soft caps
+90 per run / 500 per server; a server that does not fit leaves an honest
+`mcp_limit` record naming it and pointing at the setting); **deferred** always
+exposes only two meta functions — `mcp_search_tools({query, serverId?,
+limit?})` (full text over names, descriptions and inputSchema fields; exact
+name → name token → description → field name; up to 20 descriptors with
+complete schemas plus every server with its tool count and unavailability
+reason) and `mcp_call_tool({serverId, toolName, arguments})`, which runs only
+a tool a search returned in this run ("search for it first" otherwise),
+rejects `disabledTools` and unknown names, and connects the server lazily on
+the first call (single handshake per server per run). The system prompt gets
+one line per deferred server (`id "Name" · N tools`), never schemas.
+Native GitHub / Slack / Intercom connectors always register inline (their
+function names drive the code-changes workbench and the repo preflight).
+Deferred limits: 5 000 tools per server, 6 MB of schema JSON (over → the
+server is reported unavailable). Catalog cache: account-shard table
+`mcp_tool_catalog` (full remote table incl. disabled tools, TTL 10 min)
+written by every `/mcp/check` (Connect / Re-check now runs uncapped and no
+longer truncates big servers at 90) and by every handshake a run performs;
+`/mcp/resolve` ships `toolLoading` + the cached `catalog` to project shards so
+agents defer without a handshake. Chat rows for the meta calls read
+"MCP · <server> · <tool>" (`describeToolCall`, testid `message-tool-call`)
+with the same running/done/failed chip as native tools. Unit
+`mcp-toolset.test.ts` (a–e acceptance: 3×40 tools → exactly two MCP
+functions, search by description word and schema field, call refused before
+search then lazy connect, disabled tools invisible + refused, setting picks
+the mode, auto thresholds, uncapped health check refreshes the cache, native
+connectors stay inline next to deferred servers, rejected server reported
+without leaking its credential); browser scenario
+`connect-open-mcp-deferred`.
+
 Server ownership (2026-09-01): OAuth access/refresh grants, pasted API keys,
 custom headers, refresh single-flight, connection checks, protocol sessions and
 tool calls are owned by the signed-in account's ChatStore shard. `/mcp/oauth-store`
@@ -1204,7 +1260,11 @@ row instead). Sections: General, Shortcuts, Notifications, Toolkit.
   honest toast when denied/unsupported, warning while permission is denied).
 - **Toolkit**: per-builtin-tool master switches — off means the agent
   never sees the tool; auto routing picks media tools per prompt from the
-  enabled set; search/fetch ride every message while enabled.
+  enabled set; search/fetch ride every message while enabled. "MCP tool
+  loading" segmented control (testid `settings-mcp-loading`, options
+  `mcp-loading-option-{auto|native|deferred}`; default auto, normalized in
+  `history.ts`) with a hint that changes per option — see MCP › Deferred
+  tools for the run-time semantics.
   Models are NOT here — they're picked in the composer/arena.
 
 ## Admin (`/admin`)
@@ -1261,6 +1321,9 @@ host is remembered. Failures throw `storage_unavailable:<hosts + statuses>`
 reason verbatim. Unit: `rork-storage.test.ts`. · `/repo-preview/:id/:access/*`
 public expiring static artifact delivery ·
 `/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
+`/mcp/check` (uncapped handshake, refreshes the account's `mcp_tool_catalog`
+cache) · internal `/mcp/resolve` (project shards; answers `servers`,
+`toolLoading`, cached `catalog`) ·
 `/automations/run-now` · `/projects` +
 `/projects/create` + `/projects/:id/*` (overview, messages, message, read,
 channels/create, members/*, agents/*, screens/*, intercom/inbox|thread|details|
@@ -1300,6 +1363,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | projects-page-opens | Projects page renders + create action behind the gate |
 | studio-pages-navigate | Tabs automations → hub → mcp → settings |
 | connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
+| connect-open-mcp-deferred | Settings → Toolkit “Always deferred” → send → `/runs/start` carries `mcpToolLoading` + `contextWindow` → `mcp_search_tools` / `mcp_call_tool` rows read “MCP · deepwiki · ask_question · done” → reply |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
@@ -1335,7 +1399,7 @@ that a new bundle adopts the MCP pair escrowed before the old response vanished.
 
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
 Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
-Share dialog, Settings toggles, media modes,
+Share dialog, Settings toggles other than MCP tool loading, media modes,
 Julius/Deep Research runs, repository setup-PR merge + real external build
 callback, dynamic SSR previews, incognito, thread menu (pin/rename/delete),
 Project workspace internals (posting, threads, agent editor, members,
@@ -1356,7 +1420,9 @@ read-only GitHub arms zero write tools; missing tokens arm nothing and are
 reported), plus `mcp-rotation`, `mcp-file-content`, `github-security` (all 30
 browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
 account isolation), `mcp-security` (catalog, auth-mode, OAuth/egress/session/
-protocol and native Slack/Intercom parity), `auth-boundary` +
+protocol and native Slack/Intercom parity), `mcp-toolset` (deferred tools:
+mode decision, search ranking, search gate, lazy connect, disabled tools,
+catalog cache, native soft caps with honest records), `auth-boundary` +
 `mcp-oauth-refresh` + `mcp-session` (staggered expired-Gera 401s, provider-token
 rotation rescue, deploy-response escrow/replay, transient health recovery),
 `code-change-flow` (diff capture,

@@ -57,6 +57,14 @@ import {
   normalizeCloudMcpServer,
   type CloudMcpServer,
 } from "./mcp-cloud";
+import {
+  describeSecretVaultError,
+  fieldsNeedReseal,
+  openFields,
+  sealFields,
+  SecretVault,
+  SecretVaultError,
+} from "./secret-vault";
 import { chatShardId } from "./shard-migration";
 import {
   attachmentLabel,
@@ -189,6 +197,34 @@ type McpConnectAttempt =
 /** Agent replies may exceed the human message cap, but stay bounded. */
 const AGENT_REPLY_LIMIT = 24_000;
 const SECRET_VALUE_LIMIT = 400;
+
+/**
+ * The credential fields of `agents.secrets` — sealed at rest by the vault.
+ * Everything else in the blob (ids, team names, MCP selection) is metadata
+ * the agent list needs synchronously and stays readable.
+ */
+export const AGENT_SECRET_FIELDS = [
+  "githubToken",
+  "intercomToken",
+  "slackToken",
+  "slackSigningSecret",
+  "slackClientSecret",
+] as const;
+
+/** Vault scope binding an agent's sealed fields to that agent row. */
+export function agentSecretScope(agentId: string): string {
+  return `project-agent:${agentId}`;
+}
+
+/** Slack app-manager token pair — both halves sealed at rest. */
+const SLACK_CONFIG_SECRET_FIELDS = ["access", "refresh"] as const;
+
+function slackConfigScope(projectId: string): string {
+  return `project-slack-config:${projectId}`;
+}
+
+/** `meta` key remembering which vault key the last sweep sealed rows under. */
+const VAULT_SWEEP_META_KEY = "secret_vault_kid";
 const MODEL_ID_LIMIT = 120;
 const THREAD_FETCH_LIMIT = 500;
 const SOURCES_APPENDIX_CAP = 12;
@@ -606,10 +642,13 @@ function failedProjectExecution(content: string, error: string, requester: { id?
 
 export class ProjectStore extends DurableObject {
   private readonly workerEnv: ProjectStoreEnv;
+  /** Encrypts every credential this shard stores; keyed by the Worker secret. */
+  private readonly vault: SecretVault;
 
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     this.workerEnv = (env ?? {}) as ProjectStoreEnv;
+    this.vault = SecretVault.fromEnv(env);
     const sql = this.ctx.storage.sql;
     // Registry tables (used only by the "registry" instance).
     sql.exec(`
@@ -881,6 +920,72 @@ export class ProjectStore extends DurableObject {
         // Column already exists.
       }
     }
+    // Seal pre-vault plaintext (and rows under a rotated-out key) before the
+    // first request; a failure here must never brick the object.
+    this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        await this.sealLegacySecrets();
+      } catch (error) {
+        console.error(
+          "project secret sweep failed",
+          error instanceof SecretVaultError ? error.code : "error",
+        );
+      }
+    });
+  }
+
+  /**
+   * One-time (per vault key) pass over every stored credential: plaintext
+   * rows from before the vault and rows sealed under a previous key are
+   * re-sealed under the current key. Skipped entirely once `meta` records
+   * the current key id, so routine wake-ups cost one row read.
+   */
+  private async sealLegacySecrets(): Promise<void> {
+    if (!this.vault.enabled) {
+      return;
+    }
+    const kid = await this.vault.currentKid();
+    if (this.metaValue(VAULT_SWEEP_META_KEY) === kid) {
+      return;
+    }
+    const sql = this.ctx.storage.sql;
+    const agents = sql.exec<{ id: string; secrets: string }>("SELECT id, secrets FROM agents").toArray();
+    let sealed = 0;
+    for (const row of agents) {
+      const stored = parseSecrets(row.secrets);
+      if (!(await fieldsNeedReseal(this.vault, stored, AGENT_SECRET_FIELDS))) {
+        continue;
+      }
+      sql.exec(
+        "UPDATE agents SET secrets = ? WHERE id = ?",
+        JSON.stringify(await sealFields(this.vault, stored, AGENT_SECRET_FIELDS, agentSecretScope(row.id))),
+        row.id,
+      );
+      sealed += 1;
+    }
+    const slack = this.loadSlackConfig();
+    if (slack && (await fieldsNeedReseal(this.vault, slack, SLACK_CONFIG_SECRET_FIELDS))) {
+      await this.saveSlackConfig(slack);
+      sealed += 1;
+    }
+    sql.exec(
+      "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      VAULT_SWEEP_META_KEY,
+      kid,
+    );
+    if (sealed > 0) {
+      console.log("project secrets sealed", sealed);
+    }
+  }
+
+  /** Decrypts an agent's credential fields for use inside this shard only. */
+  private revealAgentSecrets(agent: Pick<AgentRow, "id" | "secrets">): Promise<AgentSecrets> {
+    return openFields(this.vault, parseSecrets(agent.secrets), AGENT_SECRET_FIELDS, agentSecretScope(agent.id));
+  }
+
+  /** Serializes agent secrets for storage with every credential field sealed. */
+  private async sealedAgentSecrets(agentId: string, secrets: AgentSecrets): Promise<string> {
+    return JSON.stringify(await sealFields(this.vault, secrets, AGENT_SECRET_FIELDS, agentSecretScope(agentId)));
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -1047,6 +1152,12 @@ export class ProjectStore extends DurableObject {
       }
       return json({ error: "not_found" }, 404);
     } catch (error) {
+      if (error instanceof SecretVaultError) {
+        // Fail closed and say why: no plaintext credential is ever written
+        // because the key is missing, and no sealed one is silently dropped.
+        console.error("project store vault", path, error.code);
+        return json({ error: error.code, message: describeSecretVaultError(error) }, 503);
+      }
       console.error("project store failed", path, error instanceof Error ? error.message : "error");
       return json({ error: "internal" }, 500);
     }
@@ -1595,7 +1706,7 @@ export class ProjectStore extends DurableObject {
     }
   }
 
-  private handleAgentUpsert(me: MemberRow, body: unknown): Response {
+  private async handleAgentUpsert(me: MemberRow, body: unknown): Promise<Response> {
     if (!canManageProject(this.memberRole(me))) {
       return json({ error: "admin_required" }, 403);
     }
@@ -1641,6 +1752,8 @@ export class ProjectStore extends DurableObject {
     const access = normalizeAccess(body.access);
 
     // Secrets: non-empty string replaces, empty string keeps, null clears.
+    // Untouched fields stay sealed exactly as stored; only incoming plaintext
+    // is sealed on the way in (`sealedAgentSecrets` below).
     const secrets: AgentSecrets = existing ? parseSecrets(existing.secrets) : {};
     const incoming = isRecord(body.secrets) ? body.secrets : {};
     // Disconnecting a Gera-created Slack app forgets everything minted with
@@ -1696,6 +1809,7 @@ export class ProjectStore extends DurableObject {
     }
 
     const agentId = existing?.id ?? newId("a");
+    const sealedSecrets = await this.sealedAgentSecrets(agentId, secrets);
     if (existing) {
       sql.exec(
         `UPDATE agents SET name = ?, handle = ?, emoji = ?, instructions = ?, model = ?, access = ?, secrets = ?, updated_at = ?
@@ -1706,7 +1820,7 @@ export class ProjectStore extends DurableObject {
         instructions,
         model,
         JSON.stringify(access),
-        JSON.stringify(secrets),
+        sealedSecrets,
         now,
         agentId,
       );
@@ -1721,7 +1835,7 @@ export class ProjectStore extends DurableObject {
         instructions,
         model,
         JSON.stringify(access),
-        JSON.stringify(secrets),
+        sealedSecrets,
         now,
         now,
       );
@@ -1754,10 +1868,10 @@ export class ProjectStore extends DurableObject {
     return `${url.origin}/slack/oauth/callback`;
   }
 
-  private saveAgentSecrets(agentId: string, secrets: AgentSecrets): void {
+  private async saveAgentSecrets(agentId: string, secrets: AgentSecrets): Promise<void> {
     this.ctx.storage.sql.exec(
       "UPDATE agents SET secrets = ?, updated_at = ? WHERE id = ?",
-      JSON.stringify(secrets),
+      await this.sealedAgentSecrets(agentId, secrets),
       Date.now(),
       agentId,
     );
@@ -1793,22 +1907,28 @@ export class ProjectStore extends DurableObject {
     }
   }
 
-  private saveSlackConfig(config: StoredSlackConfig | null): void {
+  /** Decrypts the stored app-manager pair for a Slack call inside this shard. */
+  private revealSlackConfig(config: StoredSlackConfig): Promise<StoredSlackConfig> {
+    return openFields(this.vault, config, SLACK_CONFIG_SECRET_FIELDS, slackConfigScope(this.projectId()));
+  }
+
+  private async saveSlackConfig(config: StoredSlackConfig | null): Promise<void> {
     const sql = this.ctx.storage.sql;
     if (!config) {
       sql.exec("DELETE FROM meta WHERE key = 'slack_config'");
       return;
     }
+    const sealed = await sealFields(this.vault, config, SLACK_CONFIG_SECRET_FIELDS, slackConfigScope(this.projectId()));
     sql.exec(
       "INSERT INTO meta (key, value) VALUES ('slack_config', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      JSON.stringify(config),
+      JSON.stringify(sealed),
     );
   }
 
   /** Rotation result → stored pair (keeps the original connect timestamp). */
-  private storeSlackRotation(rotation: SlackConfigRotation): void {
+  private async storeSlackRotation(rotation: SlackConfigRotation): Promise<void> {
     const previous = this.loadSlackConfig();
-    this.saveSlackConfig({
+    await this.saveSlackConfig({
       access: rotation.accessToken,
       refresh: rotation.refreshToken,
       teamId: rotation.teamId || previous?.teamId || "",
@@ -1833,10 +1953,11 @@ export class ProjectStore extends DurableObject {
    * forgotten so the editor honestly asks to reconnect.
    */
   private async freshSlackConfigToken(): Promise<string | null> {
-    const config = this.loadSlackConfig();
-    if (!config) {
+    const stored = this.loadSlackConfig();
+    if (!stored) {
       return null;
     }
+    const config = await this.revealSlackConfig(stored);
     if (!config.refresh) {
       return config.access;
     }
@@ -1848,11 +1969,11 @@ export class ProjectStore extends DurableObject {
       rotation = await rotateSlackConfigToken(config.refresh);
     } catch (error) {
       if (isSlackConfigAuthError(error)) {
-        this.saveSlackConfig(null);
+        await this.saveSlackConfig(null);
       }
       throw error;
     }
-    this.storeSlackRotation(rotation);
+    await this.storeSlackRotation(rotation);
     return rotation.accessToken;
   }
 
@@ -1872,7 +1993,7 @@ export class ProjectStore extends DurableObject {
       return json({ error: "invalid_body" }, 400);
     }
     if (body.token === null) {
-      this.saveSlackConfig(null);
+      await this.saveSlackConfig(null);
       return json({ ok: true, slackConfig: null });
     }
     const token = asStr(body.token).trim();
@@ -1888,7 +2009,7 @@ export class ProjectStore extends DurableObject {
       );
     }
     if (kind === "access") {
-      this.saveSlackConfig({
+      await this.saveSlackConfig({
         access: token,
         refresh: "",
         teamId: "",
@@ -1905,8 +2026,8 @@ export class ProjectStore extends DurableObject {
       const message = error instanceof Error ? error.message : "Slack rejected the token.";
       return json({ error: "rotate_failed", message }, 502);
     }
-    this.saveSlackConfig(null);
-    this.storeSlackRotation(rotation);
+    await this.saveSlackConfig(null);
+    await this.storeSlackRotation(rotation);
     return json({ ok: true, slackConfig: this.slackConfigWire() });
   }
 
@@ -1943,7 +2064,7 @@ export class ProjectStore extends DurableObject {
       // Pasting the refresh token doubles as connecting the app manager.
       try {
         const rotation = await rotateSlackConfigToken(pasted);
-        this.storeSlackRotation(rotation);
+        await this.storeSlackRotation(rotation);
         configToken = rotation.accessToken;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Slack rejected the token.";
@@ -1989,7 +2110,7 @@ export class ProjectStore extends DurableObject {
     secrets.slackClientSecret = credentials.clientSecret;
     secrets.slackSigningSecret = credentials.signingSecret;
     delete secrets.slackTeam;
-    this.saveAgentSecrets(agent.id, secrets);
+    await this.saveAgentSecrets(agent.id, secrets);
 
     let warning = "";
     try {
@@ -2028,7 +2149,7 @@ export class ProjectStore extends DurableObject {
     if (!agent) {
       return json({ error: "agent_not_found" }, 404);
     }
-    const secrets = parseSecrets(agent.secrets);
+    const secrets = await this.revealAgentSecrets(agent);
     if (!secrets.slackAppId || !secrets.slackClientId || !secrets.slackClientSecret) {
       return json({ error: "slack_app_missing" }, 400);
     }
@@ -2061,7 +2182,7 @@ export class ProjectStore extends DurableObject {
     if (!agent) {
       return json({ error: "agent_not_found" }, 404);
     }
-    const secrets = parseSecrets(agent.secrets);
+    const secrets = await this.revealAgentSecrets(agent);
     if (!secrets.slackClientId || !secrets.slackClientSecret) {
       return json({ error: "slack_app_missing", message: "This agent has no Gera-created Slack app." }, 400);
     }
@@ -2092,7 +2213,7 @@ export class ProjectStore extends DurableObject {
     this.ctx.storage.sql.exec(
       "UPDATE agents SET access = ?, secrets = ?, updated_at = ? WHERE id = ?",
       JSON.stringify(access),
-      JSON.stringify(secrets),
+      await this.sealedAgentSecrets(agent.id, secrets),
       Date.now(),
       agent.id,
     );
@@ -2164,7 +2285,7 @@ export class ProjectStore extends DurableObject {
   }
 
   /** The inbox widget's agent supplies the Intercom credential for the screen. */
-  private screenIntercomToken(screen: ScreenRow): { token: string } | { error: string } {
+  private async screenIntercomToken(screen: ScreenRow): Promise<{ token: string } | { error: string }> {
     const inbox = parseWidgets(screen.widgets).find((widget) => widget.kind === "intercom-inbox");
     if (!inbox?.agentId) {
       return { error: "This screen has no Intercom inbox widget." };
@@ -2173,7 +2294,7 @@ export class ProjectStore extends DurableObject {
     if (!agent) {
       return { error: "The agent powering this inbox was deleted — an admin must re-link the widget." };
     }
-    const secrets = parseSecrets(agent.secrets);
+    const secrets = await this.revealAgentSecrets(agent);
     if (!secrets.intercomToken) {
       return {
         error: `No Intercom token is stored on @${agent.handle} — an admin must add it in the agent's settings.`,
@@ -2189,7 +2310,7 @@ export class ProjectStore extends DurableObject {
    * channel selection, and per-project bots keep one workspace serving many
    * Gera projects correctly partitioned.
    */
-  private screenSlackToken(screen: ScreenRow): { token: string } | { error: string } {
+  private async screenSlackToken(screen: ScreenRow): Promise<{ token: string } | { error: string }> {
     const widgets = parseWidgets(screen.widgets);
     const ordered = [
       ...widgets.filter((widget) => widget.kind === "intercom-inbox"),
@@ -2209,7 +2330,7 @@ export class ProjectStore extends DurableObject {
         continue;
       }
       sawSlackAgent = true;
-      const secrets = parseSecrets(agent.secrets);
+      const secrets = await this.revealAgentSecrets(agent);
       if (secrets.slackToken) {
         return { token: secrets.slackToken };
       }
@@ -2313,7 +2434,7 @@ export class ProjectStore extends DurableObject {
     if (!screen) {
       return json({ error: "screen_not_found" }, 404);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -2336,7 +2457,7 @@ export class ProjectStore extends DurableObject {
     if (!conversationId) {
       return json({ error: "invalid_body" }, 400);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -2360,7 +2481,7 @@ export class ProjectStore extends DurableObject {
     if (!conversationId) {
       return json({ error: "invalid_body" }, 400);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -2511,7 +2632,7 @@ export class ProjectStore extends DurableObject {
     if (!conversationId || text.length === 0 || text.length > MESSAGE_BODY_LIMIT) {
       return json({ error: "invalid_body", limit: MESSAGE_BODY_LIMIT }, 400);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -2538,7 +2659,7 @@ export class ProjectStore extends DurableObject {
     if (!screen) {
       return json({ error: "screen_not_found" }, 404);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -2599,7 +2720,7 @@ export class ProjectStore extends DurableObject {
     if (!conversationId) {
       return json({ error: "invalid_body" }, 400);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -2668,7 +2789,7 @@ export class ProjectStore extends DurableObject {
       // the prompt so drafts can wait for (or use) the internal outcome.
       let slackThreads: string[] = [];
       let slackLastTs = 0;
-      const slackResolved = this.screenSlackToken(screen);
+      const slackResolved = await this.screenSlackToken(screen);
       if ("token" in slackResolved) {
         try {
           const { threads } = await this.deskSlackThreads(screen, slackResolved.token, {
@@ -2890,12 +3011,12 @@ export class ProjectStore extends DurableObject {
     if (!conversationId) {
       return json({ error: "invalid_body" }, 400);
     }
-    const slack = this.screenSlackToken(screen);
+    const slack = await this.screenSlackToken(screen);
     if ("error" in slack) {
       // No Slack agent on this screen is a normal setup — quiet null, honest reason.
       return json({ slack: null, reason: slack.error, now: Date.now() });
     }
-    const intercom = this.screenIntercomToken(screen);
+    const intercom = await this.screenIntercomToken(screen);
     if ("error" in intercom) {
       return json({ slack: null, reason: intercom.error, now: Date.now() });
     }
@@ -2928,7 +3049,7 @@ export class ProjectStore extends DurableObject {
     if (!conversationId || !action) {
       return json({ error: "invalid_body" }, 400);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -3254,7 +3375,7 @@ export class ProjectStore extends DurableObject {
     const payload = this.deskStatsPayload(me, screen, deskStatsRange(body));
     if (payload.isAdmin === true) {
       // Admins also get the Intercom teammate directory for manual linking.
-      const resolved = this.screenIntercomToken(screen);
+      const resolved = await this.screenIntercomToken(screen);
       if ("token" in resolved) {
         try {
           payload.intercomAdmins = await listIntercomAdmins(resolved.token);
@@ -3285,7 +3406,7 @@ export class ProjectStore extends DurableObject {
     if (!screen) {
       return json({ error: "screen_not_found" }, 404);
     }
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("error" in resolved) {
       return json({ error: resolved.error }, 400);
     }
@@ -3548,7 +3669,7 @@ export class ProjectStore extends DurableObject {
       }
     }
     const payload = this.deskStatsPayload(me, screen, deskStatsRange(body));
-    const resolved = this.screenIntercomToken(screen);
+    const resolved = await this.screenIntercomToken(screen);
     if ("token" in resolved) {
       try {
         payload.intercomAdmins = await listIntercomAdmins(resolved.token);
@@ -3760,7 +3881,7 @@ export class ProjectStore extends DurableObject {
       normalizeAccess(JSON.parse(agent.access || "{}") as unknown),
       surface,
     );
-    const secrets = parseSecrets(agent.secrets);
+    const secrets = await this.revealAgentSecrets(agent);
     const requestedSelection = access.mcp ? secrets.mcpSelection : undefined;
     const selectionOwner = requestedSelection ? this.loadMember(requestedSelection.owner) : undefined;
     const selection =
@@ -4235,7 +4356,7 @@ export class ProjectStore extends DurableObject {
     // fetch through the screen's own credential, never client-supplied text.
     let attachment = "";
     if (job.conversation_id && screen) {
-      const resolved = this.screenIntercomToken(screen);
+      const resolved = await this.screenIntercomToken(screen);
       if ("token" in resolved) {
         try {
           attachment = await callIntercomNativeTool(resolved.token, "read_conversation", {
@@ -4365,7 +4486,7 @@ export class ProjectStore extends DurableObject {
     if (!agent) {
       return json({ error: "agent_not_found" }, 404);
     }
-    const secrets = parseSecrets(agent.secrets);
+    const secrets = await this.revealAgentSecrets(agent);
     if (!secrets.slackSigningSecret) {
       // Setup order is honest: save the signing secret first, then paste the
       // URL into Slack — its URL check fails loudly until the secret exists.

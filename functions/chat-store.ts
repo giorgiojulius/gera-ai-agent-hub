@@ -140,6 +140,29 @@ import {
 } from "./mcp-oauth-flow";
 import { fetchPublicHttps } from "./network-safety";
 import { RunManager } from "./run-manager";
+import {
+  deviceCodeScope,
+  GRANT_SECRET_FIELDS,
+  OAUTH_PENDING_SECRET_FIELDS,
+  oauthPendingFieldScope,
+  oauthPendingScope,
+  openGrantPayload,
+  openRotationValue,
+  openServerSecret,
+  sealGrantPayload,
+  sealRotationValue,
+  sealServerSecret,
+  SERVER_SECRET_FIELDS,
+  type ServerSecret,
+} from "./secret-rows";
+import {
+  describeSecretVaultError,
+  fieldsNeedReseal,
+  isSealedEnvelope,
+  openFields,
+  SecretVault,
+  SecretVaultError,
+} from "./secret-vault";
 
 /** Worker env as visible inside this Durable Object (same bindings). */
 type ChatStoreEnv = {
@@ -214,8 +237,13 @@ type OAuthPendingRow = {
   updated_at: number;
 };
 
+/** KV key remembering which vault key the last sweep sealed this shard under. */
+const VAULT_SWEEP_KEY = "secretVaultKid";
+
 export class ChatStore extends DurableObject {
   private readonly workerEnv: ChatStoreEnv;
+  /** Encrypts every credential row in this shard; keyed by the Worker secret. */
+  private readonly vault: SecretVault;
   /** Interactive server-side agent runs (chat / research / Julius). */
   private readonly runs: RunManager;
   /** Automation occurrences executing in this isolate; absent after a deploy. */
@@ -225,6 +253,7 @@ export class ChatStore extends DurableObject {
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env);
     this.workerEnv = (env ?? {}) as ChatStoreEnv;
+    this.vault = SecretVault.fromEnv(env);
     this.runs = new RunManager(ctx, env);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS chats (
@@ -428,9 +457,193 @@ export class ChatStore extends DurableObject {
       )
     `);
     this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_hooks_owner ON hooks (owner_email)");
+    // Seal pre-vault plaintext (and rows under a rotated-out key) before the
+    // first request; a failure here must never brick the shard.
+    this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        await this.sealLegacySecrets();
+      } catch (error) {
+        console.error("account secret sweep failed", error instanceof SecretVaultError ? error.code : "error");
+      }
+    });
+  }
+
+  /**
+   * One-time (per vault key) pass over every credential row in this shard:
+   * OAuth grants, pasted keys/headers, PKCE verifiers and authorization
+   * codes, GitHub device codes, and the legacy rotation escrow in KV.
+   * Plaintext rows from before the vault and rows sealed under a previous
+   * key are re-sealed; poisoned legacy placeholder rows are dropped.
+   */
+  private async sealLegacySecrets(): Promise<void> {
+    if (!this.vault.enabled) {
+      return;
+    }
+    const kid = await this.vault.currentKid();
+    if ((await this.ctx.storage.get<string>(VAULT_SWEEP_KEY)) === kid) {
+      return;
+    }
+    const sql = this.ctx.storage.sql;
+    let sealed = 0;
+    for (const row of sql
+      .exec<{ owner_email: string; server_id: string; payload: string }>(
+        "SELECT owner_email, server_id, payload FROM mcp_oauth_grants",
+      )
+      .toArray()) {
+      const token = await openGrantPayload(this.vault, row.owner_email, row.server_id, row.payload);
+      if (!token || !(await fieldsNeedReseal(this.vault, cloudOAuthToken(JSON.parse(row.payload)) ?? {}, GRANT_SECRET_FIELDS))) {
+        continue;
+      }
+      sql.exec(
+        "UPDATE mcp_oauth_grants SET payload = ? WHERE owner_email = ? AND server_id = ?",
+        await sealGrantPayload(this.vault, row.owner_email, row.server_id, {
+          ...(JSON.parse(row.payload) as Record<string, unknown>),
+          ...token,
+        }),
+        row.owner_email,
+        row.server_id,
+      );
+      sealed += 1;
+    }
+    for (const row of sql
+      .exec<{ owner_email: string; server_id: string; payload: string }>(
+        "SELECT owner_email, server_id, payload FROM mcp_server_secrets",
+      )
+      .toArray()) {
+      const stored = this.parseServerSecretRow(row.owner_email, row.server_id, row.payload);
+      if (!stored) {
+        continue; // poisoned placeholder row — already deleted by the parser
+      }
+      if (!(await fieldsNeedReseal(this.vault, stored, SERVER_SECRET_FIELDS))) {
+        continue;
+      }
+      sql.exec(
+        "UPDATE mcp_server_secrets SET payload = ? WHERE owner_email = ? AND server_id = ?",
+        await sealServerSecret(this.vault, row.owner_email, row.server_id, stored),
+        row.owner_email,
+        row.server_id,
+      );
+      sealed += 1;
+    }
+    for (const row of sql
+      .exec<{ owner_email: string; state: string; verifier: string; authorization_code: string }>(
+        "SELECT owner_email, state, verifier, authorization_code FROM mcp_oauth_pending WHERE verifier != '' OR authorization_code != ''",
+      )
+      .toArray()) {
+      if (!(await fieldsNeedReseal(this.vault, row, OAUTH_PENDING_SECRET_FIELDS))) {
+        continue;
+      }
+      sql.exec(
+        "UPDATE mcp_oauth_pending SET verifier = ?, authorization_code = ? WHERE owner_email = ? AND state = ?",
+        await this.vault.reseal(row.verifier, oauthPendingFieldScope(row.owner_email, row.state, "verifier")),
+        await this.vault.reseal(
+          row.authorization_code,
+          oauthPendingFieldScope(row.owner_email, row.state, "authorization_code"),
+        ),
+        row.owner_email,
+        row.state,
+      );
+      sealed += 1;
+    }
+    for (const row of sql
+      .exec<{ owner_email: string; flow_id: string; device_code: string }>(
+        "SELECT owner_email, flow_id, device_code FROM mcp_github_device_pending WHERE device_code != ''",
+      )
+      .toArray()) {
+      if (await this.vault.isCurrent(row.device_code)) {
+        continue;
+      }
+      sql.exec(
+        "UPDATE mcp_github_device_pending SET device_code = ? WHERE owner_email = ? AND flow_id = ?",
+        await this.vault.reseal(row.device_code, deviceCodeScope(row.owner_email, row.flow_id)),
+        row.owner_email,
+        row.flow_id,
+      );
+      sealed += 1;
+    }
+    const escrow = await this.ctx.storage.list<unknown>({ prefix: OAUTH_REF_PREFIX });
+    for (const [key, value] of escrow) {
+      const rest = key.slice(OAUTH_REF_PREFIX.length);
+      const split = rest.lastIndexOf(":");
+      if (split <= 0) {
+        continue;
+      }
+      const owner = rest.slice(0, split);
+      const serverId = rest.slice(split + 1);
+      if (isSealedEnvelope(value) && (await this.vault.isCurrent(value.sealed))) {
+        continue;
+      }
+      await this.ctx.storage.put(key, await sealRotationValue(this.vault, owner, serverId, value));
+      sealed += 1;
+    }
+    await this.ctx.storage.put(VAULT_SWEEP_KEY, kid);
+    if (sealed > 0) {
+      console.log("account secrets sealed", sealed);
+    }
+  }
+
+  /**
+   * Parses one `mcp_server_secrets` row as stored (fields still sealed).
+   * Returns null — after deleting the row — for a poisoned legacy row where
+   * the browser's `gera-account:` marker was stored as a manual token and
+   * shadowed the real OAuth grant on every call.
+   */
+  private parseServerSecretRow(owner: string, serverId: string, payload: string): ServerSecret | null {
+    let value: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(payload) as unknown;
+      value = isRecord(parsed) ? parsed : {};
+    } catch {
+      return null;
+    }
+    const rawToken = typeof value.token === "string" ? value.token : "";
+    const headersJson = typeof value.headersJson === "string" && value.headersJson ? value.headersJson : "";
+    const token = rawToken && (this.vault.isSealed(rawToken) || !isPlaceholderCredential(rawToken)) ? rawToken : "";
+    if (rawToken && !token && !headersJson) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
+        owner,
+        serverId,
+      );
+      return null;
+    }
+    if (!token && !headersJson) {
+      return null;
+    }
+    return { ...(token ? { token } : {}), ...(headersJson ? { headersJson } : {}) };
+  }
+
+  /** Reads a legacy rotation escrow entry; unreadable envelopes count as absent. */
+  private async readRotation(owner: string, serverId: string, raw: unknown): Promise<OAuthRotation | null> {
+    if (raw === undefined || raw === null) {
+      return null;
+    }
+    try {
+      return normalizeOAuthOverride(serverId, await openRotationValue(this.vault, owner, serverId, raw));
+    } catch (error) {
+      if (error instanceof SecretVaultError) {
+        console.error("oauth rotation escrow unreadable", serverId, error.code);
+        return null;
+      }
+      throw error;
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.route(request);
+    } catch (error) {
+      if (error instanceof SecretVaultError) {
+        // Fail closed and say why: no plaintext credential is ever written
+        // because the key is missing, and no sealed one is silently dropped.
+        console.error("account store vault", new URL(request.url).pathname, error.code);
+        return json({ error: error.code, message: describeSecretVaultError(error) }, 503);
+      }
+      throw error;
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const url = new URL(request.url);
     // Internal plumbing, only reachable through the Worker entrypoint (it
     // never forwards arbitrary paths here): migration export/import between
@@ -848,12 +1061,12 @@ export class ChatStore extends DurableObject {
     // Synced browser sign-ins, overlaid with grants this shard rotated
     // server-side. An override applies while the blob's token is anywhere on
     // its rotation chain; a caught-up blob or a fresh sign-in retires it.
-    const oauthTokens = this.profileOAuthTokens(owner);
+    const oauthTokens = await this.profileOAuthTokens(owner);
     const oauthRefPrefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const overrideRows = await this.ctx.storage.list<unknown>({ prefix: oauthRefPrefix });
     const rotations: OAuthRotation[] = [];
     for (const [key, value] of overrideRows) {
-      const rotation = normalizeOAuthOverride(key.slice(oauthRefPrefix.length), value);
+      const rotation = await this.readRotation(owner, key.slice(oauthRefPrefix.length), value);
       if (rotation) {
         rotations.push(rotation);
       } else {
@@ -965,7 +1178,7 @@ export class ChatStore extends DurableObject {
     for (const item of batch) {
       const startedAt = Date.now();
       const runPrompt = item.hook ? withHookContext(item.auto.prompt, item.hook) : item.auto.prompt;
-      const job = this.buildClaimJob(owner, { ...item.auto, prompt: runPrompt }, settings, life, oauthTokens);
+      const job = await this.buildClaimJob(owner, { ...item.auto, prompt: runPrompt }, settings, life, oauthTokens);
       const receiptId = `automation:${item.auto.id}:${crypto.randomUUID()}`;
       const claimed = await this.claimAutomationRun(owner, item, job, runPrompt, receiptId, startedAt);
       if (!claimed) {
@@ -1083,7 +1296,7 @@ export class ChatStore extends DurableObject {
         }
         let canonical = token;
         const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-        const rotation = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(rotationKey));
+        const rotation = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(rotationKey));
         if (rotation?.bases.includes(token.accessToken)) {
           canonical = rotation.token;
         }
@@ -1091,7 +1304,7 @@ export class ChatStore extends DurableObject {
           "INSERT OR IGNORE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
           owner,
           serverId,
-          JSON.stringify(canonical),
+          await sealGrantPayload(this.vault, owner, serverId, canonical),
           Date.now(),
         );
         this.markOAuthReady(owner, serverId);
@@ -1101,9 +1314,11 @@ export class ChatStore extends DurableObject {
     }
     if (isRecord(profile.settings) && Array.isArray(profile.settings.mcpServers)) {
       const settings = { ...profile.settings };
-      settings.mcpServers = profile.settings.mcpServers.map((item) => {
+      const redactedServers: unknown[] = [];
+      for (const item of profile.settings.mcpServers) {
         if (!isRecord(item)) {
-          return item;
+          redactedServers.push(item);
+          continue;
         }
         const server = { ...item };
         const serverId = typeof server.id === "string" && isValidId(server.id) ? server.id : "";
@@ -1130,14 +1345,17 @@ export class ChatStore extends DurableObject {
               "INSERT OR IGNORE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
               owner,
               serverId,
-              JSON.stringify({ ...(token ? { token } : {}), ...(headersJson ? { headersJson } : {}) }),
+              await sealServerSecret(this.vault, owner, serverId, {
+                ...(token ? { token } : {}),
+                ...(headersJson ? { headersJson } : {}),
+              }),
               Date.now(),
             );
           }
         }
         const ids = [...new Set([serverId, ...(catalogId && catalogId !== serverId ? [catalogId] : [])])]
           .filter(Boolean);
-        const hasSecret = ids.some((id) => Object.keys(this.mcpServerSecret(owner, id)).length > 0);
+        const hasSecret = ids.some((id) => this.hasMcpServerSecret(owner, id));
         const hasGrant = ids.some((id) => {
           const grant = this.ctx.storage.sql
             .exec<{ present: number }>(
@@ -1157,24 +1375,30 @@ export class ChatStore extends DurableObject {
           return Boolean(grant && !revoked && state !== "reauth_required" && state !== "step_up_required");
         });
         server.credentialStored = hasSecret || hasGrant;
-        return server;
-      });
+        redactedServers.push(server);
+      }
+      settings.mcpServers = redactedServers;
       profile.settings = settings;
     }
     return JSON.stringify(profile);
   }
 
   /** Overlays server-only keys/headers onto redacted profile connector rows. */
-  private mcpConfigsWithSecrets(owner: string, raw: unknown): unknown[] {
+  private async mcpConfigsWithSecrets(owner: string, raw: unknown): Promise<unknown[]> {
     if (!Array.isArray(raw)) return [];
-    return raw.map((item) => {
-      if (!isRecord(item) || typeof item.id !== "string") return item;
-      return { ...item, ...this.mcpServerSecret(owner, item.id) };
-    });
+    const out: unknown[] = [];
+    for (const item of raw) {
+      if (!isRecord(item) || typeof item.id !== "string") {
+        out.push(item);
+        continue;
+      }
+      out.push({ ...item, ...(await this.mcpServerSecret(owner, item.id)) });
+    }
+    return out;
   }
 
-  /** Reads one saved API-key/header pair; it never leaves the account shard. */
-  private mcpServerSecret(owner: string, serverId: string): { token?: string; headersJson?: string } {
+  /** The stored (still sealed) key/header row, healing poisoned legacy rows. */
+  private storedMcpServerSecret(owner: string, serverId: string): ServerSecret | null {
     const row = this.ctx.storage.sql
       .exec<{ payload: string }>(
         "SELECT payload FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
@@ -1182,30 +1406,21 @@ export class ChatStore extends DurableObject {
         serverId,
       )
       .toArray()[0];
-    try {
-      const value = row ? JSON.parse(row.payload) as Record<string, unknown> : {};
-      const token =
-        typeof value.token === "string" && value.token && !isPlaceholderCredential(value.token)
-          ? value.token
-          : "";
-      const headersJson = typeof value.headersJson === "string" && value.headersJson ? value.headersJson : "";
-      if (row && !token && typeof value.token === "string" && value.token && !headersJson) {
-        // Poisoned legacy row: the browser's `gera-account:` marker was stored
-        // as a manual token and shadowed the real OAuth grant on every call.
-        // Deleting it here heals the account without requiring a re-sign-in.
-        this.ctx.storage.sql.exec(
-          "DELETE FROM mcp_server_secrets WHERE owner_email = ? AND server_id = ?",
-          owner,
-          serverId,
-        );
-      }
-      return {
-        ...(token ? { token } : {}),
-        ...(headersJson ? { headersJson } : {}),
-      };
-    } catch {
+    return row ? this.parseServerSecretRow(owner, serverId, row.payload) : null;
+  }
+
+  /** Presence only — no key needed, safe inside synchronous profile shaping. */
+  private hasMcpServerSecret(owner: string, serverId: string): boolean {
+    return this.storedMcpServerSecret(owner, serverId) !== null;
+  }
+
+  /** Reads one saved API-key/header pair decrypted; it never leaves the account shard. */
+  private async mcpServerSecret(owner: string, serverId: string): Promise<ServerSecret> {
+    const stored = this.storedMcpServerSecret(owner, serverId);
+    if (!stored) {
       return {};
     }
+    return openServerSecret(this.vault, owner, serverId, stored);
   }
 
   /**
@@ -1248,7 +1463,7 @@ export class ChatStore extends DurableObject {
    * even when an older failure left a stale reauth/step-up marker behind —
    * otherwise a successful re-sign-in stays invisible forever.
    */
-  private rawOAuthGrant(owner: string, serverId: string): CloudOAuthToken | null {
+  private async rawOAuthGrant(owner: string, serverId: string): Promise<CloudOAuthToken | null> {
     const revoked = this.ctx.storage.sql
       .exec<{ present: number }>(
         "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
@@ -1269,11 +1484,7 @@ export class ChatStore extends DurableObject {
     if (!row) {
       return null;
     }
-    try {
-      return cloudOAuthToken(JSON.parse(row.payload));
-    } catch {
-      return null;
-    }
+    return openGrantPayload(this.vault, owner, serverId, row.payload);
   }
 
   /**
@@ -1305,7 +1516,7 @@ export class ChatStore extends DurableObject {
       grantPresent: Boolean(grantRow && !revoked),
       grantRow: Boolean(grantRow),
       revoked: Boolean(revoked),
-      secret: Object.keys(this.mcpServerSecret(owner, serverId)).length > 0,
+      secret: this.hasMcpServerSecret(owner, serverId),
       state: this.oauthGrantState(owner, serverId),
     };
   }
@@ -1381,7 +1592,7 @@ export class ChatStore extends DurableObject {
   }
 
   /** Reads OAuth grants from the account shard; legacy profile grants migrate once. */
-  private profileOAuthTokens(owner: string): Record<string, CloudOAuthToken> {
+  private async profileOAuthTokens(owner: string): Promise<Record<string, CloudOAuthToken>> {
     const tokens: Record<string, CloudOAuthToken> = {};
     const profileRow = this.ctx.storage.sql
       .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
@@ -1401,13 +1612,16 @@ export class ChatStore extends DurableObject {
       )
       .toArray();
     for (const row of rows) {
+      // Sealed at rest; a row this key cannot open authenticates nothing and
+      // surfaces as a missing grant rather than a failed request.
       try {
-        const token = cloudOAuthToken(JSON.parse(row.payload));
+        const token = await openGrantPayload(this.vault, owner, row.server_id, row.payload);
         if (token) {
           tokens[row.server_id] = token;
         }
-      } catch {
-        // Ignore malformed rows; they never leave the shard.
+      } catch (error) {
+        if (!(error instanceof SecretVaultError)) throw error;
+        console.error("oauth grant unreadable", row.server_id, error.code);
       }
     }
     const revoked = this.ctx.storage.sql
@@ -1482,7 +1696,7 @@ export class ChatStore extends DurableObject {
        VALUES (?, ?, 'github', ?, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)`,
       owner,
       flowId,
-      deviceCode,
+      await this.vault.seal(deviceCode, deviceCodeScope(owner, flowId)),
       userCode,
       verificationUri,
       clientId,
@@ -1537,6 +1751,7 @@ export class ChatStore extends DurableObject {
       owner,
       flowId,
     );
+    const deviceCode = await this.vault.open(row.device_code, deviceCodeScope(owner, flowId));
     let response: Response;
     try {
       response = await fetchPublicHttps("https://github.com/login/oauth/access_token", {
@@ -1544,7 +1759,7 @@ export class ChatStore extends DurableObject {
         headers: githubOAuthFormHeaders(),
         body: new URLSearchParams({
           client_id: row.client_id,
-          device_code: row.device_code,
+          device_code: deviceCode,
           grant_type: "urn:ietf:params:oauth:grant-type:device_code",
         }).toString(),
         signal: AbortSignal.timeout(12_000),
@@ -1575,7 +1790,7 @@ export class ChatStore extends DurableObject {
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, 'github', ?, ?)",
         owner,
-        JSON.stringify(token),
+        await sealGrantPayload(this.vault, owner, "github", token),
         Date.now(),
       );
       // Latest credential wins: a fresh sign-in supersedes any pasted PAT or
@@ -1636,6 +1851,11 @@ export class ChatStore extends DurableObject {
         state,
       )
       .toArray()[0];
+  }
+
+  /** The pending row with its PKCE verifier and authorization code decrypted. */
+  private revealOAuthPending(owner: string, row: OAuthPendingRow): Promise<OAuthPendingRow> {
+    return openFields(this.vault, row, OAUTH_PENDING_SECRET_FIELDS, oauthPendingScope(owner, row.state));
   }
 
   private oauthReturnUrl(
@@ -1735,7 +1955,7 @@ export class ChatStore extends DurableObject {
         mcpUrl,
         discovery.tokenEndpoint,
         clientId,
-        verifier,
+        await this.vault.seal(verifier, oauthPendingFieldScope(owner, state, "verifier")),
         callbackUrl,
         discovery.resource ?? "",
         discovery.issuer,
@@ -1826,10 +2046,11 @@ export class ChatStore extends DurableObject {
     }
     const replayable = ["awaiting_confirmation", "exchanging", "exchange_retryable", "exchange_unknown"].includes(row.status);
     if (replayable) {
+      const stored = await this.revealOAuthPending(owner, row);
       if (
         !providerError &&
         code &&
-        code === row.authorization_code &&
+        code === stored.authorization_code &&
         (!issuer || sameOAuthEndpoint(issuer, row.issuer)) &&
         row.callback_challenge
       ) {
@@ -1873,7 +2094,7 @@ export class ChatStore extends DurableObject {
       `UPDATE mcp_oauth_pending
        SET status = 'awaiting_confirmation', authorization_code = ?, callback_challenge = ?, updated_at = ?
        WHERE owner_email = ? AND state = ? AND status = 'pending'`,
-      code,
+      await this.vault.seal(code, oauthPendingFieldScope(owner, state, "authorization_code")),
       callbackChallenge,
       Date.now(),
       owner,
@@ -1930,22 +2151,28 @@ export class ChatStore extends DurableObject {
       state,
     );
     try {
+      const pending = await this.revealOAuthPending(owner, row);
       const token = await exchangeAuthorizationCode({
         tokenEndpoint: row.token_endpoint,
         clientId: row.client_id,
-        code: row.authorization_code,
-        verifier: row.verifier,
+        code: pending.authorization_code,
+        verifier: pending.verifier,
         redirectUri: row.redirect_uri,
         resource: row.resource || undefined,
         mcpUrl: row.mcp_url,
       });
       const committedAt = Date.now();
+      // Sealed before the synchronous transaction — no await inside it.
+      const sealedGrant = await sealGrantPayload(this.vault, owner, row.server_id, {
+        ...token,
+        authorizationState: state,
+      });
       this.ctx.storage.transactionSync(() => {
         this.ctx.storage.sql.exec(
           "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
           owner,
           row.server_id,
-          JSON.stringify({ ...token, authorizationState: state }),
+          sealedGrant,
           committedAt,
         );
         this.ctx.storage.sql.exec(
@@ -2052,7 +2279,7 @@ export class ChatStore extends DurableObject {
       }
       let canonical = token;
       const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-      const rotation = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(rotationKey));
+      const rotation = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(rotationKey));
       if (rotation?.bases.includes(token.accessToken)) {
         canonical = rotation.token;
       }
@@ -2060,7 +2287,7 @@ export class ChatStore extends DurableObject {
         "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
         owner,
         serverId,
-        JSON.stringify(canonical),
+        await sealGrantPayload(this.vault, owner, serverId, canonical),
         Date.now(),
       );
       this.ctx.storage.sql.exec(
@@ -2211,12 +2438,13 @@ export class ChatStore extends DurableObject {
         "INSERT OR REPLACE INTO mcp_server_secrets (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
         owner,
         serverId,
-        JSON.stringify(secret),
+        await sealServerSecret(this.vault, owner, serverId, secret),
         Date.now(),
       );
     }
-    const storedSecret = this.mcpServerSecret(owner, serverId);
-    const legacyCatalogSecret = catalogId && catalogId !== serverId ? this.mcpServerSecret(owner, catalogId) : {};
+    const storedSecret = await this.mcpServerSecret(owner, serverId);
+    const legacyCatalogSecret: ServerSecret =
+      catalogId && catalogId !== serverId ? await this.mcpServerSecret(owner, catalogId) : {};
     let resolvedSecret = Object.keys(storedSecret).length > 0 ? storedSecret : legacyCatalogSecret;
     const nativeGithub = (catalogId || serverId) === "github";
     if (nativeGithub && !resolvedSecret.token) {
@@ -2248,7 +2476,7 @@ export class ChatStore extends DurableObject {
     ];
     const storedGrants = new Map<string, CloudOAuthToken>();
     for (const id of grantIds) {
-      const grant = this.rawOAuthGrant(owner, id);
+      const grant = await this.rawOAuthGrant(owner, id);
       if (grant) {
         storedGrants.set(id, grant);
       }
@@ -2264,7 +2492,7 @@ export class ChatStore extends DurableObject {
     if (blockedState) {
       return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
     }
-    const oauthTokens = this.profileOAuthTokens(owner);
+    const oauthTokens = await this.profileOAuthTokens(owner);
     for (const [id, grant] of storedGrants) {
       if (!oauthTokens[id]) {
         oauthTokens[id] = grant;
@@ -2367,9 +2595,9 @@ export class ChatStore extends DurableObject {
 
   /** Rejects a late refresh when the canonical grant changed while the provider request awaited. */
   private async assertOAuthRotationCurrent(owner: string, rotated: RefreshedOAuth): Promise<void> {
-    const tokens = this.profileOAuthTokens(owner);
+    const tokens = await this.profileOAuthTokens(owner);
     const key = `${OAUTH_REF_PREFIX}${owner}:${rotated.serverId}`;
-    const existing = normalizeOAuthOverride(rotated.serverId, await this.ctx.storage.get<unknown>(key));
+    const existing = await this.readRotation(owner, rotated.serverId, await this.ctx.storage.get<unknown>(key));
     if (existing) {
       overlayOAuthRotations(tokens, [existing]);
     }
@@ -2386,7 +2614,7 @@ export class ChatStore extends DurableObject {
       "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
       owner,
       rotated.serverId,
-      JSON.stringify(rotated.token),
+      await sealGrantPayload(this.vault, owner, rotated.serverId, rotated.token),
       Date.now(),
     );
     this.ctx.storage.sql.exec(
@@ -2422,8 +2650,8 @@ export class ChatStore extends DurableObject {
     }
 
     const key = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-    let existing = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
-    const profileGrant = this.profileOAuthTokens(owner)[serverId];
+    let existing = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(key));
+    const profileGrant = (await this.profileOAuthTokens(owner))[serverId];
     if (existing?.bases.includes(incoming.accessToken)) {
       const profileStillOnChain =
         Boolean(profileGrant) &&
@@ -2468,14 +2696,14 @@ export class ChatStore extends DurableObject {
       oauth: grant,
     };
     const persist = async (rotated: RefreshedOAuth): Promise<void> => {
-      const latestProfile = this.profileOAuthTokens(owner)[serverId];
+      const latestProfile = (await this.profileOAuthTokens(owner))[serverId];
       if (
         (profileAnchor !== null && latestProfile?.accessToken !== profileAnchor && latestProfile?.accessToken !== rotated.token.accessToken) ||
         (profileAnchor === null && latestProfile && latestProfile.accessToken !== rotated.baseAccessToken && latestProfile.accessToken !== rotated.token.accessToken)
       ) {
         throw new Error("stale OAuth refresh result");
       }
-      const latestOverride = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
+      const latestOverride = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(key));
       if (latestOverride?.bases.includes(rotated.baseAccessToken)) {
         throw new Error("OAuth refresh already committed");
       }
@@ -2513,7 +2741,7 @@ export class ChatStore extends DurableObject {
       // A sibling request may have durably committed the shared provider
       // response first. Return that winner; otherwise keep the caller's local
       // grant untouched and let a later retry reconcile it.
-      const winner = normalizeOAuthOverride(serverId, await this.ctx.storage.get<unknown>(key));
+      const winner = await this.readRotation(owner, serverId, await this.ctx.storage.get<unknown>(key));
       if (winner?.bases.includes(incoming.accessToken)) {
         this.markOAuthReady(owner, serverId);
         return json({ ok: true, credentialStored: true, replayed: true });
@@ -2559,7 +2787,7 @@ export class ChatStore extends DurableObject {
       ]),
     ];
     for (const id of ids) {
-      const secret = this.mcpServerSecret(owner, id);
+      const secret = await this.mcpServerSecret(owner, id);
       if (secret.token) {
         const authorization = /^Bearer\s/i.test(secret.token) ? secret.token : `Bearer ${secret.token}`;
         return json({ authorization });
@@ -2567,7 +2795,7 @@ export class ChatStore extends DurableObject {
     }
     const storedGrants = new Map<string, CloudOAuthToken>();
     for (const id of ids) {
-      const stored = this.rawOAuthGrant(owner, id);
+      const stored = await this.rawOAuthGrant(owner, id);
       if (stored) {
         storedGrants.set(id, stored);
       }
@@ -2583,7 +2811,7 @@ export class ChatStore extends DurableObject {
     if (blockedState) {
       return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
     }
-    const tokens = this.profileOAuthTokens(owner);
+    const tokens = await this.profileOAuthTokens(owner);
     for (const [id, stored] of storedGrants) {
       if (!tokens[id]) {
         tokens[id] = stored;
@@ -2680,19 +2908,19 @@ export class ChatStore extends DurableObject {
     if (!isRecord(parsed) || !isRecord(parsed.settings)) {
       return json({ servers: [] });
     }
-    const oauthTokens = this.profileOAuthTokens(owner);
+    const oauthTokens = await this.profileOAuthTokens(owner);
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
     const overrideRows = await this.ctx.storage.list<unknown>({ prefix });
     const rotations: OAuthRotation[] = [];
     for (const [key, value] of overrideRows) {
-      const rotation = normalizeOAuthOverride(key.slice(prefix.length), value);
+      const rotation = await this.readRotation(owner, key.slice(prefix.length), value);
       if (rotation) {
         rotations.push(rotation);
       }
     }
     const { appliedChains } = overlayOAuthRotations(oauthTokens, rotations);
     const servers = cloudMcpServersForAutomation(
-      this.mcpConfigsWithSecrets(owner, parsed.settings.mcpServers),
+      await this.mcpConfigsWithSecrets(owner, parsed.settings.mcpServers),
       ids,
       oauthTokens,
     ).filter(
@@ -2766,7 +2994,7 @@ export class ChatStore extends DurableObject {
     const tokens = cloudOAuthTokens(isRecord(parsed) ? parsed.mcpOAuth : undefined);
     const rotations: OAuthRotation[] = [];
     for (const [key, value] of rows) {
-      const rotation = normalizeOAuthOverride(key.slice(prefix.length), value);
+      const rotation = await this.readRotation(owner, key.slice(prefix.length), value);
       if (rotation) {
         rotations.push(rotation);
       } else {
@@ -3044,7 +3272,13 @@ export class ChatStore extends DurableObject {
           }
           const key = `${OAUTH_REF_PREFIX}${owner}:${row.serverId}`;
           if ((await this.ctx.storage.get(key)) === undefined) {
-            await this.ctx.storage.put(key, row.value);
+            // Exported envelopes re-seal under this shard's scope (same owner
+            // and server id, so the same key opens them); a keyless shard
+            // keeps the row exactly as exported — a move, not a new secret.
+            const value = this.vault.enabled
+              ? await sealRotationValue(this.vault, owner, row.serverId, row.value)
+              : row.value;
+            await this.ctx.storage.put(key, value);
           }
         }
       },
@@ -3053,13 +3287,13 @@ export class ChatStore extends DurableObject {
 
 
   /** Assembles everything the Worker's LLM loop needs for one cloud run. */
-  private buildClaimJob(
+  private async buildClaimJob(
     owner: string,
     auto: StoredAutomation,
     settings: Record<string, unknown>,
     life: Record<string, unknown>,
     oauthTokens: Record<string, CloudOAuthToken>,
-  ): ClaimJob {
+  ): Promise<ClaimJob> {
     const agents = Array.isArray(settings.agents) ? settings.agents : [];
     const agent = agents.find(
       (item): item is Record<string, unknown> => isRecord(item) && item.id === auto.agentId,
@@ -3162,7 +3396,7 @@ export class ChatStore extends DurableObject {
       // Profile and automation allow-lists intersect exactly like browser
       // runs; a cloud schedule can never resurrect GitHub excluded by its profile.
       mcpServers: cloudMcpServersForAutomation(
-        this.mcpConfigsWithSecrets(owner, settings.mcpServers),
+        await this.mcpConfigsWithSecrets(owner, settings.mcpServers),
         intersectMcpAllowIds(settings.mcpServers, agent?.mcpServerIds, auto.mcpServerIds),
         oauthTokens,
       ),

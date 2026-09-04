@@ -35,6 +35,8 @@ import {
   type RefreshedOAuth,
 } from "./mcp-cloud";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
+import { openGrantPayload, openRotationValue, sealGrantPayload } from "./secret-rows";
+import { SecretVault, SecretVaultError } from "./secret-vault";
 import { runServerJulius } from "./julius-runner";
 import { callGitHubNativeTool, fetchGitHubRepoMeta, githubRunRepoRefs } from "./native-github";
 import {
@@ -229,11 +231,14 @@ export function joinResumedText(head: string, tail: string): string {
 export class RunManager {
   private readonly ctx: DurableObjectState;
   private readonly env: ManagerEnv;
+  /** Same key as the owning ChatStore — grants it rotates stay readable there. */
+  private readonly vault: SecretVault;
   private readonly live = new Map<string, LiveRun>();
 
   constructor(ctx: DurableObjectState, env: unknown) {
     this.ctx = ctx;
     this.env = (env ?? {}) as ManagerEnv;
+    this.vault = SecretVault.fromEnv(env);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS agent_runs (
         owner_email TEXT NOT NULL,
@@ -2135,11 +2140,14 @@ export class RunManager {
       )
       .toArray();
     for (const row of durableRows) {
+      // Sealed at rest; a row this key cannot open authenticates nothing and
+      // surfaces as a missing grant rather than a crashed run.
       try {
-        const token = cloudOAuthTokens({ [row.server_id]: JSON.parse(row.payload) })[row.server_id];
+        const token = await openGrantPayload(this.vault, owner, row.server_id, row.payload);
         if (token) tokens[row.server_id] = token;
-      } catch {
-        // malformed vault rows authenticate nothing
+      } catch (error) {
+        if (!(error instanceof SecretVaultError)) throw error;
+        console.error("oauth grant unreadable", row.server_id, error.code);
       }
     }
     const revoked = this.ctx.storage.sql
@@ -2164,11 +2172,18 @@ export class RunManager {
     const rows = await this.ctx.storage.list<unknown>({ prefix });
     const rotations: OAuthRotation[] = [];
     for (const [key, value] of rows) {
-      const rotation = normalizeOAuthOverride(key.slice(prefix.length), value);
+      const serverId = key.slice(prefix.length);
+      let opened: unknown = null;
+      try {
+        opened = await openRotationValue(this.vault, owner, serverId, value);
+      } catch (error) {
+        if (!(error instanceof SecretVaultError)) throw error;
+      }
+      const rotation = normalizeOAuthOverride(serverId, opened);
       if (rotation) {
         rotations.push(rotation);
       } else {
-        await this.ctx.storage.delete(key); // malformed — cannot authenticate anything
+        await this.ctx.storage.delete(key); // malformed or unreadable — cannot authenticate anything
       }
     }
     const { appliedChains, staleIds } = overlayOAuthRotations(tokens, rotations);
@@ -2203,7 +2218,7 @@ export class RunManager {
       "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
       owner,
       rotated.serverId,
-      JSON.stringify(rotated.token),
+      await sealGrantPayload(this.vault, owner, rotated.serverId, rotated.token),
       Date.now(),
     );
     this.ctx.storage.sql.exec(

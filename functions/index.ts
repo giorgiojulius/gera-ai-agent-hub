@@ -87,6 +87,14 @@ type Env = {
   EXPO_PUBLIC_RORK_APP_KEY?: string;
   /** Stable private salt for opaque repository-preview account shards. */
   RORK_AUTH_SECRET_KEY?: string;
+  /**
+   * Key material for encrypting stored credentials at rest (OAuth grants,
+   * pasted keys, bot tokens) inside the Durable Objects — see secret-vault.ts.
+   * Without it, credential writes fail closed with `secrets_key_unavailable`.
+   */
+  SECRETS_ENCRYPTION_KEY?: string;
+  /** Comma-separated previous keys, decrypt-only, while a rotation completes. */
+  SECRETS_ENCRYPTION_KEY_PREVIOUS?: string;
   /** Present only on the isolated black-box acceptance Worker. */
   STAGING_VERSION?: string;
 };

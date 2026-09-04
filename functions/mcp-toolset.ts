@@ -18,11 +18,31 @@
 // their static tables are first-party, bounded, and drive UI flows (code
 // changes, repo preflight) by function name.
 //
+// Policy (mcp-policy.ts) sits in front of every call the toolset executes —
+// inline function or mcp_call_tool alike: the allowlist decides what the
+// model sees, and write / destructive tools pause interactive runs for the
+// user's confirmation (background runs decline honestly). Every decision is
+// journaled without argument values.
+//
 // Credentials never appear in records, prompt notes, or search results — the
 // tool tables are already redacted by the transport (mcp-cloud.ts).
 
 import type { ChatSql } from "./chat-shared";
 import { classifyMcpAuthRejection, describeStepUp } from "./mcp-auth-challenge";
+import {
+  CONFIRMATION_TIMEOUT_MS,
+  describeMcpWritePolicy,
+  mcpApprovalKey,
+  mcpPolicyVerdict,
+  mcpServerAllowed,
+  mcpToolAllowed,
+  OPEN_MCP_POLICY,
+  previewToolArguments,
+  type McpConfirmationAction,
+  type McpRunPolicy,
+  type McpToolRisk,
+  type NativeConnectorKind,
+} from "./mcp-policy";
 import {
   callCloudMcpTool,
   cloudMcpFunctionName,
@@ -59,6 +79,7 @@ import {
   type McpServerCapabilities,
   type McpServerRequest,
   type McpServerRequestReply,
+  type McpToolAnnotations,
 } from "./mcp-protocol";
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
 import { callIntercomNativeTool, INTERCOM_NATIVE_TOOLS } from "./native-intercom";
@@ -85,6 +106,8 @@ export type McpRoute =
       auth: string;
       toolName: string;
       serverName: string;
+      /** Connector id in the account profile (policy approvals key on it; falls back to `kind`). */
+      serverId?: string;
     };
 
 export type McpRuntime = {
@@ -535,8 +558,8 @@ const NATIVE_TOOL_TABLES = {
   intercom: INTERCOM_NATIVE_TOOLS,
 } as const;
 
-/** Arms one native connector from its static tool table. */
-function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, cap: number): void {
+/** Arms one native connector from its static tool table (allowlisted tools only). */
+function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, cap: number, policy: McpRunPolicy): void {
   if (server.kind === "mcp") {
     return;
   }
@@ -555,7 +578,7 @@ function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, cap: numbe
     if (runtime.routes.size >= cap) {
       break;
     }
-    if (server.disabledTools.includes(tool.name)) {
+    if (server.disabledTools.includes(tool.name) || !mcpToolAllowed(policy, server.id, tool.name)) {
       continue;
     }
     const fnName = cloudMcpFunctionName(server.id, tool.name);
@@ -568,6 +591,7 @@ function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, cap: numbe
       auth,
       toolName: tool.name,
       serverName: server.name,
+      serverId: server.id,
     });
     runtime.toolDefs.push({
       type: "function",
@@ -627,13 +651,42 @@ export type McpToolsetServerInfo = {
 /** An elicitation the toolset asks the surface to answer (interactive runs pause on it). */
 export type McpToolsetElicitation = McpElicitationRequest & { serverId: string; serverName: string };
 
-/** Mid-run honest record (elicitation declined, catalog refreshed, step-up…) for surfaces that keep a journal. */
+/**
+ * Mid-run honest record (elicitation declined, catalog refreshed, step-up,
+ * policy decision…) for surfaces that keep a journal. Policy entries name
+ * the tool; none of them ever carries an argument value.
+ */
 export type McpToolsetJournalEntry = {
-  kind: "elicitation_declined" | "elicitation_timeout" | "elicitation_invalid" | "catalog_refreshed" | "step_up_required";
+  kind:
+    | "elicitation_declined"
+    | "elicitation_timeout"
+    | "elicitation_invalid"
+    | "catalog_refreshed"
+    | "step_up_required"
+    | "confirmation_granted"
+    | "confirmation_always"
+    | "confirmation_declined"
+    | "confirmation_timeout"
+    | "policy_blocked";
   serverId: string;
   serverName: string;
   detail: string;
+  toolName?: string;
 };
+
+/** A write / destructive call the policy wants approved — what the confirmation card shows. */
+export type McpToolsetConfirmation = {
+  serverId: string;
+  serverName: string;
+  toolName: string;
+  risk: Exclude<McpToolRisk, "read">;
+  /** What the tool does (its description), capped. */
+  description: string;
+  /** Redacted, capped JSON preview of the arguments. */
+  argumentsPreview: string;
+};
+
+export type McpConfirmationAnswer = { action: McpConfirmationAction };
 
 export type McpToolset = McpRuntime & {
   mode: McpToolsetMode;
@@ -658,8 +711,16 @@ export type ResolveMcpToolsetOptions = {
   servers: CloudMcpServer[];
   /** Account setting; unknown values behave as "auto". */
   mode?: McpToolLoadingMode;
-  /** Interactive surfaces can pause for the user later (Phase 4); background ones cannot. */
+  /** Interactive surfaces pause for the user (elicitation, confirmations); background ones decline honestly. */
   surface?: "interactive" | "background";
+  /** Allowlist + write policy for this run; absent = everything visible, everything auto-runs. */
+  policy?: McpRunPolicy;
+  /**
+   * Interactive surfaces approve write / destructive calls by pausing the run
+   * on a confirmation card; without a handler such calls are declined and
+   * journaled (background runs).
+   */
+  confirm?: (request: McpToolsetConfirmation) => Promise<McpConfirmationAnswer>;
   /** Context window of the run's model; unknown → 128k. */
   contextWindowTokens?: number;
   catalog?: McpCatalogStore;
@@ -719,13 +780,15 @@ function jsonText(value: unknown): string {
   }
 }
 
-/** Tools the model may see: disabled ones and MCP Apps UI-only tools are excluded. */
-function visibleTools(state: ServerState): CloudMcpTool[] {
+/** Tools the model may see: disabled, UI-only, and non-allowlisted tools are excluded. */
+function visibleTools(state: ServerState, policy: McpRunPolicy): CloudMcpTool[] {
   if (!state.catalog) {
     return [];
   }
   const disabled = new Set(state.server.disabledTools);
-  return state.catalog.filter((tool) => !disabled.has(tool.name) && tool.uiOnly !== true);
+  return state.catalog.filter(
+    (tool) => !disabled.has(tool.name) && tool.uiOnly !== true && mcpToolAllowed(policy, state.server.id, tool.name),
+  );
 }
 
 function withTimeout<T>(task: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
@@ -759,10 +822,15 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     ? Number.POSITIVE_INFINITY
     : Math.max(0, Math.floor(options.nativeCap ?? NATIVE_TOOL_CAP));
   const perServerCap = options.uncapped ? Number.POSITIVE_INFINITY : NATIVE_TOOLS_PER_SERVER;
+  const policy = options.policy ?? OPEN_MCP_POLICY;
+  /** Tools approved for the rest of this chat ("Always allow"), seeded from the run config. */
+  const approved = new Set<string>((policy.approved ?? []).map((item) => mcpApprovalKey(item.serverId, item.toolName)));
+  // Servers outside a set allowlist take no part in the run at all.
+  const servers = options.servers.filter((server) => mcpServerAllowed(policy, server.id));
 
   // 1. Expiring grants refresh before anything connects.
   const unavailable = new Set<string>();
-  for (const server of options.servers) {
+  for (const server of servers) {
     if (!server.oauth) {
       continue;
     }
@@ -786,7 +854,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
 
   // 2. Native connectors: static tables, inline in every mode.
   const infos: McpToolsetServerInfo[] = [];
-  for (const server of options.servers) {
+  for (const server of servers) {
     if (server.kind === "mcp") {
       continue;
     }
@@ -795,12 +863,12 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       continue;
     }
     const before = runtime.routes.size;
-    armNativeServer(runtime, server, nativeCap);
+    armNativeServer(runtime, server, nativeCap, policy);
     infos.push({ id: server.id, name: server.name, kind: server.kind, toolCount: runtime.routes.size - before, deferred: false });
   }
 
   // 3. Generic MCP servers.
-  const states: ServerState[] = options.servers
+  const states: ServerState[] = servers
     .filter((server) => server.kind === "mcp" && !unavailable.has(server.id))
     .map((server) => {
       const cached = options.catalog?.read(server.id) ?? null;
@@ -822,6 +890,79 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const note = (entry: McpToolsetJournalEntry): void => {
     journal.push(entry);
     options.onJournal?.(entry);
+  };
+
+  /**
+   * Policy gate in front of every call: outside the allowlist → honest
+   * refusal; read-only, auto-run, or already approved → proceed; otherwise
+   * the user confirms on a card (interactive) or the call is declined
+   * (background). "Always allow in this chat" lands in `approved`, so the
+   * next call of that tool runs straight away. Journal entries never carry
+   * argument values; the card gets a redacted, capped preview. Returns the
+   * outcome that replaces the call, or null to proceed.
+   */
+  const gate = async (
+    server: { id: string; name: string },
+    tool: { name: string; description?: string; annotations?: McpToolAnnotations },
+    native: NativeConnectorKind | undefined,
+    args: Record<string, unknown>,
+    redactions: string[],
+  ): Promise<McpToolOutcome | null> => {
+    const verdict = mcpPolicyVerdict(policy, approved, server.id, tool, native);
+    if (verdict.kind === "run") {
+      return null;
+    }
+    const base = { serverId: server.id, serverName: server.name, toolName: tool.name };
+    if (verdict.kind === "blocked") {
+      note({ kind: "policy_blocked", ...base, detail: `Not run: ${verdict.reason}.` });
+      return {
+        text: `Tool "${tool.name}" on "${server.name}" is not allowed by this agent's MCP policy (${verdict.reason}). Do not retry it.`,
+        isError: true,
+      };
+    }
+    const label = verdict.risk === "destructive" ? "destructive" : "write";
+    if (!options.confirm) {
+      note({
+        kind: "confirmation_declined",
+        ...base,
+        detail: `${label} tool needs the user's confirmation; this unattended run cannot ask, so the call was declined.`,
+      });
+      return {
+        text: `Tool "${tool.name}" on "${server.name}" is a ${label} tool and this run's MCP policy requires the user's confirmation before it runs. This unattended run cannot ask, so the call was declined — do not retry it; tell the user what you wanted to do so they can run it from chat or switch the policy to auto-run.`,
+        isError: true,
+      };
+    }
+    const answer = await withTimeout<McpConfirmationAnswer | { action: "timeout" }>(
+      options.confirm({
+        ...base,
+        risk: verdict.risk,
+        description: (tool.description ?? "").slice(0, 400),
+        argumentsPreview: previewToolArguments(args, (text) => redactCloudMcpText(text, redactions)),
+      }),
+      CONFIRMATION_TIMEOUT_MS,
+      () => ({ action: "timeout" }),
+    );
+    switch (answer.action) {
+      case "accept":
+        note({ kind: "confirmation_granted", ...base, detail: `The user confirmed this ${label} call once.` });
+        return null;
+      case "always":
+        approved.add(mcpApprovalKey(server.id, tool.name));
+        note({ kind: "confirmation_always", ...base, detail: `The user allowed this ${label} tool for the rest of the chat.` });
+        return null;
+      case "timeout":
+        note({ kind: "confirmation_timeout", ...base, detail: "No decision within 10 minutes; the call was declined." });
+        return {
+          text: `No decision on running "${tool.name}" on "${server.name}" arrived within 10 minutes, so the call was declined. Do not retry it; ask the user how to proceed.`,
+          isError: true,
+        };
+      default:
+        note({ kind: "confirmation_declined", ...base, detail: `The user declined this ${label} call.` });
+        return {
+          text: `The user declined running "${tool.name}" on "${server.name}". Do not retry it; ask the user how to proceed.`,
+          isError: true,
+        };
+    }
   };
 
   /**
@@ -1065,7 +1206,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   let mode: McpToolsetMode;
   if (requested === "auto") {
     await connectMissing((state) => state.catalog === null);
-    const tools = states.flatMap((state) => visibleTools(state));
+    const tools = states.flatMap((state) => visibleTools(state, policy));
     mode = decideMcpToolLoading(
       "auto",
       { toolCount: tools.length, schemaChars: jsonText(tools.map((tool) => tool.inputSchema)).length },
@@ -1092,7 +1233,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: 0, deferred: false, unavailable: reason });
         continue;
       }
-      const visible = visibleTools(state);
+      const visible = visibleTools(state, policy);
       let added = 0;
       let skipped = 0;
       for (const tool of visible) {
@@ -1157,7 +1298,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: 0, deferred: true, unavailable: reason });
         continue;
       }
-      const count = visibleTools(state).length;
+      const count = visibleTools(state, policy).length;
       runtime.summary.push(`${server.name} (${count} tools · deferred)`);
       infos.push({
         id: server.id,
@@ -1174,18 +1315,23 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   }
 
   const deferredInfos = infos.filter((info) => info.deferred && !info.unavailable);
-  const promptNote =
+  const deferredNote =
     mode === "deferred" && deferredInfos.length > 0
       ? [
           `MCP servers are connected in deferred mode — their tools are NOT listed as functions. Discover them with ${MCP_SEARCH_TOOL_NAME}({ query, serverId?, limit? }) (full-text over names, descriptions and input fields; returns descriptors with complete schemas), then run one with ${MCP_CALL_TOOL_NAME}({ serverId, toolName, arguments }). Only tools a search returned in this conversation can be called.`,
           `Servers: ${deferredInfos.map((info) => `${info.id} "${info.name}" · ${info.toolCount} tools`).join("; ")}.`,
         ].join(" ")
       : "";
+  // The model learns what a confirmation means for it only when something is armed.
+  const policyNote = infos.some((info) => !info.unavailable && info.toolCount !== 0)
+    ? describeMcpWritePolicy(policy.writes, Boolean(options.confirm))
+    : "";
+  const promptNote = [deferredNote, policyNote].filter(Boolean).join(" ");
 
   const searchable = (): McpSearchableServer[] =>
     states
       .filter((state) => state.catalog !== null && !state.failure)
-      .map((state) => ({ serverId: state.server.id, serverName: state.server.name, tools: visibleTools(state) }));
+      .map((state) => ({ serverId: state.server.id, serverName: state.server.name, tools: visibleTools(state, policy) }));
 
   const findState = (serverId: string): ServerState | undefined => {
     const wanted = serverId.trim();
@@ -1227,7 +1373,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     const servers = states.map((state) => ({
       serverId: state.server.id,
       name: state.server.name,
-      toolCount: state.catalog ? visibleTools(state).length : 0,
+      toolCount: state.catalog ? visibleTools(state, policy).length : 0,
       ...(state.failure ? { unavailable: state.failure } : {}),
     }));
     const matches = hits.map((hit) => ({
@@ -1285,6 +1431,13 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     if (!catalogTool) {
       return { text: `MCP server "${server.name}" has no tool named "${toolName}". Find the exact name with ${MCP_SEARCH_TOOL_NAME} first.`, isError: true };
     }
+    if (!mcpToolAllowed(policy, server.id, toolName)) {
+      note({ kind: "policy_blocked", serverId: server.id, serverName: server.name, toolName, detail: "Not run: the tool is not in this agent's allowlist." });
+      return {
+        text: `Tool "${toolName}" on "${server.name}" is not allowed by this agent's MCP policy (the tool is not in this agent's allowlist). Do not retry it.`,
+        isError: true,
+      };
+    }
     if (catalogTool.uiOnly) {
       return {
         text: `Tool "${toolName}" on MCP server "${server.name}" is UI-only (an MCP App that renders its own interface) and cannot be run by the model.`,
@@ -1307,6 +1460,11 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       } catch {
         return { text: `"arguments" must be a JSON object matching the tool's inputSchema.`, isError: true };
       }
+    }
+    // The policy decides before the server is even contacted.
+    const refused = await gate(server, catalogTool, undefined, callArgs, cloudServerRedactions(server));
+    if (refused) {
+      return refused;
     }
     if (!state.session) {
       await connect(state);
@@ -1351,6 +1509,26 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         if (state?.stepUp) {
           // Parked after insufficient_scope — the same token would fail again.
           return { text: state.failure ?? describeStepUp(route.serverName, state.stepUp.scopes), isError: true };
+        }
+        // Policy gate: inline functions go through the same door as mcp_call_tool.
+        const refused =
+          route.type === "native"
+            ? await gate(
+                { id: route.serverId ?? route.kind, name: route.serverName },
+                { name: route.toolName },
+                route.kind,
+                args,
+                [route.auth],
+              )
+            : await gate(
+                { id: route.serverId ?? "", name: route.serverName },
+                state?.catalog?.find((tool) => tool.name === route.toolName) ?? { name: route.toolName },
+                undefined,
+                args,
+                state ? cloudServerRedactions(state.server) : [],
+              );
+        if (refused) {
+          return refused;
         }
         try {
           const output =

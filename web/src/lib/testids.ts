@@ -176,6 +176,15 @@ export const TID = {
   runPauseCard: "run-pause-card",
   runPauseAccept: "run-pause-accept",
   runPauseDecline: "run-pause-decline",
+  /** Write-tool confirmation card (MCP policy) and its three decisions. */
+  runConfirmCard: "run-confirm-card",
+  runConfirmOnce: "run-confirm-once",
+  runConfirmAlways: "run-confirm-always",
+  runConfirmDecline: "run-confirm-decline",
+  /** Settings → Toolkit → "Confirm write tools by default" switch. */
+  settingsConfirmWrites: "settings-confirm-writes",
+  /** Project agent editor: write-policy radiogroup for linked MCP servers. */
+  agentMcpWrites: "agent-mcp-writes",
   /** One annotation badge on an MCP tool row in McpStudio (read-only, destructive, UI-only…). */
   mcpToolBadge: "mcp-tool-badge",
   /** McpStudio server card: the collapsed "Advanced" OAuth section toggle and its fields. */

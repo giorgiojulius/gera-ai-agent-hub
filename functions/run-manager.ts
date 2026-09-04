@@ -27,7 +27,10 @@ import {
   normalizeMcpToolLoading,
   resolveMcpToolset,
   type McpToolset,
+  type McpToolsetJournalEntry,
 } from "./mcp-toolset";
+import { appendMcpJournal, mcpJournalRow } from "./mcp-journal";
+import { accountMcpPolicy, CONFIRMATION_TIMEOUT_MS } from "./mcp-policy";
 import { createRunPauseBoard, type RunPauseBoard } from "./run-pause";
 import { deriveCodeChangeFlow, finalizeCodeChangeFlow, mergeRunCodeChangeStates } from "./code-change-flow";
 import {
@@ -864,6 +867,20 @@ export class RunManager {
       typeof config.contextWindow === "number" && Number.isFinite(config.contextWindow) && config.contextWindow > 0
         ? config.contextWindow
         : undefined;
+    // "Confirm write tools by default": the tab's snapshot wins, then the
+    // synced profile; tools the user already allowed in this chat ride along.
+    const policy = accountMcpPolicy(
+      config.confirmWriteTools ?? this.profileSettings(run.owner)?.confirmWriteTools,
+      config.mcpApproved,
+    );
+    // Every policy decision lands in the account's diagnostics journal (no argument values).
+    const journalSurface = run.kind === "research" ? "research" : isAutomation ? "automation" : "chat";
+    const onJournal = (entry: McpToolsetJournalEntry): void => {
+      const row = mcpJournalRow(entry, { surface: journalSurface, label: run.body.title });
+      if (row) {
+        appendMcpJournal(this.ctx.storage.sql, run.owner, [row]);
+      }
+    };
 
     if (run.kind === "research") {
       try {
@@ -879,6 +896,10 @@ export class RunManager {
               surface: "interactive",
               contextWindowTokens,
               catalog,
+              // The scout reads; with confirmations on, write tools are declined
+              // honestly instead of pausing a research run.
+              policy,
+              onJournal,
               persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
               reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
               beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
@@ -1061,13 +1082,15 @@ export class RunManager {
               surface: "interactive",
               contextWindowTokens,
               catalog,
+              policy,
+              onJournal,
               persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
               reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
               beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
               // Interactive: an MCP server asking for input pauses the run on a
               // card in the thread; the board cancels honestly after 5 minutes.
-              elicit: (request) =>
-                run.pauses.request(
+              elicit: async (request) => {
+                const answer = await run.pauses.request(
                   {
                     kind: "elicitation",
                     serverId: request.serverId,
@@ -1076,7 +1099,31 @@ export class RunManager {
                     fields: request.fields,
                   },
                   ELICITATION_TIMEOUT_MS,
-                ),
+                );
+                // "always" is a confirmation answer; the board never issues it here.
+                return answer.action === "always" ? { action: "accept", content: answer.content } : { action: answer.action, content: answer.content };
+              },
+              // A write / destructive tool pauses the run on a confirmation card
+              // (Run once / Always allow in this chat / Decline); 10 minutes
+              // without a decision declines honestly.
+              confirm: async (request) => {
+                const answer = await run.pauses.request(
+                  {
+                    kind: "confirmation",
+                    serverId: request.serverId,
+                    serverName: request.serverName,
+                    message: request.description,
+                    fields: [],
+                    confirm: {
+                      toolName: request.toolName,
+                      risk: request.risk,
+                      argumentsPreview: request.argumentsPreview,
+                    },
+                  },
+                  CONFIRMATION_TIMEOUT_MS,
+                );
+                return { action: answer.action };
+              },
             })
           : idleToolset();
         // Servers left out because their sign-in is blocked (renew / wider

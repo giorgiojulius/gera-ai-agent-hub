@@ -20,6 +20,7 @@ const SCOPE_STYLE: Record<string, string> = {
   app: "bg-foreground/10 text-foreground",
   promise: "bg-muted text-muted-foreground",
   mcp: "bg-ember/10 text-ember",
+  "mcp-policy": "bg-emerald-500/10 text-emerald-700",
 };
 
 function timeLabel(at: number): string {

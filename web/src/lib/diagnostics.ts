@@ -87,10 +87,14 @@ export function listDiagnostics(): DiagnosticEntry[] {
   return entries;
 }
 
+/** Scope of MCP policy decisions (confirmed / declined / blocked tool calls) — an audit trail, not errors. */
+export const MCP_POLICY_SCOPE = "mcp-policy";
+
 export function unseenDiagnosticsCount(): number {
   let count = 0;
   for (const entry of entries) {
-    if (entry.at > seenAt) {
+    // Policy rows are records of the user's own decisions; they never light the badge.
+    if (entry.at > seenAt && entry.scope !== MCP_POLICY_SCOPE) {
       count += 1;
     }
   }

@@ -1,6 +1,11 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-04 · commit `462816a` (+ MCP OAuth parity: pinned scopes
+Last synced: 2026-09-04 · commit `e08cd72` (+ MCP policies & confirmations:
+  one policy gate in the toolset resolver — per-agent tool allowlists and a
+  write policy for project agents, the account "Confirm write tools by
+  default" switch, a Run once / Always allow in this chat / Decline card on
+  the run-pause board, honest declines on unattended runs, and an
+  `mcp-policy` audit trail in Diagnostics — MCP OAuth parity: pinned scopes
   and a metadata-URL override behind "Advanced" on the server card, scope order
   challenge → resource → authorization server, `offline_access` only when
   declared, `insufficient_scope` step-up that parks the server for the run and
@@ -718,13 +723,28 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   excluded — they have dedicated rows). Empty state links to /mcp; the
   footer counter also links there ("Missing a server?") and says the
   native trio has its own rows above. The
-  agent stores only refs `{owner, servers:[{id,name}]}`
+  agent stores only refs `{owner, servers:[{id,name,tools?}], writes?}`
   (`parseMcpSelectionPatch` / `normalizeStoredMcpSelection` in
   `functions/project-shared.ts`; honest 400s `invalid_mcp_selection` /
-  `too_many_mcp_servers`; omit = keep, [] unlinks, every non-empty save
-  re-links to the saving admin — refs saved by another admin render as
-  removable "saved link" rows plus an amber "linked through <owner>'s
-  account" note). Authenticated runs — channel mention and screen assistant —
+  `too_many_mcp_servers` / `invalid_mcp_writes`; omit = keep, [] unlinks,
+  every non-empty save re-links to the saving admin — refs saved by another
+  admin render as removable "saved link" rows plus an amber "linked through
+  <owner>'s account" note).
+  **Per-agent MCP policy** (2026-09-04): a linked server row expands
+  ("Limit tools" / "Tool allowlist") into per-tool switches with
+  read-only / writes / destructive chips from the annotations the last check
+  saw, plus "Allow all" and "Read-only only" shortcuts — the first uncheck
+  turns the ref's `tools` into an explicit allowlist (tools the server adds
+  later stay out until allowed). Below the servers a "Write tools"
+  radiogroup (`agent-mcp-writes`: Auto-run | Ask before running) sets
+  `mcpWrites`; "Ask" is honest about agents running unattended: write and
+  destructive tools are declined with a note in the reply, read-only tools
+  run. Runs turn the selection into `agentMcpPolicy(selection)` (allow map
+  per server, null = all tools) for the toolset resolver; the agent card
+  chips read "MCP · <server> · N tools" and "MCP · writes need
+  confirmation". Policy decisions of agent runs are posted to the linking
+  admin's diagnostics journal (`postMcpJournal` → owner shard
+  `/diag/append`). Authenticated runs — channel mention and screen assistant —
   resolve the refs through the owner's account shard (internal worker-only
   `POST /mcp/resolve` on ChatStore: profile
   blob + rotation overlays via `cloudMcpServersForAutomation`, expiring
@@ -1173,6 +1193,42 @@ bodies over 2M chars refused.
   `mcp_elicitation` tool record naming the server; URL-mode elicitation is
   declined everywhere with the reason. Research/Julius runs are not
   steerable and never pause.
+- **Policy & confirmations** (2026-09-04, `functions/mcp-policy.ts` — the
+  pure policy: allowlist, risk, verdict, argument preview, prompt wording;
+  `functions/mcp-journal.ts` — journal rows; the gate itself lives in
+  `resolveMcpToolset` so inline functions, native GitHub/Slack/Intercom
+  routes and `mcp_call_tool` all pass the same door). Risk: `readOnlyHint`
+  true → read; `destructiveHint` true → destructive; anything else —
+  annotations missing included — is a write; native connectors use a static
+  table (GitHub create/put/branch/pull writes, `delete_file` destructive,
+  Slack `send_message`, Intercom reply/send). Allowlist (`policy.allow`,
+  server id → tool names | null): servers outside a set allowlist take no
+  part in the run; non-allowlisted tools vanish from inline definitions,
+  search results and counts, and `mcp_call_tool` refuses them ("not allowed
+  by this agent's MCP policy", journal `policy_blocked`). Write policy
+  `ask`: read-only tools run; write/destructive calls on interactive chat
+  runs pause on a confirmation card through the run-pause board
+  (`kind: "confirmation"`, `confirm: {toolName, risk, argumentsPreview}` —
+  the preview masks secret-looking keys, runs the server's credential
+  redaction and caps at 2 000 chars; `run-confirm-card`, buttons
+  `run-confirm-once` → `{action:"accept"}`, `run-confirm-always` →
+  `{action:"always"}` + the thread remembers `mcpApproved` so later runs
+  skip the card, `run-confirm-decline`); 10 minutes without a decision
+  declines; the model is told not to retry a declined call. Unattended
+  surfaces (automations, project/Slack agents, the Deep Research scout)
+  decline honestly ("this unattended run cannot ask") and the system
+  prompt says so up front. Account switch: Settings → Toolkit "Confirm
+  write tools by default" (`settings-confirm-writes`,
+  `settings.confirmWriteTools`, synced; the tab's snapshot rides in
+  `StartRunConfig.confirmWriteTools`, the profile is the fallback) covers
+  chat, resume, Deep Research and cloud automations. Journal: every
+  granted / always / declined / timed-out / blocked decision becomes a
+  `diagnostics` row with scope `mcp-policy` ("Declined: write_thing on
+  Things", detail = server id, tool, run surface + label, reason — never an
+  argument value); RunManager and the automation alarm append directly to
+  the account shard, project agents post to the linking owner's shard.
+  Automations also keep `mcp_policy` tool records in the thread. The
+  Diagnostics badge ignores `mcp-policy` rows (audit trail, not errors).
 - **Conformance** (`web/src/test/mcp-conformance.test.ts`, unit run, Node):
   an in-process `@modelcontextprotocol/sdk` 1.30 Streamable HTTP server
   (stateful sessions, random port) proves version negotiation, the version
@@ -1413,7 +1469,12 @@ row instead). Sections: General, Shortcuts, Notifications, Toolkit.
   loading" segmented control (testid `settings-mcp-loading`, options
   `mcp-loading-option-{auto|native|deferred}`; default auto, normalized in
   `history.ts`) with a hint that changes per option — see MCP › Deferred
-  tools for the run-time semantics.
+  tools for the run-time semantics. "Confirm write tools by default"
+  switch (`settings-confirm-writes`, `settings.confirmWriteTools`, default
+  off, normalized in `history.ts`): write / destructive MCP tools (native
+  GitHub / Slack / Intercom writes included) pause chat runs on a
+  confirmation card, unattended automations decline them honestly — see
+  MCP › Policy & confirmations.
   Models are NOT here — they're picked in the composer/arena.
 
 ## Admin (`/admin`)
@@ -1427,7 +1488,11 @@ Requires `role === "admin"` from `/access/status`; others see an honest
 - **Diagnostics** — client/worker error journal (`/diag`), clearable. Cloud
   runs that finish as `error` (they no longer throw in the tab) still land in
   the journal, as do real MCP disconnects and failed sign-ins. Transient Gera
-  relay/account blips and a missing browser grant stay silent.
+  relay/account blips and a missing browser grant stay silent. MCP policy
+  decisions (confirmed once / always allowed / declined / timed out / blocked
+  by allowlist) appear as green `mcp-policy` rows written server-side — an
+  audit trail that never lights the unseen badge; declined background
+  elicitations use the `mcp` scope.
 
 ## Sharing (`/s/:shareId`)
 
@@ -1452,8 +1517,9 @@ storage probe (`{ok, bucket, apiHost, expiresAt}` 200 or `{ok:false, error}` 503
 — the first thing to curl when a Repo Preview or knowledge upload reports
 `storage_unavailable`) · `/access/*` gate+admin ·
 `/share/*` · `/arena/*` (usage, battles, log, clear) · `/chats/sync` ·
-`/runs/*` (start, stream SSE, active, steer/stop, answer — elicitation card
-replies) · `/diag/*` ·
+`/runs/*` (start, stream SSE, active, steer/stop, answer — elicitation and
+write-tool confirmation card replies: `accept` / `always` / `decline` /
+`cancel`) · `/diag/*` ·
 `/repo-previews/{inspect|install|start|status|cancel}` authenticated launch
 control · `/repo-preview-hook/:id/*` GitHub Actions OIDC-authenticated workflow
 callback (the runner's `PUT …/archive` tar is handled in the entrypoint:
@@ -1519,6 +1585,7 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | prompt-slash | Connected DeepWiki → type `/expl` → prompts menu → pick `explain_repo` → required-argument dialog → submit → `/mcp/prompt-get` text lands in the composer input, dialog gone |
 | resource-mention | Type `@READ` → resources menu → pick the README → `/mcp/resource-read` becomes an attachment chip, `@deepwiki/wiki://…` mention stays in the input |
 | elicitation-accept | Send → stream pauses with a `pause` event → card with the `region` field → fill + Accept → `/runs/answer` carries `{action:"accept", content:{region:"eu"}}` → card clears, reply streams |
+| mcp-confirm-card | Settings → Toolkit “Confirm write tools by default” → send → `/runs/start` carries `confirmWriteTools: true` → stream pauses with a `confirmation` request → card names `create_issue` on Tracker with the masked (`•••`) argument preview, Always allow + Decline present → Run once → `/runs/answer` carries `{action:"accept"}` → card clears, reply streams |
 | oauth-step-up | `/mcp?server=scoped` (custom OAuth server, signed in) → boot re-check's `/mcp/check` reports `stepUp` → amber hint names `things:write` + “Sign in again with wider access” → Advanced collapsed → toggle → Scopes + Metadata URL fields |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
@@ -1558,9 +1625,12 @@ Admin tabs, the MCP OAuth popup itself and API-key/custom-header setup (open
 connect, the step-up hint and the Advanced OAuth fields are covered; editing
 Scopes / Metadata URL and the sign-out it triggers are unit-level only),
 elicitation Decline/Cancel and enum/boolean fields (accept with a text field
-is covered; validation is unit-tested), resource-template variable dialog
+is covered; validation is unit-tested), confirmation “Always allow” /
+Decline clicks and the project-agent tool-allowlist editor (Run once is
+clicked; always/decline/timeout/allowlist semantics are unit-tested against
+the resolver), resource-template variable dialog
 (prompt-argument dialog is covered), Share dialog, Settings toggles other
-than MCP tool loading, media modes,
+than MCP tool loading and Confirm write tools, media modes,
 Julius/Deep Research runs, repository setup-PR merge + real external build
 callback, dynamic SSR previews, incognito, thread menu (pin/rename/delete),
 Project workspace internals (posting, threads, agent editor, members,
@@ -1587,7 +1657,12 @@ catalog cache, native soft caps with honest records), `mcp-conformance` (the
 real `@modelcontextprotocol/sdk` server in-process: negotiation, headers,
 pagination, prompts/resources, routes, elicitation, UI-only, list_changed),
 `mcp-protocol` (transport failures, frames, annotations, templates,
-elicitation validation, run pause board, composer triggers), `mcp-oauth-scopes`
+elicitation validation, run pause board, composer triggers), `mcp-policy`
+(risk classification incl. native tables, verdicts, masked/capped argument
+previews, allowlist filtering of functions/search/calls, unattended declines
+without network for MCP and GitHub routes, interactive accept/always/decline/
+timeout, run-config approvals, confirmation answers on the pause board, agent
+selection → policy, journal rows without argument values), `mcp-oauth-scopes`
 (WWW-Authenticate parsing, scope order, pinned scopes, offline_access rule,
 metadata override, step-up parking/union, blocked-run records), `auth-boundary` +
 `mcp-oauth-refresh` + `mcp-session` (staggered expired-Gera 401s, provider-token

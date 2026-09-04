@@ -25,7 +25,15 @@ export type AgentSecretFlags = { github: boolean; intercom: boolean; slack: bool
  * point into the linking admin's connected servers (the same list chat
  * uses); URLs, keys and sign-ins stay on that account server-side.
  */
-export type AgentMcpServer = { id: string; name: string };
+export type AgentMcpServer = {
+  id: string;
+  name: string;
+  /** Allowlisted tool names on this server; absent = every tool the server publishes. */
+  tools?: string[];
+};
+
+/** Write policy for an agent's linked MCP servers (write / destructive tools). */
+export type AgentMcpWrites = "ask" | "auto";
 
 export const MAX_AGENT_MCP_SERVERS = 5;
 
@@ -41,6 +49,8 @@ export type ProjectAgent = {
   mcpServers?: AgentMcpServer[];
   /** Whose account the linked MCP servers resolve through ("" = none). */
   mcpOwner?: string;
+  /** Write policy for the linked servers; absent = "auto". */
+  mcpWrites?: AgentMcpWrites;
   /** Set when the Slack app was created from Gera; `team` fills in on install. */
   slackApp?: { appId: string; team: string } | null;
   createdAt: number;
@@ -286,11 +296,14 @@ export type AgentSecretsPatch = {
   slackApp?: null;
   /**
    * Full desired MCP link — ids + names picked from YOUR connected servers
-   * (the same list chat and automations use); omit the field to keep the
-   * stored link untouched, [] unlinks. Runs resolve the link through your
-   * account server-side — keys and sign-ins never copy into the project.
+   * (the same list chat and automations use), each with an optional tool
+   * allowlist; omit the field to keep the stored link untouched, [] unlinks.
+   * Runs resolve the link through your account server-side — keys and
+   * sign-ins never copy into the project.
    */
   mcpSelection?: AgentMcpServer[];
+  /** Write policy for the linked servers: "ask" declines write tools (agents run unattended), "auto" runs them. */
+  mcpWrites?: AgentMcpWrites;
 };
 
 /** Public Slack Events API URL for one agent — pasted into the Slack app config. */
@@ -962,7 +975,10 @@ export function accessSummary(agent: ProjectAgent): string[] {
       chips.push("MCP · no servers");
     } else {
       for (const server of servers) {
-        chips.push(`MCP · ${server.name}`);
+        chips.push(server.tools ? `MCP · ${server.name} · ${server.tools.length} tools` : `MCP · ${server.name}`);
+      }
+      if (agent.mcpWrites === "ask") {
+        chips.push("MCP · writes need confirmation");
       }
     }
   }

@@ -6,6 +6,7 @@
 // directly, so nothing Cloudflare-specific may appear here. The native tool
 // tables it imports are plain data + fetch-based callers.
 
+import { normalizeMcpWritePolicy, type McpRunPolicy, type McpToolAllowlist, type McpWritePolicy } from "./mcp-policy";
 import { GITHUB_NATIVE_TOOLS } from "./native-github";
 import { INTERCOM_NATIVE_TOOLS } from "./native-intercom";
 import { SLACK_NATIVE_TOOLS } from "./native-slack";
@@ -27,15 +28,20 @@ export type AgentAccess = {
   mcp: boolean;
 };
 
-/** One linked server — a ref into the linking admin's connected MCP catalog. */
-export type AgentMcpServerRef = { id: string; name: string };
+/**
+ * One linked server — a ref into the linking admin's connected MCP catalog.
+ * `tools` is the agent's allowlist on that server (absent = every tool).
+ */
+export type AgentMcpServerRef = { id: string; name: string; tools?: string[] };
 
 /**
  * The agent's MCP link: server refs resolved through the linking admin's
  * account shard on every run — the same pipeline cloud automations use.
  * Keys and sign-ins stay on that account and never copy into the project.
+ * `writes` is the agent's policy for write / destructive tools: "ask" (agents
+ * run unattended, so such calls are declined honestly) or "auto" (default).
  */
-export type AgentMcpSelection = { owner: string; servers: AgentMcpServerRef[] };
+export type AgentMcpSelection = { owner: string; servers: AgentMcpServerRef[]; writes?: McpWritePolicy };
 
 /** Project-scoped credentials the agent acts with — stored server-side only. */
 export type AgentSecrets = {
@@ -83,10 +89,12 @@ export type ProjectAgentWire = {
   model: string;
   access: AgentAccess;
   secretsSet: AgentSecretFlags;
-  /** Linked MCP servers (names only) — resolved via `mcpOwner`'s account. */
+  /** Linked MCP servers (names + tool allowlists) — resolved via `mcpOwner`'s account. */
   mcpServers: AgentMcpServerRef[];
   /** Whose account the MCP servers resolve through; "" when none linked. */
   mcpOwner: string;
+  /** Policy for write / destructive tools on the linked servers. */
+  mcpWrites: McpWritePolicy;
   /** Set when the Slack app was created from Gera; `team` fills in on install. */
   slackApp: { appId: string; team: string } | null;
   createdAt: number;
@@ -208,6 +216,9 @@ export const SCREEN_CHAT_KEEP = 200;
 export const SCREEN_CHAT_CONTEXT_MESSAGES = 24;
 export const MAX_AGENT_MCP_SERVERS = 5;
 export const AGENT_MCP_NAME_LIMIT = 40;
+/** Allowlisted tool names per linked server (deferred catalogs can be large; the editor lists what the check saw). */
+export const MAX_AGENT_MCP_TOOLS = 300;
+const AGENT_MCP_TOOL_NAME_LIMIT = 120;
 
 export function canManageProject(role: ProjectRole): boolean {
   return role === "owner" || role === "admin";
@@ -292,6 +303,26 @@ export function parseMentions(body: string, handles: string[]): string[] {
 
 // --- Linked MCP servers per agent ---------------------------------------------
 
+/** Allowlist of one ref: an array of tool names (deduplicated, bounded) or absent for "every tool". */
+function mcpToolAllowlistFrom(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const tools: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (tools.length >= MAX_AGENT_MCP_TOOLS) {
+      break;
+    }
+    const name = (typeof item === "string" ? item : "").trim().slice(0, AGENT_MCP_TOOL_NAME_LIMIT);
+    if (name && !seen.has(name)) {
+      seen.add(name);
+      tools.push(name);
+    }
+  }
+  return tools;
+}
+
 function mcpServerRefFrom(item: unknown): AgentMcpServerRef | null {
   if (!item || typeof item !== "object" || Array.isArray(item)) {
     return null;
@@ -303,7 +334,8 @@ function mcpServerRefFrom(item: unknown): AgentMcpServerRef | null {
   }
   const name =
     (typeof record.name === "string" ? record.name : "").trim().slice(0, AGENT_MCP_NAME_LIMIT) || id;
-  return { id, name };
+  const tools = mcpToolAllowlistFrom(record.tools);
+  return tools ? { id, name, tools } : { id, name };
 }
 
 /** Tolerant parse of the stored MCP link (unknown JSON → clean selection). */
@@ -328,7 +360,42 @@ export function normalizeStoredMcpSelection(raw: unknown): AgentMcpSelection | u
       servers.push(ref);
     }
   }
-  return servers.length > 0 ? { owner, servers } : undefined;
+  if (servers.length === 0) {
+    return undefined;
+  }
+  return record.writes === "ask" ? { owner, servers, writes: "ask" } : { owner, servers };
+}
+
+/**
+ * The run policy of a linked selection: every linked server with its tool
+ * allowlist (absent = all tools), plus the agent's write policy. Servers
+ * outside the selection never reach the run anyway.
+ */
+export function agentMcpPolicy(selection: AgentMcpSelection | undefined): McpRunPolicy {
+  if (!selection) {
+    return { allow: null, writes: "auto" };
+  }
+  const allow: McpToolAllowlist = {};
+  for (const ref of selection.servers) {
+    allow[ref.id] = ref.tools ? [...ref.tools] : null;
+  }
+  return { allow, writes: normalizeMcpWritePolicy(selection.writes) };
+}
+
+export type McpWritesPatch =
+  | { action: "keep" }
+  | { action: "set"; writes: McpWritePolicy }
+  | { action: "error"; error: "invalid_mcp_writes" };
+
+/** The editor's write-policy field: omitted keeps the stored value; "ask" | "auto" sets it. */
+export function parseMcpWritesPatch(raw: unknown): McpWritesPatch {
+  if (raw === undefined) {
+    return { action: "keep" };
+  }
+  if (raw === "ask" || raw === "auto") {
+    return { action: "set", writes: raw };
+  }
+  return { action: "error", error: "invalid_mcp_writes" };
 }
 
 export type McpSelectionPatch =

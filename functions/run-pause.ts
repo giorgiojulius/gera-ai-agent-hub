@@ -1,18 +1,28 @@
 // Run pause board — the ONE mechanism an interactive server run uses to stop
-// and ask the user something mid-tool-call: MCP elicitation today, tool
-// confirmations in Phase 4. The board holds the open requests, resolves them
+// and ask the user something mid-tool-call: MCP elicitation (a form the
+// server requested) and tool confirmations (a write / destructive tool the
+// policy wants approved). The board holds the open requests, resolves them
 // when `/runs/answer` arrives, and cancels them honestly on timeout, stop, or
-// run end. Answers are validated against the request's field list before they
-// resolve; submitted values never reach a log or a journal entry.
+// run end. Elicitation answers are validated against the request's field
+// list before they resolve; submitted values never reach a log or a journal
+// entry. Confirmation cards carry a redacted argument preview, never the
+// arguments themselves.
 
 import {
   validateElicitationContent,
   type McpElicitationAction,
-  type McpElicitationAnswer,
   type McpElicitationField,
 } from "./mcp-protocol";
 
-export type RunPauseKind = "elicitation";
+export type RunPauseKind = "elicitation" | "confirmation";
+
+/** What a confirmation card shows about the call it guards (no argument values beyond the redacted preview). */
+export type RunPauseConfirmation = {
+  toolName: string;
+  risk: "write" | "destructive";
+  /** Redacted, capped JSON preview of the arguments. */
+  argumentsPreview: string;
+};
 
 /** One open question shown as a card in the thread (wire shape, no secrets). */
 export type RunPauseRequest = {
@@ -20,14 +30,24 @@ export type RunPauseRequest = {
   kind: RunPauseKind;
   serverId: string;
   serverName: string;
+  /** Elicitation: the server's question. Confirmation: what the tool does. */
   message: string;
   fields: McpElicitationField[];
   createdAt: number;
   /** Epoch ms after which Gera answers `cancel` on the user's behalf. */
   expiresAt: number;
+  /** Present on confirmation cards only. */
+  confirm?: RunPauseConfirmation;
 };
 
-export type RunPauseAnswer = McpElicitationAnswer;
+export type RunPauseAction = McpElicitationAction | "always";
+
+/**
+ * Elicitation: accept (with validated content), decline, cancel.
+ * Confirmation: accept (run once), always (run and stop asking for this tool
+ * in this chat), decline, cancel.
+ */
+export type RunPauseAnswer = { action: RunPauseAction; content?: Record<string, unknown> };
 
 export type RunPauseAnswerOutcome =
   | { ok: true }
@@ -55,7 +75,8 @@ type OpenPause = {
   timer: ReturnType<typeof setTimeout>;
 };
 
-const ACTIONS: readonly McpElicitationAction[] = ["accept", "decline", "cancel"];
+const ELICITATION_ACTIONS: readonly RunPauseAction[] = ["accept", "decline", "cancel"];
+const CONFIRMATION_ACTIONS: readonly RunPauseAction[] = ["accept", "always", "decline", "cancel"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -108,11 +129,12 @@ export function createRunPauseBoard(options: { now?: () => number; newId?: () =>
         return { ok: false, error: "not_found" };
       }
       const action = isRecord(raw) && typeof raw.action === "string" ? raw.action : "";
-      if (!ACTIONS.includes(action as McpElicitationAction)) {
+      const allowed = entry.request.kind === "confirmation" ? CONFIRMATION_ACTIONS : ELICITATION_ACTIONS;
+      if (!allowed.includes(action as RunPauseAction)) {
         return { ok: false, error: "invalid_action" };
       }
-      if (action !== "accept") {
-        settle(id, { action: action as McpElicitationAction });
+      if (entry.request.kind === "confirmation" || action !== "accept") {
+        settle(id, { action: action as RunPauseAction });
         return { ok: true };
       }
       const valid = validateElicitationContent(

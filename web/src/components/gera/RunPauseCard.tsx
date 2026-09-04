@@ -1,10 +1,15 @@
-// Elicitation card: an MCP server asked the live run for input. The form is
-// built from the fields the server requested (strings, numbers, booleans,
-// enums); Accept sends the validated values through /runs/answer, Decline and
-// Cancel answer without content. The run waits until one of them lands or the
-// server-side 5-minute timeout cancels on the user's behalf.
+// Run pause cards — the live run stopped to ask the user something:
+//
+// - elicitation: an MCP server asked for input. The form is built from the
+//   fields the server requested (strings, numbers, booleans, enums); Accept
+//   sends the validated values through /runs/answer, Decline and Cancel answer
+//   without content; the server-side 5-minute timeout cancels otherwise;
+// - confirmation: the MCP policy wants a write / destructive tool approved.
+//   The card names the server and tool, shows a redacted argument preview,
+//   and offers Run once / Always allow in this chat / Decline; 10 minutes
+//   without a decision declines on the user's behalf.
 
-import { Loader2, MessageSquareWarning } from "lucide-react";
+import { Loader2, MessageSquareWarning, ShieldAlert } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
@@ -12,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { useAgent } from "@/hooks/agent-context";
 import { errorFromUnknown } from "@/lib/errors";
 import { answerRunPause, type RunPauseAnswer } from "@/lib/server-run";
 import { runPauseFieldTid, TID } from "@/lib/testids";
@@ -88,6 +94,142 @@ function remainingLabel(expiresAt: number, now: number): string {
 }
 
 export function RunPauseCard({ request, conversationId }: { request: RunPauseRequest; conversationId: string }) {
+  if (request.kind === "confirmation") {
+    return <RunConfirmCard request={request} conversationId={conversationId} />;
+  }
+  return <ElicitationCard request={request} conversationId={conversationId} />;
+}
+
+/** Write-tool confirmation: Run once / Always allow in this chat / Decline. */
+function RunConfirmCard({ request, conversationId }: { request: RunPauseRequest; conversationId: string }) {
+  const { approveMcpTool } = useAgent();
+  const [busy, setBusy] = useState<RunPauseAnswer["action"] | null>(null);
+  const [now, setNow] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const toolName = request.confirm?.toolName ?? "tool";
+  const destructive = request.confirm?.risk === "destructive";
+  const preview = request.confirm?.argumentsPreview ?? "";
+
+  const answer = async (action: "accept" | "always" | "decline") => {
+    if (busy) {
+      return;
+    }
+    setBusy(action);
+    try {
+      const result = await answerRunPause(conversationId, request.id, { action });
+      if (!result.ok) {
+        if (result.reason === "not_found" || result.reason === "not_running") {
+          toast.message("This confirmation was already answered or the run has moved on.");
+        } else {
+          toast.error("Could not send the decision", { description: result.reason ?? "unknown error" });
+        }
+        return;
+      }
+      if (action === "always") {
+        // Later runs of this thread carry the approval, so the card never returns for this tool.
+        approveMcpTool(conversationId, { serverId: request.serverId, toolName });
+      }
+    } catch (error) {
+      toast.error("Could not send the decision", { description: errorFromUnknown(error) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div
+      data-testid={TID.runConfirmCard}
+      className={cn(
+        "mb-3 rounded-2xl border p-3 shadow-sm",
+        destructive
+          ? "border-destructive/40 bg-[linear-gradient(180deg,hsl(var(--destructive)/0.08),transparent_70%)]"
+          : "border-ember/40 bg-[linear-gradient(180deg,hsl(var(--ember)/0.08),transparent_70%)]",
+      )}
+    >
+      <div className="flex items-start gap-2.5">
+        <span
+          className={cn(
+            "mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-xl",
+            destructive ? "bg-destructive/15 text-destructive" : "bg-ember/15 text-ember",
+          )}
+        >
+          <ShieldAlert className="h-4 w-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <span className="text-sm font-medium">
+              Run <code className="rounded bg-foreground/[0.06] px-1 font-mono text-[12px]">{toolName}</code> on {request.serverName}?
+            </span>
+            <span
+              className={cn(
+                "rounded-full border px-1.5 py-px text-[10px] font-medium",
+                destructive
+                  ? "border-destructive/40 bg-destructive/10 text-destructive"
+                  : "border-amber-500/40 bg-amber-500/10 text-amber-700",
+              )}
+            >
+              {destructive ? "destructive" : "writes data"}
+            </span>
+            <span className="text-[11px] text-muted-foreground">MCP policy · the run is paused · {remainingLabel(request.expiresAt, now)}</span>
+          </div>
+          {request.message ? (
+            <p className="mt-1 whitespace-pre-wrap text-[12px] leading-relaxed text-muted-foreground">{request.message}</p>
+          ) : null}
+        </div>
+      </div>
+      {preview ? (
+        <pre className="mt-2.5 max-h-48 overflow-auto rounded-xl border border-border/60 bg-background/80 px-3 py-2 text-[11px] leading-relaxed">
+          {preview}
+        </pre>
+      ) : null}
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          data-testid={TID.runConfirmOnce}
+          className="h-8 rounded-full"
+          disabled={busy !== null}
+          onClick={() => void answer("accept")}
+        >
+          {busy === "accept" ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+          Run once
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          data-testid={TID.runConfirmAlways}
+          className="h-8 rounded-full border-border"
+          disabled={busy !== null}
+          onClick={() => void answer("always")}
+        >
+          {busy === "always" ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+          Always allow in this chat
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          data-testid={TID.runConfirmDecline}
+          className="h-8 rounded-full text-muted-foreground"
+          disabled={busy !== null}
+          onClick={() => void answer("decline")}
+        >
+          Decline
+        </Button>
+        <span className="ml-auto text-[11px] text-muted-foreground">Secrets in the arguments are masked; the decision is journaled.</span>
+      </div>
+    </div>
+  );
+}
+
+/** MCP elicitation form card. */
+function ElicitationCard({ request, conversationId }: { request: RunPauseRequest; conversationId: string }) {
   const [values, setValues] = useState<Record<string, FieldValue>>(() => initialValues(request.fields));
   const [busy, setBusy] = useState<RunPauseAnswer["action"] | null>(null);
   const [errors, setErrors] = useState<string[]>([]);

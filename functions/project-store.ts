@@ -61,6 +61,8 @@ import {
   type McpToolLoadingMode,
   type McpToolset,
 } from "./mcp-toolset";
+import { mcpJournalRow, postMcpJournal } from "./mcp-journal";
+import { normalizeMcpWritePolicy } from "./mcp-policy";
 import {
   describeSecretVaultError,
   fieldsNeedReseal,
@@ -134,6 +136,7 @@ import {
   SCREEN_NAME_LIMIT,
   THREAD_CONTEXT_MESSAGES,
   accessForAgentSurface,
+  agentMcpPolicy,
   canManageProject,
   describeAgentAccess,
   ensureUniqueHandle,
@@ -142,6 +145,7 @@ import {
   normalizeHandle,
   normalizeStoredMcpSelection,
   parseMcpSelectionPatch,
+  parseMcpWritesPatch,
   parseMentions,
   planAgentTools,
   validateScreenWidgets,
@@ -515,6 +519,7 @@ function agentWire(row: AgentRow): ProjectAgentWire {
     secretsSet: secretFlags(secrets),
     mcpServers: secrets.mcpSelection?.servers ?? [],
     mcpOwner: secrets.mcpSelection?.owner ?? "",
+    mcpWrites: normalizeMcpWritePolicy(secrets.mcpSelection?.writes),
     slackApp: secrets.slackAppId ? { appId: secrets.slackAppId, team: secrets.slackTeam ?? "" } : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1795,11 +1800,27 @@ export class ProjectStore extends DurableObject {
     if (mcpPatch.action === "error") {
       return json({ error: mcpPatch.error }, 400);
     }
+    // Write policy ("ask" | "auto") for the linked servers; omitted = keep.
+    const writesPatch = parseMcpWritesPatch(incoming.mcpWrites);
+    if (writesPatch.action === "error") {
+      return json({ error: writesPatch.error }, 400);
+    }
     if (mcpPatch.action === "set") {
       if (mcpPatch.servers.length > 0) {
-        secrets.mcpSelection = { owner: me.email, servers: mcpPatch.servers };
+        secrets.mcpSelection = {
+          owner: me.email,
+          servers: mcpPatch.servers,
+          ...(secrets.mcpSelection?.writes === "ask" ? { writes: "ask" as const } : {}),
+        };
       } else {
         delete secrets.mcpSelection;
+      }
+    }
+    if (writesPatch.action === "set" && secrets.mcpSelection) {
+      if (writesPatch.writes === "ask") {
+        secrets.mcpSelection.writes = "ask";
+      } else {
+        delete secrets.mcpSelection.writes;
       }
     }
 
@@ -3983,6 +4004,16 @@ export class ProjectStore extends DurableObject {
             mode: resolved.toolLoading,
             surface: "background",
             catalog,
+            // Per-agent policy: tool allowlists per linked server and the
+            // write policy ("ask" declines write tools — agents run unattended).
+            policy: agentMcpPolicy(selection),
+            // Decisions land in the linking admin's diagnostics journal.
+            onJournal: (entry) => {
+              const row = mcpJournalRow(entry, { surface: surface === "slack" ? "slack" : "project", label: agent.name });
+              if (row) {
+                this.ctx.waitUntil(postMcpJournal(this.workerEnv.DO, selection.owner, [row]));
+              }
+            },
             // Agent runs are short and background: no GET notification stream
             // to keep alive (list_changed reaches them through the owner's
             // catalog cache on the next resolve); elicitation is declined.

@@ -28,6 +28,8 @@ import { buildRunReport, runScenario, type E2eDriver } from "../../e2e/runner";
 import {
   E2E_SCENARIOS,
   STUB_CODE_PROMPT,
+  STUB_CONFIRM_PROMPT,
+  STUB_CONFIRM_TOOL,
   STUB_ELICIT_FIELD,
   STUB_ELICIT_PROMPT,
   STUB_HANG_PROMPT,
@@ -146,6 +148,7 @@ type StubRunBody = {
     githubRepo?: string;
     mcpServers?: Array<{ id?: string; catalogId?: string; token?: string }>;
     mcpToolLoading?: string;
+    confirmWriteTools?: boolean;
     contextWindow?: number;
   };
 };
@@ -158,6 +161,8 @@ let codeStubRun = false;
 let mcpStubRun = false;
 /** Set by /runs/start for STUB_ELICIT_PROMPT — the stream pauses on an elicitation card until /runs/answer lands. */
 let elicitStubRun = false;
+/** Set by /runs/start for STUB_CONFIRM_PROMPT — the stream pauses on a write-tool confirmation card until /runs/answer lands. */
+let confirmStubRun = false;
 /** The answer body /runs/answer received (never contains anything but the fixture values). */
 let lastStubAnswer: unknown = null;
 let resolveStubAnswer: (() => void) | null = null;
@@ -336,6 +341,75 @@ function elicitationRunStreamResponse(): Response {
         resolveStubAnswer = resolve;
       });
       const done = [{ ...call, status: "done", result: '{"action":"accept","content":{"region":"eu"}}' }];
+      push({ t: "pause", seq: 4, pending: [] });
+      push({ t: "tools", seq: 5, toolCalls: done });
+      push({ t: "text", seq: 6, content: REPLY_TEXT });
+      push({
+        t: "done",
+        seq: 7,
+        status: "done",
+        message: { id: run?.assistantMessageId ?? "e2e-assistant", content: REPLY_TEXT, toolCalls: done },
+        usageEvents: [{ modelId: "stub/model", usage: { prompt_tokens: 42, completion_tokens: 12, total_tokens: 54 } }],
+        steered: [],
+        chatUpdatedAt: Date.now(),
+      });
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
+/**
+ * A run stream that pauses on a write-tool confirmation: snapshot → running
+ * inline tool row → `pause` event with one confirmation request (tool, risk,
+ * redacted argument preview) until /runs/answer arrives — what the run node
+ * emits while the policy gate waits for the user. After the answer the card
+ * clears, the tool settles, and the reply streams.
+ */
+function confirmationRunStreamResponse(): Response {
+  const run = lastStubRun;
+  const encoder = new TextEncoder();
+  const now = Date.now();
+  const pending = [
+    {
+      id: "pause-1",
+      kind: "confirmation",
+      serverId: "tracker",
+      serverName: "Tracker",
+      message: "Creates an issue in the tracker project.",
+      fields: [],
+      createdAt: now,
+      expiresAt: now + 10 * 60_000,
+      confirm: {
+        toolName: STUB_CONFIRM_TOOL,
+        risk: "write",
+        argumentsPreview: '{\n "title": "Release 1.2",\n "apiKey": "•••"\n}',
+      },
+    },
+  ];
+  const call = {
+    id: "mcp-create-issue",
+    name: `mcp_tracker_${STUB_CONFIRM_TOOL}`,
+    arguments: JSON.stringify({ title: "Release 1.2" }),
+  };
+  const snapshot = {
+    runId: run?.runId ?? "e2e-run",
+    conversationId: run?.conversationId ?? "e2e-thread",
+    kind: "chat",
+    status: "running",
+    startedAt: now,
+    content: "",
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      push({ t: "snapshot", seq: 1, snapshot });
+      push({ t: "tools", seq: 2, toolCalls: [{ ...call, status: "running" }] });
+      push({ t: "pause", seq: 3, pending });
+      await new Promise<void>((resolve) => {
+        resolveStubAnswer = resolve;
+      });
+      const done = [{ ...call, status: "done", result: "Issue #42 created." }];
       push({ t: "pause", seq: 4, pending: [] });
       push({ t: "tools", seq: 5, toolCalls: done });
       push({ t: "text", seq: 6, content: REPLY_TEXT });
@@ -579,11 +653,15 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
       codeStubRun = body.config?.prompt === STUB_CODE_PROMPT;
       mcpStubRun = body.config?.prompt === STUB_MCP_PROMPT;
       elicitStubRun = body.config?.prompt === STUB_ELICIT_PROMPT;
+      confirmStubRun = body.config?.prompt === STUB_CONFIRM_PROMPT;
       return jsonResponse({ ok: true, runId: lastStubRun.runId, historyOnServer: true });
     }
     if (url.includes("/runs/stream")) {
       if (elicitStubRun) {
         return elicitationRunStreamResponse();
+      }
+      if (confirmStubRun) {
+        return confirmationRunStreamResponse();
       }
       return hangStubRun ? hangingRunStreamResponse(init?.signal) : runStreamResponse();
     }
@@ -740,6 +818,7 @@ beforeEach(() => {
   codeStubRun = false;
   mcpStubRun = false;
   elicitStubRun = false;
+  confirmStubRun = false;
   lastStubAnswer = null;
   resolveStubAnswer = null;
   localStorage.setItem(ACCESS_TOKEN_KEY, fakeAccessToken());
@@ -865,6 +944,11 @@ for (const scenario of E2E_SCENARIOS) {
     if (scenario.id === "elicitation-accept") {
       // The card's Accept sent exactly the validated form values through /runs/answer.
       expect(lastStubAnswer).toEqual({ action: "accept", content: { [STUB_ELICIT_FIELD]: "eu" } });
+    }
+    if (scenario.id === "mcp-confirm-card") {
+      // "Run once" answers accept without content; the Settings switch rode into the run config.
+      expect(lastStubAnswer).toEqual({ action: "accept" });
+      expect(lastStubRunBody?.config?.confirmWriteTools).toBe(true);
     }
     if (scenario.id === "connect-open-mcp-deferred") {
       // The Settings switch rides into the run config as a snapshot, and the

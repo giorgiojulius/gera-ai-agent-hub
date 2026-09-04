@@ -24,6 +24,7 @@ import type {
   JuliusSettings,
   KnowledgeDoc,
   McpServerConfig,
+  McpToolApproval,
   QueuedMessage,
   VideoAspect,
 } from "@/lib/types";
@@ -91,8 +92,35 @@ export function loadConversations(): Conversation[] {
         // Blank drafts ("New thread" ghosts) never survive a reload.
         item.messages.length > 0,
     )
-    .map((item) => ({ ...item, messages: item.messages.map(reviveMessage) }))
+    .map((item) => ({
+      ...item,
+      messages: item.messages.map(reviveMessage),
+      ...(item.mcpApproved !== undefined ? { mcpApproved: normalizeMcpApprovals(item.mcpApproved) } : {}),
+    }))
     .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/** Bounded, deduplicated "Always allow in this chat" approvals from stored or synced history. */
+export function normalizeMcpApprovals(raw: unknown): McpToolApproval[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const out: McpToolApproval[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= 200 || !item || typeof item !== "object") {
+      continue;
+    }
+    const approval = item as Partial<McpToolApproval>;
+    const serverId = boundedString(approval.serverId, 120)?.trim();
+    const toolName = boundedString(approval.toolName, 120)?.trim();
+    if (!serverId || !toolName || seen.has(`${serverId}\u0000${toolName}`)) {
+      continue;
+    }
+    seen.add(`${serverId}\u0000${toolName}`);
+    out.push({ serverId, toolName });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 /**
@@ -662,6 +690,7 @@ export function normalizeStoredSettings(raw: unknown): AgentSettings {
     mcpServers: keepUserMcpServers(servers),
     mcpToolLoading:
       stored.mcpToolLoading === "native" || stored.mcpToolLoading === "deferred" ? stored.mcpToolLoading : "auto",
+    confirmWriteTools: stored.confirmWriteTools === true,
     agents,
     skills: normalizeSkills(stored.skills),
     automations,

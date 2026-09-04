@@ -924,6 +924,10 @@ export type StartRunConfig = {
   mcpServers: WireMcpServer[];
   /** Snapshot of the account's MCP tool loading setting; absent → the synced profile decides. */
   mcpToolLoading?: McpToolLoadingSetting;
+  /** Snapshot of Settings → Toolkit → "Confirm write tools by default"; absent → the synced profile decides. */
+  confirmWriteTools?: boolean;
+  /** Tools the user already allowed for this chat ("Always allow in this chat") — they run without a card. */
+  mcpApproved?: Array<{ serverId: string; toolName: string }>;
   /** Context window (tokens) of the picked model from the gateway catalog; unknown → 128k assumed. */
   contextWindow?: number;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */
@@ -1025,7 +1029,7 @@ export type RunSnapshot = {
   julius?: JuliusState;
   /** Steer items already woven into the live context, in consumption order. */
   steered?: RunSteerItem[];
-  /** Open questions the run is paused on (MCP elicitation); answered via /runs/answer. */
+  /** Open questions the run is paused on (MCP elicitation, tool confirmations); answered via /runs/answer. */
   pending?: RunPauseRequest[];
   error?: string;
 };

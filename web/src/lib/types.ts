@@ -453,10 +453,15 @@ export type Conversation = {
   pinned?: boolean;
   /** Incognito thread: lives only in this tab — never persisted, never synced, no auto-memory. */
   incognito?: boolean;
+  /** Write tools the user chose "Always allow in this chat" for — later runs skip the confirmation card. */
+  mcpApproved?: McpToolApproval[];
   messages: ChatMessage[];
   createdAt: number;
   updatedAt: number;
 };
+
+/** One MCP tool approved for the rest of a chat. */
+export type McpToolApproval = { serverId: string; toolName: string };
 
 export type MemoryFact = {
   id: string;
@@ -716,17 +721,30 @@ export type ElicitationField = {
   default?: string | number | boolean;
 };
 
-/** An open question a live run paused on (MCP elicitation); answered through /runs/answer. */
+/** What a confirmation card shows about the call it guards (redacted preview, never the raw arguments). */
+export type RunPauseConfirmation = {
+  toolName: string;
+  risk: "write" | "destructive";
+  argumentsPreview: string;
+};
+
+/**
+ * An open question a live run paused on — an MCP elicitation form or a
+ * write-tool confirmation; answered through /runs/answer.
+ */
 export type RunPauseRequest = {
   id: string;
-  kind: "elicitation";
+  kind: "elicitation" | "confirmation";
   serverId: string;
   serverName: string;
+  /** Elicitation: the server's question. Confirmation: what the tool does. */
   message: string;
   fields: ElicitationField[];
   createdAt: number;
   /** Epoch ms after which the server cancels on the user's behalf. */
   expiresAt: number;
+  /** Present on confirmation cards only. */
+  confirm?: RunPauseConfirmation;
 };
 
 /** Completion chime scope: never, only out-of-view finishes, or every finish. */
@@ -761,6 +779,11 @@ export type AgentSettings = {
   mcpServers: McpServerConfig[];
   /** MCP tool loading for server runs — synced in the profile so cloud runs honor it too. */
   mcpToolLoading: McpToolLoadingMode;
+  /**
+   * Write and destructive MCP tools pause chat runs for a confirmation card;
+   * unattended automations decline them honestly. Synced in the profile.
+   */
+  confirmWriteTools: boolean;
   /** Saved agent personas the user can chat with. */
   agents: AgentProfile[];
   /** Reusable instruction packs injected into matching runs (chat / research / Julius). */

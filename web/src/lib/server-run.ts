@@ -21,6 +21,7 @@ import type {
   JuliusSettings,
   JuliusState,
   McpServerConfig,
+  McpToolApproval,
   McpToolLoadingMode,
   ResearchDepth,
   ResearchState,
@@ -63,6 +64,10 @@ export type ServerRunConfig = {
   mcpServers: McpServerConfig[];
   /** Snapshot of Settings → Toolkit → MCP tool loading; the server falls back to the synced profile. */
   mcpToolLoading?: McpToolLoadingMode;
+  /** Snapshot of Settings → Toolkit → "Confirm write tools by default"; the server falls back to the synced profile. */
+  confirmWriteTools?: boolean;
+  /** Tools the user chose "Always allow in this chat" for — they run without a confirmation card. */
+  mcpApproved?: McpToolApproval[];
   /** Context window (tokens) of the picked model from the gateway catalog, when known. */
   contextWindow?: number;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */
@@ -134,7 +139,7 @@ export type ServerRunSnapshot = {
   research?: ResearchState;
   julius?: JuliusState;
   steered?: ServerSteerItem[];
-  /** Open questions (MCP elicitation) the run is paused on. */
+  /** Open questions (MCP elicitation, tool confirmations) the run is paused on. */
   pending?: RunPauseRequest[];
 };
 
@@ -339,16 +344,21 @@ export async function stopServerRun(conversationId: string): Promise<{ ok: boole
   return parseOrThrow(response, "Could not stop the run");
 }
 
-/** Answer to one open run question: accept with form values, decline, or cancel. */
+/**
+ * Answer to one open run question. Elicitation: accept with form values,
+ * decline, or cancel. Confirmation: accept (run once), always (run and stop
+ * asking for this tool in this chat), decline.
+ */
 export type RunPauseAnswer = {
-  action: "accept" | "decline" | "cancel";
+  action: "accept" | "always" | "decline" | "cancel";
   content?: Record<string, string | number | boolean>;
 };
 
 /**
- * Answers an MCP elicitation card. The server validates accepted values
- * against the requested schema and reports field errors (`errors`) — the
- * card shows them; values themselves are never logged anywhere.
+ * Answers an MCP elicitation or confirmation card. The server validates
+ * accepted elicitation values against the requested schema and reports field
+ * errors (`errors`) — the card shows them; values themselves are never logged
+ * anywhere.
  */
 export async function answerRunPause(
   conversationId: string,

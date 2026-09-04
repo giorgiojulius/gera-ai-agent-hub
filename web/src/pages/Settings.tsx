@@ -358,6 +358,19 @@ export default function SettingsPage() {
                   ))}
                 </div>
               </div>
+              <label className="flex cursor-pointer items-center justify-between gap-4 py-4 last:pb-1">
+                <span className="min-w-0">
+                  <span className="block text-sm">Confirm write tools by default</span>
+                  <span className="mt-0.5 block text-[11px] leading-relaxed text-muted-foreground">
+                    MCP tools that change data (anything not marked read-only, native GitHub / Slack / Intercom writes included) pause the chat on a card — Run once, Always allow in this chat, or Decline. Unattended automations decline them honestly and say so in the thread. Every decision lands in Diagnostics.
+                  </span>
+                </span>
+                <Switch
+                  data-testid={TID.settingsConfirmWrites}
+                  checked={settings.confirmWriteTools}
+                  onCheckedChange={(checked) => patchSettings({ confirmWriteTools: checked })}
+                />
+              </label>
             </div>
           </SettingsCard>
         </div>

@@ -25,12 +25,14 @@ import {
   type CloudOAuthRefreshFailure,
   type RefreshedOAuth,
 } from "./mcp-cloud";
+import type { McpRunPolicy } from "./mcp-policy";
 import {
   idleToolset,
   resolveMcpToolset,
   type McpCatalogStore,
   type McpToolLoadingMode,
   type McpToolset,
+  type McpToolsetJournalEntry,
   type ToolDef,
   type ToolRecord,
 } from "./mcp-toolset";
@@ -62,6 +64,8 @@ export type ClaimJob = {
   mcpServers: CloudMcpServer[];
   /** Account setting from the synced profile (Settings → Toolkit); absent → auto. */
   mcpToolLoading?: McpToolLoadingMode;
+  /** Account policy ("Confirm write tools by default"); absent → everything auto-runs. */
+  mcpPolicy?: McpRunPolicy;
 };
 
 // Shared tool shapes and the native arming helpers now live in mcp-toolset.ts;
@@ -85,6 +89,8 @@ export type AutomationRunResult = {
   execution: ExecutionOutcome;
   /** OAuth grants rotated during this run — the account shard persists them. */
   refreshedOAuth: RefreshedOAuth[];
+  /** Mid-run MCP records (policy decisions, declined elicitations) for the account journal. */
+  journal?: McpToolsetJournalEntry[];
 };
 
 type GatewayMessage = {
@@ -287,6 +293,8 @@ export async function runAutomationJob(
         servers: job.mcpServers,
         mode: job.mcpToolLoading,
         surface: "background",
+        // Unattended: with confirmations on, write tools are declined honestly.
+        policy: job.mcpPolicy,
         catalog,
         persist: persistOAuth,
         reportFailure: reportOAuthFailure,
@@ -306,13 +314,20 @@ export async function runAutomationJob(
   let lastContent = "";
   let executionClaim: ExecutionOutcomeClaim | null = null;
   const finish = (content: string): AutomationRunResult => {
-    // Background surface: every elicitation the servers asked for was declined
-    // honestly — the thread shows it as a record instead of a silent gap. The
-    // run's notification streams close with it.
+    // Background surface: every elicitation the servers asked for and every
+    // write tool the policy held back was declined honestly — the thread
+    // shows it as a record instead of a silent gap. The run's notification
+    // streams close with it.
     for (const entry of mcp.journal) {
-      if (entry.kind !== "catalog_refreshed") {
-        records.push({ name: "mcp_elicitation", arguments: entry.serverName, result: entry.detail });
+      if (entry.kind === "catalog_refreshed") {
+        continue;
       }
+      const policyEntry = entry.kind.startsWith("confirmation_") || entry.kind === "policy_blocked";
+      records.push({
+        name: policyEntry ? "mcp_policy" : "mcp_elicitation",
+        arguments: policyEntry && entry.toolName ? `${entry.serverName} · ${entry.toolName}` : entry.serverName,
+        result: entry.detail,
+      });
     }
     mcp.close();
     const marked = extractExecutionOutcomeMarker(content);
@@ -330,6 +345,7 @@ export async function runAutomationJob(
         surface: "automation",
       }),
       refreshedOAuth: mcp.refreshed,
+      journal: mcp.journal,
     };
   };
 

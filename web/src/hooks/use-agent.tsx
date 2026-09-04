@@ -45,6 +45,7 @@ import type {
   CreateMode,
   ExecutionOutcome,
   LifeState,
+  McpToolApproval,
   QueuedMessage,
   RepoPreviewJob,
 } from "@/lib/types";
@@ -296,6 +297,25 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         item.id === current.id
           ? { ...item, githubRepo: trimmed || undefined, updatedAt: Date.now() }
           : item,
+      );
+      saveConversations(conversations);
+      return { ...prev, conversations };
+    });
+  }, []);
+
+  /** "Always allow in this chat" — the approval rides into every later run of the thread. */
+  const approveMcpTool = useCallback((conversationId: string, approval: McpToolApproval) => {
+    setState((prev) => {
+      const current = prev.conversations.find((item) => item.id === conversationId);
+      if (!current) {
+        return prev;
+      }
+      const existing = current.mcpApproved ?? [];
+      if (existing.some((item) => item.serverId === approval.serverId && item.toolName === approval.toolName)) {
+        return prev;
+      }
+      const conversations = prev.conversations.map((item) =>
+        item.id === conversationId ? { ...item, mcpApproved: [...existing, approval].slice(-200) } : item,
       );
       saveConversations(conversations);
       return { ...prev, conversations };
@@ -1459,6 +1479,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       newChatWithAgent,
       setChatAgent,
       setChatRepo,
+      approveMcpTool,
       recordRepoPreview,
       updateRepoPreview,
       createAgent,
@@ -1515,6 +1536,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     newChatWithAgent,
     setChatAgent,
     setChatRepo,
+    approveMcpTool,
     recordRepoPreview,
     updateRepoPreview,
     createAgent,

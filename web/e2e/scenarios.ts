@@ -57,6 +57,11 @@ export const STUB_MCP_RESOURCE_LABEL = "README";
 /** Field the stubbed elicitation asks for. */
 export const STUB_ELICIT_FIELD = "region";
 
+/** Prompt marker that makes the platform stub pause the run on a write-tool confirmation card before replying. */
+export const STUB_CONFIRM_PROMPT = "Create the release issue through the MCP server";
+/** Tool the stubbed confirmation card guards. */
+export const STUB_CONFIRM_TOOL = "create_issue";
+
 /** Custom OAuth server whose stubbed /mcp/check reports a pending scope step-up. */
 export const STUB_STEP_UP_SERVER_ID = "scoped";
 /** Scope the stubbed insufficient_scope challenge demanded. */
@@ -328,6 +333,30 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "tap", target: TID.runPauseAccept },
       { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
       { do: "notSee", target: TID.runPauseCard },
+    ],
+  },
+  {
+    id: "mcp-confirm-card",
+    title: "With confirmations on, a write tool pauses the run on a card; Run once resumes it",
+    steps: [
+      // The account switch rides into the run config as a snapshot.
+      { do: "goto", path: "/settings" },
+      { do: "see", target: studioPageTid("settings"), timeoutMs: 20_000 },
+      { do: "tap", target: TID.settingsConfirmWrites },
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "tap", target: TID.sidebarNewChat },
+      { do: "fill", target: TID.composerInput, text: STUB_CONFIRM_PROMPT },
+      { do: "tap", target: TID.composerSend },
+      { do: "see", target: TID.runConfirmCard, timeoutMs: 20_000 },
+      // The card names the tool and server and shows the redacted arguments.
+      { do: "seeText", target: TID.runConfirmCard, text: STUB_CONFIRM_TOOL },
+      { do: "seeText", target: TID.runConfirmCard, text: "•••" },
+      { do: "see", target: TID.runConfirmAlways },
+      { do: "see", target: TID.runConfirmDecline },
+      { do: "tap", target: TID.runConfirmOnce },
+      { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
+      { do: "notSee", target: TID.runConfirmCard },
     ],
   },
   {

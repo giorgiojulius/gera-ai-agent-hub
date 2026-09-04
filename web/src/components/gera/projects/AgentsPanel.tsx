@@ -77,12 +77,14 @@ import {
   saveProjectSlackConfig,
   upsertProjectAgent,
   type AgentMcpServer,
+  type AgentMcpWrites,
   type AgentUpsertPayload,
   type GithubAccessLevel,
   type ProjectAgent,
   type ProjectSlackConfig,
 } from "@/lib/projects";
-import type { McpServerConfig } from "@/lib/types";
+import { TID } from "@/lib/testids";
+import type { McpServerConfig, McpToolInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type TokenDraft = { value: string; clear: boolean };
@@ -100,10 +102,12 @@ type Draft = {
   intercom: boolean;
   slack: boolean;
   mcp: boolean;
-  /** Linked MCP servers — ids + names picked from the admin's connected list. */
+  /** Linked MCP servers — ids + names (+ optional tool allowlists) picked from the admin's connected list. */
   mcpSelection: AgentMcpServer[];
   /** Whose account the saved link resolves through ("" = none yet). */
   mcpOwner: string;
+  /** Write policy for the linked servers: "ask" declines write tools (agents run unattended), "auto" runs them. */
+  mcpWrites: AgentMcpWrites;
   githubToken: TokenDraft;
   githubFromAccount: boolean;
   intercomToken: TokenDraft;
@@ -253,8 +257,13 @@ function draftFrom(agent: ProjectAgent | null): Draft {
     intercom: agent?.access.intercom ?? false,
     slack: agent?.access.slack ?? false,
     mcp: agent?.access.mcp ?? false,
-    mcpSelection: (agent?.mcpServers ?? []).map((server) => ({ id: server.id, name: server.name })),
+    mcpSelection: (agent?.mcpServers ?? []).map((server) => ({
+      id: server.id,
+      name: server.name,
+      ...(server.tools ? { tools: [...server.tools] } : {}),
+    })),
     mcpOwner: agent?.mcpOwner ?? "",
+    mcpWrites: agent?.mcpWrites === "ask" ? "ask" : "auto",
     githubToken: { ...EMPTY_TOKEN },
     githubFromAccount: false,
     intercomToken: { ...EMPTY_TOKEN },
@@ -594,7 +603,7 @@ export function AgentsPanel({
           ...(draft.slackDisconnect ? { slackApp: null } : {}),
           // Sent only while the switch is on — switched off, the stored
           // link stays put, mirroring how tokens behave.
-          ...(draft.mcp ? { mcpSelection: draft.mcpSelection } : {}),
+          ...(draft.mcp ? { mcpSelection: draft.mcpSelection, mcpWrites: draft.mcpWrites } : {}),
         },
       };
       const saved = await upsertProjectAgent(projectId, payload);
@@ -1423,7 +1432,9 @@ export function AgentsPanel({
                         <McpServerPicker
                           selection={draft.mcpSelection}
                           savedOwner={draft.mcpOwner}
+                          writes={draft.mcpWrites}
                           onChange={(next) => setDraft({ ...draft, mcpSelection: next })}
+                          onWritesChange={(next) => setDraft({ ...draft, mcpWrites: next })}
                         />
                       ) : null}
                     </AccessRow>
@@ -1670,15 +1681,32 @@ function SaveAgentFirstNote({
 function McpServerPicker({
   selection,
   savedOwner,
+  writes,
   onChange,
+  onWritesChange,
 }: {
   selection: AgentMcpServer[];
   savedOwner: string;
+  writes: AgentMcpWrites;
   onChange: (next: AgentMcpServer[]) => void;
+  onWritesChange: (next: AgentMcpWrites) => void;
 }) {
   const { state } = useAgent();
   const { user } = useAuth();
   const myEmail = user?.email ?? "";
+  /** Servers whose tool allowlist editor is expanded. */
+  const [openTools, setOpenTools] = useState<Record<string, boolean>>({});
+  const setTools = (serverId: string, tools: string[] | undefined) => {
+    onChange(
+      selection.map((ref) => {
+        if (ref.id !== serverId) {
+          return ref;
+        }
+        const next: AgentMcpServer = { id: ref.id, name: ref.name };
+        return tools ? { ...next, tools } : next;
+      }),
+    );
+  };
   // Native GitHub/Slack/Intercom connectors have dedicated agent rows above.
   const connected = state.settings.mcpServers.filter(
     (server) => !findCatalogEntry(server.catalogId ?? server.id)?.native,
@@ -1717,36 +1745,63 @@ function McpServerPicker({
         </p>
       ) : null}
       {connected.map((server) => {
-        const picked = selection.some((ref) => ref.id === server.id);
+        const ref = selection.find((entry) => entry.id === server.id);
+        const picked = ref !== undefined;
         const needsAuth = cloudMcpReadiness(server) === "needs-auth";
+        const allowlisted = ref?.tools;
+        const toolsLabel =
+          server.tools.length === 0
+            ? "not connected yet"
+            : allowlisted
+              ? `${allowlisted.length} of ${server.tools.length} tools allowed`
+              : `${server.tools.length} tools · all allowed`;
         return (
-          <label
-            key={server.id}
-            className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-background/70 px-2.5 py-2"
-          >
-            <span className="flex min-w-0 items-center gap-2">
-              <ServerFavicon server={server} />
-              <span className="min-w-0">
-                <span className="flex items-center gap-1.5">
-                  <span className="truncate text-sm">{server.name}</span>
-                  {needsAuth ? (
-                    <span className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-px text-[10px] font-medium text-amber-700">
-                      connect first
-                    </span>
-                  ) : null}
-                </span>
-                <span className="block text-[11px] text-muted-foreground">
-                  {server.tools.length > 0 ? `${server.tools.length} tools` : "not connected yet"}
+          <div key={server.id} className="rounded-xl border border-border/70 bg-background/70">
+            <label className="flex items-center justify-between gap-3 px-2.5 py-2">
+              <span className="flex min-w-0 items-center gap-2">
+                <ServerFavicon server={server} />
+                <span className="min-w-0">
+                  <span className="flex items-center gap-1.5">
+                    <span className="truncate text-sm">{server.name}</span>
+                    {needsAuth ? (
+                      <span className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-px text-[10px] font-medium text-amber-700">
+                        connect first
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="block text-[11px] text-muted-foreground">{toolsLabel}</span>
                 </span>
               </span>
-            </span>
-            <Switch
-              checked={picked}
-              disabled={!picked && full}
-              onCheckedChange={(checked) => toggle({ id: server.id, name: server.name }, checked)}
-              aria-label={`Link ${server.name}`}
-            />
-          </label>
+              <Switch
+                checked={picked}
+                disabled={!picked && full}
+                onCheckedChange={(checked) => toggle({ id: server.id, name: server.name }, checked)}
+                aria-label={`Link ${server.name}`}
+              />
+            </label>
+            {picked && server.tools.length > 0 ? (
+              <div className="border-t border-border/60 px-2.5 py-1.5">
+                <button
+                  type="button"
+                  onClick={() => setOpenTools((prev) => ({ ...prev, [server.id]: !prev[server.id] }))}
+                  className="flex w-full items-center gap-1 text-left text-[11px] text-muted-foreground hover:text-foreground"
+                  aria-expanded={openTools[server.id] === true}
+                >
+                  <ChevronRight
+                    className={cn("h-3 w-3 transition-transform", openTools[server.id] ? "rotate-90" : "")}
+                  />
+                  {allowlisted ? "Tool allowlist" : "Limit tools"}
+                </button>
+                {openTools[server.id] ? (
+                  <McpToolAllowlist
+                    tools={server.tools}
+                    allowed={allowlisted}
+                    onChange={(next) => setTools(server.id, next)}
+                  />
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         );
       })}
       {savedOnly.map((ref) => (
@@ -1763,6 +1818,45 @@ function McpServerPicker({
           <Switch checked onCheckedChange={() => toggle(ref, false)} aria-label={`Unlink ${ref.name}`} />
         </label>
       ))}
+      {selection.length > 0 ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border/70 bg-background/70 px-2.5 py-2">
+          <span className="min-w-0">
+            <span className="block text-sm">Write tools</span>
+            <span className="block text-[11px] leading-relaxed text-muted-foreground">
+              {writes === "ask"
+                ? "Agents run unattended, so tools that change data (anything not marked read-only) are declined with an honest note in the reply; read-only tools run. Decisions land in your Diagnostics."
+                : "Every allowed tool runs, including ones that change data."}
+            </span>
+          </span>
+          <div
+            role="radiogroup"
+            aria-label="Write tools"
+            data-testid={TID.agentMcpWrites}
+            className="inline-flex shrink-0 rounded-full border border-border bg-background p-0.5"
+          >
+            {(
+              [
+                { value: "auto", label: "Auto-run" },
+                { value: "ask", label: "Ask before running" },
+              ] as const
+            ).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={writes === option.value}
+                onClick={() => onWritesChange(option.value)}
+                className={cn(
+                  "rounded-full px-2.5 py-1 text-[11px] transition-colors",
+                  writes === option.value ? "bg-foreground text-background" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
       <p className="text-[11px] leading-relaxed text-muted-foreground">
         {selection.length}/{MAX_AGENT_MCP_SERVERS} linked. Runs resolve these through your account —
         keys and sign-ins stay there (synced and refreshed like cloud automations) and never reach
@@ -1772,6 +1866,83 @@ function McpServerPicker({
         </Link>{" "}
         — GitHub, Slack and Intercom aren't listed here because they have their own rows above.
       </p>
+    </div>
+  );
+}
+
+/**
+ * Per-server tool allowlist: every tool the last check listed, with a switch
+ * each. "All tools" (no allowlist) is the default; the first uncheck turns the
+ * list into an explicit allowlist so tools the server adds later stay out
+ * until an admin allows them.
+ */
+function McpToolAllowlist({
+  tools,
+  allowed,
+  onChange,
+}: {
+  tools: McpToolInfo[];
+  allowed: string[] | undefined;
+  onChange: (next: string[] | undefined) => void;
+}) {
+  const allowedSet = allowed ? new Set(allowed) : null;
+  const isAllowed = (name: string) => allowedSet === null || allowedSet.has(name);
+  const toggleTool = (name: string, checked: boolean) => {
+    const current = allowedSet ? [...allowedSet] : tools.map((tool) => tool.name);
+    const next = checked ? [...current.filter((item) => item !== name), name] : current.filter((item) => item !== name);
+    // Keep catalog order so the saved list reads like the server's table.
+    const ordered = tools.map((tool) => tool.name).filter((item) => next.includes(item));
+    onChange(ordered);
+  };
+  const riskOf = (tool: McpToolInfo): "read" | "write" | "destructive" =>
+    tool.annotations?.readOnlyHint === true ? "read" : tool.annotations?.destructiveHint === true ? "destructive" : "write";
+  return (
+    <div className="mt-1.5 space-y-1">
+      <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{allowedSet ? `${allowedSet.size} of ${tools.length} allowed` : "All tools allowed"}</span>
+        <span className="flex gap-2">
+          <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => onChange(undefined)}>
+            Allow all
+          </button>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:text-foreground"
+            onClick={() => onChange(tools.filter((tool) => riskOf(tool) === "read").map((tool) => tool.name))}
+          >
+            Read-only only
+          </button>
+        </span>
+      </div>
+      <div className="max-h-56 space-y-0.5 overflow-auto pr-0.5">
+        {tools.map((tool) => {
+          const risk = riskOf(tool);
+          return (
+            <label key={tool.name} className="flex items-center justify-between gap-2 rounded-lg px-1.5 py-1 hover:bg-foreground/[0.03]">
+              <span className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate font-mono text-[11px]">{tool.name}</span>
+                <span
+                  className={cn(
+                    "shrink-0 rounded-full border px-1.5 py-px text-[10px]",
+                    risk === "read"
+                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700"
+                      : risk === "destructive"
+                        ? "border-destructive/40 bg-destructive/10 text-destructive"
+                        : "border-amber-500/40 bg-amber-500/10 text-amber-700",
+                  )}
+                >
+                  {risk === "read" ? "read-only" : risk === "destructive" ? "destructive" : "writes"}
+                </span>
+              </span>
+              <Switch
+                checked={isAllowed(tool.name)}
+                onCheckedChange={(checked) => toggleTool(tool.name, checked)}
+                aria-label={`Allow ${tool.name}`}
+                className="scale-90"
+              />
+            </label>
+          );
+        })}
+      </div>
     </div>
   );
 }

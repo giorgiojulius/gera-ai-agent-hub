@@ -544,18 +544,23 @@ function createSteerBridge(
 }
 
 /**
- * MCP loading facts every server run carries: the account's tool-loading
- * setting (so a switch flipped moments ago applies before the profile syncs)
- * and the picked model's context window from the gateway catalog, which the
- * server's auto mode uses to judge when tool schemas would crowd the prompt.
+ * MCP facts every server run carries: the account's tool-loading setting and
+ * its "Confirm write tools" switch (so a change flipped moments ago applies
+ * before the profile syncs), the tools already allowed for this chat, and the
+ * picked model's context window from the gateway catalog, which the server's
+ * auto mode uses to judge when tool schemas would crowd the prompt.
  */
 function mcpRunConfig(
   settings: AgentSettings,
   selectionId: string,
-): Pick<ServerRunConfig, "mcpToolLoading" | "contextWindow"> {
+  conversation?: Pick<Conversation, "mcpApproved">,
+): Pick<ServerRunConfig, "mcpToolLoading" | "confirmWriteTools" | "mcpApproved" | "contextWindow"> {
   const contextWindow = cachedContextWindow(selectionId);
+  const approved = conversation?.mcpApproved ?? [];
   return {
     mcpToolLoading: settings.mcpToolLoading,
+    confirmWriteTools: settings.confirmWriteTools,
+    ...(approved.length > 0 ? { mcpApproved: approved } : {}),
     ...(contextWindow !== undefined ? { contextWindow } : {}),
   };
 }
@@ -1085,7 +1090,7 @@ export async function sendPrompt(params: {
           // the same credential to check repository claims independently.
           mcpServers:
             wantJulius && githubServer ? injectGitHubRunAuth([githubServer], githubAuth) : [],
-          ...mcpRunConfig(settings, selectionId),
+          ...mcpRunConfig(settings, selectionId, seeded),
           githubRepo: pinnedRepo || undefined,
           ...(wantResearch
             ? {
@@ -1239,7 +1244,7 @@ export async function sendPrompt(params: {
         prompt,
         builtins: armedBuiltins,
         mcpServers: injectGitHubRunAuth(armedServers, githubAuth),
-        ...mcpRunConfig(settings, selectionId),
+        ...mcpRunConfig(settings, selectionId, seeded),
         githubRepo: pinnedRepo || undefined,
         grounding: grounding ?? undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
@@ -1499,7 +1504,7 @@ export async function resumePrompt(params: {
         prompt: lastUser?.content ?? "",
         builtins: scoped.builtinTools,
         mcpServers: injectGitHubRunAuth(scoped.mcpServers, resumeGithubAuth),
-        ...mcpRunConfig(settings, selectionId),
+        ...mcpRunConfig(settings, selectionId, conversation),
         githubRepo: resumeRepo || undefined,
         steeringWrapNote: STEER_WRAP_NOTE,
         resume: { messageId: assistantId, partial },

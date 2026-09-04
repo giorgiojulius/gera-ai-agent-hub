@@ -15,6 +15,7 @@ import type {
   GatewayModel,
   LifeState,
   McpServerConfig,
+  McpToolApproval,
   RepoPreviewJob,
 } from "@/lib/types";
 
@@ -36,6 +37,8 @@ export type AgentContextValue = {
   setChatAgent: (agentId: string | null) => void;
   /** Pins/unpins a GitHub repository ("owner/repo") on the active thread — runs default their GitHub tools to it. */
   setChatRepo: (repo: string | null) => void;
+  /** "Always allow in this chat": later runs of the thread skip the confirmation card for this tool. */
+  approveMcpTool: (conversationId: string, approval: McpToolApproval) => void;
   /** Appends a durable repository launch receipt to its originating thread. */
   recordRepoPreview: (job: RepoPreviewJob, conversationId?: string) => void;
   /** Persists phase changes without syncing private preview URLs or build logs. */

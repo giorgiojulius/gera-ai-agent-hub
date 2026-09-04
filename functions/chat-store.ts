@@ -42,6 +42,8 @@ import {
   type ToolRecord,
 } from "./automation-runner";
 import { buildExecutionOutcome, type ExecutionOutcome } from "./run-protocol";
+import { appendMcpJournal, mcpJournalRow, type McpJournalRow } from "./mcp-journal";
+import { accountMcpPolicy } from "./mcp-policy";
 import {
   automationDue,
   cloudSkillsBlock,
@@ -1339,6 +1341,13 @@ export class ChatStore extends DurableObject {
           refreshedOAuth: [],
         };
       }
+      // Policy decisions and declined elicitations of this unattended run go
+      // to the account's diagnostics journal (never argument values).
+      const journalRows: McpJournalRow[] = (result.journal ?? []).flatMap((entry) => {
+        const row = mcpJournalRow(entry, { surface: "automation", label: item.auto.name });
+        return row ? [row] : [];
+      });
+      appendMcpJournal(this.ctx.storage.sql, owner, journalRows);
       try {
         const terminalStatus = result.execution.status === "error" ? "error" : "done";
         this.ctx.storage.transactionSync(() => {
@@ -3517,6 +3526,8 @@ export class ChatStore extends DurableObject {
         oauthTokens,
       ),
       mcpToolLoading: normalizeMcpToolLoading(settings.mcpToolLoading),
+      // "Confirm write tools by default": unattended runs decline write tools honestly.
+      mcpPolicy: accountMcpPolicy(settings.confirmWriteTools),
     };
   }
 

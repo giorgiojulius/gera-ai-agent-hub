@@ -306,6 +306,15 @@ export async function runAutomationJob(
   let lastContent = "";
   let executionClaim: ExecutionOutcomeClaim | null = null;
   const finish = (content: string): AutomationRunResult => {
+    // Background surface: every elicitation the servers asked for was declined
+    // honestly — the thread shows it as a record instead of a silent gap. The
+    // run's notification streams close with it.
+    for (const entry of mcp.journal) {
+      if (entry.kind !== "catalog_refreshed") {
+        records.push({ name: "mcp_elicitation", arguments: entry.serverName, result: entry.detail });
+      }
+    }
+    mcp.close();
     const marked = extractExecutionOutcomeMarker(content);
     const sources = ledger.list();
     return {

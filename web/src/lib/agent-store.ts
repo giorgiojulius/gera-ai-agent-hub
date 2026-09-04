@@ -383,9 +383,14 @@ function applyRunEvent(
         ...(snap.sources && snap.sources.length > 0 ? { sources: snap.sources } : {}),
         ...(snap.research ? { research: snap.research } : {}),
         ...(snap.julius ? { julius: snap.julius } : {}),
+        // A reopened tab sees the open elicitation card too (or none).
+        pauses: snap.pending && snap.pending.length > 0 ? snap.pending : undefined,
       });
       return;
     }
+    case "pause":
+      patchAssistant({ pauses: event.pending.length > 0 ? event.pending : undefined });
+      return;
     case "text":
       patchAssistant({ content: event.content });
       return;
@@ -453,6 +458,8 @@ async function settleDone(done: ServerRunDone): Promise<Partial<ChatMessage>> {
     ...(images && images.length > 0 ? { images } : {}),
     ...(videos && videos.length > 0 ? { videos } : {}),
     ...(audioUrl ? { audioUrl } : {}),
+    // No question survives its run — a settled reply never shows a card.
+    pauses: undefined,
     interrupted: message.interrupted ? true : undefined,
   };
 }
@@ -1852,6 +1859,8 @@ export async function reconnectMcp(
               identity: connection.identity,
               verifiedAt: Date.now(),
               credentialStored: connection.credentialStored === true,
+              promptCount: connection.promptCount ?? 0,
+              resourceCount: connection.resourceCount ?? 0,
               error: undefined,
               name: item.name || server.name,
             }
@@ -1859,7 +1868,7 @@ export async function reconnectMcp(
       ),
     }));
     toast.success(`${server.name} verified`, {
-      description: `${connection.tools.length} tools listed${connection.identity ? ` · ${connection.identity}` : ""}`,
+      description: `${connection.tools.length} tools listed${connection.promptCount ? ` · ${connection.promptCount} prompts` : ""}${connection.resourceCount ? ` · ${connection.resourceCount} resources` : ""}${connection.identity ? ` · ${connection.identity}` : ""}`,
     });
   } catch (error) {
     const message = errorFromUnknown(error);
@@ -2024,6 +2033,8 @@ async function revalidateQuietly(
           item.error === undefined &&
           item.identity === connection.identity &&
           item.credentialStored === (connection.credentialStored === true) &&
+          (item.promptCount ?? 0) === (connection.promptCount ?? 0) &&
+          (item.resourceCount ?? 0) === (connection.resourceCount ?? 0) &&
           sameMcpTools(item.tools, connection.tools)
         ) {
           return item;
@@ -2036,6 +2047,8 @@ async function revalidateQuietly(
           identity: connection.identity,
           verifiedAt: Date.now(),
           credentialStored: connection.credentialStored === true,
+          promptCount: connection.promptCount ?? 0,
+          resourceCount: connection.resourceCount ?? 0,
           error: undefined,
         };
       });

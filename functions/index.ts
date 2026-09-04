@@ -1723,7 +1723,8 @@ async function relayRuns(request: Request, url: URL, env: Env): Promise<Response
       sub === "/runs/steer" ||
       sub === "/runs/retract" ||
       sub === "/runs/stop" ||
-      sub === "/runs/ack";
+      sub === "/runs/ack" ||
+      sub === "/runs/answer";
     if (isGet ? !allowedGet : !(request.method === "POST" && allowedPost)) {
       return corsJson({ error: "not_found" }, 404);
     }
@@ -1874,6 +1875,9 @@ async function relayAccountMcp(request: Request, url: URL, env: Env): Promise<Re
       "/mcp/oauth-store": "POST",
       "/mcp/oauth-clear": "POST",
       "/mcp/check": "POST",
+      "/mcp/inventory": "POST",
+      "/mcp/prompt-get": "POST",
+      "/mcp/resource-read": "POST",
     };
     const method = methods[url.pathname];
     if (!method || request.method !== method) {
@@ -2974,7 +2978,10 @@ export default {
       url.pathname === "/mcp/github-device-status" ||
       url.pathname === "/mcp/oauth-store" ||
       url.pathname === "/mcp/oauth-clear" ||
-      url.pathname === "/mcp/check"
+      url.pathname === "/mcp/check" ||
+      url.pathname === "/mcp/inventory" ||
+      url.pathname === "/mcp/prompt-get" ||
+      url.pathname === "/mcp/resource-read"
     ) {
       return relayAccountMcp(request, url, env);
     }

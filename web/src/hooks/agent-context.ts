@@ -8,6 +8,7 @@ import type { AutomationDraftInput } from "@/lib/automations";
 import type {
   AgentProfile,
   AgentSettings,
+  Attachment,
   Automation,
   Conversation,
   CreateMode,
@@ -58,6 +59,8 @@ export type AgentContextValue = {
   markUnreadChat: (id: string) => void;
   setInput: (value: string) => void;
   addAttachments: (files: File[], options?: { replace?: boolean }) => Promise<void>;
+  /** Attaches ready records (MCP resources read through the account shard, prompt images). */
+  addAttachmentRecords: (records: Attachment[]) => void;
   removeAttachment: (id: string) => void;
   send: () => void;
   /** Edits a sent user message: truncates the thread there and resends. */

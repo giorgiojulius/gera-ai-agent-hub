@@ -25,6 +25,7 @@ import type {
   ResearchDepth,
   ResearchState,
   ResearchSource,
+  RunPauseRequest,
   ToolCallRecord,
 } from "@/lib/types";
 
@@ -133,10 +134,13 @@ export type ServerRunSnapshot = {
   research?: ResearchState;
   julius?: JuliusState;
   steered?: ServerSteerItem[];
+  /** Open questions (MCP elicitation) the run is paused on. */
+  pending?: RunPauseRequest[];
 };
 
 export type ServerRunEvent =
   | { t: "snapshot"; seq: number; snapshot: ServerRunSnapshot }
+  | { t: "pause"; seq: number; pending: RunPauseRequest[] }
   | { t: "text"; seq: number; content: string }
   | { t: "reasoning"; seq: number; tail: string }
   | { t: "tools"; seq: number; toolCalls: ToolCallRecord[] }
@@ -333,6 +337,35 @@ export async function stopServerRun(conversationId: string): Promise<{ ok: boole
     body: JSON.stringify({ conversationId }),
   });
   return parseOrThrow(response, "Could not stop the run");
+}
+
+/** Answer to one open run question: accept with form values, decline, or cancel. */
+export type RunPauseAnswer = {
+  action: "accept" | "decline" | "cancel";
+  content?: Record<string, string | number | boolean>;
+};
+
+/**
+ * Answers an MCP elicitation card. The server validates accepted values
+ * against the requested schema and reports field errors (`errors`) — the
+ * card shows them; values themselves are never logged anywhere.
+ */
+export async function answerRunPause(
+  conversationId: string,
+  requestId: string,
+  answer: RunPauseAnswer,
+): Promise<{ ok: boolean; reason?: string; errors?: string[] }> {
+  const response = await authedFetch("/runs/answer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId, requestId, answer }),
+  });
+  const data = (await response.json().catch(() => ({}))) as { ok?: unknown; reason?: unknown; errors?: unknown };
+  return {
+    ok: data.ok === true,
+    ...(typeof data.reason === "string" ? { reason: data.reason } : {}),
+    ...(Array.isArray(data.errors) ? { errors: data.errors.filter((item): item is string => typeof item === "string") } : {}),
+  };
 }
 
 export async function ackServerRun(runId: string): Promise<void> {

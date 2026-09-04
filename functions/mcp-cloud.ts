@@ -1,9 +1,38 @@
+import {
+  isUiOnlyTool,
+  mcpInitialize,
+  mcpListAll,
+  mcpRequest,
+  mcpResourceLinks,
+  normalizePromptInfo,
+  normalizeResourceInfo,
+  normalizeResourceTemplateInfo,
+  normalizeToolAnnotations,
+  parseJsonRpcPayload,
+  redactMcpText,
+  redactMcpValue,
+  selectRpcResponse,
+  stringifyMcpPromptContent,
+  stringifyMcpResourceRead,
+  stringifyMcpToolResult,
+  type JsonRpcMessage,
+  type McpFetch,
+  type McpNotification,
+  type McpPromptInfo,
+  type McpProtocolSession,
+  type McpResourceInfo,
+  type McpResourceTemplateInfo,
+  type McpServerRequest,
+  type McpServerRequestReply,
+  type McpToolAnnotations,
+} from "./mcp-protocol";
 import { fetchPublicHttps, safePublicHttpsUrl } from "./network-safety";
 
 // Cloud-side MCP for scheduled automation runs: decides which of the
 // profile's connected servers can fire without the browser, and speaks the
 // MCP Streamable HTTP protocol (initialize → tools/list → tools/call)
-// directly from the Worker — no CORS constraints here, so no relay hop.
+// directly from the Worker through the shared protocol core
+// (mcp-protocol.ts) — no CORS constraints here, so no relay hop.
 //
 // Every connected server reaches cloud runs: pasted keys and custom headers
 // sync inside the profile blob, browser sign-ins sync as OAuth grants (and
@@ -74,18 +103,16 @@ export type CloudMcpTool = {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  /** Display title from the tool or its annotations. */
+  title?: string;
+  /** Spec annotations (readOnlyHint, destructiveHint, …) as the server declared them. */
+  annotations?: McpToolAnnotations;
+  /** MCP Apps: renders its own UI — never offered to the model. */
+  uiOnly?: boolean;
 };
 
-export type CloudMcpSession = {
-  url: string;
-  headers: Record<string, string>;
-  omitMcpHeaders: boolean;
-  protocolVersion?: string;
-  sessionId?: string;
-  nextId: number;
-  /** Exact server-owned values stripped from every provider-originated surface. */
-  redactions?: string[];
-};
+/** One live Streamable HTTP session — the shared protocol session shape. */
+export type CloudMcpSession = McpProtocolSession;
 
 function credentialVariants(values: string[]): string[] {
   const variants = new Set<string>();
@@ -107,32 +134,12 @@ function credentialVariants(values: string[]): string[] {
 
 /** Redacts exact server-owned credentials before output reaches an LLM, log, or row. */
 export function redactCloudMcpText(text: string, credentials: string[]): string {
-  let redacted = text;
-  for (const credential of credentialVariants(credentials)) {
-    redacted = redacted.split(credential).join("[REDACTED_CREDENTIAL]");
-  }
-  return redacted;
+  return redactMcpText(text, credentials);
 }
 
 /** Deep string redaction for provider-controlled schemas and structured output. */
 export function redactCloudMcpValue(value: unknown, credentials: string[], depth: number = 0): unknown {
-  if (typeof value === "string") {
-    return redactCloudMcpText(value, credentials);
-  }
-  if (depth >= 20) {
-    return "[REDACTED_DEEP_PROVIDER_VALUE]";
-  }
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactCloudMcpValue(item, credentials, depth + 1));
-  }
-  const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    output[redactCloudMcpText(key, credentials)] = redactCloudMcpValue(item, credentials, depth + 1);
-  }
-  return output;
+  return redactMcpValue(value, credentials, depth);
 }
 
 /** Every exact credential value a server carries — for redacting provider-originated text. */
@@ -857,353 +864,176 @@ export async function forceRefreshCloudOAuth(
   return (await forceRefreshCloudOAuthOutcome(server, refreshed, persist, begin)).ok;
 }
 
-type JsonRpcResponse = {
-  id?: number | string;
-  result?: unknown;
-  error?: { code?: number; message?: string };
-};
-
-function protocolHeaders(session: CloudMcpSession): Record<string, string> {
-  if (session.omitMcpHeaders) {
-    return {};
-  }
-  return {
-    "MCP-Protocol-Version": session.protocolVersion ?? MCP_PROTOCOL_VERSION,
-    ...(session.sessionId ? { "Mcp-Session-Id": session.sessionId } : {}),
-  };
-}
-
-function jsonRpcMessages(payload: string): JsonRpcResponse[] {
-  const parsed = JSON.parse(payload) as unknown;
-  const values = Array.isArray(parsed) ? parsed : [parsed];
-  return values.filter(isRecord).map((value) => value as JsonRpcResponse);
-}
+type JsonRpcResponse = JsonRpcMessage;
 
 /**
  * Streamable HTTP may emit progress/log notifications before the response.
  * Read every SSE event and select the response for this request id instead of
  * accidentally treating the first notification as an empty tool result.
+ * (Kept as a thin wrapper over the protocol core for existing callers/tests.)
  */
 export function parseCloudMcpRpcResponse(text: string, expectedId: number): JsonRpcResponse {
-  const trimmed = text.trim();
-  let messages: JsonRpcResponse[] = [];
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-    messages = jsonRpcMessages(trimmed);
-  } else {
-    for (const event of text.split(/\r?\n\r?\n/)) {
-      const payload = event
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n")
-        .trim();
-      if (!payload || payload === "[DONE]") {
-        continue;
-      }
-      messages.push(...jsonRpcMessages(payload));
-    }
+  const selected = selectRpcResponse(parseJsonRpcPayload(text), expectedId);
+  if (!selected) {
+    throw new Error(`no JSON-RPC response for request ${expectedId}`);
   }
-  const responses = messages.filter((message) => "result" in message || "error" in message);
-  const exact = responses.find((message) => String(message.id) === String(expectedId));
-  if (exact) {
-    return exact;
-  }
-  // Keep compatibility with a few non-conforming stateless servers that omit
-  // an id, but never accept a mismatched id from another request.
-  if (responses.length === 1 && responses[0].id === undefined) {
-    return responses[0];
-  }
-  throw new Error(`no JSON-RPC response for request ${expectedId}`);
+  return selected;
 }
 
-const MAX_MCP_RESPONSE_CHARS = 2_000_000;
-
-async function readLimitedResponseText(response: Response): Promise<string> {
-  if (!response.body) {
-    const text = await response.text();
-    if (text.length > MAX_MCP_RESPONSE_CHARS) {
-      throw new Error("MCP response was too large");
-    }
-    return text;
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) {
-        text += decoder.decode();
-        return text;
-      }
-      text += decoder.decode(chunk.value, { stream: true });
-      if (text.length > MAX_MCP_RESPONSE_CHARS) {
-        throw new Error("MCP response was too large");
-      }
-    }
-  } finally {
-    await reader.cancel().catch(() => undefined);
-  }
-}
-
-async function readCloudRpcResponse(response: Response, expectedId: number): Promise<JsonRpcResponse> {
-  if (!response.body) {
-    return parseCloudMcpRpcResponse(await readLimitedResponseText(response), expectedId);
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) {
-        text += decoder.decode();
-        return parseCloudMcpRpcResponse(text, expectedId);
-      }
-      text += decoder.decode(chunk.value, { stream: true });
-      if (text.length > MAX_MCP_RESPONSE_CHARS) {
-        throw new Error("MCP response was too large");
-      }
-      try {
-        return parseCloudMcpRpcResponse(text, expectedId);
-      } catch {
-        // Long-lived SSE: keep reading only until this request's event lands.
-      }
-    }
-  } finally {
-    await reader.cancel().catch(() => undefined);
-  }
-}
-
-async function rpc(
-  session: CloudMcpSession,
-  method: string,
-  params: unknown,
-  timeoutMs: number,
-): Promise<unknown> {
-  session.nextId += 1;
-  const requestId = session.nextId;
-  const response = await fetchPublicHttps(session.url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      ...protocolHeaders(session),
-      ...session.headers,
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params: params ?? {} }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const sessionHeader = response.headers.get("mcp-session-id");
-  if (sessionHeader) {
-    session.sessionId = sessionHeader;
-    session.redactions = credentialVariants([...(session.redactions ?? []), sessionHeader]);
-  }
-  if (!response.ok) {
-    await readLimitedResponseText(response);
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(
-        `auth rejected (${response.status}) — the synced sign-in or key was refused; open Gera and reconnect this server so a fresh credential syncs`,
-      );
-    }
-    throw new Error(`HTTP ${response.status}`);
-  }
-  let parsed: JsonRpcResponse;
-  try {
-    parsed = await readCloudRpcResponse(response, requestId);
-  } catch (error) {
-    if (error instanceof Error && /too large/i.test(error.message)) {
-      throw error;
-    }
-    throw new Error("unexpected response shape");
-  }
-  if (parsed.error) {
-    throw new Error(redactCloudMcpText(parsed.error.message || "MCP request failed", session.redactions ?? []));
-  }
-  return parsed.result;
+/** One JSON-RPC request on a live session (timeouts are idle timeouts — handlers may pause them). */
+async function rpc(session: CloudMcpSession, method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+  return mcpRequest(session, method, params, timeoutMs);
 }
 
 /** Default page budget for one tools/list walk; deferred loading raises it. */
 const DEFAULT_MAX_TOOLS = 500;
+/** Prompts and resources listed during an inventory handshake (bounded, cached). */
+const MAX_INVENTORY_PROMPTS = 200;
+const MAX_INVENTORY_RESOURCES = 300;
+const MAX_INVENTORY_TEMPLATES = 100;
 
 export type ConnectCloudMcpOptions = {
   /** Stop listing after this many tools (default 500). */
   maxTools?: number;
   /** Keep tools the user disabled — catalog caches store the full remote table. */
   includeDisabled?: boolean;
+  /** Also list prompts, resources and resource templates (capability-gated). */
+  inventory?: boolean;
+  /** Injected transport (conformance tests); production keeps the public-HTTPS guard. */
+  fetch?: McpFetch;
+  /** Answers server → client requests (elicitation/create, roots/list…) on any stream. */
+  onServerRequest?: (request: McpServerRequest) => Promise<McpServerRequestReply>;
+  /** Receives notifications (list_changed, progress, logging) on any stream. */
+  onNotification?: (notification: McpNotification) => void;
 };
 
-/** initialize → initialized → tools/list; returns a live session + its tools. */
+export type CloudMcpConnection = {
+  session: CloudMcpSession;
+  tools: CloudMcpTool[];
+  prompts: McpPromptInfo[];
+  resources: McpResourceInfo[];
+  resourceTemplates: McpResourceTemplateInfo[];
+};
+
+/** Turns one raw `tools/list` entry into the redacted catalog shape; null when unusable. */
+export function normalizeCloudMcpTool(raw: Record<string, unknown>, redactions: string[]): CloudMcpTool | null {
+  const name = typeof raw.name === "string" ? raw.name : "";
+  if (!name || redactCloudMcpText(name, redactions) !== name) {
+    return null;
+  }
+  const rawDescription = typeof raw.description === "string" && raw.description ? raw.description : name;
+  const inputSchema = isRecord(raw.inputSchema) ? raw.inputSchema : { type: "object", properties: {} };
+  const annotations = normalizeToolAnnotations(raw.annotations);
+  const title =
+    typeof raw.title === "string" && raw.title.trim()
+      ? redactCloudMcpText(raw.title.trim().slice(0, 200), redactions)
+      : annotations?.title;
+  const uiOnly = isUiOnlyTool(raw);
+  return {
+    name,
+    description: redactCloudMcpText(rawDescription, redactions),
+    inputSchema: redactCloudMcpValue(inputSchema, redactions) as Record<string, unknown>,
+    ...(title ? { title } : {}),
+    ...(annotations ? { annotations } : {}),
+    ...(uiOnly ? { uiOnly: true } : {}),
+  };
+}
+
+/** Lists tools on a live session (used by the first handshake and by list_changed refreshes). */
+export async function listCloudMcpTools(
+  session: CloudMcpSession,
+  server: Pick<CloudMcpServer, "disabledTools">,
+  options: { maxTools?: number; includeDisabled?: boolean } = {},
+): Promise<CloudMcpTool[]> {
+  const maxTools = Math.max(1, Math.floor(options.maxTools ?? DEFAULT_MAX_TOOLS));
+  const rawTools = await mcpListAll(session, "tools/list", "tools", {
+    maxItems: maxTools,
+    maxPages: 20,
+    timeoutMs: CONNECT_TIMEOUT_MS,
+  });
+  const redactions = session.redactions ?? [];
+  const tools: CloudMcpTool[] = [];
+  for (const raw of rawTools) {
+    const tool = normalizeCloudMcpTool(raw, redactions);
+    if (!tool || (!options.includeDisabled && server.disabledTools.includes(tool.name))) {
+      continue;
+    }
+    tools.push(tool);
+  }
+  return tools;
+}
+
+/** Lists prompts, resources and templates the server's capabilities advertise. */
+export async function listCloudMcpInventory(
+  session: CloudMcpSession,
+): Promise<Pick<CloudMcpConnection, "prompts" | "resources" | "resourceTemplates">> {
+  const redactions = session.redactions ?? [];
+  const clean = <T>(value: T): T => redactCloudMcpValue(value, redactions) as T;
+  const prompts: McpPromptInfo[] = [];
+  const resources: McpResourceInfo[] = [];
+  const resourceTemplates: McpResourceTemplateInfo[] = [];
+  if (session.capabilities?.prompts) {
+    for (const raw of await mcpListAll(session, "prompts/list", "prompts", { maxItems: MAX_INVENTORY_PROMPTS, timeoutMs: CONNECT_TIMEOUT_MS })) {
+      const prompt = normalizePromptInfo(raw);
+      if (prompt) prompts.push(clean(prompt));
+    }
+  }
+  if (session.capabilities?.resources) {
+    for (const raw of await mcpListAll(session, "resources/list", "resources", { maxItems: MAX_INVENTORY_RESOURCES, timeoutMs: CONNECT_TIMEOUT_MS })) {
+      const resource = normalizeResourceInfo(raw);
+      if (resource) resources.push(clean(resource));
+    }
+    try {
+      for (const raw of await mcpListAll(session, "resources/templates/list", "resourceTemplates", { maxItems: MAX_INVENTORY_TEMPLATES, timeoutMs: CONNECT_TIMEOUT_MS })) {
+        const template = normalizeResourceTemplateInfo(raw);
+        if (template) resourceTemplates.push(clean(template));
+      }
+    } catch {
+      // Templates are optional; a server advertising resources may still reject the method.
+    }
+  }
+  return { prompts, resources, resourceTemplates };
+}
+
+/** initialize → initialized → tools/list (+ optional inventory); returns a live session + its tables. */
 export async function connectCloudMcp(
   server: CloudMcpServer,
   options: ConnectCloudMcpOptions = {},
-): Promise<{ session: CloudMcpSession; tools: CloudMcpTool[] }> {
-  const maxTools = Math.max(1, Math.floor(options.maxTools ?? DEFAULT_MAX_TOOLS));
+): Promise<CloudMcpConnection> {
   const headers: Record<string, string> = { ...server.headers };
   if (server.oauth && !headers.Authorization) {
     headers.Authorization = `Bearer ${server.oauth.accessToken}`;
   }
-  const redactions = serverCredentialValues(server);
   const session: CloudMcpSession = {
     url: server.url,
     headers,
     omitMcpHeaders: server.omitMcpHeaders,
     protocolVersion: MCP_PROTOCOL_VERSION,
     nextId: 0,
-    redactions,
+    redactions: serverCredentialValues(server),
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+    ...(options.onServerRequest ? { onServerRequest: options.onServerRequest } : {}),
+    ...(options.onNotification ? { onNotification: options.onNotification } : {}),
   };
-  const initialized = (await rpc(
-    session,
-    "initialize",
-    {
-      protocolVersion: MCP_PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: { name: "Gera AI cloud runs", version: "1.0.0" },
-    },
-    CONNECT_TIMEOUT_MS,
-  )) as { protocolVersion?: unknown } | null;
-  if (typeof initialized?.protocolVersion === "string" && /^\d{4}-\d{2}-\d{2}$/.test(initialized.protocolVersion)) {
-    session.protocolVersion = initialized.protocolVersion;
-  }
-  try {
-    await fetchPublicHttps(session.url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        ...protocolHeaders(session),
-        ...session.headers,
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-      signal: AbortSignal.timeout(6_000),
-    });
-  } catch {
-    // the initialized notification is best-effort
-  }
-  const rawTools: Array<Record<string, unknown>> = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < 20 && rawTools.length < maxTools; page += 1) {
-    const listed = (await rpc(session, "tools/list", cursor ? { cursor } : {}, CONNECT_TIMEOUT_MS)) as {
-      tools?: Array<Record<string, unknown>>;
-      nextCursor?: unknown;
-    } | null;
-    rawTools.push(...(listed?.tools ?? []).slice(0, maxTools - rawTools.length));
-    cursor = typeof listed?.nextCursor === "string" && listed.nextCursor ? listed.nextCursor : undefined;
-    if (!cursor) {
-      break;
-    }
-  }
-  const tools: CloudMcpTool[] = [];
-  const providerRedactions = session.redactions ?? redactions;
-  for (const raw of rawTools) {
-    const name = typeof raw.name === "string" ? raw.name : "";
-    if (
-      !name ||
-      (!options.includeDisabled && server.disabledTools.includes(name)) ||
-      redactCloudMcpText(name, providerRedactions) !== name
-    ) {
-      continue;
-    }
-    const rawDescription = typeof raw.description === "string" && raw.description ? raw.description : name;
-    const inputSchema = isRecord(raw.inputSchema) ? raw.inputSchema : { type: "object", properties: {} };
-    tools.push({
-      name,
-      description: redactCloudMcpText(rawDescription, providerRedactions),
-      inputSchema: redactCloudMcpValue(inputSchema, providerRedactions) as Record<string, unknown>,
-    });
-  }
-  return { session, tools };
+  await mcpInitialize(session, {
+    clientInfo: { name: "Gera AI cloud runs", version: "1.0.0" },
+    timeoutMs: CONNECT_TIMEOUT_MS,
+  });
+  const tools = await listCloudMcpTools(session, server, {
+    maxTools: options.maxTools,
+    includeDisabled: options.includeDisabled,
+  });
+  const inventory = options.inventory
+    ? await listCloudMcpInventory(session)
+    : { prompts: [], resources: [], resourceTemplates: [] };
+  return { session, tools, ...inventory };
 }
 
 const MAX_RESOURCE_LINK_READS = 4;
 
-function jsonText(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function resourceHeading(resource: Record<string, unknown>): string {
-  const uri = typeof resource.uri === "string" ? resource.uri : "resource";
-  const mime = typeof resource.mimeType === "string" && resource.mimeType ? ` · ${resource.mimeType}` : "";
-  return `[Resource ${uri}${mime}]`;
-}
-
-function stringifyResource(resource: Record<string, unknown>): string {
-  const heading = resourceHeading(resource);
-  if (typeof resource.text === "string") {
-    return `${heading}\n${resource.text}`;
-  }
-  if (typeof resource.blob === "string") {
-    return `${heading}\n[Binary data omitted · ${resource.blob.length} base64 chars]`;
-  }
-  return heading;
-}
-
-function stringifyContentPart(part: unknown): string {
-  if (!isRecord(part)) {
-    return jsonText(part);
-  }
-  if (typeof part.text === "string") {
-    return part.text;
-  }
-  if (part.type === "resource" && isRecord(part.resource)) {
-    return stringifyResource(part.resource);
-  }
-  if (part.type === "resource_link" && typeof part.uri === "string") {
-    const label = typeof part.name === "string" && part.name ? `${part.name} · ` : "";
-    return `[Resource link ${label}${part.uri}]`;
-  }
-  if ((part.type === "image" || part.type === "audio") && typeof part.data === "string") {
-    const mime = typeof part.mimeType === "string" && part.mimeType ? ` · ${part.mimeType}` : "";
-    return `[${part.type} content omitted${mime} · ${part.data.length} base64 chars]`;
-  }
-  return jsonText(part);
-}
-
 /** Flattens text, embedded resources, and structured MCP results for the model. */
 export function stringifyCloudMcpResult(result: unknown): string {
-  if (typeof result === "string") {
-    return result;
-  }
-  if (!isRecord(result)) {
-    return jsonText(result);
-  }
-  const pieces = Array.isArray(result.content)
-    ? result.content.map(stringifyContentPart).filter((part) => part.length > 0)
-    : [];
-  if (result.structuredContent !== undefined) {
-    pieces.push(`[Structured content]\n${jsonText(result.structuredContent)}`);
-  }
-  const text = pieces.join("\n");
-  return result.isError === true ? `Tool reported an error${text ? `:\n${text}` : "."}` : text;
-}
-
-function resourceLinks(result: unknown): string[] {
-  if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) {
-    return [];
-  }
-  const links: string[] = [];
-  for (const part of result.content) {
-    if (isRecord(part) && part.type === "resource_link" && typeof part.uri === "string" && part.uri) {
-      if (!links.includes(part.uri)) {
-        links.push(part.uri);
-      }
-    }
-  }
-  return links.slice(0, MAX_RESOURCE_LINK_READS);
-}
-
-function stringifyResourceReadResult(result: unknown): string {
-  if (!isRecord(result) || !Array.isArray(result.contents)) {
-    return jsonText(result);
-  }
-  return result.contents
-    .map((content) => (isRecord(content) ? stringifyResource(content) : jsonText(content)))
-    .filter((content) => content.length > 0)
-    .join("\n");
+  return stringifyMcpToolResult(result);
 }
 
 /**
@@ -1225,10 +1055,10 @@ export async function callCloudMcpTool(
     throw new Error(rendered || "MCP tool reported an error.");
   }
   const pieces = [rendered];
-  for (const uri of resourceLinks(result)) {
+  for (const uri of mcpResourceLinks(result, MAX_RESOURCE_LINK_READS)) {
     try {
       const resource = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
-      const text = redactCloudMcpText(stringifyResourceReadResult(resource), redactions);
+      const text = redactCloudMcpText(stringifyMcpResourceRead(resource), redactions);
       if (text) {
         pieces.push(text);
       }
@@ -1243,6 +1073,112 @@ export async function callCloudMcpTool(
   return output.length > MAX_MCP_RENDER_CHARS
     ? `${output.slice(0, MAX_MCP_RENDER_CHARS)}\n… [MCP result truncated]`
     : output;
+}
+
+/** Text cap for one resource read handed to the composer as an attachment. */
+export const RESOURCE_TEXT_CHARS = 300_000;
+/** Base64 cap for one binary resource handed to the composer (4 MB of bytes). */
+export const RESOURCE_BLOB_BASE64_CHARS = Math.ceil((4 * 1024 * 1024) / 3) * 4;
+
+export type CloudMcpResourceContent = {
+  uri: string;
+  mimeType?: string;
+  /** Text content, capped at RESOURCE_TEXT_CHARS with `truncated` set. */
+  text?: string;
+  truncated?: boolean;
+  /** Base64 bytes when the blob fits the 4 MB cap. */
+  blob?: string;
+  /** Set when a binary body was too large to ship; `size` is the byte estimate. */
+  omitted?: boolean;
+  size?: number;
+};
+
+/** `resources/read` for the composer's @-mentions: text capped honestly, blobs bounded. */
+export async function readCloudMcpResource(session: CloudMcpSession, uri: string): Promise<CloudMcpResourceContent[]> {
+  const result = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
+  const redactions = session.redactions ?? [];
+  if (!isRecord(result) || !Array.isArray(result.contents)) {
+    throw new Error("resources/read returned no contents");
+  }
+  const out: CloudMcpResourceContent[] = [];
+  for (const raw of result.contents.slice(0, 8)) {
+    if (!isRecord(raw)) {
+      continue;
+    }
+    const entry: CloudMcpResourceContent = {
+      uri: typeof raw.uri === "string" ? redactCloudMcpText(raw.uri, redactions) : uri,
+      ...(typeof raw.mimeType === "string" && raw.mimeType ? { mimeType: raw.mimeType.slice(0, 200) } : {}),
+    };
+    if (typeof raw.text === "string") {
+      const text = redactCloudMcpText(raw.text, redactions);
+      if (text.length > RESOURCE_TEXT_CHARS) {
+        entry.text = text.slice(0, RESOURCE_TEXT_CHARS);
+        entry.truncated = true;
+      } else {
+        entry.text = text;
+      }
+    } else if (typeof raw.blob === "string") {
+      const size = Math.floor((raw.blob.length * 3) / 4);
+      if (raw.blob.length > RESOURCE_BLOB_BASE64_CHARS) {
+        entry.omitted = true;
+        entry.size = size;
+      } else {
+        entry.blob = raw.blob;
+        entry.size = size;
+      }
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
+export type CloudMcpPromptMessage = {
+  role: "user" | "assistant";
+  /** Flattened text (embedded resources included, media described). */
+  text: string;
+  /** Inline image when the part was an image small enough to ship. */
+  image?: { data: string; mimeType: string };
+};
+
+export type CloudMcpPromptResult = {
+  description?: string;
+  messages: CloudMcpPromptMessage[];
+};
+
+/** `prompts/get` for the composer's slash menu: messages flattened per role. */
+export async function getCloudMcpPrompt(
+  session: CloudMcpSession,
+  name: string,
+  args: Record<string, string>,
+): Promise<CloudMcpPromptResult> {
+  const result = await rpc(session, "prompts/get", { name, arguments: args }, CALL_TIMEOUT_MS);
+  const redactions = session.redactions ?? [];
+  if (!isRecord(result) || !Array.isArray(result.messages)) {
+    throw new Error("prompts/get returned no messages");
+  }
+  const messages: CloudMcpPromptMessage[] = [];
+  for (const raw of result.messages.slice(0, 40)) {
+    if (!isRecord(raw)) {
+      continue;
+    }
+    const role = raw.role === "assistant" ? "assistant" : "user";
+    const content = raw.content;
+    const image =
+      isRecord(content) &&
+      content.type === "image" &&
+      typeof content.data === "string" &&
+      content.data.length <= RESOURCE_BLOB_BASE64_CHARS
+        ? { data: content.data, mimeType: typeof content.mimeType === "string" && content.mimeType ? content.mimeType : "image/png" }
+        : undefined;
+    const text = image ? "" : redactCloudMcpText(stringifyMcpPromptContent(content), redactions);
+    messages.push({ role, text: text.length > RESOURCE_TEXT_CHARS ? `${text.slice(0, RESOURCE_TEXT_CHARS)}\n… [truncated]` : text, ...(image ? { image } : {}) });
+  }
+  return {
+    ...(typeof result.description === "string" && result.description
+      ? { description: redactCloudMcpText(result.description.slice(0, 2_000), redactions) }
+      : {}),
+    messages,
+  };
 }
 
 /** Collision-resistant mirror of the browser's MCP function namespace. */

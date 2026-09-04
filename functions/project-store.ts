@@ -3983,6 +3983,10 @@ export class ProjectStore extends DurableObject {
             mode: resolved.toolLoading,
             surface: "background",
             catalog,
+            // Agent runs are short and background: no GET notification stream
+            // to keep alive (list_changed reaches them through the owner's
+            // catalog cache on the next resolve); elicitation is declined.
+            notificationStreams: false,
             nativeCap: Math.max(0, AGENT_TOOL_CAP - routes.size),
             reconnect: async (serverId) => {
               const forced = await this.resolveOwnerMcp(selection, [serverId]);

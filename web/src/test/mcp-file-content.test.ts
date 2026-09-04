@@ -184,55 +184,9 @@ describe("generic MCP file-content transport", () => {
     }
   });
 
-  it("follows a resource_link through resources/read in a cloud project-agent session", async () => {
-    const methods: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { id: number; method: string };
-        methods.push(body.method);
-        if (body.method === "tools/call") {
-          return sseResponse([
-            { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } },
-            {
-              jsonrpc: "2.0",
-              id: body.id,
-              result: {
-                content: [{ type: "resource_link", uri: "file:///project/src/main.ts", name: "main.ts" }],
-              },
-            },
-          ]);
-        }
-        if (body.method === "resources/read") {
-          return jsonResponse({
-            jsonrpc: "2.0",
-            id: body.id,
-            result: {
-              contents: [
-                {
-                  uri: "file:///project/src/main.ts",
-                  mimeType: "text/typescript",
-                  text: "RESOURCE_FILE_BODY",
-                },
-              ],
-            },
-          });
-        }
-        throw new Error(`Unexpected method ${body.method}`);
-      }),
-    );
-    const session: CloudMcpSession = {
-      url: "https://mcp.example.com",
-      headers: { Authorization: "Bearer secret" },
-      omitMcpHeaders: false,
-      nextId: 0,
-    };
-
-    await expect(callCloudMcpTool(session, "read_file", { path: "src/main.ts" })).resolves.toContain(
-      "RESOURCE_FILE_BODY",
-    );
-    expect(methods).toEqual(["tools/call", "resources/read"]);
-  });
+  // The cloud session's resource_link follow-up (tools/call → resources/read on
+  // the same authenticated session) runs against the real SDK server in
+  // mcp-conformance.test.ts.
 
   it("follows resource links in the browser MCP client as well", async () => {
     const methods: string[] = [];

@@ -1,11 +1,14 @@
 import {
   TID,
+  composerMcpItemTid,
   effortOptionTid,
+  mcpArgsFieldTid,
   mcpCatalogConnectTid,
   mcpLoadingOptionTid,
   mcpServerCardTid,
   modelOptionTid,
   runModeOptionTid,
+  runPauseFieldTid,
   studioPageTid,
   studioTabTid,
 } from "../src/lib/testids";
@@ -38,6 +41,21 @@ export const STUB_MCP_PROMPT = "Ask DeepWiki through the deferred MCP tools";
 
 /** Server · tool label the deferred MCP call row must show. */
 export const STUB_MCP_CALL_LABEL = "deepwiki · ask_question";
+
+/** Prompt marker that makes the platform stub pause the run on an MCP elicitation card before replying. */
+export const STUB_ELICIT_PROMPT = "Deploy through the MCP server that asks for a region";
+
+/** MCP server / prompt / resource the platform stub lists for the composer menus. */
+export const STUB_MCP_SERVER_ID = "deepwiki";
+export const STUB_MCP_PROMPT_NAME = "explain_repo";
+export const STUB_MCP_PROMPT_ARG = "repoName";
+/** Text the stubbed prompts/get returns — must land in the composer input. */
+export const STUB_MCP_PROMPT_TEXT = "Explain the repository acme/private-app in plain words";
+export const STUB_MCP_RESOURCE_URI = "wiki://acme/private-app/README";
+/** Attachment label the stubbed resources/read produces (server · file name). */
+export const STUB_MCP_RESOURCE_LABEL = "README";
+/** Field the stubbed elicitation asks for. */
+export const STUB_ELICIT_FIELD = "region";
 
 /** Curated chat model every platform's picker must offer. */
 export const SWITCH_TARGET_MODEL_ID = "anthropic/claude-opus-5";
@@ -258,6 +276,53 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "seeText", target: TID.messageToolCall, text: STUB_MCP_CALL_LABEL, timeoutMs: 20_000 },
       { do: "seeText", target: TID.messageToolCall, text: "done" },
       { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
+    ],
+  },
+  {
+    id: "prompt-slash",
+    title: "Slash menu lists MCP prompts, collects arguments, and inserts the prompt text",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "fill", target: TID.composerInput, text: "/expl" },
+      { do: "see", target: TID.composerMcpMenu, timeoutMs: 15_000 },
+      { do: "tap", target: composerMcpItemTid("prompt", STUB_MCP_SERVER_ID, STUB_MCP_PROMPT_NAME) },
+      // The prompt declares a required argument → the form opens first.
+      { do: "see", target: TID.mcpArgsDialog },
+      { do: "fill", target: mcpArgsFieldTid(STUB_MCP_PROMPT_ARG), text: "acme/private-app" },
+      { do: "tap", target: TID.mcpArgsSubmit },
+      { do: "seeValue", target: TID.composerInput, text: STUB_MCP_PROMPT_TEXT, timeoutMs: 15_000 },
+      { do: "notSee", target: TID.mcpArgsDialog },
+    ],
+  },
+  {
+    id: "resource-mention",
+    title: "@ menu lists MCP resources and attaches the one picked",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "fill", target: TID.composerInput, text: "@READ" },
+      { do: "see", target: TID.composerMcpMenu, timeoutMs: 15_000 },
+      { do: "tap", target: composerMcpItemTid("resource", STUB_MCP_SERVER_ID, STUB_MCP_RESOURCE_URI) },
+      { do: "seeText", target: TID.composerAttachment, text: STUB_MCP_RESOURCE_LABEL, timeoutMs: 15_000 },
+      // The mention stays in the message so the model knows what was attached.
+      { do: "seeValue", target: TID.composerInput, text: `@${STUB_MCP_SERVER_ID}/${STUB_MCP_RESOURCE_URI}` },
+    ],
+  },
+  {
+    id: "elicitation-accept",
+    title: "An MCP elicitation pauses the run on a card; accepting resumes it",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "tap", target: TID.sidebarNewChat },
+      { do: "fill", target: TID.composerInput, text: STUB_ELICIT_PROMPT },
+      { do: "tap", target: TID.composerSend },
+      { do: "see", target: TID.runPauseCard, timeoutMs: 20_000 },
+      { do: "fill", target: runPauseFieldTid(STUB_ELICIT_FIELD), text: "eu" },
+      { do: "tap", target: TID.runPauseAccept },
+      { do: "seeText", target: TID.messageAssistant, text: STUB_REPLY_SNIPPET, timeoutMs: 20_000 },
+      { do: "notSee", target: TID.runPauseCard },
     ],
   },
   {

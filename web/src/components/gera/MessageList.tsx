@@ -23,6 +23,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { CodeChangeFlow } from "@/components/gera/CodeChangeFlow";
 import { RepoPreviewFlow } from "@/components/gera/RepoPreviewFlow";
+import { RunPauseCard } from "@/components/gera/RunPauseCard";
 import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { JuliusPanel } from "@/components/gera/JuliusPanel";
 import { MediaAudioCard, MediaImageCard, MediaImageGrid, MediaVideoCard } from "@/components/gera/VaultMedia";
@@ -106,11 +107,14 @@ export function MessageList({
   messages,
   streaming,
   readOnly = false,
+  conversationId,
 }: {
   messages: ChatMessage[];
   streaming: boolean;
   /** Shared/public rendering: no edit-and-resend, no Julius winner picking. */
   readOnly?: boolean;
+  /** Thread id — needed to answer elicitation cards of a live run. */
+  conversationId?: string;
 }) {
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-4 py-8">
@@ -123,6 +127,7 @@ export function MessageList({
             streaming={streaming && isLast && message.role === "assistant"}
             busy={streaming}
             readOnly={readOnly}
+            conversationId={conversationId}
           />
         );
       })}
@@ -146,11 +151,13 @@ function MessageBubble({
   streaming,
   busy,
   readOnly,
+  conversationId,
 }: {
   message: ChatMessage;
   streaming: boolean;
   busy: boolean;
   readOnly: boolean;
+  conversationId?: string;
 }) {
   if (message.role === "user") {
     return <UserBubble message={message} busy={busy} readOnly={readOnly} />;
@@ -202,6 +209,11 @@ function MessageBubble({
         ) : null}
         {message.codeChanges ? <CodeChangeFlow flow={message.codeChanges} /> : null}
         {message.repoPreview ? <RepoPreviewFlow initialJob={message.repoPreview} readOnly={readOnly} /> : null}
+        {!readOnly && conversationId && streaming && message.pauses && message.pauses.length > 0
+          ? message.pauses.map((request) => (
+              <RunPauseCard key={request.id} request={request} conversationId={conversationId} />
+            ))
+          : null}
         {ordinaryToolCalls.length > 0 ? (
           <div className="mb-3 flex flex-col gap-1.5">
             {ordinaryToolCalls.map((call) => {

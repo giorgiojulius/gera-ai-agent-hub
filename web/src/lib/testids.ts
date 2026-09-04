@@ -167,6 +167,17 @@ export const TID = {
   settingsMcpLoading: "settings-mcp-loading",
   /** One tool-call row under an assistant reply (repeats; MCP meta calls render as "MCP · server · tool"). */
   messageToolCall: "message-tool-call",
+  /** Composer `/` (prompts) or `@` (resources) MCP menu panel. */
+  composerMcpMenu: "composer-mcp-menu",
+  /** Prompt-arguments / template-variables dialog opened from the MCP menu. */
+  mcpArgsDialog: "mcp-args-dialog",
+  mcpArgsSubmit: "mcp-args-submit",
+  /** One open elicitation card under a live reply (repeats). */
+  runPauseCard: "run-pause-card",
+  runPauseAccept: "run-pause-accept",
+  runPauseDecline: "run-pause-decline",
+  /** One annotation badge on an MCP tool row in McpStudio (read-only, destructive, UI-only…). */
+  mcpToolBadge: "mcp-tool-badge",
 } as const;
 
 /** All registry values, for uniqueness checks in tests. */
@@ -200,6 +211,25 @@ export function mcpLoadingOptionTid(mode: string): string {
 /** Connected/configured MCP card in "Your tools". */
 export function mcpServerCardTid(serverId: string): string {
   return `mcp-server-${serverId}`;
+}
+
+function tidSlug(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 80);
+}
+
+/** One row of the composer MCP menu: kind "prompt" | "resource" | "template", server id, prompt name / URI. */
+export function composerMcpItemTid(kind: string, serverId: string, name: string): string {
+  return `composer-mcp-${kind}-${tidSlug(serverId)}-${tidSlug(name)}`;
+}
+
+/** One input of the MCP prompt-arguments / template-variables dialog. */
+export function mcpArgsFieldTid(name: string): string {
+  return `mcp-args-field-${tidSlug(name)}`;
+}
+
+/** One input of an elicitation card form. */
+export function runPauseFieldTid(name: string): string {
+  return `run-pause-field-${tidSlug(name)}`;
 }
 
 /** Content root of one workspace page (automations, hub, mcp, settings…). */

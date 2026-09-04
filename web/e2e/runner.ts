@@ -24,6 +24,8 @@ export type E2eDriver = {
   /** Waits until the target is unmounted or visually hidden (fade-outs count). */
   notSee: (target: string, timeoutMs: number) => Promise<void>;
   seeText: (target: string, text: string, timeoutMs: number) => Promise<void>;
+  /** Waits until an input/textarea target's value contains the fragment. */
+  seeValue: (target: string, text: string, timeoutMs: number) => Promise<void>;
   /** Waits until the current address (path + query) contains the fragment. */
   urlContains: (text: string, timeoutMs: number) => Promise<void>;
 };
@@ -42,6 +44,8 @@ export function stepLabel(step: E2eStep): string {
       return `not see ${step.target}`;
     case "seeText":
       return `see "${step.text}" in ${step.target}`;
+    case "seeValue":
+      return `value of ${step.target} contains "${step.text}"`;
     case "urlContains":
       return `url contains "${step.text}"`;
   }
@@ -61,6 +65,8 @@ async function execute(driver: E2eDriver, step: E2eStep): Promise<void> {
       return driver.notSee(step.target, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
     case "seeText":
       return driver.seeText(step.target, step.text, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
+    case "seeValue":
+      return driver.seeValue(step.target, step.text, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
     case "urlContains":
       return driver.urlContains(step.text, step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS);
   }

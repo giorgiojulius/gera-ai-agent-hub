@@ -181,7 +181,7 @@ export function ChatPane() {
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="relative min-h-0 flex-1">
           <div ref={attachScroller} onScroll={measure} data-testid={TID.chatThread} className="h-full overflow-y-auto">
-            <MessageList messages={messages} streaming={streaming} />
+            <MessageList messages={messages} streaming={streaming} conversationId={active?.id} />
           </div>
           {awayFromBottom ? (
             <button

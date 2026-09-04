@@ -470,6 +470,9 @@ export type McpConnection = {
   identity?: string;
   /** The account shard has a key, custom headers, or OAuth grant for this connector. */
   credentialStored?: boolean;
+  /** Prompts / resources the handshake listed (generic MCP servers only). */
+  promptCount?: number;
+  resourceCount?: number;
 };
 
 /**
@@ -509,6 +512,8 @@ type McpCheckBody = {
   tools?: unknown;
   identity?: unknown;
   credentialStored?: unknown;
+  promptCount?: unknown;
+  resourceCount?: unknown;
   error?: unknown;
   detail?: unknown;
   reason?: unknown;
@@ -626,6 +631,8 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
     tools: serverTools,
     identity: typeof data.identity === "string" && data.identity ? data.identity : "Server verified",
     credentialStored: data.credentialStored === true,
+    promptCount: typeof data.promptCount === "number" && data.promptCount >= 0 ? data.promptCount : 0,
+    resourceCount: typeof data.resourceCount === "number" && data.resourceCount >= 0 ? data.resourceCount : 0,
   };
 }
 

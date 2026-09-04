@@ -338,6 +338,8 @@ export type ChatMessage = {
    * and the next load turns it into an honest `interrupted` marker.
    */
   pending?: boolean;
+  /** Open questions (MCP elicitation) the live run is paused on — rendered as cards. Never persisted past the run. */
+  pauses?: RunPauseRequest[];
   /** Set on load when a reload cut this reply mid-run — offers Continue/Retry. */
   interrupted?: boolean;
   createdAt: number;
@@ -652,12 +654,58 @@ export type McpServerConfig = {
   credentialStored?: boolean;
   tools: McpToolInfo[];
   disabledTools: string[];
+  /** Prompts / resources the last health check listed (composer `/` and `@` menus). */
+  promptCount?: number;
+  resourceCount?: number;
+};
+
+/** Spec tool annotations as the server declared them (hints, never guarantees). */
+export type McpToolAnnotations = {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
 };
 
 export type McpToolInfo = {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
+  title?: string;
+  annotations?: McpToolAnnotations;
+  /** MCP Apps: renders its own UI — never offered to the model, shown as a badge only. */
+  uiOnly?: boolean;
+};
+
+/** One field of an MCP elicitation form (flattened from requestedSchema on the server). */
+export type ElicitationField = {
+  name: string;
+  type: "string" | "number" | "integer" | "boolean";
+  title?: string;
+  description?: string;
+  required: boolean;
+  enum?: string[];
+  enumLabels?: string[];
+  format?: "email" | "uri" | "date" | "date-time";
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  default?: string | number | boolean;
+};
+
+/** An open question a live run paused on (MCP elicitation); answered through /runs/answer. */
+export type RunPauseRequest = {
+  id: string;
+  kind: "elicitation";
+  serverId: string;
+  serverName: string;
+  message: string;
+  fields: ElicitationField[];
+  createdAt: number;
+  /** Epoch ms after which the server cancels on the user's behalf. */
+  expiresAt: number;
 };
 
 /** Completion chime scope: never, only out-of-view finishes, or every finish. */

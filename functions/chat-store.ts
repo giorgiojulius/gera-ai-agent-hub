@@ -110,7 +110,13 @@ import {
   type PushEntry,
   type TombstoneRow,
 } from "./chat-shared";
-import { createSqlMcpCatalogStore, normalizeMcpToolLoading, resolveMcpToolset } from "./mcp-toolset";
+import { handleMcpInventory, handleMcpPromptGet, handleMcpResourceRead, type McpRouteContext } from "./mcp-routes";
+import {
+  createSqlMcpCatalogStore,
+  normalizeMcpToolLoading,
+  resolveMcpToolset,
+  type McpToolLoadingMode,
+} from "./mcp-toolset";
 import { githubOAuthFormHeaders } from "./native-github";
 import {
   chainRotationBases,
@@ -124,6 +130,7 @@ import {
   overlayOAuthRotations,
   redactCloudMcpText,
   refreshCloudOAuthGrant,
+  type CloudMcpServer,
   type CloudOAuthRefreshFailure,
   type CloudOAuthToken,
   type OAuthRotation,
@@ -841,6 +848,15 @@ export class ChatStore extends DurableObject {
     }
     if (request.method === "POST" && url.pathname === "/mcp/check") {
       return this.handleMcpCheck(request, email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/inventory") {
+      return handleMcpInventory(this.mcpRouteContext(), request, email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/prompt-get") {
+      return handleMcpPromptGet(this.mcpRouteContext(), request, email);
+    }
+    if (request.method === "POST" && url.pathname === "/mcp/resource-read") {
+      return handleMcpResourceRead(this.mcpRouteContext(), request, email);
     }
     if (request.method === "POST" && url.pathname === "/mcp/oauth-refresh") {
       return this.handleBrowserOAuthRefresh(request, email);
@@ -2655,13 +2671,17 @@ export class ChatStore extends DurableObject {
       appliedChains.set(rotated.serverId, bases);
     };
     try {
-      // Uncapped: a health check returns the complete remote table, and the
-      // handshake refreshes the account's tool catalog cache (deferred runs
-      // search it without reconnecting).
+      // Uncapped: a health check returns the complete remote table (with
+      // annotations and UI-only markers), lists prompts/resources, and the
+      // handshake refreshes the account's catalog cache (deferred runs and the
+      // composer menus read it without reconnecting). No notification stream:
+      // a check has no run to keep it alive.
       const runtime = await resolveMcpToolset({
         servers,
         mode: "native",
         uncapped: true,
+        inventory: true,
+        notificationStreams: false,
         catalog: createSqlMcpCatalogStore(this.ctx.storage.sql, owner),
         persist,
         reportFailure: (id, outcome) => this.recordOAuthFailure(owner, id, outcome),
@@ -2688,20 +2708,39 @@ export class ChatStore extends DurableObject {
           }
         }
       }
-      const tools = [...runtime.routes.entries()].map(([functionName, route]) => {
-        const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
-        return {
-          name: route.toolName,
-          description: definition?.function.description ?? route.toolName,
-          inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
-        };
-      });
+      const info = runtime.servers[0];
+      // Generic MCP servers: the complete remote table straight from the
+      // handshake (titles, annotations, UI-only). Native connectors: their
+      // static tables as armed.
+      const tools = info?.tools
+        ? info.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            ...(tool.title ? { title: tool.title } : {}),
+            ...(tool.annotations ? { annotations: tool.annotations } : {}),
+            ...(tool.uiOnly ? { uiOnly: true } : {}),
+          }))
+        : [...runtime.routes.entries()].map(([functionName, route]) => {
+            const definition = runtime.toolDefs.find((tool) => tool.function.name === functionName);
+            return {
+              name: route.toolName,
+              description: definition?.function.description ?? route.toolName,
+              inputSchema: definition?.function.parameters ?? { type: "object", properties: {} },
+            };
+          });
       const credentialStored = Boolean(
         resolvedSecret.token ||
         resolvedSecret.headersJson ||
         oauthTokens[serverId],
       );
-      return json({ tools, identity: `${servers[0].name} · server verified`, credentialStored });
+      return json({
+        tools,
+        identity: `${servers[0].name} · server verified`,
+        credentialStored,
+        promptCount: info?.promptCount ?? 0,
+        resourceCount: info?.resourceCount ?? 0,
+      });
     } catch (error) {
       // An unexpected fault inside the check (a refresh race, a storage error)
       // must not escape as a Durable Object exception: the Worker would report
@@ -3022,6 +3061,41 @@ export class ChatStore extends DurableObject {
     if (ids.length === 0) {
       return json({ servers: [] });
     }
+    const resolved = await this.resolveOwnerMcpServers(owner, ids, force);
+    if (!resolved) {
+      return json({ servers: [] });
+    }
+    // Project agents inherit the linking account's loading mode and its
+    // catalog cache, so their runs can defer without a fresh handshake.
+    const catalog = createSqlMcpCatalogStore(this.ctx.storage.sql, owner);
+    return json({
+      servers: resolved.servers,
+      toolLoading: resolved.toolLoading,
+      catalog: resolved.servers.flatMap((server) => {
+        const entry = catalog.read(server.id);
+        return entry ? [entry] : [];
+      }),
+    });
+  }
+
+  /** Seam for the prompt/resource routes (mcp-routes.ts): storage plus server resolution. */
+  private mcpRouteContext(): McpRouteContext {
+    return {
+      sql: this.ctx.storage.sql,
+      resolveServers: async (owner, ids) => (await this.resolveOwnerMcpServers(owner, ids, new Set()))?.servers ?? [],
+    };
+  }
+
+  /**
+   * The owner's connected generic MCP servers for the given ids with auth
+   * attached and expiring grants refreshed (forced for ids in `force`).
+   * Null when the account has no profile yet.
+   */
+  private async resolveOwnerMcpServers(
+    owner: string,
+    ids: string[],
+    force: Set<string>,
+  ): Promise<{ servers: CloudMcpServer[]; toolLoading: McpToolLoadingMode } | null> {
     const profileRow = this.ctx.storage.sql
       .exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner)
       .toArray()[0];
@@ -3034,7 +3108,7 @@ export class ChatStore extends DurableObject {
       }
     }
     if (!isRecord(parsed) || !isRecord(parsed.settings)) {
-      return json({ servers: [] });
+      return null;
     }
     const oauthTokens = await this.profileOAuthTokens(owner);
     const prefix = `${OAUTH_REF_PREFIX}${owner}:`;
@@ -3085,18 +3159,10 @@ export class ChatStore extends DurableObject {
         }
       }
     }
-    // Project agents inherit the linking account's loading mode and its
-    // catalog cache, so their runs can defer without a fresh handshake.
-    const catalog = createSqlMcpCatalogStore(this.ctx.storage.sql, owner);
-    const available = servers.filter((server) => !unavailable.has(server.id));
-    return json({
-      servers: available,
+    return {
+      servers: servers.filter((server) => !unavailable.has(server.id)),
       toolLoading: normalizeMcpToolLoading(parsed.settings.mcpToolLoading),
-      catalog: available.flatMap((server) => {
-        const entry = catalog.read(server.id);
-        return entry ? [entry] : [];
-      }),
-    });
+    };
   }
 
   /**

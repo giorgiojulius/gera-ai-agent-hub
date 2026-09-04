@@ -1,6 +1,11 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-04 · commit `e141bdb` (+ deferred MCP tools through one
+Last synced: 2026-09-04 · commit `b4f7bca` (+ MCP spec coverage: one protocol
+  core (`functions/mcp-protocol.ts`, 2025-11-25 negotiation, injectable fetch),
+  composer `/` prompts and `@` resources menus, elicitation cards that pause a
+  run, tool annotation badges + UI-only markers, list_changed over the GET
+  stream, conformance suite against the real `@modelcontextprotocol/sdk` server
+  — deferred MCP tools through one
   toolset resolver — `mcp_search_tools` / `mcp_call_tool`, Settings → Toolkit
   "MCP tool loading", account tool-catalog cache, Deep Research connector
   scout — MCP server-owned credential
@@ -1087,6 +1092,98 @@ connectors stay inline next to deferred servers, rejected server reported
 without leaking its credential); browser scenario
 `connect-open-mcp-deferred`.
 
+Protocol core & spec coverage (2026-09-04, `functions/mcp-protocol.ts` — the
+ONE JSON-RPC / Streamable HTTP implementation; `mcp-cloud.ts` is a thin
+transport over it, the browser legacy transport moves onto it in Phase 6).
+`fetch` is injected (production keeps the public-HTTPS guard; the conformance
+suite talks to 127.0.0.1). Initialize proposes **2025-11-25** and declares
+`elicitation: { form: {} }`; accepted answers: 2025-11-25 / 2025-06-18 /
+2025-03-26 / 2024-11-05 (anything else → honest "unsupported MCP protocol
+version"); `MCP-Protocol-Version` rides on every request AFTER initialize
+(never on initialize itself), `Mcp-Session-Id` is adopted from the response
+and redacted from provider text. SSE bodies are read incrementally: progress
+notifications dispatch as they land, server → client requests are answered by
+POST (`ping` → `{}`, `roots/list` → `[]`, `sampling/createMessage` → method
+not found, `elicitation/create` → see below); the idle timeout pauses while a
+handler runs. 401/403 → `McpAuthRejectedError` (status + WWW-Authenticate kept
+for Phase 3), 404/"session" 400 after a session id → `McpSessionLostError`,
+bodies over 2M chars refused.
+
+- **Annotations & MCP Apps**: `tools/list` `annotations` (readOnlyHint,
+  destructiveHint, idempotentHint, openWorldHint, title) and `title` are kept
+  on catalog tools and shown as badges on McpStudio tool rows (testid
+  `mcp-tool-badge`: read-only / destructive / idempotent / open-world /
+  UI-only). A tool with `_meta.ui.resourceUri` or `_meta["ui/resourceUri"]`
+  is **UI-only**: kept in the catalog for the badge (switch disabled), never
+  registered as a function, never returned by `mcp_search_tools`, refused by
+  `mcp_call_tool` with the reason.
+- **Prompts & resources** (`functions/mcp-routes.ts`, account routes through
+  the `McpRouteContext` seam; ChatStore dispatches three lines): `/mcp/check`
+  now lists prompts / resources / templates too (`inventory: true`, bounded
+  200/300/100) and returns `promptCount` + `resourceCount` (card: "N tools · M
+  prompts · K resources"); `/mcp/inventory {serverId}` answers from the
+  account catalog cache when fresh (else one handshake refreshes it);
+  `/mcp/prompt-get {serverId, name, arguments}` and `/mcp/resource-read
+  {serverId, uri}` connect server-side (credentials never leave the shard).
+  Composer (chat mode): typing `/` at the start or after whitespace opens the
+  prompts menu (testid `composer-mcp-menu`, rows
+  `composer-mcp-prompt-<server>-<name>`), `@` the resources menu (rows
+  `composer-mcp-resource-<server>-<uri>` / `composer-mcp-template-…`); menus
+  list only connected, enabled, generic servers (native GitHub/Slack/Intercom
+  never), filter on the typed query, arrow/Enter/Tab/Escape. A prompt with
+  arguments opens the form dialog (`mcp-args-dialog`, fields
+  `mcp-args-field-<name>`, required enforced, `mcp-args-submit`); the result
+  replaces the token with the prompt text (one user message as-is; several or
+  assistant turns keep `[user]` / `[assistant]` markers), inline images become
+  attachments. A resource replaces the token with `@<server>/<uri>` and
+  attaches the read: text as an extracted-text attachment (server cap 300k
+  chars, truncation noted in the text), blobs ≤ 4 MB as a data-URL attachment,
+  larger ones as an honest note with mime + size; templates open the same
+  dialog for their URI variables (RFC 6570 level-1 expansion). Inventories
+  cache client-side for 5 minutes (`web/src/lib/mcp-inventory.ts`).
+- **list_changed**: after a run's handshake, when the server advertises
+  `listChanged` for tools/prompts/resources, the toolset opens the standalone
+  GET stream (405/404/no-SSE → no stream, no error) and closes it when the run
+  settles (`toolset.close()` from `finishRun`; automations close in `finish`);
+  a `notifications/*/list_changed` drops the account catalog entry and marks
+  the run's table stale — the next `mcp_search_tools` / `mcp_call_tool`
+  re-lists on the live session (journal `catalog_refreshed`). Project agents
+  run with `notificationStreams: false` (short background runs; the owner's
+  cache carries the change to their next resolve). Browser: Re-check.
+- **Elicitation** (`functions/run-pause.ts` — the ONE run-pause board,
+  reused by Phase 4 confirmations): `elicitation/create` arriving on the
+  tools/call stream or the GET stream is flattened to fields (string / number
+  / integer / boolean, enums incl. titled `oneOf`, formats, bounds, defaults).
+  Interactive chat runs pause: RunManager emits `{t:"pause", pending}` (also
+  in the persisted snapshot, so a reopened tab sees the card) and the thread
+  shows a card (`run-pause-card`: server name, message, form fields
+  `run-pause-field-<name>`, Accept `run-pause-accept` / Decline
+  `run-pause-decline` / Cancel, time left). Answers go to `POST /runs/answer
+  {conversationId, requestId, answer}`; the board validates accepted values
+  against the schema (field errors come back and show on the card; values are
+  never logged or journaled) and resolves the waiting tool call; 5 minutes
+  without an answer → `cancel`; Stop and run end cancel every open card. The
+  toolset re-validates before replying and answers `cancel` on a mismatch.
+  Background surfaces (automations, project/Slack agents, Deep Research
+  scout) answer `decline` and record it — automations show an
+  `mcp_elicitation` tool record naming the server; URL-mode elicitation is
+  declined everywhere with the reason. Research/Julius runs are not
+  steerable and never pause.
+- **Conformance** (`web/src/test/mcp-conformance.test.ts`, unit run, Node):
+  an in-process `@modelcontextprotocol/sdk` 1.30 Streamable HTTP server
+  (stateful sessions, random port) proves version negotiation, the version
+  header + session echo on every later request, 3-page `tools/list`
+  pagination, prompts/get, resources/templates/read, the account routes
+  (inventory cached on the second call, prompt-get, resource-read, 404 for an
+  unknown server), elicitation accept + decline through the pause hook,
+  background decline journaling, UI-only hiding/refusal, `list_changed` over
+  the GET stream refreshing the catalog. Mocks of those scenarios were removed
+  from `mcp-security` / `mcp-file-content`; only failures a conforming server
+  never produces stay mocked (`mcp-protocol.test.ts`: 401/403 with challenge,
+  lost session, oversized body, unsupported revision, 405 GET, in-stream
+  ping/notification dispatch, elicitation validation, URI templates, pause
+  board, composer trigger parsing).
+
 Server ownership (2026-09-01): OAuth access/refresh grants, pasted API keys,
 custom headers, refresh single-flight, connection checks, protocol sessions and
 tool calls are owned by the signed-in account's ChatStore shard. `/mcp/oauth-store`
@@ -1303,7 +1400,8 @@ storage probe (`{ok, bucket, apiHost, expiresAt}` 200 or `{ok:false, error}` 503
 — the first thing to curl when a Repo Preview or knowledge upload reports
 `storage_unavailable`) · `/access/*` gate+admin ·
 `/share/*` · `/arena/*` (usage, battles, log, clear) · `/chats/sync` ·
-`/runs/*` (start, stream SSE, active, steer/stop) · `/diag/*` ·
+`/runs/*` (start, stream SSE, active, steer/stop, answer — elicitation card
+replies) · `/diag/*` ·
 `/repo-previews/{inspect|install|start|status|cancel}` authenticated launch
 control · `/repo-preview-hook/:id/*` GitHub Actions OIDC-authenticated workflow
 callback (the runner's `PUT …/archive` tar is handled in the entrypoint:
@@ -1321,9 +1419,11 @@ host is remembered. Failures throw `storage_unavailable:<hosts + statuses>`
 reason verbatim. Unit: `rork-storage.test.ts`. · `/repo-preview/:id/:access/*`
 public expiring static artifact delivery ·
 `/mcp/oauth-refresh` (durable rotating-token escrow) + `/mcp/oauth-rotations` ·
-`/mcp/check` (uncapped handshake, refreshes the account's `mcp_tool_catalog`
-cache) · internal `/mcp/resolve` (project shards; answers `servers`,
-`toolLoading`, cached `catalog`) ·
+`/mcp/check` (uncapped handshake + prompts/resources inventory, refreshes the
+account's `mcp_tool_catalog` cache) · `/mcp/inventory` · `/mcp/prompt-get` ·
+`/mcp/resource-read` (composer menus; `functions/mcp-routes.ts`) · internal
+`/mcp/resolve` (project shards; answers `servers`, `toolLoading`, cached
+`catalog`) ·
 `/automations/run-now` · `/projects` +
 `/projects/create` + `/projects/:id/*` (overview, messages, message, read,
 channels/create, members/*, agents/*, screens/*, intercom/inbox|thread|details|
@@ -1364,6 +1464,9 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | studio-pages-navigate | Tabs automations → hub → mcp → settings |
 | connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
 | connect-open-mcp-deferred | Settings → Toolkit “Always deferred” → send → `/runs/start` carries `mcpToolLoading` + `contextWindow` → `mcp_search_tools` / `mcp_call_tool` rows read “MCP · deepwiki · ask_question · done” → reply |
+| prompt-slash | Connected DeepWiki → type `/expl` → prompts menu → pick `explain_repo` → required-argument dialog → submit → `/mcp/prompt-get` text lands in the composer input, dialog gone |
+| resource-mention | Type `@READ` → resources menu → pick the README → `/mcp/resource-read` becomes an attachment chip, `@deepwiki/wiki://…` mention stays in the input |
+| elicitation-accept | Send → stream pauses with a `pause` event → card with the `region` field → fill + Accept → `/runs/answer` carries `{action:"accept", content:{region:"eu"}}` → card clears, reply streams |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 
@@ -1399,7 +1502,10 @@ that a new bundle adopts the MCP pair escrowed before the old response vanished.
 
 Honest gaps (no click coverage yet): Skills page actions, Automations CRUD,
 Admin tabs, MCP OAuth/API-key/custom-header setup (open connect is covered),
-Share dialog, Settings toggles other than MCP tool loading, media modes,
+elicitation Decline/Cancel and enum/boolean fields (accept with a text field
+is covered; validation is unit-tested), resource-template variable dialog
+(prompt-argument dialog is covered), Share dialog, Settings toggles other
+than MCP tool loading, media modes,
 Julius/Deep Research runs, repository setup-PR merge + real external build
 callback, dynamic SSR previews, incognito, thread menu (pin/rename/delete),
 Project workspace internals (posting, threads, agent editor, members,
@@ -1422,7 +1528,11 @@ browser/Worker tools, traversal, optimistic SHA writes, redirects, scopes,
 account isolation), `mcp-security` (catalog, auth-mode, OAuth/egress/session/
 protocol and native Slack/Intercom parity), `mcp-toolset` (deferred tools:
 mode decision, search ranking, search gate, lazy connect, disabled tools,
-catalog cache, native soft caps with honest records), `auth-boundary` +
+catalog cache, native soft caps with honest records), `mcp-conformance` (the
+real `@modelcontextprotocol/sdk` server in-process: negotiation, headers,
+pagination, prompts/resources, routes, elicitation, UI-only, list_changed),
+`mcp-protocol` (transport failures, frames, annotations, templates,
+elicitation validation, run pause board, composer triggers), `auth-boundary` +
 `mcp-oauth-refresh` + `mcp-session` (staggered expired-Gera 401s, provider-token
 rotation rescue, deploy-response escrow/replay, transient health recovery),
 `code-change-flow` (diff capture,

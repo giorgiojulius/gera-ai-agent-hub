@@ -29,14 +29,35 @@ import {
   connectCloudMcp,
   ensureFreshCloudOAuth,
   forceRefreshCloudOAuthOutcome,
+  listCloudMcpTools,
   redactCloudMcpText,
   type BeginCloudOAuthRefresh,
+  type CloudMcpConnection,
   type CloudMcpServer,
   type CloudMcpSession,
   type CloudMcpTool,
   type CloudOAuthRefreshFailure,
   type RefreshedOAuth,
 } from "./mcp-cloud";
+import {
+  JSON_RPC_INVALID_PARAMS,
+  JSON_RPC_METHOD_NOT_FOUND,
+  normalizeElicitationRequest,
+  normalizeServerCapabilities,
+  normalizeToolAnnotations,
+  openMcpNotificationStream,
+  validateElicitationContent,
+  type McpElicitationAnswer,
+  type McpElicitationRequest,
+  type McpFetch,
+  type McpNotificationStream,
+  type McpPromptInfo,
+  type McpResourceInfo,
+  type McpResourceTemplateInfo,
+  type McpServerCapabilities,
+  type McpServerRequest,
+  type McpServerRequestReply,
+} from "./mcp-protocol";
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
 import { callIntercomNativeTool, INTERCOM_NATIVE_TOOLS } from "./native-intercom";
 import { callSlackNativeTool, SLACK_NATIVE_TOOLS } from "./native-slack";
@@ -186,7 +207,17 @@ export type McpCatalogEntry = {
   /** The full remote table (disabled tools included) — filtering happens per run. */
   tools: CloudMcpTool[];
   fetchedAt: number;
+  /** Inventory (prompts / resources / templates) when the writing handshake listed it. */
+  prompts?: McpPromptInfo[];
+  resources?: McpResourceInfo[];
+  resourceTemplates?: McpResourceTemplateInfo[];
+  capabilities?: McpServerCapabilities;
 };
+
+/** True when the entry carries an inventory (not just the tool table). */
+export function catalogHasInventory(entry: McpCatalogEntry | null): entry is McpCatalogEntry & { prompts: McpPromptInfo[] } {
+  return entry !== null && Array.isArray(entry.prompts);
+}
 
 export type McpCatalogStore = {
   read(serverId: string): McpCatalogEntry | null;
@@ -235,13 +266,31 @@ function normalizeCatalogTools(value: unknown): CloudMcpTool[] {
     if (!isRecord(raw) || typeof raw.name !== "string" || !raw.name) {
       continue;
     }
+    const annotations = normalizeToolAnnotations(raw.annotations);
     tools.push({
       name: raw.name,
       description: typeof raw.description === "string" ? raw.description : raw.name,
       inputSchema: isRecord(raw.inputSchema) ? raw.inputSchema : { type: "object", properties: {} },
+      ...(typeof raw.title === "string" && raw.title ? { title: raw.title } : {}),
+      ...(annotations ? { annotations } : {}),
+      ...(raw.uiOnly === true ? { uiOnly: true } : {}),
     });
   }
   return tools;
+}
+
+function normalizeCatalogInventory(parsed: Record<string, unknown>): Pick<McpCatalogEntry, "prompts" | "resources" | "resourceTemplates" | "capabilities"> {
+  if (!Array.isArray(parsed.prompts)) {
+    return {};
+  }
+  const list = <T>(value: unknown, key: string): T[] =>
+    Array.isArray(value) ? (value.filter((item) => isRecord(item) && typeof item[key] === "string") as T[]) : [];
+  return {
+    prompts: list<McpPromptInfo>(parsed.prompts, "name"),
+    resources: list<McpResourceInfo>(parsed.resources, "uri"),
+    resourceTemplates: list<McpResourceTemplateInfo>(parsed.resourceTemplates, "uriTemplate"),
+    capabilities: normalizeServerCapabilities(parsed.capabilities),
+  };
 }
 
 /**
@@ -273,13 +322,26 @@ export function createSqlMcpCatalogStore(sql: ChatSql, owner: string): McpCatalo
           serverName: typeof parsed.serverName === "string" ? parsed.serverName : serverId,
           tools: normalizeCatalogTools(parsed.tools),
           fetchedAt: row.updated_at,
+          ...normalizeCatalogInventory(parsed),
         };
       } catch {
         return null;
       }
     },
     write(entry) {
-      const payload = JSON.stringify({ v: 1, serverName: entry.serverName, tools: entry.tools });
+      const payload = JSON.stringify({
+        v: 2,
+        serverName: entry.serverName,
+        tools: entry.tools,
+        ...(entry.prompts
+          ? {
+              prompts: entry.prompts,
+              resources: entry.resources ?? [],
+              resourceTemplates: entry.resourceTemplates ?? [],
+              capabilities: entry.capabilities ?? {},
+            }
+          : {}),
+      });
       if (payload.length > CATALOG_ROW_CHARS) {
         return; // oversized tables stay uncached — the run still connects live
       }
@@ -312,6 +374,7 @@ export function normalizeMcpCatalogEntries(raw: unknown): McpCatalogEntry[] {
       serverName: typeof item.serverName === "string" && item.serverName ? item.serverName : item.serverId,
       tools: normalizeCatalogTools(item.tools),
       fetchedAt: typeof item.fetchedAt === "number" && Number.isFinite(item.fetchedAt) ? item.fetchedAt : 0,
+      ...normalizeCatalogInventory(item),
     });
   }
   return out;
@@ -552,6 +615,22 @@ export type McpToolsetServerInfo = {
   deferred: boolean;
   /** Honest reason when the server contributes nothing this run. */
   unavailable?: string;
+  /** The complete remote table (disabled + UI-only included) — filled by health checks (uncapped). */
+  tools?: CloudMcpTool[];
+  /** Inventory counts when the handshake listed them (`inventory: true`). */
+  promptCount?: number;
+  resourceCount?: number;
+};
+
+/** An elicitation the toolset asks the surface to answer (interactive runs pause on it). */
+export type McpToolsetElicitation = McpElicitationRequest & { serverId: string; serverName: string };
+
+/** Mid-run honest record (elicitation declined, catalog refreshed…) for surfaces that keep a journal. */
+export type McpToolsetJournalEntry = {
+  kind: "elicitation_declined" | "elicitation_timeout" | "elicitation_invalid" | "catalog_refreshed";
+  serverId: string;
+  serverName: string;
+  detail: string;
 };
 
 export type McpToolset = McpRuntime & {
@@ -563,7 +642,14 @@ export type McpToolset = McpRuntime & {
   owns(name: string): boolean;
   /** Runs an inline or meta tool call; tool failures come back as isError outcomes. */
   execute(name: string, args: Record<string, unknown>): Promise<McpToolOutcome>;
+  /** Closes notification streams — call when the run settles. */
+  close(): void;
+  /** Mid-run records (background surfaces append them to their summaries). */
+  journal: McpToolsetJournalEntry[];
 };
+
+/** Elicitation waits this long for the user before Gera answers `cancel` honestly. */
+export const ELICITATION_TIMEOUT_MS = 5 * 60_000;
 
 export type ResolveMcpToolsetOptions = {
   /** Resolved connectors (auth already attached) — see cloudMcpServersForAutomation. */
@@ -589,6 +675,19 @@ export type ResolveMcpToolsetOptions = {
    */
   reconnect?: (serverId: string) => Promise<CloudMcpServer | null>;
   now?: () => number;
+  /** Injected transport for conformance tests; production keeps the public-HTTPS guard. */
+  fetch?: McpFetch;
+  /**
+   * Interactive surfaces answer `elicitation/create` by pausing the run for
+   * the user; without a handler every elicitation is declined honestly.
+   */
+  elicit?: (request: McpToolsetElicitation) => Promise<McpElicitationAnswer>;
+  /** Receives mid-run journal entries as they happen. */
+  onJournal?: (entry: McpToolsetJournalEntry) => void;
+  /** Open the GET notification stream for list_changed (default true; health checks pass false). */
+  notificationStreams?: boolean;
+  /** Also list prompts/resources during the handshake and cache them (health checks). */
+  inventory?: boolean;
 };
 
 type ServerState = {
@@ -597,6 +696,11 @@ type ServerState = {
   session: CloudMcpSession | null;
   connecting: Promise<void> | null;
   failure: string | null;
+  /** A list_changed notification arrived — the next search/call re-lists tools. */
+  stale: boolean;
+  stream: McpNotificationStream | null;
+  promptCount?: number;
+  resourceCount?: number;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -611,12 +715,29 @@ function jsonText(value: unknown): string {
   }
 }
 
+/** Tools the model may see: disabled ones and MCP Apps UI-only tools are excluded. */
 function visibleTools(state: ServerState): CloudMcpTool[] {
   if (!state.catalog) {
     return [];
   }
   const disabled = new Set(state.server.disabledTools);
-  return state.catalog.filter((tool) => !disabled.has(tool.name));
+  return state.catalog.filter((tool) => !disabled.has(tool.name) && tool.uiOnly !== true);
+}
+
+function withTimeout<T>(task: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(onTimeout()), ms);
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(onTimeout());
+      },
+    );
+  });
 }
 
 /**
@@ -680,11 +801,108 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     .map((server) => {
       const cached = options.catalog?.read(server.id) ?? null;
       const fresh = cached !== null && now() - cached.fetchedAt < CATALOG_TTL_MS;
-      return { server, catalog: fresh ? cached.tools : null, session: null, connecting: null, failure: null };
+      return {
+        server,
+        catalog: fresh ? cached.tools : null,
+        session: null,
+        connecting: null,
+        failure: null,
+        stale: false,
+        stream: null,
+        ...(fresh && cached.prompts ? { promptCount: cached.prompts.length, resourceCount: cached.resources?.length ?? 0 } : {}),
+      };
     });
 
-  const connectRaw = async (server: CloudMcpServer): Promise<{ session: CloudMcpSession; tools: CloudMcpTool[] }> =>
-    connectCloudMcp(server, { maxTools: DEFERRED_TOOLS_PER_SERVER, includeDisabled: true });
+  const journal: McpToolsetJournalEntry[] = [];
+  const note = (entry: McpToolsetJournalEntry): void => {
+    journal.push(entry);
+    options.onJournal?.(entry);
+  };
+
+  /**
+   * Server → client requests. Elicitation pauses interactive surfaces for the
+   * user (bounded), is declined honestly everywhere else; the answer is
+   * validated against the requested schema before it leaves; values are never
+   * journaled. Roots are empty; sampling is not offered.
+   */
+  const serverRequestHandler =
+    (state: ServerState) =>
+    async (request: McpServerRequest): Promise<McpServerRequestReply> => {
+      const server = state.server;
+      if (request.method === "elicitation/create") {
+        const parsed = normalizeElicitationRequest(request.params);
+        if (!parsed) {
+          return { error: { code: JSON_RPC_INVALID_PARAMS, message: "elicitation/create params were not understood" } };
+        }
+        if (parsed.mode === "url") {
+          note({ kind: "elicitation_declined", serverId: server.id, serverName: server.name, detail: "URL-mode elicitation is not supported by Gera; declined." });
+          return { result: { action: "decline" } };
+        }
+        if (!options.elicit) {
+          note({ kind: "elicitation_declined", serverId: server.id, serverName: server.name, detail: `Server asked for input (“${parsed.message.slice(0, 120)}”); this run cannot ask the user, so it declined.` });
+          return { result: { action: "decline" } };
+        }
+        const answer = await withTimeout(
+          options.elicit({ ...parsed, serverId: server.id, serverName: server.name }),
+          ELICITATION_TIMEOUT_MS,
+          (): McpElicitationAnswer => {
+            note({ kind: "elicitation_timeout", serverId: server.id, serverName: server.name, detail: "No answer within 5 minutes; cancelled." });
+            return { action: "cancel" };
+          },
+        );
+        if (answer.action !== "accept") {
+          return { result: { action: answer.action } };
+        }
+        const valid = validateElicitationContent(parsed, answer.content ?? {});
+        if (valid.ok === false) {
+          note({ kind: "elicitation_invalid", serverId: server.id, serverName: server.name, detail: valid.errors.join("; ") });
+          return { result: { action: "cancel" } };
+        }
+        return { result: { action: "accept", content: valid.content } };
+      }
+      if (request.method === "roots/list") {
+        return { result: { roots: [] } };
+      }
+      if (request.method === "sampling/createMessage") {
+        return { error: { code: JSON_RPC_METHOD_NOT_FOUND, message: "Gera does not offer sampling to servers" } };
+      }
+      return { error: { code: JSON_RPC_METHOD_NOT_FOUND, message: `Unsupported request ${request.method}` } };
+    };
+
+  /** list_changed → the account cache is dropped and this run re-lists before its next search/call. */
+  const notificationHandler = (state: ServerState) => (notification: { method: string }): void => {
+    if (/^notifications\/(tools|prompts|resources)\/list_changed$/.test(notification.method)) {
+      options.catalog?.invalidate(state.server.id);
+      state.stale = true;
+    }
+  };
+
+  const connectRaw = async (state: ServerState, server: CloudMcpServer): Promise<CloudMcpConnection> =>
+    connectCloudMcp(server, {
+      maxTools: DEFERRED_TOOLS_PER_SERVER,
+      includeDisabled: true,
+      inventory: options.inventory === true,
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+      onServerRequest: serverRequestHandler(state),
+      onNotification: notificationHandler(state),
+    });
+
+  const writeCatalog = (state: ServerState, connection: Pick<CloudMcpConnection, "tools"> & Partial<CloudMcpConnection>): void => {
+    options.catalog?.write({
+      serverId: state.server.id,
+      serverName: state.server.name,
+      tools: connection.tools,
+      fetchedAt: now(),
+      ...(options.inventory && connection.prompts
+        ? {
+            prompts: connection.prompts,
+            resources: connection.resources ?? [],
+            resourceTemplates: connection.resourceTemplates ?? [],
+            capabilities: state.session?.capabilities ?? {},
+          }
+        : {}),
+    });
+  };
 
   /** One handshake per server per run; auth rejections get one repair attempt. */
   const connect = (state: ServerState): Promise<void> => {
@@ -692,9 +910,9 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       return state.connecting;
     }
     state.connecting = (async () => {
-      const attempt = async (): Promise<{ session: CloudMcpSession; tools: CloudMcpTool[] }> => {
+      const attempt = async (): Promise<CloudMcpConnection> => {
         try {
-          return await connectRaw(state.server);
+          return await connectRaw(state, state.server);
         } catch (error) {
           const message = error instanceof Error ? error.message : "connect failed";
           if (!/auth rejected/i.test(message)) {
@@ -704,7 +922,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
             const fresh = await options.reconnect(state.server.id).catch(() => null);
             if (fresh) {
               state.server = fresh;
-              return connectRaw(fresh);
+              return connectRaw(state, fresh);
             }
             throw error;
           }
@@ -722,7 +940,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
               await options.reportFailure?.(state.server.id, outcome);
             }
             if (outcome?.ok) {
-              return connectRaw(state.server);
+              return connectRaw(state, state.server);
             }
           }
           throw error;
@@ -733,24 +951,64 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         state.session = connection.session;
         state.catalog = connection.tools;
         state.failure = null;
+        state.stale = false;
+        if (options.inventory) {
+          state.promptCount = connection.prompts.length;
+          state.resourceCount = connection.resources.length;
+        }
         const tableChars = jsonText(connection.tools).length;
         if (tableChars > DEFERRED_SCHEMA_CHARS) {
           state.failure = `publishes ${connection.tools.length} tools whose schemas exceed ${Math.round(DEFERRED_SCHEMA_CHARS / 1_000_000)} MB — too large to search`;
           state.catalog = null;
           return;
         }
-        options.catalog?.write({
-          serverId: state.server.id,
-          serverName: state.server.name,
-          tools: connection.tools,
-          fetchedAt: now(),
-        });
+        writeCatalog(state, connection);
+        const capabilities = connection.session.capabilities;
+        const listens =
+          capabilities?.tools?.listChanged === true ||
+          capabilities?.prompts?.listChanged === true ||
+          capabilities?.resources?.listChanged === true;
+        if (options.notificationStreams !== false && listens) {
+          // Standalone GET stream for list_changed while the run lives; servers
+          // answering 405 simply work without one.
+          state.stream = await openMcpNotificationStream(connection.session, { connectTimeoutMs: 5_000 });
+        }
       } catch (error) {
         const raw = error instanceof Error ? error.message : "connect failed";
         state.failure = redactCloudMcpText(raw, cloudServerRedactions(state.server));
       }
     })();
     return state.connecting;
+  };
+
+  /** After list_changed: re-list on the live session (or reconnect when the run only had the cache). */
+  const refreshIfStale = async (state: ServerState): Promise<void> => {
+    if (!state.stale || state.failure) {
+      return;
+    }
+    if (!state.session) {
+      state.connecting = null;
+      await connect(state);
+      return;
+    }
+    try {
+      const tools = await listCloudMcpTools(state.session, state.server, {
+        maxTools: DEFERRED_TOOLS_PER_SERVER,
+        includeDisabled: true,
+      });
+      state.catalog = tools;
+      state.stale = false;
+      writeCatalog(state, { tools });
+      note({ kind: "catalog_refreshed", serverId: state.server.id, serverName: state.server.name, detail: `${tools.length} tools after list_changed` });
+    } catch (error) {
+      // Keep the previous table; the next search tries again.
+      note({
+        kind: "catalog_refreshed",
+        serverId: state.server.id,
+        serverName: state.server.name,
+        detail: `re-list failed: ${redactCloudMcpText(error instanceof Error ? error.message : "unknown error", cloudServerRedactions(state.server))}`,
+      });
+    }
   };
 
   const connectMissing = (predicate: (state: ServerState) => boolean): Promise<void[]> =>
@@ -816,7 +1074,17 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         added += 1;
       }
       runtime.summary.push(`${server.name} (${added} tools)`);
-      infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: added, deferred: false });
+      infos.push({
+        id: server.id,
+        name: server.name,
+        kind: "mcp",
+        toolCount: added,
+        deferred: false,
+        // Health checks (uncapped) want the complete remote table — disabled and
+        // UI-only tools included, so McpStudio can show every switch and badge.
+        ...(options.uncapped ? { tools: state.catalog ?? [] } : {}),
+        ...(state.promptCount !== undefined ? { promptCount: state.promptCount, resourceCount: state.resourceCount ?? 0 } : {}),
+      });
       if (skipped > 0) {
         runtime.failures.push({
           name: "mcp_limit",
@@ -843,7 +1111,14 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       }
       const count = visibleTools(state).length;
       runtime.summary.push(`${server.name} (${count} tools · deferred)`);
-      infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: count, deferred: true });
+      infos.push({
+        id: server.id,
+        name: server.name,
+        kind: "mcp",
+        toolCount: count,
+        deferred: true,
+        ...(state.promptCount !== undefined ? { promptCount: state.promptCount, resourceCount: state.resourceCount ?? 0 } : {}),
+      });
     }
     if (states.some((state) => state.catalog !== null)) {
       runtime.toolDefs.push(...mcpMetaToolDefinitions());
@@ -882,7 +1157,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const serverList = (): string =>
     states.map((state) => `${state.server.id} ("${state.server.name}")`).join(", ") || "none";
 
-  const runSearch = (args: Record<string, unknown>): McpToolOutcome => {
+  const runSearch = async (args: Record<string, unknown>): Promise<McpToolOutcome> => {
     const query = typeof args.query === "string" ? args.query : "";
     const serverId = typeof args.serverId === "string" && args.serverId.trim() ? args.serverId.trim() : undefined;
     const limitRaw = Number(args.limit);
@@ -893,6 +1168,9 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         isError: true,
       };
     }
+    // A list_changed notification since the last look means the table may be
+    // outdated — re-list before ranking so the model never sees a ghost tool.
+    await Promise.all(states.filter((state) => state.stale).map((state) => refreshIfStale(state)));
     const scopeId = serverId ? findState(serverId)?.server.id : undefined;
     const hits = searchMcpTools(searchable(), query, { serverId: scopeId, limit });
     for (const hit of hits) {
@@ -948,14 +1226,22 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       return { text: `No MCP server "${serverId}" is connected in this run. Known servers: ${serverList()}.`, isError: true };
     }
     const server = state.server;
+    await refreshIfStale(state);
     if (state.failure || !state.catalog) {
       return { text: `MCP server "${server.name}" is unavailable this run: ${state.failure ?? "connect failed"}.`, isError: true };
     }
     if (server.disabledTools.includes(toolName)) {
       return { text: `Tool "${toolName}" on MCP server "${server.name}" is disabled by the user in this server's tool settings.`, isError: true };
     }
-    if (!state.catalog.some((tool) => tool.name === toolName)) {
+    const catalogTool = state.catalog.find((tool) => tool.name === toolName);
+    if (!catalogTool) {
       return { text: `MCP server "${server.name}" has no tool named "${toolName}". Find the exact name with ${MCP_SEARCH_TOOL_NAME} first.`, isError: true };
+    }
+    if (catalogTool.uiOnly) {
+      return {
+        text: `Tool "${toolName}" on MCP server "${server.name}" is UI-only (an MCP App that renders its own interface) and cannot be run by the model.`,
+        isError: true,
+      };
     }
     if (!revealed.has(revealKey(server.id, toolName))) {
       return {
@@ -996,6 +1282,13 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     mode,
     promptNote,
     servers: infos,
+    journal,
+    close() {
+      for (const state of states) {
+        state.stream?.close();
+        state.stream = null;
+      }
+    },
     owns(name) {
       return runtime.routes.has(name) || (mode === "deferred" && isMcpMetaToolName(name));
     },
@@ -1040,6 +1333,8 @@ export function idleToolset(): McpToolset {
     mode: "native",
     promptNote: "",
     servers: [],
+    journal: [],
+    close: () => undefined,
     owns: () => false,
     execute: async (name) => ({ text: `Tool "${name}" is not part of this run's MCP toolset.`, isError: true }),
   };

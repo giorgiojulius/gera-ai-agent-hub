@@ -39,7 +39,15 @@ import {
   modelIdForMode,
   withStaticModels,
 } from "@/lib/models";
-import type { AgentSettings, CreateMode, ExecutionOutcome, LifeState, QueuedMessage, RepoPreviewJob } from "@/lib/types";
+import type {
+  AgentSettings,
+  Attachment,
+  CreateMode,
+  ExecutionOutcome,
+  LifeState,
+  QueuedMessage,
+  RepoPreviewJob,
+} from "@/lib/types";
 
 export { useAgent } from "@/hooks/agent-context";
 export type { AgentDraftInput } from "@/hooks/agent-context";
@@ -546,6 +554,14 @@ export function AgentProvider({ children }: { children: ReactNode }) {
 
   const removeAttachment = useCallback((id: string) => {
     setState((prev) => ({ ...prev, attachments: prev.attachments.filter((item) => item.id !== id) }));
+  }, []);
+
+  /** Attaches ready records (MCP resources, prompt images) — no file decoding involved. */
+  const addAttachmentRecords = useCallback((records: Attachment[]) => {
+    if (records.length === 0) {
+      return;
+    }
+    setState((prev) => ({ ...prev, attachments: [...prev.attachments, ...records].slice(0, 6) }));
   }, []);
 
   /** Detaches this tab from a thread's run: abort, forget the controller, clear the flag. */
@@ -1461,6 +1477,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       markUnreadChat,
       setInput,
       addAttachments,
+      addAttachmentRecords,
       removeAttachment,
       send,
       editMessage,
@@ -1513,6 +1530,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     markUnreadChat,
     setInput,
     addAttachments,
+    addAttachmentRecords,
     removeAttachment,
     send,
     editMessage,

@@ -30,8 +30,8 @@ import {
   type McpCategory,
 } from "@/lib/mcp-catalog";
 import { githubDeviceClientId, githubOrgAccessUrl } from "@/lib/github-device";
-import { mcpCatalogConnectTid, mcpServerCardTid } from "@/lib/testids";
-import type { McpAuthMode, McpServerConfig } from "@/lib/types";
+import { mcpCatalogConnectTid, mcpServerCardTid, TID } from "@/lib/testids";
+import type { McpAuthMode, McpServerConfig, McpToolInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const CATEGORIES = Object.keys(MCP_CATEGORY_LABEL) as McpCategory[];
@@ -621,9 +621,16 @@ function ConnectedCard({
     !(server.token ?? "").trim();
   const needsKey = entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";
   const blockedReason = entry?.blocked;
+  const inventoryLabel = [
+    `${server.tools.length} tools`,
+    server.promptCount ? `${server.promptCount} prompts` : "",
+    server.resourceCount ? `${server.resourceCount} resources` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const statusLabel =
     server.status === "connected"
-      ? `${server.tools.length} tools${server.identity ? ` · ${server.identity}` : ""}`
+      ? `${inventoryLabel}${server.identity ? ` · ${server.identity}` : ""}`
       : server.status === "connecting"
         ? isOAuth && !signedIn
           ? "Waiting for sign-in…"
@@ -826,18 +833,75 @@ function ConnectedCard({
             <div className="space-y-1">
               {server.tools
                 .filter((tool) => entry?.id !== "github" || !isGithubWriteTool(tool.name))
-                .map((tool) => (
-                <label key={tool.name} className="flex items-center justify-between gap-2 text-xs">
-                  <span className="truncate">{tool.name}</span>
-                  <Switch checked={!server.disabledTools.includes(tool.name)} onCheckedChange={() => onToggleTool(tool.name)} />
-                </label>
-              ))}
+                .map((tool) => {
+                  const badges = toolBadges(tool);
+                  return (
+                    <label key={tool.name} className="flex items-center justify-between gap-2 text-xs">
+                      <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span className="truncate" title={tool.title && tool.title !== tool.name ? `${tool.title} · ${tool.name}` : tool.name}>
+                          {tool.name}
+                        </span>
+                        {badges.map((badge) => (
+                          <span
+                            key={badge.label}
+                            data-testid={TID.mcpToolBadge}
+                            title={badge.title}
+                            className={cn(
+                              "shrink-0 rounded-full px-1.5 py-px text-[10px] font-medium leading-4",
+                              badge.tone === "danger"
+                                ? "bg-destructive/10 text-destructive"
+                                : badge.tone === "muted"
+                                  ? "bg-muted text-muted-foreground"
+                                  : "bg-emerald-600/10 text-emerald-700",
+                            )}
+                          >
+                            {badge.label}
+                          </span>
+                        ))}
+                      </span>
+                      <Switch
+                        checked={!tool.uiOnly && !server.disabledTools.includes(tool.name)}
+                        disabled={tool.uiOnly === true}
+                        onCheckedChange={() => onToggleTool(tool.name)}
+                      />
+                    </label>
+                  );
+                })}
             </div>
           ) : null}
         </div>
       ) : null}
     </div>
   );
+}
+
+/**
+ * Badges from the spec annotations (hints the server declared, not
+ * guarantees) plus the MCP Apps UI-only marker. Shown so a person can see at
+ * a glance which tools write, delete, or reach outside the server.
+ */
+function toolBadges(tool: McpToolInfo): Array<{ label: string; title: string; tone: "safe" | "danger" | "muted" }> {
+  const badges: Array<{ label: string; title: string; tone: "safe" | "danger" | "muted" }> = [];
+  if (tool.uiOnly) {
+    badges.push({ label: "UI-only", title: "MCP App: renders its own interface — never offered to the model", tone: "muted" });
+  }
+  const notes = tool.annotations;
+  if (!notes) {
+    return badges;
+  }
+  if (notes.readOnlyHint === true) {
+    badges.push({ label: "read-only", title: "Server hint: this tool does not modify anything", tone: "safe" });
+  }
+  if (notes.destructiveHint === true) {
+    badges.push({ label: "destructive", title: "Server hint: this tool may delete or overwrite data", tone: "danger" });
+  }
+  if (notes.idempotentHint === true) {
+    badges.push({ label: "idempotent", title: "Server hint: repeating the same call has no extra effect", tone: "muted" });
+  }
+  if (notes.openWorldHint === true) {
+    badges.push({ label: "open-world", title: "Server hint: this tool reaches systems outside the server", tone: "muted" });
+  }
+  return badges;
 }
 
 function verifiedTime(ts?: number): string {

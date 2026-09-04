@@ -409,39 +409,10 @@ describe("MCP protocol compatibility", () => {
     });
   });
 
-  it("paginates tools and uses the negotiated protocol in cloud runs", async () => {
-    const seen: Array<{ method: string; protocol: string | null }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const body = requestBody(init);
-        seen.push({ method: body.method ?? "", protocol: new Headers(init?.headers).get("MCP-Protocol-Version") });
-        if (body.method === "initialize") {
-          return rpcJson(body.id, { protocolVersion: "2024-11-05" }, { "Mcp-Session-Id": "session-sensitive" });
-        }
-        if (body.method === "notifications/initialized") {
-          return new Response(null, { status: 202 });
-        }
-        if (body.method === "tools/list" && body.params?.cursor === "two") {
-          return rpcJson(body.id, { tools: [{ name: "two", description: "echo session-sensitive" }] });
-        }
-        return rpcJson(body.id, { tools: [{ name: "one" }], nextCursor: "two" });
-      }),
-    );
-    const connection = await connectCloudMcp({
-      id: "paged-cloud",
-      name: "Paged cloud",
-      kind: "mcp",
-      url: "https://paged.example.com/mcp",
-      headers: {},
-      omitMcpHeaders: false,
-      disabledTools: [],
-    });
-    expect(connection.tools.map((tool) => tool.name)).toEqual(["one", "two"]);
-    expect(connection.tools[1]?.description).toBe("echo [REDACTED_CREDENTIAL]");
-    expect(connection.session.redactions).toContain("session-sensitive");
-    expect(seen.find((item) => item.method === "tools/list")?.protocol).toBe("2024-11-05");
-  });
+  // Cloud pagination, version negotiation, the MCP-Protocol-Version header,
+  // isError and resource_link handling run against the real SDK server in
+  // mcp-conformance.test.ts — only failures a conforming server never
+  // produces stay mocked here.
 
   it("finishes on a matching event even when an SSE stream stays open", async () => {
     const encoder = new TextEncoder();
@@ -500,26 +471,6 @@ describe("MCP protocol compatibility", () => {
     await connectMcpServerLegacy(server);
     await expect(callMcpTool(server, "mutate", {})).rejects.toThrow(/Session expired/);
     expect({ initializeCalls, toolCalls }).toEqual({ initializeCalls: 1, toolCalls: 1 });
-  });
-
-  it("turns MCP isError results into actual tool failures", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const body = requestBody(init);
-        return rpcJson(body.id, {
-          isError: true,
-          content: [{ type: "text", text: "permission denied" }],
-        });
-      }),
-    );
-    const session: CloudMcpSession = {
-      url: "https://errors.example.com/mcp",
-      headers: {},
-      omitMcpHeaders: false,
-      nextId: 0,
-    };
-    await expect(callCloudMcpTool(session, "write", {})).rejects.toThrow(/permission denied/);
   });
 
   it("redacts exact server credentials from provider text and structured values", async () => {

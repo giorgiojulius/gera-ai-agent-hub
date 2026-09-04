@@ -22,11 +22,13 @@ import {
 } from "./agent-engine";
 import {
   createSqlMcpCatalogStore,
+  ELICITATION_TIMEOUT_MS,
   idleToolset,
   normalizeMcpToolLoading,
   resolveMcpToolset,
   type McpToolset,
 } from "./mcp-toolset";
+import { createRunPauseBoard, type RunPauseBoard } from "./run-pause";
 import { deriveCodeChangeFlow, finalizeCodeChangeFlow, mergeRunCodeChangeStates } from "./code-change-flow";
 import {
   chainRotationBases,
@@ -171,6 +173,10 @@ type LiveRun = {
   stopRequested: boolean;
   subscribers: Set<(event: RunEvent) => void>;
   done: boolean;
+  /** Open questions (MCP elicitation) the run is paused on; answered via /runs/answer. */
+  pauses: RunPauseBoard;
+  /** Closes the run's MCP notification streams when it settles. */
+  closeToolset?: () => void;
   // Throttles.
   textTimer: ReturnType<typeof setTimeout> | null;
   toolsTimer: ReturnType<typeof setTimeout> | null;
@@ -353,6 +359,9 @@ export class RunManager {
     if (request.method === "POST" && pathname === "/runs/ack") {
       return this.handleAck(request, owner);
     }
+    if (request.method === "POST" && pathname === "/runs/answer") {
+      return this.handleAnswer(request, owner);
+    }
     if (request.method === "GET" && pathname === "/runs/active") {
       return this.handleActive(owner);
     }
@@ -498,10 +507,17 @@ export class RunManager {
       stopRequested: false,
       subscribers: new Set(),
       done: false,
+      pauses: createRunPauseBoard(),
       textTimer: null,
       toolsTimer: null,
       flushTimer: null,
     };
+    // Every change of the open-question list reaches watching tabs at once and
+    // lands in the persisted snapshot, so a reopened tab sees the card too.
+    run.pauses.subscribe(() => {
+      this.emit(run, { t: "pause", seq: 0, pending: run.pauses.pending() });
+      this.scheduleFlush(run);
+    });
     // Seed + idempotency receipt + execution ownership commit together. A
     // deploy can observe all three or none; it can never accept a run id while
     // leaving a second request free to execute its tools.
@@ -614,6 +630,8 @@ export class RunManager {
     const run = this.live.get(this.liveKey(owner, conversationId));
     if (run && !run.done) {
       run.stopRequested = true;
+      // A stop while the run waits on the user must not leave the question open.
+      run.pauses.cancelAll();
       for (const listener of [...run.watchers]) {
         listener();
       }
@@ -626,6 +644,37 @@ export class RunManager {
       return json({ ok: true, stale: true });
     }
     return json({ ok: false, reason: "not_running" });
+  }
+
+  /**
+   * Answers one open question of a live run (MCP elicitation card). The board
+   * validates the answer against the requested schema; only the outcome is
+   * reported, never the submitted values.
+   */
+  private async handleAnswer(request: Request, owner: string): Promise<Response> {
+    let body: { conversationId?: unknown; requestId?: unknown; answer?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const conversationId = typeof body.conversationId === "string" ? body.conversationId : "";
+    const requestId = typeof body.requestId === "string" ? body.requestId : "";
+    if (!isValidId(conversationId) || !requestId || requestId.length > ID_LIMIT) {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const run = this.live.get(this.liveKey(owner, conversationId));
+    if (!run || run.done) {
+      return json({ ok: false, reason: "not_running" });
+    }
+    const outcome = run.pauses.answer(requestId, body.answer);
+    if (!outcome.ok) {
+      return json(
+        { ok: false, reason: outcome.error, ...(outcome.errors ? { errors: outcome.errors } : {}) },
+        outcome.error === "not_found" ? 404 : 400,
+      );
+    }
+    return json({ ok: true });
   }
 
   private async handleAck(request: Request, owner: string): Promise<Response> {
@@ -833,6 +882,7 @@ export class RunManager {
               beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
             })
           : idleToolset();
+        run.closeToolset = () => researchToolset.close();
         const githubRoute = [...researchToolset.routes.values()].find(
           (route) => route.type === "native" && route.kind === "github",
         );
@@ -1012,8 +1062,22 @@ export class RunManager {
               persist: (rotated) => this.persistRefreshedGrant(run.owner, rotated, appliedChains),
               reportFailure: (id, outcome) => this.recordOAuthFailure(run.owner, id, outcome),
               beginRefresh: (id) => this.markOAuthRefreshStarted(run.owner, id),
+              // Interactive: an MCP server asking for input pauses the run on a
+              // card in the thread; the board cancels honestly after 5 minutes.
+              elicit: (request) =>
+                run.pauses.request(
+                  {
+                    kind: "elicitation",
+                    serverId: request.serverId,
+                    serverName: request.serverName,
+                    message: request.message,
+                    fields: request.fields,
+                  },
+                  ELICITATION_TIMEOUT_MS,
+                ),
             })
           : idleToolset();
+        run.closeToolset = () => mcp.close();
       } catch (error) {
         console.error("mcp arming failed:", error instanceof Error ? error.message : "unknown");
       }
@@ -1278,6 +1342,7 @@ export class RunManager {
       ...(run.research ? { research: run.research } : {}),
       ...(run.julius ? { julius: run.julius } : {}),
       ...(run.steered.length > 0 ? { steered: run.steered } : {}),
+      ...(run.pauses.pending().length > 0 ? { pending: run.pauses.pending() } : {}),
     };
   }
 
@@ -1445,6 +1510,14 @@ export class RunManager {
   ): void {
     if (run.done) {
       return;
+    }
+    // No question survives its run: open cards resolve as cancelled, and the
+    // MCP notification streams the run held close with it.
+    run.pauses.cancelAll();
+    try {
+      run.closeToolset?.();
+    } catch {
+      // closing a stream can never fail the run
     }
     const settledCodeChanges = finalizeCodeChangeFlow(run.toolCalls, run.startedAt, run.codeChanges);
     if (settledCodeChanges) {
@@ -1977,6 +2050,7 @@ export class RunManager {
         stopRequested: false,
         subscribers: new Set(),
         done: false,
+        pauses: createRunPauseBoard(),
         textTimer: null,
         toolsTimer: null,
       flushTimer: null,

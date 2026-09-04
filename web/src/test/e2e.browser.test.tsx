@@ -28,8 +28,15 @@ import { buildRunReport, runScenario, type E2eDriver } from "../../e2e/runner";
 import {
   E2E_SCENARIOS,
   STUB_CODE_PROMPT,
+  STUB_ELICIT_FIELD,
+  STUB_ELICIT_PROMPT,
   STUB_HANG_PROMPT,
   STUB_MCP_PROMPT,
+  STUB_MCP_PROMPT_ARG,
+  STUB_MCP_PROMPT_NAME,
+  STUB_MCP_PROMPT_TEXT,
+  STUB_MCP_RESOURCE_URI,
+  STUB_MCP_SERVER_ID,
   STUB_REPLY_SNIPPET,
   SWITCH_TARGET_MODEL_ID,
   SWITCH_TARGET_MODEL_NAME,
@@ -147,6 +154,11 @@ let hangStubRun = false;
 let codeStubRun = false;
 /** Set by /runs/start for STUB_MCP_PROMPT — the stream shows a deferred MCP search + call before the reply. */
 let mcpStubRun = false;
+/** Set by /runs/start for STUB_ELICIT_PROMPT — the stream pauses on an elicitation card until /runs/answer lands. */
+let elicitStubRun = false;
+/** The answer body /runs/answer received (never contains anything but the fixture values). */
+let lastStubAnswer: unknown = null;
+let resolveStubAnswer: (() => void) | null = null;
 
 /** Tool records a deferred-mode run streams: the meta calls the server executed. */
 const MCP_STUB_TOOL_CALLS = [
@@ -277,6 +289,70 @@ function runStreamResponse(): Response {
 }
 
 /**
+ * A run stream that pauses on an MCP elicitation: snapshot → running
+ * mcp_call_tool row → `pause` event with one open question, then nothing
+ * until /runs/answer arrives — exactly what the run node emits while the tool
+ * call waits for the user. After the answer the card clears, the tool settles,
+ * and the reply streams.
+ */
+function elicitationRunStreamResponse(): Response {
+  const run = lastStubRun;
+  const encoder = new TextEncoder();
+  const now = Date.now();
+  const pending = [
+    {
+      id: "pause-1",
+      kind: "elicitation",
+      serverId: "deploybot",
+      serverName: "DeployBot",
+      message: "Which region should this deploy to?",
+      fields: [{ name: STUB_ELICIT_FIELD, type: "string", title: "Region", required: true }],
+      createdAt: now,
+      expiresAt: now + 5 * 60_000,
+    },
+  ];
+  const call = {
+    id: "mcp-deploy",
+    name: "mcp_call_tool",
+    arguments: JSON.stringify({ serverId: "deploybot", toolName: "deploy", arguments: {} }),
+  };
+  const snapshot = {
+    runId: run?.runId ?? "e2e-run",
+    conversationId: run?.conversationId ?? "e2e-thread",
+    kind: "chat",
+    status: "running",
+    startedAt: now,
+    content: "",
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const push = (event: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      push({ t: "snapshot", seq: 1, snapshot });
+      push({ t: "tools", seq: 2, toolCalls: [{ ...call, status: "running" }] });
+      push({ t: "pause", seq: 3, pending });
+      await new Promise<void>((resolve) => {
+        resolveStubAnswer = resolve;
+      });
+      const done = [{ ...call, status: "done", result: '{"action":"accept","content":{"region":"eu"}}' }];
+      push({ t: "pause", seq: 4, pending: [] });
+      push({ t: "tools", seq: 5, toolCalls: done });
+      push({ t: "text", seq: 6, content: REPLY_TEXT });
+      push({
+        t: "done",
+        seq: 7,
+        status: "done",
+        message: { id: run?.assistantMessageId ?? "e2e-assistant", content: REPLY_TEXT, toolCalls: done },
+        usageEvents: [{ modelId: "stub/model", usage: { prompt_tokens: 42, completion_tokens: 12, total_tokens: 54 } }],
+        steered: [],
+        chatUpdatedAt: Date.now(),
+      });
+      controller.close();
+    },
+  });
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
+/**
  * A run stream that emits a snapshot plus one text delta and then never
  * terminates — the production shape behind "stop only works after a page
  * reload": the tab must settle from the /runs/stop response alone.
@@ -361,8 +437,47 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
           name: "ask_question",
           description: "Ask about a public repository",
           inputSchema: { type: "object", properties: { question: { type: "string" } } },
+          annotations: { readOnlyHint: true },
         }],
         identity: "DeepWiki · server verified",
+        promptCount: 1,
+        resourceCount: 1,
+      });
+    }
+    // Composer menus: prompts / resources of one connected server, then a
+    // prompt rendered with its arguments and a resource body — all shard-side.
+    if (url.includes("/mcp/inventory")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { serverId?: string };
+      expect(body.serverId).toBe(STUB_MCP_SERVER_ID);
+      return jsonResponse({
+        prompts: [
+          {
+            name: STUB_MCP_PROMPT_NAME,
+            title: "Explain repository",
+            description: "Plain-words explanation of a repository",
+            arguments: [{ name: STUB_MCP_PROMPT_ARG, description: "owner/repo", required: true }],
+          },
+        ],
+        resources: [{ uri: STUB_MCP_RESOURCE_URI, name: "README", mimeType: "text/markdown" }],
+        resourceTemplates: [],
+        toolCount: 1,
+        cached: true,
+      });
+    }
+    if (url.includes("/mcp/prompt-get")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { serverId?: string; name?: string; arguments?: Record<string, string> };
+      expect(body.name).toBe(STUB_MCP_PROMPT_NAME);
+      expect(body.arguments?.[STUB_MCP_PROMPT_ARG]).toBe("acme/private-app");
+      return jsonResponse({
+        description: "Explain repository",
+        messages: [{ role: "user", text: `${STUB_MCP_PROMPT_TEXT}.` }],
+      });
+    }
+    if (url.includes("/mcp/resource-read")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { serverId?: string; uri?: string };
+      expect(body.uri).toBe(STUB_MCP_RESOURCE_URI);
+      return jsonResponse({
+        contents: [{ uri: STUB_MCP_RESOURCE_URI, mimeType: "text/markdown", text: "# acme/private-app\n\nFixture README body." }],
       });
     }
     if (url.includes("/mcp-proxy")) {
@@ -451,10 +566,22 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
       hangStubRun = raw.includes(STUB_HANG_PROMPT);
       codeStubRun = body.config?.prompt === STUB_CODE_PROMPT;
       mcpStubRun = body.config?.prompt === STUB_MCP_PROMPT;
+      elicitStubRun = body.config?.prompt === STUB_ELICIT_PROMPT;
       return jsonResponse({ ok: true, runId: lastStubRun.runId, historyOnServer: true });
     }
     if (url.includes("/runs/stream")) {
+      if (elicitStubRun) {
+        return elicitationRunStreamResponse();
+      }
       return hangStubRun ? hangingRunStreamResponse(init?.signal) : runStreamResponse();
+    }
+    if (url.includes("/runs/answer")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { requestId?: string; answer?: unknown };
+      expect(body.requestId).toBe("pause-1");
+      lastStubAnswer = body.answer ?? null;
+      resolveStubAnswer?.();
+      resolveStubAnswer = null;
+      return jsonResponse({ ok: true });
     }
     if (url.includes("/runs/active")) {
       return jsonResponse({ runs: [] });
@@ -571,6 +698,14 @@ function webDriver(): E2eDriver {
       // `.last()` — repeated rows (messages) assert against the newest one.
       await expect.element(page.getByTestId(target).last(), { timeout: timeoutMs }).toHaveTextContent(text);
     },
+    async seeValue(target: string, text: string, timeoutMs: number) {
+      await expect
+        .poll(
+          () => (document.querySelector(`[data-testid="${target}"]`) as HTMLInputElement | HTMLTextAreaElement | null)?.value ?? "",
+          { timeout: timeoutMs },
+        )
+        .toContain(text);
+    },
     async urlContains(text: string, timeoutMs: number) {
       await expect
         .poll(() => `${window.location.pathname}${window.location.search}`, { timeout: timeoutMs })
@@ -592,6 +727,9 @@ beforeEach(() => {
   hangStubRun = false;
   codeStubRun = false;
   mcpStubRun = false;
+  elicitStubRun = false;
+  lastStubAnswer = null;
+  resolveStubAnswer = null;
   localStorage.setItem(ACCESS_TOKEN_KEY, fakeAccessToken());
   installNetworkStub();
 });
@@ -658,10 +796,39 @@ for (const scenario of E2E_SCENARIOS) {
         }),
       );
     }
+    if (scenario.id === "prompt-slash" || scenario.id === "resource-mention") {
+      // A verified generic MCP server whose prompts/resources the menus can offer.
+      localStorage.setItem(
+        "gera.settings.v1",
+        JSON.stringify({
+          mcpServers: [
+            {
+              id: STUB_MCP_SERVER_ID,
+              catalogId: STUB_MCP_SERVER_ID,
+              name: "DeepWiki",
+              url: "https://mcp.deepwiki.com/mcp",
+              headersJson: "",
+              enabled: true,
+              status: "connected",
+              tools: [{ name: "ask_question", description: "Ask about a public repository" }],
+              disabledTools: [],
+              identity: "DeepWiki · server verified",
+              verifiedAt: Date.now(),
+              promptCount: 1,
+              resourceCount: 1,
+            },
+          ],
+        }),
+      );
+    }
     const result = await runScenario(webDriver(), scenario);
     results.push(result);
     if (!result.ok) {
       expect.fail(`[${result.scenarioId}] ${result.error ?? "scenario did not finish"}`);
+    }
+    if (scenario.id === "elicitation-accept") {
+      // The card's Accept sent exactly the validated form values through /runs/answer.
+      expect(lastStubAnswer).toEqual({ action: "accept", content: { [STUB_ELICIT_FIELD]: "eu" } });
     }
     if (scenario.id === "connect-open-mcp-deferred") {
       // The Settings switch rides into the run config as a snapshot, and the

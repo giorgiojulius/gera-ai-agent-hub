@@ -29,7 +29,16 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useMemo, useRef, useState, useSyncExternalStore, type DragEvent as ReactDragEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
@@ -51,6 +60,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
+import {
+  ComposerMcpMenuPanel,
+  McpArgsDialog,
+  resourceToken,
+  useComposerMcpMenu,
+  type ComposerMcpItem,
+  type McpArgsField,
+} from "@/components/gera/ComposerMcpMenu";
 import { ModelPicker } from "@/components/gera/ModelPicker";
 import { RepoLaunchDialog } from "@/components/gera/RepoLaunchDialog";
 import { MediaImg } from "@/components/gera/VaultMedia";
@@ -68,6 +85,17 @@ import {
 import { RepoAccessCheck } from "./RepoAccessCheck";
 import { JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES, juliusLetter } from "@/lib/julius";
 import { serverIconUrl } from "@/lib/mcp-catalog";
+import {
+  expandUriTemplate,
+  getMcpPrompt,
+  promptImagesToAttachments,
+  promptMessagesToText,
+  readMcpResource,
+  replaceComposerToken,
+  resourceContentsToAttachments,
+  uriTemplateVariables,
+  type ComposerMenuTrigger,
+} from "@/lib/mcp-inventory";
 import { cloudRunPhase, cloudRunsVersion, subscribeCloudRuns } from "@/lib/server-run";
 import { SKILL_SURFACE_LABEL, groupSkillsByFolder, setFolderSurface, setSkillSurface } from "@/lib/skills";
 import { isSteerableRun } from "@/lib/steering";
@@ -134,6 +162,7 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
     reorderQueued,
     sendQueuedNow,
     addAttachments,
+    addAttachmentRecords,
     removeAttachment,
     mode,
     setMode,
@@ -145,6 +174,16 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
   // class) and only scrolls past its cap — long prompts stay reviewable.
   const inputMaxHeight = variant === "hero" ? (isMobile ? 224 : 320) : isMobile ? 192 : 256;
   const inputRef = useAutoGrow(state.input, inputMaxHeight);
+  // The auto-grow hook hands out a callback ref; the MCP menus also need the
+  // node itself to restore focus and caret after a token replacement.
+  const textareaNode = useRef<HTMLTextAreaElement | null>(null);
+  const attachTextarea = useCallback(
+    (node: HTMLTextAreaElement | null) => {
+      textareaNode.current = node;
+      inputRef(node);
+    },
+    [inputRef],
+  );
 
   const settings = state.settings;
   const isChat = mode === "chat";
@@ -319,7 +358,109 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
     return composerPlaceholder(mode);
   })();
 
+  // MCP prompt (`/`) and resource (`@`) menus. The caret position decides
+  // which token is being typed; selections replace that token and, for
+  // resources, attach what the account shard read.
+  const [caret, setCaret] = useState<number>(0);
+  const [mcpBusy, setMcpBusy] = useState<boolean>(false);
+  const [mcpArgs, setMcpArgs] = useState<{ item: ComposerMcpItem; trigger: ComposerMenuTrigger; fields: McpArgsField[] } | null>(null);
+
+  const applyToken = useCallback(
+    (trigger: ComposerMenuTrigger, replacement: string) => {
+      const next = replaceComposerToken(state.input, trigger, replacement);
+      setInput(next.value);
+      setCaret(next.caret);
+      window.requestAnimationFrame(() => {
+        const node = textareaNode.current;
+        if (node) {
+          node.focus();
+          node.setSelectionRange(next.caret, next.caret);
+        }
+      });
+    },
+    [setInput, state.input],
+  );
+
+  const runPrompt = useCallback(
+    async (item: Extract<ComposerMcpItem, { kind: "prompt" }>, trigger: ComposerMenuTrigger, args: Record<string, string>) => {
+      setMcpBusy(true);
+      try {
+        const result = await getMcpPrompt(item.server.id, item.prompt.name, args);
+        const text = promptMessagesToText(result);
+        applyToken(trigger, text);
+        addAttachmentRecords(promptImagesToAttachments(result, `${item.server.name}-${item.prompt.name}`));
+        setMcpArgs(null);
+      } catch (error) {
+        toast.error(`Prompt “${item.prompt.name}” failed`, { description: errorFromUnknown(error) });
+      } finally {
+        setMcpBusy(false);
+      }
+    },
+    [addAttachmentRecords, applyToken],
+  );
+
+  const attachResource = useCallback(
+    async (server: McpServerConfig, uri: string, trigger: ComposerMenuTrigger) => {
+      setMcpBusy(true);
+      try {
+        const contents = await readMcpResource(server.id, uri);
+        const records = resourceContentsToAttachments(server, contents);
+        applyToken(trigger, resourceToken(server, uri));
+        addAttachmentRecords(records);
+        setMcpArgs(null);
+        if (records.length === 0) {
+          toast.error("The resource came back empty", { description: uri });
+        }
+      } catch (error) {
+        toast.error("Could not attach the resource", { description: errorFromUnknown(error) });
+      } finally {
+        setMcpBusy(false);
+      }
+    },
+    [addAttachmentRecords, applyToken],
+  );
+
+  const onMcpSelect = useCallback(
+    (item: ComposerMcpItem, trigger: ComposerMenuTrigger) => {
+      if (item.kind === "prompt") {
+        const fields: McpArgsField[] = (item.prompt.arguments ?? []).map((argument) => ({
+          name: argument.name,
+          description: argument.description,
+          required: argument.required === true,
+        }));
+        if (fields.length === 0) {
+          void runPrompt(item, trigger, {});
+          return;
+        }
+        setMcpArgs({ item, trigger, fields });
+        return;
+      }
+      if (item.kind === "resource") {
+        void attachResource(item.server, item.resource.uri, trigger);
+        return;
+      }
+      const variables = uriTemplateVariables(item.template.uriTemplate);
+      if (variables.length === 0) {
+        void attachResource(item.server, item.template.uriTemplate, trigger);
+        return;
+      }
+      setMcpArgs({ item, trigger, fields: variables.map((name) => ({ name, required: true })) });
+    },
+    [attachResource, runPrompt],
+  );
+
+  const mcpMenu = useComposerMcpMenu({
+    input: state.input,
+    caret,
+    servers: settings.mcpServers,
+    enabled: isChat && !mcpArgs,
+    onSelect: onMcpSelect,
+  });
+
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mcpMenu.onKeyDown(event)) {
+      return;
+    }
     if (event.key !== "Enter") {
       return;
     }
@@ -656,11 +797,48 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
             </span>
           </div>
         ) : null}
+        <ComposerMcpMenuPanel menu={mcpMenu} />
+        <McpArgsDialog
+          open={mcpArgs !== null}
+          title={
+            mcpArgs?.item.kind === "prompt"
+              ? `Prompt “${mcpArgs.item.prompt.title ?? mcpArgs.item.prompt.name}”`
+              : mcpArgs?.item.kind === "template"
+                ? `Resource “${mcpArgs.item.template.title ?? mcpArgs.item.template.name}”`
+                : "MCP"
+          }
+          description={
+            mcpArgs?.item.kind === "prompt"
+              ? mcpArgs.item.prompt.description ?? `${mcpArgs.item.server.name} fills this prompt with your arguments and inserts it into the message.`
+              : mcpArgs?.item.kind === "template"
+                ? `${mcpArgs.item.template.uriTemplate} — fill in the variables to read this resource from ${mcpArgs.item.server.name}.`
+                : undefined
+          }
+          fields={mcpArgs?.fields ?? []}
+          submitLabel={mcpArgs?.item.kind === "prompt" ? "Insert prompt" : "Attach resource"}
+          busy={mcpBusy}
+          onClose={() => setMcpArgs(null)}
+          onSubmit={(values) => {
+            if (!mcpArgs) {
+              return;
+            }
+            if (mcpArgs.item.kind === "prompt") {
+              void runPrompt(mcpArgs.item, mcpArgs.trigger, values);
+            } else if (mcpArgs.item.kind === "template") {
+              void attachResource(mcpArgs.item.server, expandUriTemplate(mcpArgs.item.template.uriTemplate, values), mcpArgs.trigger);
+            }
+          }}
+        />
         <textarea
-          ref={inputRef}
+          ref={attachTextarea}
           data-testid={TID.composerInput}
           value={state.input}
-          onChange={(event) => setInput(event.target.value)}
+          onChange={(event) => {
+            setInput(event.target.value);
+            setCaret(event.target.selectionStart ?? event.target.value.length);
+          }}
+          onKeyUp={(event) => setCaret(event.currentTarget.selectionStart ?? state.input.length)}
+          onClick={(event) => setCaret(event.currentTarget.selectionStart ?? state.input.length)}
           onKeyDown={onKeyDown}
           placeholder={placeholder}
           rows={1}

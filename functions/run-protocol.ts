@@ -2,6 +2,10 @@
 // this module (and agent-engine.ts) must import nothing Cloudflare-specific so
 // the web app's unit tests can exercise the exact engine that ships to the DO.
 
+import type { RunPauseRequest } from "./run-pause";
+
+export type { RunPauseRequest } from "./run-pause";
+
 export type RunKind = "chat" | "research" | "julius";
 
 export type WireAttachment = {
@@ -1021,12 +1025,15 @@ export type RunSnapshot = {
   julius?: JuliusState;
   /** Steer items already woven into the live context, in consumption order. */
   steered?: RunSteerItem[];
+  /** Open questions the run is paused on (MCP elicitation); answered via /runs/answer. */
+  pending?: RunPauseRequest[];
   error?: string;
 };
 
 /** Server → client live events over the run stream. */
 export type RunEvent =
   | { t: "snapshot"; seq: number; snapshot: RunSnapshot }
+  | { t: "pause"; seq: number; pending: RunPauseRequest[] }
   | { t: "text"; seq: number; content: string }
   | { t: "reasoning"; seq: number; tail: string }
   | { t: "tools"; seq: number; toolCalls: RunToolRecord[] }

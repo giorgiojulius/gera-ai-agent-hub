@@ -3,9 +3,9 @@
 // pair the moment that happens. The account shard keeps ONE rotation chain
 // per server — the freshest pair (tip) plus every superseded access token
 // (bases) — and hands it back through sync and a rescue endpoint, so the
-// browser adopts the tip instead of dying with invalid_grant. These tests
-// drive the exact modules that ship to the backend and the browser.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// vault-backed lease always uses the tip. The browser holds no grant anymore,
+// so only the backend chain is under test here.
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   chainRotationBases,
@@ -16,9 +16,6 @@ import {
   type OAuthRotation,
   type RefreshedOAuth,
 } from "../../../functions/mcp-cloud";
-import { applyServerOAuthRotations, parseServerOAuthRotations } from "@/lib/mcp-oauth";
-
-const TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
 
 function grant(accessToken: string, refreshToken?: string): CloudOAuthToken {
   return {
@@ -163,113 +160,5 @@ describe("server rotation chain (functions/mcp-cloud)", () => {
       token: { accessToken: "DEPLOY-B", refreshToken: "DEPLOY-RB" },
     });
     expect(providerFetch).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("browser adoption (web/src/lib/mcp-oauth)", () => {
-  let store: Map<string, string>;
-
-  beforeEach(() => {
-    store = new Map<string, string>();
-    vi.stubGlobal("window", {
-      localStorage: {
-        getItem: (key: string) => store.get(key) ?? null,
-        setItem: (key: string, value: string) => void store.set(key, value),
-        removeItem: (key: string) => void store.delete(key),
-      },
-    });
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  function seedTokens(map: Record<string, unknown>): void {
-    store.set(TOKENS_KEY, JSON.stringify(map));
-  }
-
-  function storedTokens(): Record<string, { accessToken: string; refreshToken?: string }> {
-    return JSON.parse(store.get(TOKENS_KEY) ?? "{}") as Record<
-      string,
-      { accessToken: string; refreshToken?: string }
-    >;
-  }
-
-  it("validates the wire shape and drops malformed entries", () => {
-    const parsed = parseServerOAuthRotations([
-      { serverId: "linear", bases: ["A"], token: grant("T", "RT") },
-      { serverId: "", bases: ["A"], token: grant("T") },
-      { serverId: "x", bases: [], token: grant("T") },
-      { serverId: "y", bases: ["A"], token: { accessToken: "" } },
-      "garbage",
-    ]);
-    expect(parsed).toHaveLength(1);
-    expect(parsed[0].serverId).toBe("linear");
-    expect(parseServerOAuthRotations(undefined)).toEqual([]);
-  });
-
-  it("adopts the chain tip when the local token was superseded server-side", () => {
-    seedTokens({ linear: grant("A", "RA") });
-    const adopted = applyServerOAuthRotations(
-      parseServerOAuthRotations([{ serverId: "linear", bases: ["A", "T"], token: grant("U", "RU") }]),
-    );
-    expect(adopted).toBe(1);
-    expect(storedTokens().linear.accessToken).toBe("U");
-    expect(storedTokens().linear.refreshToken).toBe("RU");
-  });
-
-  it("never touches foreign sign-ins, missing servers, or already-adopted tips", () => {
-    seedTokens({ linear: grant("FRESH", "RF") });
-    const foreign = applyServerOAuthRotations(
-      parseServerOAuthRotations([{ serverId: "linear", bases: ["A"], token: grant("U") }]),
-    );
-    expect(foreign).toBe(0);
-    expect(storedTokens().linear.accessToken).toBe("FRESH");
-
-    const missing = applyServerOAuthRotations(
-      parseServerOAuthRotations([{ serverId: "ghost", bases: ["A"], token: grant("U") }]),
-    );
-    expect(missing).toBe(0);
-
-    seedTokens({ linear: grant("U", "RU") });
-    const alreadyTip = applyServerOAuthRotations(
-      parseServerOAuthRotations([{ serverId: "linear", bases: ["A", "T"], token: grant("U", "RU") }]),
-    );
-    expect(alreadyTip).toBe(0);
-  });
-
-  it("full split-brain round trip: server rotates twice, stale browser recovers", () => {
-    // Server side: blob A, two refreshes → chain [A, T] with tip U.
-    const chains = new Map<string, string[]>();
-    const bases1 = chainRotationBases(chains, {
-      serverId: "linear",
-      baseAccessToken: "A",
-      token: grant("T", "RT"),
-    });
-    chains.set("linear", bases1);
-    const blob: Record<string, CloudOAuthToken> = { linear: grant("A", "RA") };
-    const { appliedChains } = overlayOAuthRotations(blob, [
-      { serverId: "linear", bases: bases1, token: grant("T", "RT") },
-    ]);
-    const bases2 = chainRotationBases(appliedChains, {
-      serverId: "linear",
-      baseAccessToken: "T",
-      token: grant("U", "RU"),
-    });
-
-    // Browser side: still on A — sync delivers the rotation, the sign-in survives.
-    seedTokens({ linear: grant("A", "RA") });
-    const adopted = applyServerOAuthRotations(
-      parseServerOAuthRotations([{ serverId: "linear", bases: bases2, token: grant("U", "RU") }]),
-    );
-    expect(adopted).toBe(1);
-    expect(storedTokens().linear.accessToken).toBe("U");
-
-    // Server prunes the override once the pushed blob carries the tip.
-    const caughtUp: Record<string, CloudOAuthToken> = { linear: grant("U", "RU") };
-    const pruned = overlayOAuthRotations(caughtUp, [
-      { serverId: "linear", bases: bases2, token: grant("U", "RU") },
-    ]);
-    expect(pruned.staleIds).toEqual(["linear"]);
   });
 });

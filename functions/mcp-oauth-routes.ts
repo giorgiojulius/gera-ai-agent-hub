@@ -11,26 +11,10 @@
 // ChatStore's dispatch stays one line per route.
 
 import { capStr, isRecord, isValidId, json, OAUTH_REF_PREFIX } from "./chat-shared";
-import {
-  chainRotationBases,
-  cloudOAuthToken,
-  refreshCloudOAuthGrant,
-  type CloudOAuthToken,
-  type RefreshedOAuth,
-} from "./mcp-cloud";
+import { type CloudOAuthToken } from "./mcp-cloud";
 import { exchangeAuthorizationCode, newOAuthState, OAuthCodeExchangeError } from "./mcp-oauth-flow";
 import { clearOAuthScopes, recordGrantedScopes } from "./mcp-oauth-scopes";
-import {
-  githubConnectorIds,
-  markOAuthReady,
-  markOAuthRefreshStarted,
-  oauthGrantState,
-  persistCanonicalOAuthGrant,
-  profileOAuthTokens,
-  readRotation,
-  recordOAuthFailure,
-  type OAuthStoreContext,
-} from "./mcp-oauth-store";
+import { githubConnectorIds, markOAuthReady, type OAuthStoreContext } from "./mcp-oauth-store";
 import { githubOAuthFormHeaders } from "./native-github";
 import { fetchPublicHttps } from "./network-safety";
 import { deviceCodeScope, OAUTH_PENDING_SECRET_FIELDS, oauthPendingFieldScope, oauthPendingScope, sealGrantPayload } from "./secret-rows";
@@ -576,106 +560,21 @@ export async function handleOAuthComplete(ctx: McpOAuthRouteContext, request: Re
   }
 }
 
-/** POST /mcp/oauth-store — stores a newly authorized or legacy-migrated grant only in the account shard. */
-export async function handleOAuthStore(ctx: McpOAuthRouteContext, request: Request, owner: string): Promise<Response> {
-  let body: { serverId?: unknown; token?: unknown; grants?: unknown; mode?: unknown };
-  try {
-    body = (await request.json()) as typeof body;
-  } catch {
-    return json({ error: "invalid_body" }, 400);
-  }
-  if (body.mode === "replace") {
-    return json(
-      {
-        error: "server_owned_oauth_required",
-        error_description:
-          "Gera was updated — reload this page (Cmd/Ctrl+Shift+R) and start the sign-in again.",
-      },
-      410,
-    );
-  }
-  const entries: Array<[string, unknown]> = [];
-  if (typeof body.serverId === "string") {
-    entries.push([body.serverId, body.token]);
-  }
-  if (isRecord(body.grants)) {
-    entries.push(...Object.entries(body.grants));
-  }
-  let stored = 0;
-  const settledIds: string[] = [];
-  for (const [serverId, raw] of entries.slice(0, 20)) {
-    const token = cloudOAuthToken(raw);
-    if (!isValidId(serverId) || !token) {
-      continue;
-    }
-    const revoked = ctx.sql
-      .exec<{ revoked_at: number }>(
-        "SELECT revoked_at FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    const existing = ctx.sql
-      .exec<{ payload: string }>(
-        "SELECT payload FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ?",
-        owner,
-        serverId,
-      )
-      .toArray()[0];
-    if (revoked || existing) {
-      settledIds.push(serverId);
-      continue;
-    }
-    let canonical = token;
-    const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-    const rotation = await readRotation(ctx, owner, serverId, await ctx.storage.get<unknown>(rotationKey));
-    if (rotation?.bases.includes(token.accessToken)) {
-      canonical = rotation.token;
-    }
-    ctx.sql.exec(
-      "INSERT OR REPLACE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-      owner,
-      serverId,
-      // Sealed under the account scope like every other grant row — a row
-      // sealed under the legacy owner scope would be unreadable after the sweep.
-      await sealGrantPayload(ctx.vault, ctx.subject(owner), serverId, canonical),
-      Date.now(),
-    );
-    ctx.sql.exec("DELETE FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ?", owner, serverId);
-    markOAuthReady(ctx, owner, serverId);
-    await ctx.storage.delete(rotationKey);
-    settledIds.push(serverId);
-    stored += 1;
-  }
-  if (settledIds.length > 0) {
-    const row = ctx.sql.exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner).toArray()[0];
-    if (row) {
-      try {
-        const profile = JSON.parse(row.payload) as Record<string, unknown>;
-        if (isRecord(profile.mcpOAuth)) {
-          const legacy = { ...profile.mcpOAuth };
-          for (const serverId of settledIds) {
-            delete legacy[serverId];
-          }
-          if (Object.keys(legacy).length > 0) {
-            profile.mcpOAuth = legacy;
-          } else {
-            delete profile.mcpOAuth;
-          }
-          ctx.sql.exec(
-            "UPDATE profiles SET payload = ?, updated_at = ? WHERE owner_email = ?",
-            JSON.stringify(profile),
-            Date.now(),
-            owner,
-          );
-        }
-      } catch {
-        // Keep a malformed profile untouched; canonical rows are already safe.
-      }
-    }
-    return json({ ok: true, stored, settledIds });
-  }
-  return json({ error: "invalid_grant" }, 400);
+/**
+ * POST /mcp/oauth-store — retired. Grants are minted and sealed only by the
+ * server-side flows (`/mcp/oauth-complete`, the GitHub device flow); a browser
+ * never holds one to upload. Older bundles that still try get a 410 and the
+ * instruction to reload, never a silent import of a browser-held token.
+ */
+export function handleOAuthStore(): Response {
+  return json(
+    {
+      error: "server_owned_oauth_required",
+      error_description:
+        "Gera was updated — reload this page (Cmd/Ctrl+Shift+R) and sign in to this server again.",
+    },
+    410,
+  );
 }
 
 /** POST /mcp/oauth-clear — removes a grant from the server; no browser credential can resurrect it. */
@@ -739,120 +638,20 @@ export async function handleOAuthClear(ctx: McpOAuthRouteContext, request: Reque
 }
 
 /**
- * POST /mcp/oauth-refresh — deployment-safe browser refresh. The provider's
- * rotating response is committed to this account shard before it is returned
- * to the tab. If a publish reload loses that response, the next bundle sends
- * the old base again and receives the durable tip without redeeming twice.
+ * POST /mcp/oauth-refresh — retired. Refresh happens only where the grant
+ * lives: inside the shard, per request, through the credential lease. A
+ * browser has no refresh token to send; older bundles get a 410 (which their
+ * refresh path treats as transient, so they keep working until reloaded).
  */
-export async function handleBrowserOAuthRefresh(ctx: McpOAuthRouteContext, request: Request, owner: string): Promise<Response> {
-  let body: { serverId?: unknown; token?: unknown };
-  try {
-    body = (await request.json()) as typeof body;
-  } catch {
-    return json({ error: "invalid_body" }, 400);
-  }
-  const serverId = typeof body.serverId === "string" ? body.serverId : "";
-  const incoming = cloudOAuthToken(body.token);
-  if (!isValidId(serverId) || !incoming?.refreshToken || !incoming.tokenEndpoint || !incoming.clientId) {
-    return json({ error: "invalid_grant" }, 400);
-  }
-  const blockedState = oauthGrantState(ctx, owner, serverId);
-  if (blockedState === "reauth_required" || blockedState === "step_up_required") {
-    return json({ error: blockedState }, blockedState === "step_up_required" ? 403 : 401);
-  }
-
-  const key = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-  let existing = await readRotation(ctx, owner, serverId, await ctx.storage.get<unknown>(key));
-  const profileGrant = (await profileOAuthTokens(ctx, owner))[serverId];
-  if (existing?.bases.includes(incoming.accessToken)) {
-    const profileStillOnChain =
-      Boolean(profileGrant) &&
-      (profileGrant?.accessToken === existing.token.accessToken || existing.bases.includes(profileGrant?.accessToken ?? ""));
-    if (!profileStillOnChain) {
-      // A sign-out or fresh sign-in in the durable profile outranks a stale
-      // tab. Escrow repairs deploy loss, never resurrects a removed account grant.
-      return json({ error: "stale_grant" }, 409);
-    }
-    markOAuthReady(ctx, owner, serverId);
-    return json({ ok: true, credentialStored: true, replayed: true });
-  }
-
-  if (
-    existing &&
-    existing.token.accessToken !== incoming.accessToken &&
-    profileGrant?.accessToken === incoming.accessToken
-  ) {
-    // The durable profile proves this is a fresh sign-in outside the old
-    // chain. Retire the obsolete escrow before refreshing the new grant.
-    await ctx.storage.delete(key);
-    existing = null;
-  }
-  if (profileGrant && profileGrant.accessToken !== incoming.accessToken) {
-    return json({ error: "stale_grant" }, 409);
-  }
-
-  const appliedChains = new Map<string, string[]>();
-  const grant = existing?.token.accessToken === incoming.accessToken ? existing.token : incoming;
-  if (existing?.token.accessToken === grant.accessToken) {
-    appliedChains.set(serverId, existing.bases);
-  }
-  const profileAnchor = profileGrant?.accessToken ?? null;
-  const server = {
-    id: serverId,
-    name: serverId,
-    kind: "mcp" as const,
-    url: grant.mcpUrl ?? grant.tokenEndpoint,
-    headers: {},
-    omitMcpHeaders: false,
-    disabledTools: [],
-    oauth: grant,
-  };
-  const persist = async (rotated: RefreshedOAuth): Promise<void> => {
-    const latestProfile = (await profileOAuthTokens(ctx, owner))[serverId];
-    if (
-      (profileAnchor !== null && latestProfile?.accessToken !== profileAnchor && latestProfile?.accessToken !== rotated.token.accessToken) ||
-      (profileAnchor === null && latestProfile && latestProfile.accessToken !== rotated.baseAccessToken && latestProfile.accessToken !== rotated.token.accessToken)
-    ) {
-      throw new Error("stale OAuth refresh result");
-    }
-    const latestOverride = await readRotation(ctx, owner, serverId, await ctx.storage.get<unknown>(key));
-    if (latestOverride?.bases.includes(rotated.baseAccessToken)) {
-      throw new Error("OAuth refresh already committed");
-    }
-    if (
-      latestOverride &&
-      latestOverride.token.accessToken !== rotated.baseAccessToken &&
-      latestOverride.token.accessToken !== rotated.token.accessToken
-    ) {
-      throw new Error("stale OAuth refresh result");
-    }
-    if (latestOverride) {
-      appliedChains.set(serverId, latestOverride.bases);
-    }
-    const bases = chainRotationBases(appliedChains, rotated);
-    await persistCanonicalOAuthGrant(ctx, owner, rotated);
-    appliedChains.set(serverId, bases);
-  };
-
-  try {
-    const outcome = await refreshCloudOAuthGrant(server, persist, (id) => markOAuthRefreshStarted(ctx, owner, id));
-    if (outcome.ok === false) {
-      await recordOAuthFailure(ctx, owner, serverId, outcome);
-      const status = outcome.transient ? (outcome.status === 429 ? 429 : 503) : 400;
-      return json({ error: outcome.code, transient: outcome.transient }, status);
-    }
-    return json({ ok: true, credentialStored: true, replayed: false });
-  } catch {
-    // A sibling request may have durably committed the shared provider
-    // response first. Return that winner; otherwise keep the caller's local
-    // grant untouched and let a later retry reconcile it.
-    const winner = await readRotation(ctx, owner, serverId, await ctx.storage.get<unknown>(key));
-    if (winner?.bases.includes(incoming.accessToken)) {
-      markOAuthReady(ctx, owner, serverId);
-      return json({ ok: true, credentialStored: true, replayed: true });
-    }
-    return json({ error: "refresh_commit_unavailable", transient: true }, 503);
-  }
+export function handleBrowserOAuthRefresh(): Response {
+  return json(
+    {
+      error: "server_owned_oauth_required",
+      error_description:
+        "Gera was updated — reload this page (Cmd/Ctrl+Shift+R); sign-ins are refreshed on the server now.",
+    },
+    410,
+  );
 }
 
 /**

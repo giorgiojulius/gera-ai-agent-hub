@@ -1,10 +1,14 @@
 import {
   extractMcpResultMedia,
   isUiOnlyTool,
-  mcpInitialize,
+  MCP_DEFAULT_PROTOCOL_VERSION,
+  mcpConnect,
   mcpListAll,
   mcpRequest,
+  mcpRequestWithInput,
+  McpRpcError,
   mcpResourceLinks,
+  sessionWireInfo,
   normalizePromptInfo,
   normalizeResourceInfo,
   normalizeResourceTemplateInfo,
@@ -28,6 +32,7 @@ import {
   type McpServerRequest,
   type McpServerRequestReply,
   type McpToolAnnotations,
+  type McpWireInfo,
 } from "./mcp-protocol";
 import { fetchPublicHttps, safePublicHttpsUrl } from "./network-safety";
 
@@ -172,10 +177,10 @@ function serverCredentialValues(server: CloudMcpServer): string[] {
   return credentialVariants(values);
 }
 
-const MCP_PROTOCOL_VERSION = "2025-06-18";
 const CONNECT_TIMEOUT_MS = 12_000;
+/** The `server/discover` probe is bounded separately — a silent legacy server must not eat the connect budget. */
+const DISCOVER_TIMEOUT_MS = 5_000;
 const CALL_TIMEOUT_MS = 40_000;
-const MAX_SERVERS_PER_RUN = 8;
 
 // Minimal mirror of the web catalog facts the cloud needs; the full catalog
 // (hints, icons, OAuth metadata) lives in the web app.
@@ -295,6 +300,8 @@ export function intersectMcpAllowIds(
  * resolved here: pasted keys follow the catalog's token placement, custom
  * headers pass through, synced browser sign-ins ride as OAuth grants, and
  * the native GitHub/Slack/Intercom connectors carry their REST credential.
+ * There is no per-run server count limit — the toolset resolver bounds a run
+ * by its connect budget and combined catalog size instead.
  */
 export function cloudMcpServersForAutomation(
   rawServers: unknown,
@@ -306,9 +313,6 @@ export function cloudMcpServersForAutomation(
   }
   const out: CloudMcpServer[] = [];
   for (const raw of rawServers) {
-    if (out.length >= MAX_SERVERS_PER_RUN) {
-      break;
-    }
     const server = eligibleCloudServer(raw, allowIds, oauthTokens);
     if (server) {
       out.push(server);
@@ -965,6 +969,8 @@ export type ConnectCloudMcpOptions = {
    * request and dropped, and `server.headers` / `server.oauth` are ignored.
    */
   lease?: McpCredentialLease;
+  /** Negotiation cached by an earlier run (with the tool catalog) — skips the `server/discover` probe. */
+  wireHint?: McpWireInfo;
 };
 
 export type CloudMcpConnection = {
@@ -973,6 +979,8 @@ export type CloudMcpConnection = {
   prompts: McpPromptInfo[];
   resources: McpResourceInfo[];
   resourceTemplates: McpResourceTemplateInfo[];
+  /** The wire the handshake settled on (cached with the catalog). */
+  wire?: McpWireInfo;
 };
 
 /** Turns one raw `tools/list` entry into the redacted catalog shape; null when unusable. */
@@ -1055,7 +1063,20 @@ export async function listCloudMcpInventory(
   return { prompts, resources, resourceTemplates };
 }
 
-/** initialize → initialized → tools/list (+ optional inventory); returns a live session + its tables. */
+/** A cached "modern" hint that turned out wrong: the server no longer knows the stateless methods. */
+function staleModernHint(error: unknown): boolean {
+  return (
+    error instanceof McpRpcError &&
+    (error.rpcCode === -32601 || error.httpStatus === 404 || error.httpStatus === 405)
+  );
+}
+
+/**
+ * Negotiates the wire (`server/discover`, else initialize → initialized) and
+ * lists tools (+ optional inventory); returns a live session + its tables.
+ * A cached wire hint skips the probe; if the hint proves stale the handshake
+ * is redone once with a fresh probe.
+ */
 export async function connectCloudMcp(
   server: CloudMcpServer,
   options: ConnectCloudMcpOptions = {},
@@ -1064,30 +1085,47 @@ export async function connectCloudMcp(
   if (!options.lease && server.oauth && !headers.Authorization) {
     headers.Authorization = `Bearer ${server.oauth.accessToken}`;
   }
-  const session: CloudMcpSession = {
+  const newSession = (): CloudMcpSession => ({
     url: server.url,
     headers,
     omitMcpHeaders: server.omitMcpHeaders,
-    protocolVersion: MCP_PROTOCOL_VERSION,
+    protocolVersion: MCP_DEFAULT_PROTOCOL_VERSION,
     nextId: 0,
     redactions: options.lease ? [] : serverCredentialValues(server),
     ...(options.lease ? { lease: options.lease } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
     ...(options.onServerRequest ? { onServerRequest: options.onServerRequest } : {}),
     ...(options.onNotification ? { onNotification: options.onNotification } : {}),
+  });
+  const handshake = async (wireHint: McpWireInfo | undefined): Promise<CloudMcpConnection> => {
+    const session = newSession();
+    await mcpConnect(session, {
+      clientInfo: { name: "Gera AI cloud runs", version: "1.0.0" },
+      timeoutMs: CONNECT_TIMEOUT_MS,
+      discoverTimeoutMs: DISCOVER_TIMEOUT_MS,
+      ...(wireHint ? { wireHint } : {}),
+    });
+    const tools = await listCloudMcpTools(session, server, {
+      maxTools: options.maxTools,
+      includeDisabled: options.includeDisabled,
+    });
+    const inventory = options.inventory
+      ? await listCloudMcpInventory(session)
+      : { prompts: [], resources: [], resourceTemplates: [] };
+    const wire = sessionWireInfo(session);
+    return { session, tools, ...inventory, ...(wire ? { wire } : {}) };
   };
-  await mcpInitialize(session, {
-    clientInfo: { name: "Gera AI cloud runs", version: "1.0.0" },
-    timeoutMs: CONNECT_TIMEOUT_MS,
-  });
-  const tools = await listCloudMcpTools(session, server, {
-    maxTools: options.maxTools,
-    includeDisabled: options.includeDisabled,
-  });
-  const inventory = options.inventory
-    ? await listCloudMcpInventory(session)
-    : { prompts: [], resources: [], resourceTemplates: [] };
-  return { session, tools, ...inventory };
+  if (options.wireHint?.era === "modern") {
+    try {
+      return await handshake(options.wireHint);
+    } catch (error) {
+      if (!staleModernHint(error)) {
+        throw error;
+      }
+    }
+    return handshake(undefined);
+  }
+  return handshake(options.wireHint);
 }
 
 const MAX_RESOURCE_LINK_READS = 4;
@@ -1125,7 +1163,9 @@ export async function callCloudMcpToolRich(
   name: string,
   args: unknown,
 ): Promise<CloudMcpToolResult> {
-  const result = await rpc(session, "tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
+  // The stateless revision may answer with `input_required`; the input rounds
+  // ride the session's server-request handler (interactive: card; background: decline).
+  const result = await mcpRequestWithInput(session, "tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS);
   const redactions = session.redactions ?? [];
   const rendered = redactCloudMcpText(stringifyCloudMcpResult(result), redactions);
   if (isRecord(result) && result.isError === true) {
@@ -1135,7 +1175,7 @@ export async function callCloudMcpToolRich(
   const pieces = [rendered, ...media.omitted.map((note) => `[${note}]`)];
   for (const uri of mcpResourceLinks(result, MAX_RESOURCE_LINK_READS)) {
     try {
-      const resource = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
+      const resource = await mcpRequestWithInput(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
       const text = redactCloudMcpText(stringifyMcpResourceRead(resource), redactions);
       if (text) {
         pieces.push(text);
@@ -1176,7 +1216,7 @@ export type CloudMcpResourceContent = {
 
 /** `resources/read` for the composer's @-mentions: text capped honestly, blobs bounded. */
 export async function readCloudMcpResource(session: CloudMcpSession, uri: string): Promise<CloudMcpResourceContent[]> {
-  const result = await rpc(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
+  const result = await mcpRequestWithInput(session, "resources/read", { uri }, CALL_TIMEOUT_MS);
   const redactions = session.redactions ?? [];
   if (!isRecord(result) || !Array.isArray(result.contents)) {
     throw new Error("resources/read returned no contents");
@@ -1232,7 +1272,7 @@ export async function getCloudMcpPrompt(
   name: string,
   args: Record<string, string>,
 ): Promise<CloudMcpPromptResult> {
-  const result = await rpc(session, "prompts/get", { name, arguments: args }, CALL_TIMEOUT_MS);
+  const result = await mcpRequestWithInput(session, "prompts/get", { name, arguments: args }, CALL_TIMEOUT_MS);
   const redactions = session.redactions ?? [];
   if (!isRecord(result) || !Array.isArray(result.messages)) {
     throw new Error("prompts/get returned no messages");

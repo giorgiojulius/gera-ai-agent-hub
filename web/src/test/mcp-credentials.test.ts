@@ -144,8 +144,10 @@ describe("toolset sessions carry no credentials", () => {
     expect(outcome.text).toContain("key=[REDACTED_CREDENTIAL]");
     expect(outcome.text).not.toContain(TOKEN);
 
-    // Every request went out with the real credential …
+    // Every request went out with the real credential — the stateless probe
+    // included (this fake is a legacy server, so initialize follows it) …
     expect(remote.requests.map((request) => request.method)).toEqual([
+      "server/discover",
       "initialize",
       "notifications/initialized",
       "tools/list",

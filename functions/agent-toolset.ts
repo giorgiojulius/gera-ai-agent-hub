@@ -43,8 +43,6 @@ export type AgentToolsetContext<A extends { name: string } = { name: string }> =
   secretFlags(secrets: AgentSecrets): AgentSecretFlags;
   /** True when `email` is a current member who may manage the project — linked servers and accounts resolve only through such members. */
   canManage(email: string): boolean;
-  /** Function budget for one agent run (native routes + MCP). */
-  toolCap: number;
 };
 
 export type AgentToolsetResult = {
@@ -179,7 +177,6 @@ export async function buildAgentToolset<A extends { name: string }>(
           // to keep alive (list_changed reaches them through the owner's
           // catalog cache on the next resolve); elicitation is declined.
           notificationStreams: false,
-          nativeCap: Math.max(0, ctx.toolCap - routes.size),
           // Per-request credential lease through the owner's shard: the grant
           // or key is opened there for each MCP request (refresh inside, forced
           // after an auth rejection) and never retained in this project shard.

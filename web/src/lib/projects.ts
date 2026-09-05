@@ -35,8 +35,6 @@ export type AgentMcpServer = {
 /** Write policy for an agent's linked MCP servers (write / destructive tools). */
 export type AgentMcpWrites = "ask" | "auto";
 
-export const MAX_AGENT_MCP_SERVERS = 5;
-
 export type ProjectAgent = {
   id: string;
   name: string;

@@ -1,7 +1,6 @@
 import { FUNCTIONS_URL, authedFetch } from "@/lib/backend";
 import { newId } from "@/lib/env";
 import { findCatalogEntry } from "@/lib/mcp-catalog";
-import { hasOAuthToken } from "@/lib/mcp-oauth";
 import type { Automation, AutomationCadence, McpServerConfig } from "@/lib/types";
 
 /** Fields the editor manages; ids and schedule bookkeeping are derived. */
@@ -198,7 +197,8 @@ export function cloudMcpReadiness(server: McpServerConfig): CloudMcpReadiness {
   const catalogKey = server.catalogId ?? server.id;
   const hasKey = (server.token ?? "").trim().length > 0;
   const hasHeaders = server.headersJson.trim().length > 0;
-  const signedIn = hasOAuthToken(server.id, server.url);
+  // Sign-ins live only in the account vault; the card's non-secret flag is the proof.
+  const signedIn = server.credentialStored === true;
   if (entry?.native) {
     if (catalogKey === "github") {
       return hasKey || signedIn ? "ready" : "needs-auth";

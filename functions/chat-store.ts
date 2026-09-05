@@ -137,7 +137,6 @@ import {
 } from "./mcp-oauth-routes";
 import {
   hasMcpServerSecret,
-  markOAuthReady,
   markOAuthRefreshStarted,
   mcpConfigsWithSecrets,
   oauthGrantState,
@@ -1285,9 +1284,10 @@ export class ChatStore extends DurableObject {
   }
 
   /**
-   * Imports credentials from pre-vault profile blobs, then returns a payload
-   * that is safe to synchronize to browsers. Canonical rows and revocation
-   * tombstones always outrank stale legacy copies.
+   * Returns a profile payload that is safe to synchronize to browsers. A
+   * legacy `mcpOAuth` half (grants older bundles mirrored into the profile) is
+   * dropped without being imported: sign-ins are minted only by the
+   * server-side flows, and a browser-held token never becomes a vault row.
    */
   private async prepareProfilePayload(owner: string, payload: string): Promise<string | null> {
     let parsed: unknown;
@@ -1300,45 +1300,7 @@ export class ChatStore extends DurableObject {
       return null;
     }
     const profile: Record<string, unknown> = { ...parsed };
-    if (isRecord(profile.mcpOAuth)) {
-      for (const [serverId, rawToken] of Object.entries(profile.mcpOAuth).slice(0, 40)) {
-        const token = cloudOAuthToken(rawToken);
-        if (!isValidId(serverId) || !token) {
-          continue;
-        }
-        const revoked = this.ctx.storage.sql
-          .exec<{ present: number }>(
-            "SELECT 1 AS present FROM mcp_oauth_revocations WHERE owner_email = ? AND server_id = ? LIMIT 1",
-            owner,
-            serverId,
-          )
-          .toArray()[0];
-        const existing = this.ctx.storage.sql
-          .exec<{ present: number }>(
-            "SELECT 1 AS present FROM mcp_oauth_grants WHERE owner_email = ? AND server_id = ? LIMIT 1",
-            owner,
-            serverId,
-          )
-          .toArray()[0];
-        if (revoked || existing) {
-          continue;
-        }
-        let canonical = token;
-        const rotationKey = `${OAUTH_REF_PREFIX}${owner}:${serverId}`;
-        const rotation = await readRotation(this.oauthStore, owner, serverId, await this.ctx.storage.get<unknown>(rotationKey));
-        if (rotation?.bases.includes(token.accessToken)) {
-          canonical = rotation.token;
-        }
-        this.ctx.storage.sql.exec(
-          "INSERT OR IGNORE INTO mcp_oauth_grants (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-          owner,
-          serverId,
-          await sealGrantPayload(this.vault, this.scope.subject(owner), serverId, canonical),
-          Date.now(),
-        );
-        markOAuthReady(this.oauthStore, owner, serverId);
-        await this.ctx.storage.delete(rotationKey);
-      }
+    if ("mcpOAuth" in profile) {
       delete profile.mcpOAuth;
     }
     if (isRecord(profile.settings) && Array.isArray(profile.settings.mcpServers)) {
@@ -1669,11 +1631,11 @@ export class ChatStore extends DurableObject {
       case "/mcp/oauth-callback":
         return method === "POST" ? handleOAuthCallback(this.oauthRouteContext(), request, email) : null;
       case "/mcp/oauth-store":
-        return method === "POST" ? handleOAuthStore(this.oauthRouteContext(), request, email) : null;
+        return method === "POST" ? handleOAuthStore() : null;
       case "/mcp/oauth-clear":
         return method === "POST" ? handleOAuthClear(this.oauthRouteContext(), request, email) : null;
       case "/mcp/oauth-refresh":
-        return method === "POST" ? handleBrowserOAuthRefresh(this.oauthRouteContext(), request, email) : null;
+        return method === "POST" ? handleBrowserOAuthRefresh() : null;
       case "/mcp/check":
         return method === "POST" ? handleMcpCheck(this.oauthStore, request, email) : null;
       case "/mcp/inventory":

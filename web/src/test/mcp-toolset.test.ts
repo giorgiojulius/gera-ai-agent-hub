@@ -9,14 +9,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { CloudMcpServer, CloudMcpTool } from "../../../functions/mcp-cloud";
+import { cloudMcpServersForAutomation } from "../../../functions/mcp-cloud";
 import {
   createMemoryMcpCatalogStore,
   decideMcpToolLoading,
-  DEFERRED_AUTO_TOOL_THRESHOLD,
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  DEFERRED_AUTO_CONTEXT_SHARE,
   describeMcpMetaCall,
   MCP_CALL_TOOL_NAME,
   MCP_SEARCH_TOOL_NAME,
-  NATIVE_TOOL_CAP,
+  NATIVE_TOOLS_PER_SERVER,
   normalizeMcpToolLoading,
   resolveMcpToolset,
   searchMcpTools,
@@ -36,6 +38,8 @@ type FixtureServer = {
   calls: Array<{ name: string; arguments: unknown }>;
   /** Respond 401 to every request — an auth-rejected server. */
   reject?: boolean;
+  /** Delay every response by this many ms — a slow server the connect budget may leave behind. */
+  delayMs?: number;
 };
 
 function jsonResponse(value: unknown, headers: Record<string, string> = {}): Response {
@@ -105,6 +109,9 @@ function installFixtureFetch(servers: FixtureServer[]): void {
       if (server.reject) {
         return new Response("nope", { status: 401 });
       }
+      if (server.delayMs) {
+        await new Promise((resolve) => setTimeout(resolve, server.delayMs));
+      }
       const body = JSON.parse(String(init?.body ?? "{}")) as {
         id?: number;
         method?: string;
@@ -157,11 +164,16 @@ async function searchResult(toolset: McpToolset, args: Record<string, unknown>) 
 }
 
 describe("resolveMcpToolset · deferred loading", () => {
-  it("(a) three servers × 40 tools in auto mode expose exactly two MCP functions", async () => {
+  it("(a) three servers × 40 tools whose schemas outgrow a small context window expose exactly two MCP functions", async () => {
     const servers = [fixture("alpha", 40), fixture("beta", 40), fixture("gamma", 40)];
     installFixtureFetch(servers);
 
-    const toolset = await resolveMcpToolset({ servers: servers.map((server) => cloudServer(server)), mode: "auto" });
+    // 120 tiny schemas (~7k chars ≈ 1.7k tokens) are more than 15% of an 8k window.
+    const toolset = await resolveMcpToolset({
+      servers: servers.map((server) => cloudServer(server)),
+      mode: "auto",
+      contextWindowTokens: 8_000,
+    });
 
     expect(toolset.mode).toBe("deferred");
     expect(mcpFunctionDefs(toolset)).toEqual([MCP_SEARCH_TOOL_NAME, MCP_CALL_TOOL_NAME]);
@@ -288,32 +300,33 @@ describe("resolveMcpToolset · deferred loading", () => {
     expect(servers[0].calls).toEqual([]);
   });
 
-  it("(e) the account setting picks the mode; auto stays native for a small table", async () => {
-    const servers = [fixture("alpha", 40), fixture("beta", 40), fixture("gamma", 40)];
+  it("(e) the account setting picks the mode; native has no per-run cap; auto stays native for small schemas", async () => {
+    // Twelve servers × 30 tools: every one of the 360 functions reaches the prompt.
+    const servers = Array.from({ length: 12 }, (_, index) => fixture(`srv${String(index).padStart(2, "0")}`, 30));
     installFixtureFetch(servers);
     const cloud = servers.map((server) => cloudServer(server));
 
     const native = await resolveMcpToolset({ servers: cloud, mode: "native" });
     expect(native.mode).toBe("native");
     const nativeNames = mcpFunctionDefs(native);
-    expect(nativeNames).toHaveLength(NATIVE_TOOL_CAP);
-    expect(nativeNames).toContain("mcp_alpha_alpha_tool_01");
+    expect(nativeNames).toHaveLength(360);
+    expect(nativeNames).toContain("mcp_srv00_srv00_tool_01");
+    expect(nativeNames).toContain("mcp_srv11_srv11_tool_30");
     expect(nativeNames).not.toContain(MCP_SEARCH_TOOL_NAME);
-    // The third server did not fit the soft cap — an honest record names it.
-    const limit = native.failures.find((failure) => failure.name === "mcp_limit");
-    expect(limit?.arguments).toBe("Gamma");
-    expect(limit?.result).toContain("30 of 40 tools");
-    expect(limit?.result).toContain("Deferred");
+    expect(native.failures).toEqual([]);
+    expect(native.servers.every((info) => info.toolCount === 30 && !info.unavailable)).toBe(true);
+    expect(servers.every((server) => server.initializes === 1)).toBe(true);
 
     const deferred = await resolveMcpToolset({ servers: cloud, mode: "deferred" });
     expect(deferred.mode).toBe("deferred");
     expect(mcpFunctionDefs(deferred)).toEqual([MCP_SEARCH_TOOL_NAME, MCP_CALL_TOOL_NAME]);
 
-    const small = [fixture("delta", 5)];
-    installFixtureFetch(small);
-    const auto = await resolveMcpToolset({ servers: [cloudServer(small[0])], mode: "auto" });
+    // Forty tools with small schemas stay native under the default 128k window.
+    const forty = [fixture("delta", 40)];
+    installFixtureFetch(forty);
+    const auto = await resolveMcpToolset({ servers: [cloudServer(forty[0])], mode: "auto" });
     expect(auto.mode).toBe("native");
-    expect(mcpFunctionDefs(auto)).toHaveLength(5);
+    expect(mcpFunctionDefs(auto)).toHaveLength(40);
     expect(auto.promptNote).toBe("");
 
     expect(normalizeMcpToolLoading("deferred")).toBe("deferred");
@@ -322,16 +335,113 @@ describe("resolveMcpToolset · deferred loading", () => {
     expect(normalizeMcpToolLoading(undefined)).toBe("auto");
   });
 
-  it("auto weighs the tool count and the schema share of the context window", () => {
-    expect(decideMcpToolLoading("auto", { toolCount: DEFERRED_AUTO_TOOL_THRESHOLD, schemaChars: 2_000 })).toBe("native");
-    expect(decideMcpToolLoading("auto", { toolCount: DEFERRED_AUTO_TOOL_THRESHOLD + 1, schemaChars: 2_000 })).toBe("deferred");
-    // 12 tools whose schemas take ~12.5k tokens: over 8% of an assumed 128k window …
-    expect(decideMcpToolLoading("auto", { toolCount: 12, schemaChars: 50_000 })).toBe("deferred");
+  it("auto weighs only the schema share of the context window — never the tool count", () => {
+    expect(DEFERRED_AUTO_CONTEXT_SHARE).toBe(0.15);
+    // Many tiny tools stay native: the count alone means nothing.
+    expect(decideMcpToolLoading("auto", { toolCount: 40, schemaChars: 2_400 })).toBe("native");
+    expect(decideMcpToolLoading("auto", { toolCount: 400, schemaChars: 24_000 })).toBe("native");
+    // 12 tools whose schemas take ~20k tokens: over 15% of an assumed 128k window …
+    expect(decideMcpToolLoading("auto", { toolCount: 12, schemaChars: 80_000 })).toBe("deferred");
     // … but fine inside a 1M window.
-    expect(decideMcpToolLoading("auto", { toolCount: 12, schemaChars: 50_000 }, 1_000_000)).toBe("native");
+    expect(decideMcpToolLoading("auto", { toolCount: 12, schemaChars: 80_000 }, 1_000_000)).toBe("native");
+    // Exactly at the threshold stays native; the first character over flips.
+    const thresholdChars = DEFAULT_CONTEXT_WINDOW_TOKENS * DEFERRED_AUTO_CONTEXT_SHARE * 4;
+    expect(decideMcpToolLoading("auto", { toolCount: 5, schemaChars: thresholdChars })).toBe("native");
+    expect(decideMcpToolLoading("auto", { toolCount: 5, schemaChars: thresholdChars + 4 })).toBe("deferred");
     expect(decideMcpToolLoading("native", { toolCount: 500, schemaChars: 900_000 })).toBe("native");
     expect(decideMcpToolLoading("deferred", { toolCount: 1, schemaChars: 10 })).toBe("deferred");
     expect(decideMcpToolLoading("auto", { toolCount: 0, schemaChars: 0 })).toBe("native");
+  });
+
+  it("native keeps only the per-server fuse and names the server it trimmed", async () => {
+    const servers = [fixture("huge", NATIVE_TOOLS_PER_SERVER + 20), fixture("tiny", 3)];
+    installFixtureFetch(servers);
+    const toolset = await resolveMcpToolset({ servers: servers.map((server) => cloudServer(server)), mode: "native" });
+    expect(toolset.routes.size).toBe(NATIVE_TOOLS_PER_SERVER + 3);
+    const limit = toolset.failures.find((failure) => failure.name === "mcp_limit");
+    expect(limit?.arguments).toBe("Huge");
+    expect(limit?.result).toContain(`20 of ${NATIVE_TOOLS_PER_SERVER + 20} tools`);
+    expect(limit?.result).toContain(`${NATIVE_TOOLS_PER_SERVER} inline functions per server`);
+    expect(limit?.result).not.toMatch(/\b90\b/);
+    expect(limit?.result).toContain("Deferred");
+  });
+
+  it("twenty connected servers all reach the resolver — no per-run server count", () => {
+    const raw = Array.from({ length: 20 }, (_, index) => ({
+      id: `server-${index}`,
+      name: `Server ${index}`,
+      url: `https://server-${index}.example.com/mcp`,
+      enabled: true,
+      status: "connected",
+      disabledTools: [],
+    }));
+    const servers = cloudMcpServersForAutomation(raw, null);
+    expect(servers).toHaveLength(20);
+    expect(servers.map((server) => server.id)).toEqual(raw.map((server) => server.id));
+  });
+
+  it("a slow server does not hold the run past the connect budget, and a later call picks it up", async () => {
+    const servers = [fixture("alpha", 10), { ...fixture("slow", 10), delayMs: 400 }];
+    installFixtureFetch(servers);
+
+    const startedAt = Date.now();
+    const native = await resolveMcpToolset({
+      servers: servers.map((server) => cloudServer(server)),
+      mode: "native",
+      connectBudgetMs: 150,
+    });
+    expect(Date.now() - startedAt).toBeLessThan(350);
+    expect(mcpFunctionDefs(native)).toHaveLength(10);
+    expect(mcpFunctionDefs(native).every((name) => name.startsWith("mcp_alpha_"))).toBe(true);
+    const late = native.failures.find((failure) => failure.name === "mcp_connect");
+    expect(late?.arguments).toBe("Slow");
+    expect(late?.result).toContain("connection budget");
+    expect(native.servers.find((info) => info.id === "slow")?.unavailable).toContain("connection budget");
+    expect(native.servers.find((info) => info.id === "alpha")?.toolCount).toBe(10);
+
+    // Deferred: the budget lapses the same way, but the first search waits for
+    // the handshake that kept going in the background and lists the table.
+    const again = [fixture("alpha", 10), { ...fixture("slow", 10), delayMs: 400 }];
+    installFixtureFetch(again);
+    const deferred = await resolveMcpToolset({
+      servers: again.map((server) => cloudServer(server)),
+      mode: "deferred",
+      connectBudgetMs: 150,
+    });
+    expect(deferred.servers.find((info) => info.id === "slow")?.unavailable).toContain("connection budget");
+    const found = await searchResult(deferred, { query: "slow_tool_02" });
+    const slow = found.servers.find((server) => server.serverId === "slow");
+    expect(slow?.unavailable).toBeUndefined();
+    expect(slow?.toolCount).toBe(10);
+    expect(found.matches[0]?.toolName).toBe("slow_tool_02");
+    const ran = await deferred.execute(MCP_CALL_TOOL_NAME, { serverId: "slow", toolName: "slow_tool_02", arguments: { input: "z" } });
+    expect(ran.isError).toBeUndefined();
+    expect(again[1].calls).toEqual([{ name: "slow_tool_02", arguments: { input: "z" } }]);
+  });
+
+  it("the combined catalog budget leaves later servers out with an honest record that names them", async () => {
+    const servers = [fixture("alpha", 40), fixture("beta", 40), fixture("gamma", 40)];
+    installFixtureFetch(servers);
+    const perServer = JSON.stringify(servers[0].tools).length;
+    const toolset = await resolveMcpToolset({
+      servers: servers.map((server) => cloudServer(server)),
+      mode: "deferred",
+      // Room for two tables, not three.
+      catalogBudgetChars: perServer * 2 + 100,
+    });
+    expect(toolset.servers.map((info) => [info.id, info.unavailable === undefined])).toEqual([
+      ["alpha", true],
+      ["beta", true],
+      ["gamma", false],
+    ]);
+    const limit = toolset.failures.find((failure) => failure.name === "mcp_limit");
+    expect(limit?.arguments).toBe("Gamma");
+    expect(limit?.result).toContain("left out of this run");
+    expect(limit?.result).toContain("combined tool catalogs");
+    expect(toolset.failures.some((failure) => failure.name === "mcp_connect")).toBe(false);
+    const found = await searchResult(toolset, { query: "gamma_tool_01" });
+    expect(found.servers.find((server) => server.serverId === "gamma")?.unavailable).toContain("left out");
+    expect(found.matches.every((match) => match.serverId !== "gamma")).toBe(true);
   });
 
   it("uncapped native mode (health checks) registers every tool and refreshes the catalog cache", async () => {

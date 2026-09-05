@@ -40,6 +40,7 @@ import {
 } from "../../../functions/mcp-cloud";
 import {
   MCP_LATEST_PROTOCOL_VERSION,
+  MCP_MODERN_PROTOCOL_VERSION,
   type McpFetch,
 } from "../../../functions/mcp-protocol";
 import { handleMcpInventory, handleMcpPromptGet, handleMcpResourceRead, type McpRouteContext } from "../../../functions/mcp-routes";
@@ -293,13 +294,26 @@ describe("MCP conformance against @modelcontextprotocol/sdk", () => {
     expect(connection.session.capabilities?.tools?.listChanged).toBe(true);
     expect(connection.session.serverInfo?.name).toBe("Gera conformance");
     const mine = harness.requests.slice(before);
-    const initialize = mine.find((request) => (request.body as { method?: string } | undefined)?.method === "initialize");
+    const methodOf = (request: RecordedRequest): string | undefined => (request.body as { method?: string } | undefined)?.method;
+    // The stateless probe goes first, on the 2026-07-28 wire with the method
+    // header and no session id; this legacy SDK server refuses it (400, not
+    // JSON-RPC) and the client falls back to the initialize handshake.
+    const probe = mine.find((request) => methodOf(request) === "server/discover");
+    expect(probe).toBeDefined();
+    expect(probe?.headers["mcp-protocol-version"]).toBe(MCP_MODERN_PROTOCOL_VERSION);
+    expect(probe?.headers["mcp-method"]).toBe("server/discover");
+    expect(probe?.headers["mcp-session-id"]).toBeUndefined();
+    expect(connection.wire).toEqual(expect.objectContaining({ era: "legacy", protocolVersion: MCP_LATEST_PROTOCOL_VERSION }));
+    const initialize = mine.find((request) => methodOf(request) === "initialize");
     expect(initialize).toBeDefined();
-    const later = mine.filter((request) => request !== initialize);
+    const later = mine.filter((request) => request !== initialize && request !== probe);
     expect(later.length).toBeGreaterThan(3); // initialized, 3 tools/list pages, prompts, resources, templates
     for (const request of later) {
       expect(request.headers["mcp-protocol-version"]).toBe(MCP_LATEST_PROTOCOL_VERSION);
       expect(request.headers["mcp-session-id"]).toBe(connection.session.sessionId);
+      // Legacy wire: no stateless-only headers or `_meta` leak into the handshake family.
+      expect(request.headers["mcp-method"]).toBeUndefined();
+      expect((request.body as { params?: { _meta?: unknown } } | undefined)?.params?._meta).toBeUndefined();
     }
     // Pagination: five tools in pages of two → three tools/list requests.
     const listPages = later.filter((request) => (request.body as { method?: string } | undefined)?.method === "tools/list");

@@ -64,6 +64,12 @@ export const STUB_CONFIRM_PROMPT = "Create the release issue through the MCP ser
 /** Tool the stubbed confirmation card guards. */
 export const STUB_CONFIRM_TOOL = "create_issue";
 
+/** Custom OAuth server signed in through the stubbed server-side flow; its grant lives only in the vault. */
+export const STUB_VAULT_OAUTH_SERVER_ID = "vault-oauth";
+export const STUB_VAULT_OAUTH_IDENTITY = "Vault Things · server verified";
+/** OAuth server whose grant an older bundle kept in this browser — retired on boot. */
+export const STUB_LEGACY_OAUTH_SERVER_ID = "legacy-oauth";
+
 /** Custom OAuth server whose stubbed /mcp/check reports a pending scope step-up. */
 export const STUB_STEP_UP_SERVER_ID = "scoped";
 /** Scope the stubbed insufficient_scope challenge demanded. */
@@ -454,6 +460,32 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "tap", target: TID.mcpAdvancedToggle },
       { do: "see", target: TID.mcpScopesInput },
       { do: "see", target: TID.mcpMetadataUrlInput },
+    ],
+  },
+  {
+    id: "oauth-sign-in-vault",
+    title: "OAuth sign-in ends with a verified green card and no token in this browser",
+    steps: [
+      { do: "goto", path: `/mcp?server=${STUB_VAULT_OAUTH_SERVER_ID}` },
+      { do: "see", target: studioPageTid("mcp"), timeoutMs: 20_000 },
+      { do: "see", target: mcpServerCardTid(STUB_VAULT_OAUTH_SERVER_ID) },
+      { do: "seeText", target: mcpServerConnectTid(STUB_VAULT_OAUTH_SERVER_ID), text: "Sign in" },
+      // The popup is a stub window; the account shard runs discovery, PKCE and
+      // the code exchange, then the real /mcp/check proves the vault grant.
+      { do: "tap", target: mcpServerConnectTid(STUB_VAULT_OAUTH_SERVER_ID) },
+      { do: "seeText", target: mcpServerConnectTid(STUB_VAULT_OAUTH_SERVER_ID), text: "Re-check", timeoutMs: 20_000 },
+      { do: "seeText", target: mcpServerCardTid(STUB_VAULT_OAUTH_SERVER_ID), text: STUB_VAULT_OAUTH_IDENTITY },
+    ],
+  },
+  {
+    id: "mcp-vault-migration",
+    title: "A browser-held sign-in is retired on boot: the card asks to sign in again instead of failing red",
+    steps: [
+      { do: "goto", path: `/mcp?server=${STUB_LEGACY_OAUTH_SERVER_ID}` },
+      { do: "see", target: studioPageTid("mcp"), timeoutMs: 20_000 },
+      { do: "see", target: mcpServerCardTid(STUB_LEGACY_OAUTH_SERVER_ID) },
+      { do: "seeText", target: TID.mcpResigninNotice, text: "sign in again" },
+      { do: "seeText", target: mcpServerConnectTid(STUB_LEGACY_OAUTH_SERVER_ID), text: "Sign in" },
     ],
   },
   {

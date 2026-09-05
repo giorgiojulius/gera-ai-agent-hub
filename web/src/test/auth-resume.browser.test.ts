@@ -5,7 +5,6 @@ import { render } from "vitest-browser-react";
 import { useAuth, AuthProvider } from "@/hooks/use-auth";
 import { ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY, refreshAccessTokenResult } from "@/lib/auth-tokens";
 import { relayFetch } from "@/lib/backend";
-import { forceRefreshOAuthHeader } from "@/lib/mcp-oauth";
 
 beforeEach(() => {
   localStorage.clear();
@@ -107,59 +106,4 @@ test("AuthProvider keeps expired identity context while a deploy refresh retries
   await expect.element(screen.getByTestId("auth-deploy-probe")).toHaveTextContent("ready:deploy-user");
   expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(expiredJwt);
   expect(localStorage.getItem(REFRESH_TOKEN_KEY)).toBe("refresh-a");
-});
-
-test("new bundle adopts an MCP refresh escrowed before the old response was lost", async () => {
-  const serverId = "deploy-browser";
-  const oldToken = {
-    accessToken: "provider-a",
-    refreshToken: "provider-ra",
-    expiresAt: 1,
-    tokenEndpoint: "https://auth.example.org/token",
-    clientId: "client-1",
-    mcpUrl: "https://mcp.example.org/mcp",
-  };
-  const newToken = {
-    ...oldToken,
-    accessToken: "provider-b",
-    refreshToken: "provider-rb",
-    expiresAt: Date.now() + 3_600_000,
-  };
-  localStorage.setItem("gera.mcp.oauth.tokens.v1", JSON.stringify({ [serverId]: oldToken }));
-  localStorage.setItem(
-    `gera.mcp.oauth.token.v2.${encodeURIComponent(serverId)}`,
-    JSON.stringify(oldToken),
-  );
-  let attempts = 0;
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
-      if (String(input).includes("/mcp/oauth-refresh")) {
-        attempts += 1;
-        if (attempts === 1) {
-          // The shard persisted provider-b/provider-rb, then this old page's
-          // response disappeared with the published bundle.
-          throw new TypeError("page unloaded");
-        }
-        return new Response(JSON.stringify({ token: newToken, replayed: true }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response(JSON.stringify({ rotations: [] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }),
-  );
-
-  await expect(forceRefreshOAuthHeader(serverId)).resolves.toBeNull();
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  await expect(forceRefreshOAuthHeader(serverId)).resolves.toBe("Bearer provider-b");
-  expect(attempts).toBe(2);
-  const stored = JSON.parse(localStorage.getItem("gera.mcp.oauth.tokens.v1") ?? "{}") as Record<
-    string,
-    { refreshToken?: string }
-  >;
-  expect(stored[serverId]?.refreshToken).toBe("provider-rb");
 });

@@ -15,7 +15,7 @@
  * sync backend) — deterministic, hermetic, and no real credits are ever spent.
  */
 import { commands as browserCommands, page } from "vitest/browser";
-import { afterAll, beforeEach, expect, test } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, test, vi } from "vitest";
 import { render } from "vitest-browser-react";
 
 import App from "@/App";
@@ -33,6 +33,7 @@ import {
   STUB_ELICIT_FIELD,
   STUB_ELICIT_PROMPT,
   STUB_HANG_PROMPT,
+  STUB_LEGACY_OAUTH_SERVER_ID,
   STUB_MCP_PROMPT,
   STUB_MCP_PROMPT_ARG,
   STUB_MCP_PROMPT_NAME,
@@ -42,6 +43,8 @@ import {
   STUB_REPLY_SNIPPET,
   STUB_STEP_UP_SCOPE,
   STUB_STEP_UP_SERVER_ID,
+  STUB_VAULT_OAUTH_IDENTITY,
+  STUB_VAULT_OAUTH_SERVER_ID,
   SWITCH_TARGET_MODEL_ID,
   SWITCH_TARGET_MODEL_NAME,
 } from "../../e2e/scenarios";
@@ -66,6 +69,10 @@ let deployRecovery: boolean = false;
 let resolveCancelledCheck: (() => void) | null = null;
 let cancelledCheckCount: number = 0;
 const recoveryChecks = new Map<string, number>();
+/** Server-side OAuth flow stub: start → popup navigated → status completed; the browser never sees a token. */
+let oauthFlowStarted: boolean = false;
+let oauthPopupNavigatedTo: string | null = null;
+let vaultOAuthChecks: number = 0;
 
 type GatewayModelStub = {
   id: string;
@@ -508,6 +515,33 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
     if (url.includes("/access/status")) {
       return jsonResponse({ email: "e2e@gera.app", status: "invited", role: "member", requestedAt: null });
     }
+    // Vault-backed GitHub: the browser addresses the sign-in by sentinel and the
+    // Worker leases the real token per request — no PAT ever rides from here.
+    if (url.includes("/github-proxy")) {
+      const query = new URL(url).searchParams;
+      const headers = new Headers(init?.headers);
+      expect(query.get("serverId")).toBe("github");
+      expect(headers.get("X-Gera-GitHub-Accept")).toBeTruthy();
+      expect(headers.get("authorization") ?? "").not.toContain("ghp_");
+      const path = new URL(`https://api.github.com${query.get("path") ?? ""}`).pathname;
+      if (path === "/user") {
+        return jsonResponse({ login: "e2e-octocat", name: "E2E GitHub" });
+      }
+      if (path === "/user/orgs") {
+        return jsonResponse([{ login: "acme" }]);
+      }
+      if (path === "/user/repos") {
+        return jsonResponse([
+          {
+            full_name: "acme/private-app",
+            private: true,
+            description: "Private fixture repository",
+            pushed_at: "2026-08-30T10:00:00Z",
+          },
+        ]);
+      }
+      throw new Error(`Unstubbed GitHub proxy request: ${path}`);
+    }
     if (url.includes("/mcp/check")) {
       const body = JSON.parse(String(init?.body ?? "{}")) as {
         server?: { id?: string; token?: string; url?: string; catalogId?: string; authMode?: string; headersJson?: string; credentialStored?: boolean };
@@ -566,6 +600,24 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
           identity: "GitHub · server verified",
         });
       }
+      if (body.server?.id === STUB_VAULT_OAUTH_SERVER_ID) {
+        vaultOAuthChecks += 1;
+        // The check carries no credential: the shard resolves the grant it minted.
+        expect(body.server.token ?? "").toBe("");
+        expect(body.server.headersJson ?? "").toBe("");
+        expect(body.server.authMode).toBe("oauth");
+        if (!oauthFlowStarted) {
+          return new Response(
+            JSON.stringify({ error: "server_auth_missing", detail: [{ id: STUB_VAULT_OAUTH_SERVER_ID, grantPresent: false }] }),
+            { status: 401, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return jsonResponse({
+          tools: [{ name: "list_things", description: "Lists things", inputSchema: { type: "object", properties: {} } }],
+          identity: STUB_VAULT_OAUTH_IDENTITY,
+          credentialStored: true,
+        });
+      }
       if (body.server?.id === STUB_STEP_UP_SERVER_ID) {
         // The grant still handshakes, but a run's tools/call was refused with
         // insufficient_scope — the shard reports the pending step-up.
@@ -587,6 +639,25 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
         promptCount: 1,
         resourceCount: 1,
       });
+    }
+    // Server-owned OAuth: the shard discovers, registers and builds the
+    // authorize URL; the browser only opens it and polls for completion.
+    if (url.includes("/mcp/oauth-start")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { server?: { id?: string; url?: string; token?: string } };
+      expect(body.server?.id).toBe(STUB_VAULT_OAUTH_SERVER_ID);
+      expect(body.server?.token).toBeUndefined();
+      oauthFlowStarted = true;
+      return jsonResponse({
+        authorizationUrl: "https://auth.vault-things.dev/authorize?state=e2e-state",
+        state: "e2e-state",
+        browserNonce: "e2e-browser-nonce",
+        expiresAt: Date.now() + 60_000,
+      });
+    }
+    if (url.includes("/mcp/oauth-status")) {
+      expect(url).toContain("state=e2e-state");
+      expect(oauthPopupNavigatedTo).toContain("auth.vault-things.dev");
+      return jsonResponse({ status: "completed" });
     }
     // Composer menus: prompts / resources of one connected server, then a
     // prompt rendered with its arguments and a resource body — all shard-side.
@@ -665,7 +736,8 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
     }
     if (url.includes("/repo-previews/inspect")) {
       const headers = new Headers(init?.headers);
-      expect(headers.get("X-Gera-Upstream-Authorization")).toBe("Bearer ghp_e2e_fixture");
+      // The relay swaps the sentinel for a vault lease; the PAT never leaves the shard.
+      expect(headers.get("X-Gera-Upstream-Authorization")).toBe("gera-account:github");
       return jsonResponse({
         inspection: {
           repository: "acme/private-app",
@@ -684,7 +756,7 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
     }
     if (url.includes("/repo-previews/start")) {
       const headers = new Headers(init?.headers);
-      expect(headers.get("X-Gera-Upstream-Authorization")).toBe("Bearer ghp_e2e_fixture");
+      expect(headers.get("X-Gera-Upstream-Authorization")).toBe("gera-account:github");
       return jsonResponse({ job: previewStubJob("queued") });
     }
     if (url.includes("/repo-previews/status")) {
@@ -885,9 +957,23 @@ beforeEach(() => {
   confirmStubRun = false;
   lastStubAnswer = null;
   resolveStubAnswer = null;
+  oauthFlowStarted = false;
+  oauthPopupNavigatedTo = null;
+  vaultOAuthChecks = 0;
   localStorage.setItem(ACCESS_TOKEN_KEY, fakeAccessToken());
   installNetworkStub();
 });
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/** Every localStorage key an older bundle used for browser-held MCP grants. */
+function legacyOAuthStorageKeys(): string[] {
+  return Object.keys(localStorage).filter(
+    (key) => key === "gera.mcp.oauth.tokens.v1" || key === "gera.mcp.oauth.clients.v1" || key.startsWith("gera.mcp.oauth.token.v2."),
+  );
+}
 
 afterAll(async () => {
   const report = buildRunReport({ platform: "web", app: "gera-web", startedAt, results });
@@ -992,6 +1078,42 @@ for (const scenario of E2E_SCENARIOS) {
         tools: [{ name: "read_fixture" }], disabledTools: ["write_fixture"],
       })) }));
     }
+    if (scenario.id === "oauth-sign-in-vault") {
+      // An OAuth server added but never signed in. The popup is a stub window
+      // the flow navigates; the shard completes the exchange behind the scenes.
+      localStorage.setItem(
+        "gera.settings.v1",
+        JSON.stringify({
+          mcpServers: [{
+            id: STUB_VAULT_OAUTH_SERVER_ID, name: "Vault Things", url: "https://mcp.vault-things.dev/mcp", headersJson: "",
+            authMode: "oauth", enabled: true, status: "idle", tools: [], disabledTools: [],
+          }],
+        }),
+      );
+      vi.stubGlobal("open", () => ({
+        closed: false,
+        location: { replace: (target: string) => { oauthPopupNavigatedTo = target; } },
+        close: () => undefined,
+      }));
+    }
+    if (scenario.id === "mcp-vault-migration") {
+      // An older bundle left a grant in this browser and a green card that
+      // relied on it (no vault proof). Boot retires both.
+      const legacyGrant = { accessToken: "legacy-access", refreshToken: "legacy-refresh", tokenEndpoint: "https://auth.legacy.dev/token", clientId: "legacy-client" };
+      localStorage.setItem("gera.mcp.oauth.tokens.v1", JSON.stringify({ [STUB_LEGACY_OAUTH_SERVER_ID]: legacyGrant }));
+      localStorage.setItem(`gera.mcp.oauth.token.v2.${STUB_LEGACY_OAUTH_SERVER_ID}`, JSON.stringify(legacyGrant));
+      localStorage.setItem("gera.mcp.oauth.clients.v1", JSON.stringify({ "https://auth.legacy.dev/register": { clientId: "legacy-client" } }));
+      localStorage.setItem(
+        "gera.settings.v1",
+        JSON.stringify({
+          mcpServers: [{
+            id: STUB_LEGACY_OAUTH_SERVER_ID, name: "Legacy Things", url: "https://mcp.legacy.dev/mcp", headersJson: "",
+            authMode: "oauth", enabled: true, status: "connected", tools: [{ name: "list_things" }], disabledTools: [],
+            identity: "Legacy Things · server verified", verifiedAt: Date.now(),
+          }],
+        }),
+      );
+    }
     if (scenario.id === "oauth-step-up") {
       // A custom OAuth server signed in earlier; the shard now reports a step-up.
       localStorage.setItem(
@@ -1029,6 +1151,32 @@ for (const scenario of E2E_SCENARIOS) {
         const persisted = JSON.parse(localStorage.getItem("gera.settings.v1") ?? "{}");
         return persisted.mcpServers?.filter((item: { status: string; credentialStored?: boolean }) => item.status === "connected" && item.credentialStored === true).length;
       }).toBe(3);
+    }
+    if (scenario.id === "oauth-sign-in-vault") {
+      expect(oauthFlowStarted).toBe(true);
+      expect(vaultOAuthChecks).toBeGreaterThan(0);
+      // The browser holds only the non-secret proof: no grant, no client registration.
+      expect(legacyOAuthStorageKeys()).toEqual([]);
+      const dump = JSON.stringify(Object.entries(localStorage));
+      expect(dump).not.toContain("e2e-browser-nonce");
+      const persisted = JSON.parse(localStorage.getItem("gera.settings.v1") ?? "{}") as {
+        mcpServers?: Array<{ id: string; status: string; credentialStored?: boolean; token?: string }>;
+      };
+      const card = persisted.mcpServers?.find((item) => item.id === STUB_VAULT_OAUTH_SERVER_ID);
+      expect(card).toMatchObject({ status: "connected", credentialStored: true });
+      expect(card?.token ?? "").toBe("");
+    }
+    if (scenario.id === "mcp-vault-migration") {
+      expect(legacyOAuthStorageKeys()).toEqual([]);
+      expect(JSON.stringify(Object.entries(localStorage))).not.toContain("legacy-access");
+      expect(JSON.stringify(Object.entries(localStorage))).not.toContain("legacy-refresh");
+      const persisted = JSON.parse(localStorage.getItem("gera.settings.v1") ?? "{}") as {
+        mcpServers?: Array<{ id: string; status: string; credentialStored?: boolean; error?: string }>;
+      };
+      expect(persisted.mcpServers?.[0]).toMatchObject({ status: "error", credentialStored: false });
+      expect(persisted.mcpServers?.[0]?.error).toContain("sign in again");
+      const report = JSON.parse(localStorage.getItem("gera.mcp.oauth.migration.v1") ?? "{}") as { moved?: number; awaiting?: number };
+      expect(report).toMatchObject({ moved: 0, awaiting: 1 });
     }
     if (scenario.id === "blender-mcp-setup") {
       expect(blenderCheckCount).toBe(0);

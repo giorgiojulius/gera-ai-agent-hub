@@ -42,8 +42,8 @@ const MCP_LOADING_OPTIONS: { value: McpToolLoadingMode; label: string }[] = [
 ];
 
 const MCP_LOADING_HINT: Record<McpToolLoadingMode, string> = {
-  auto: "Native while the connected servers expose up to 24 tools whose schemas stay under 8% of the model's context window; beyond that the model searches tools on demand.",
-  native: "Every tool is registered as its own function (first 90 per run, 500 per server); servers that do not fit are reported honestly in the thread.",
+  auto: "Native while the connected servers' tool schemas stay under 15% of the model's context window — however many tools that is; beyond that the model searches tools on demand.",
+  native: "Every tool is registered as its own function (no per-run cap; 500 per server); a run is bounded only by a 20 s connection budget and a 24 MB combined catalog, and anything left out is reported honestly in the thread.",
   deferred: "The model sees only mcp_search_tools and mcp_call_tool: it searches the connected servers' catalogs, loads a schema when needed, and servers connect on the first call.",
 };
 

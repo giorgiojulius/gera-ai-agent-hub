@@ -67,7 +67,6 @@ import {
   type ReasoningEffort,
 } from "@/lib/models";
 import {
-  MAX_AGENT_MCP_SERVERS,
   accessSummary,
   createAgentSlackApp,
   deleteProjectAgent,
@@ -1673,10 +1672,11 @@ function SaveAgentFirstNote({
 
 /**
  * The same server list chat and automations use — the admin picks which of
- * their connected MCP servers ride with the agent (capped at
- * MAX_AGENT_MCP_SERVERS). Runs resolve the selection through the admin's
- * account server-side (keys and sign-ins stay there, refreshed like cloud
- * automations), so there is nothing to paste.
+ * their connected MCP servers ride with the agent (any number; runs are
+ * bounded by the toolset's connect and catalog budgets, not a count). Runs
+ * resolve the selection through the admin's account server-side (keys and
+ * sign-ins stay there, refreshed like cloud automations), so there is
+ * nothing to paste.
  */
 function McpServerPicker({
   selection,
@@ -1715,11 +1715,10 @@ function McpServerPicker({
   // Saved refs (possibly linked by another admin) whose servers are not in
   // this browser's list — shown removable instead of silently hidden.
   const savedOnly = selection.filter((ref) => !connectedIds.has(ref.id));
-  const full = selection.length >= MAX_AGENT_MCP_SERVERS;
   const relinks = savedOwner !== "" && myEmail !== "" && savedOwner !== myEmail;
   const toggle = (ref: AgentMcpServer, checked: boolean) => {
     if (checked) {
-      if (!full && !selection.some((entry) => entry.id === ref.id)) {
+      if (!selection.some((entry) => entry.id === ref.id)) {
         onChange([...selection, ref]);
       }
     } else {
@@ -1774,7 +1773,6 @@ function McpServerPicker({
               </span>
               <Switch
                 checked={picked}
-                disabled={!picked && full}
                 onCheckedChange={(checked) => toggle({ id: server.id, name: server.name }, checked)}
                 aria-label={`Link ${server.name}`}
               />
@@ -1858,7 +1856,7 @@ function McpServerPicker({
         </div>
       ) : null}
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        {selection.length}/{MAX_AGENT_MCP_SERVERS} linked. Runs resolve these through your account —
+        {selection.length} linked. Runs resolve these through your account —
         keys and sign-ins stay there (synced and refreshed like cloud automations) and never reach
         members. Missing a server? Add it on the{" "}
         <Link to="/mcp" className="font-medium text-foreground underline underline-offset-2">

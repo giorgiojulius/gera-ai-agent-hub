@@ -26,13 +26,7 @@ import {
   connectMcpServerLegacy,
   mcpFunctionName,
 } from "@/lib/mcp";
-import {
-  beginOAuthGrantFlow,
-  hasOAuthToken,
-  oauthAuthHeader,
-  safeOAuthEndpoint,
-  storeExternalOAuthToken,
-} from "@/lib/mcp-oauth";
+import { safeOAuthEndpoint } from "@/lib/mcp-oauth";
 import { SLACK_NATIVE_TOOLS as BROWSER_SLACK_TOOLS } from "@/lib/slack-native";
 import type { McpServerConfig } from "@/lib/types";
 
@@ -244,20 +238,6 @@ describe("MCP OAuth boundaries", () => {
         headers: { Authorization: "Bearer provider-secret" },
       }),
     ).rejects.toThrow(/Sign in to Gera/i);
-  });
-
-  it("binds new grants to their MCP endpoint", async () => {
-    const flow = beginOAuthGrantFlow("bound");
-    storeExternalOAuthToken("bound", {
-      accessToken: "secret",
-      refreshToken: "refresh",
-      tokenEndpoint: "https://auth.example.com/token",
-      clientId: "client",
-      mcpUrl: "https://one.example.com/mcp",
-    }, flow);
-    expect(hasOAuthToken("bound", "https://one.example.com/mcp")).toBe(true);
-    expect(hasOAuthToken("bound", "https://two.example.com/mcp")).toBe(false);
-    await expect(oauthAuthHeader("bound", "https://two.example.com/mcp")).resolves.toBeNull();
   });
 
   it("separates Gera auth from provider auth and does not retry a provider 401", async () => {

@@ -9,10 +9,6 @@
 import { isAuthSessionCurrent } from "@/lib/auth-tokens";
 import { AuthSessionChangedError, authedFetch, authedFetchForSession, parseOrThrow } from "@/lib/backend";
 import { reviveMessage, slimMessage } from "@/lib/history";
-import {
-  applyServerOAuthRotations,
-  parseServerOAuthRotations,
-} from "@/lib/mcp-oauth";
 import { inlineMessageMedia, vaultConversationMedia } from "@/lib/media-vault";
 import { DEFAULT_CHAT_MODEL } from "@/lib/models";
 import { resolveCloudMediaInConversation } from "@/lib/server-run";
@@ -134,14 +130,18 @@ export function serializeProfile(settings: AgentSettings, life: LifeState): stri
   return slim.length <= PROFILE_PAYLOAD_LIMIT ? slim : null;
 }
 
-/** Splits a synced profile blob; each half is validated by its own normalizer. */
-export function parseProfilePayload(payload: string): { settings: unknown; life: unknown; mcpOAuth: unknown } | null {
+/**
+ * Splits a synced profile blob; each half is validated by its own normalizer.
+ * A legacy `mcpOAuth` field (grants older bundles mirrored here) is ignored:
+ * the vault is the only home of a credential.
+ */
+export function parseProfilePayload(payload: string): { settings: unknown; life: unknown } | null {
   try {
-    const parsed = JSON.parse(payload) as { settings?: unknown; life?: unknown; mcpOAuth?: unknown } | null;
+    const parsed = JSON.parse(payload) as { settings?: unknown; life?: unknown } | null;
     if (!parsed || typeof parsed !== "object") {
       return null;
     }
-    return { settings: parsed.settings, life: parsed.life, mcpOAuth: parsed.mcpOAuth };
+    return { settings: parsed.settings, life: parsed.life };
   } catch {
     return null;
   }
@@ -163,8 +163,6 @@ type SyncResponse = {
   profileWant?: boolean;
   profileAck?: number;
   profileSkipped?: boolean;
-  /** MCP grants rotated by server runs — this browser adopts matching chains. */
-  oauthRotations?: unknown;
 };
 
 export type ChatSyncResult = {
@@ -179,8 +177,6 @@ export type ChatSyncResult = {
   profileApplied?: { updatedAt: number; payload: string };
   /** The profile clock value the server acknowledged storing. */
   profileAckedAt?: number;
-  /** Server-rotated MCP sign-ins adopted into this browser during the sync. */
-  oauthAdopted: number;
   /** True when caps were hit — schedule a follow-up sync soon. */
   incomplete: boolean;
 };
@@ -299,7 +295,6 @@ export async function runChatSync(input: {
   );
   let profileApplied: { updatedAt: number; payload: string } | undefined;
   let profileAckedAt: number | undefined;
-  let oauthAdopted = 0;
   if (profileInput && profileInput.dirty && profileInput.payload === null) {
     console.warn("gera sync: settings profile is too large to sync — it stays on this device for now.");
   }
@@ -458,14 +453,6 @@ export async function runChatSync(input: {
       }
     }
 
-    if (data.oauthRotations !== undefined) {
-      ensureCurrentSession();
-      // Server runs redeem (and thereby rotate) MCP refresh tokens while this
-      // browser sleeps — adopt the fresh pairs so the local sign-in survives
-      // instead of dying on its next refresh attempt.
-      oauthAdopted += applyServerOAuthRotations(parseServerOAuthRotations(data.oauthRotations));
-    }
-
     if (profileInput && !profileSettled) {
       if (typeof data.profileAck === "number") {
         profileAckedAt = data.profileAck;
@@ -502,7 +489,6 @@ export async function runChatSync(input: {
     ackedDeleteIds: [...acked],
     profileApplied,
     profileAckedAt,
-    oauthAdopted,
     incomplete: moreLeft || pendingPush.size > 0 || !profileSettled || unackedDeletes,
   };
 }

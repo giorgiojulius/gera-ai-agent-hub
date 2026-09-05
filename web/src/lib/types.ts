@@ -669,6 +669,8 @@ export type McpServerConfig = {
   /** Prompts / resources the last health check listed (composer `/` and `@` menus). */
   promptCount?: number;
   resourceCount?: number;
+  /** The MCP revision the last check actually spoke (stateless 2026-07-28 or a legacy handshake). */
+  protocolVersion?: string;
   /**
    * OAuth Advanced: pinned scopes for the authorize request (RFC 6749 §3.3,
    * space-separated). Empty = the server's own hints decide. Metadata only.

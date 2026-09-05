@@ -11,6 +11,7 @@ import {
   syncDiagnostics,
   type DiagnosticEntry,
 } from "@/lib/diagnostics";
+import { CredentialMigrationLine } from "@/components/gera/CredentialMigrationLine";
 import { VaultStatusLine } from "@/components/gera/VaultStatusLine";
 import { cn } from "@/lib/utils";
 
@@ -81,6 +82,7 @@ export function DiagnosticsJournal({ frame }: { frame: "dialog" | "page" }) {
     return (
       <>
         <VaultStatusLine className={cn("border-b border-border/50 py-2.5", padX)} />
+        <CredentialMigrationLine className={cn("border-b border-border/50 py-2.5", padX)} />
         <div className={cn("flex flex-col items-center gap-2 py-14 text-center", padX)}>
           <CheckCircle2 className="h-9 w-9 text-gold" />
           <p className="text-sm font-medium">All clear</p>
@@ -95,6 +97,7 @@ export function DiagnosticsJournal({ frame }: { frame: "dialog" | "page" }) {
   return (
     <>
       <VaultStatusLine className={cn("border-b border-border/50 py-2.5", padX)} />
+      <CredentialMigrationLine className={cn("border-b border-border/50 py-2.5", padX)} />
       <div className={cn("overflow-y-auto", frame === "dialog" ? "max-h-[55vh]" : "max-h-[65vh]")}>
         {entries.map((entry) => (
           <div key={entry.id} className={cn("border-b border-border/50 py-3 last:border-b-0", padX)}>

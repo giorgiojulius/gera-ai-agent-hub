@@ -31,6 +31,7 @@ import {
   type McpCategory,
 } from "@/lib/mcp-catalog";
 import { githubDeviceClientId, githubOrgAccessUrl } from "@/lib/github-device";
+import { VAULT_RESIGNIN_NOTICE } from "@/lib/mcp-credential-migration";
 import { mcpCatalogConnectTid, mcpServerCardTid, mcpServerConnectTid, mcpServerEnabledTid, TID } from "@/lib/testids";
 import type { McpAuthMode, McpServerConfig, McpToolInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -499,7 +500,7 @@ function catalogStatusLabel(server: McpServerConfig, entry: McpCatalogEntry): st
     return "Connecting…";
   }
   if (server.status === "error") {
-    return "Failed — see Your tools";
+    return server.error === VAULT_RESIGNIN_NOTICE ? "Sign-in needed again" : "Failed — see Your tools";
   }
   if (entry.auth === "token" && !server.credentialStored && !(server.token ?? "").trim()) {
     return entry.deviceFlow ? "Sign-in or key needed" : "Key needed";
@@ -662,6 +663,8 @@ function ConnectedCard({
     !server.credentialStored &&
     !(server.token ?? "").trim();
   const needsKey = entry?.setup ? false : entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";
+  // A retired browser-held sign-in is a to-do, not a failure: amber, not red.
+  const needsResignin = server.status === "error" && server.error === VAULT_RESIGNIN_NOTICE;
   const blockedReason = entry?.blocked;
   const inventoryLabel = [
     `${server.tools.length} tools`,
@@ -700,10 +703,13 @@ function ConnectedCard({
               "block truncate text-[11px]",
               server.status === "connected"
                 ? "text-emerald-700"
-                : server.status === "error"
-                  ? "text-destructive"
-                  : "text-muted-foreground",
+                : needsResignin
+                  ? "text-amber-700"
+                  : server.status === "error"
+                    ? "text-destructive"
+                    : "text-muted-foreground",
             )}
+            data-testid={needsResignin ? TID.mcpResigninNotice : undefined}
           >
             {statusLabel}
           </span>
@@ -754,6 +760,19 @@ function ConnectedCard({
             <p className="text-[11px] leading-relaxed text-emerald-700">
               Verified {verifiedTime(server.verifiedAt)} — handshake and tool listing succeeded
               {server.identity ? ` · ${server.identity}` : ""}.
+              {server.protocolVersion ? (
+                <span
+                  data-testid={TID.mcpProtocolBadge}
+                  title={
+                    server.protocolVersion >= "2026-07-28"
+                      ? "Stateless MCP revision: no initialize, no session id; every request carries its own protocol metadata."
+                      : "Legacy MCP revision negotiated through the initialize handshake."
+                  }
+                  className="ml-1.5 inline-flex rounded-full border border-emerald-600/30 bg-emerald-600/10 px-1.5 py-px font-mono text-[10px] text-emerald-800"
+                >
+                  MCP {server.protocolVersion}
+                </span>
+              ) : null}
             </p>
           ) : null}
           {server.stepUp ? (

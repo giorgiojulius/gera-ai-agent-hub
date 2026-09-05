@@ -10,9 +10,12 @@ import { githubOrgAccessUrl, type GitHubViewer } from "@/lib/github-device";
  * probes both contours for one repository and maps the result matrix to a
  * plain-language verdict with the concrete fix.
  *
- * All probes run in the browser against api.github.com (CORS `*`), so the
- * credential never leaves the machine.
+ * Probes ride the same transport as every GitHub call: a vault sign-in goes
+ * through the authenticated /github-proxy (the token is leased server-side),
+ * a just-pasted PAT goes straight to api.github.com (CORS `*`).
  */
+
+import { githubTransportFetch } from "@/lib/github-native";
 
 const GITHUB_API = "https://api.github.com";
 
@@ -53,7 +56,7 @@ export type RepoProbe = {
 };
 
 function gh(auth: string, path: string): Promise<Response> {
-  return fetch(`${GITHUB_API}${path}`, {
+  return githubTransportFetch(auth, new URL(`${GITHUB_API}${path}`), {
     headers: { Authorization: auth, Accept: "application/vnd.github+json" },
   });
 }

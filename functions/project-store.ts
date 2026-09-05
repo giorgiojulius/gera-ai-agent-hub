@@ -198,8 +198,6 @@ const SLACK_JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const SLACK_THREAD_CONTEXT = 25;
 /** Slack chat.postMessage truncates around 40k chars — stay well under. */
 const SLACK_REPLY_LIMIT = 11_500;
-/** Hard cap on the routed tool surface of one agent run (native + MCP). */
-const AGENT_TOOL_CAP = 90;
 
 type ChannelRow = { id: string; name: string; topic: string; created_at: number };
 type MessageRow = {
@@ -2195,7 +2193,6 @@ export class ProjectStore extends DurableObject {
         const member = this.loadMember(email);
         return member !== null && canManageProject(this.memberRole(member));
       },
-      toolCap: AGENT_TOOL_CAP,
     };
   }
 

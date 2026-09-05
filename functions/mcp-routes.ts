@@ -546,6 +546,8 @@ export async function handleMcpCheck(ctx: OAuthStoreContext, request: Request, o
       credentialStored,
       promptCount: info?.promptCount ?? 0,
       resourceCount: info?.resourceCount ?? 0,
+      // The revision the conversation actually runs on (stateless 2026-07-28 or a legacy handshake).
+      ...(info?.protocolVersion ? { protocolVersion: info.protocolVersion } : {}),
       ...(stepUp ? { stepUp } : {}),
     });
   } catch (error) {

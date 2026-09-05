@@ -1,6 +1,25 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-05 · commit `0f24731` (+ MCP deploy-error recovery / account-pinned retries and stale-check guards;
+Last synced: 2026-09-05 · commit `0f24731` (+ MCP audit closure in three phases — (1) no per-run
+  inline cap (was 90; only 500/server remains), `auto → deferred` decided
+  solely by schema share > 15% of the context window, no per-run server
+  count (was 8) and no per-agent link cap (was 5): a 20 s parallel connect
+  budget (`CONNECT_BUDGET_MS`, late handshakes finish in the background and
+  a deferred call waits for them) and a 24 MB combined-catalog budget
+  (`RUN_CATALOG_CHARS`, `mcp_limit` record names the left-out server) bound a
+  run instead; (2) the browser holds no MCP grant anymore — legacy
+  `gera.mcp.oauth.*` keys are purged on boot (`mcp-credential-migration.ts`),
+  cards that relied on one show the amber "sign in again" notice
+  (`mcp-resignin-notice`), `/mcp/oauth-store` and `/mcp/oauth-refresh` answer
+  410, GitHub REST from the browser goes through `/github-proxy` by sentinel
+  whenever the card has a vault credential, Diagnostics shows a
+  `credential-migration` line; (3) the stateless MCP revision 2026-07-28 —
+  `server/discover` probe first (5 s), `_meta` + `Mcp-Method`/`Mcp-Name` on
+  every request, no initialize / session id, `input_required` answered
+  through the elicitation hook and re-sent with `inputResponses` +
+  `requestState`, `subscriptions/listen` SSE instead of the GET stream,
+  `-32022` retry, negotiation cached with the catalog (`wire`), protocol badge
+  `mcp-protocol-badge` on the card; MCP deploy-error recovery / account-pinned retries and stale-check guards;
   Astra and Grok together in quick choices / Fast retirement,
   Blender MCP secured-bridge setup; previous Phase 6 engineering, behaviour
   unchanged under the existing suites: Worker MCP/OAuth relays moved
@@ -1165,11 +1184,13 @@ still get no generic MCP via `accessForAgentSurface`). Setting "MCP tool
 loading" (Settings → Toolkit, `settings.mcpToolLoading`, synced in the
 profile, snapshot sent in every `/runs/start` config as `mcpToolLoading` +
 `contextWindow` from the gateway catalog): **auto** registers one
-`mcp_<server>_<tool>` function per tool while the visible generic MCP tools
-are ≤ 24 and their schema JSON stays under 8% of the model's context window
-(unknown window → 128k), otherwise defers; **native** always inlines (soft caps
-90 per run / 500 per server; a server that does not fit leaves an honest
-`mcp_limit` record naming it and pointing at the setting); **deferred** always
+`mcp_<server>_<tool>` function per tool while the visible generic MCP tools'
+schema JSON stays under 15% of the model's context window (unknown window →
+128k; the tool count alone never decides — `DEFERRED_AUTO_CONTEXT_SHARE`),
+otherwise defers; **native** always inlines (no per-run cap since
+2026-09-05; 500 per server is the one remaining fuse — a server that does not
+fit leaves an honest `mcp_limit` record naming it and pointing at the
+setting); **deferred** always
 exposes only two meta functions — `mcp_search_tools({query, serverId?,
 limit?})` (full text over names, descriptions and inputSchema fields; exact
 name → name token → description → field name; up to 20 descriptors with
@@ -1182,7 +1203,22 @@ one line per deferred server (`id "Name" · N tools`), never schemas.
 Native GitHub / Slack / Intercom connectors always register inline (their
 function names drive the code-changes workbench and the repo preflight).
 Deferred limits: 5 000 tools per server, 6 MB of schema JSON (over → the
-server is reported unavailable). Catalog cache: account-shard table
+server is reported unavailable). Run budgets (2026-09-05, replacing the old
+8-servers-per-run and 5-servers-per-agent counts, which are gone from
+`cloudMcpServersForAutomation`, `parseMcpSelectionPatch` and the agent
+editor — "N linked", no cap): every handshake of a run starts in parallel
+inside one 20 s budget (`CONNECT_BUDGET_MS`; the clock starts at the first
+handshake, so auto's two rounds share it); a server still pending when it
+lapses gets `mcp_connect` "did not connect within the run's 20 s connection
+budget (the handshake continues in the background)" and, in deferred mode,
+the first search/call to it waits for that late handshake (`awaitLate`);
+tables are admitted in server order until their JSON would exceed 24 MB
+(`RUN_CATALOG_CHARS`), the rest stay out with an `mcp_limit` record "left
+out of this run … combined tool catalogs" naming them (health checks are
+uncapped). Unit: `mcp-toolset.test.ts` (12 servers × 30 tools → 360
+functions, per-server fuse, 20 servers reach the resolver, slow server +
+late pick-up, catalog budget); `project-shared.test.ts` (12 linked servers
+save and load). Catalog cache: account-shard table
 `mcp_tool_catalog` (full remote table incl. disabled tools, TTL 10 min)
 written by every `/mcp/check` (Connect / Re-check now runs uncapped and no
 longer truncates big servers at 90) and by every handshake a run performs;
@@ -1211,6 +1247,49 @@ the mode, auto thresholds, uncapped health check refreshes the cache, native
 connectors stay inline next to deferred servers, rejected server reported
 without leaking its credential); browser scenario
 `connect-open-mcp-deferred`.
+
+Stateless revision 2026-07-28 (2026-09-05, `functions/mcp-protocol.ts`, one
+source of versions: `MCP_MODERN_PROTOCOL_VERSION(S)`, legacy
+`MCP_LATEST_PROTOCOL_VERSION` / `MCP_SUPPORTED_PROTOCOL_VERSIONS` /
+`MCP_DEFAULT_PROTOCOL_VERSION` — `mcp-cloud.ts` no longer keeps its own
+copy). `mcpConnect` probes `server/discover` first (5 s,
+`DISCOVER_TIMEOUT_MS`): a result with `supportedVersions` ∋ 2026-07-28 puts
+the session on the **modern** wire (`session.wire`), `-32022` is retried once
+with a version from `data.supported`, `-32021` fails honestly, anything else
+(404/-32601, non-JSON-RPC 4xx/5xx, silence) falls back to the legacy
+initialize handshake unchanged; 401/403 propagate. Modern requests carry
+`_meta` (`io.modelcontextprotocol/protocolVersion`, `clientCapabilities`
+(`elicitation: { form: {} }`), `clientInfo`), headers `MCP-Protocol-Version`,
+`Mcp-Method`, `Mcp-Name` (tools/call name, resources/read uri, prompts/get
+name; non-ASCII as `=?base64?…?=`), never `Mcp-Session-Id` (a stray one is
+ignored), no `initialize` / `notifications/initialized` / `ping`. Results:
+missing `resultType` = complete; `input_required` (tools/call, resources/read,
+prompts/get via `mcpRequestWithInput`) answers each `inputRequests` entry
+through the session's server-request handler — `elicitation/create` → the
+same run-pause card / honest background decline, `roots/list` → `[]`,
+`sampling/createMessage` → refused — and re-sends the call (new id) with
+`inputResponses` + the opaque `requestState`, up to 3 rounds
+(`MCP_MAX_INPUT_ROUNDS`). `serverInfo` comes from
+`result._meta["io.modelcontextprotocol/serverInfo"]`. Notifications:
+`subscriptions/listen` POST (filter from capabilities) whose SSE response
+stays open — acknowledgement, then `notifications/*/list_changed` → catalog
+invalidation; a final `result` frame = server closed it. JSON-RPC errors on
+400/404 bodies surface as `McpRpcError` (`rpcCode`, `rpcData`,
+`httpStatus`). The negotiation is cached with the tool catalog
+(`McpCatalogEntry.wire`: era, version, capabilities, serverInfo; SQL payload
+key `wire`, `/mcp/resolve` carries it) so runs skip the probe (a stale
+"modern" hint that meets -32601/404/405 is redone with a fresh probe); a
+Re-check (uncapped) always probes afresh. `/mcp/check` returns
+`protocolVersion`; the card persists it (`McpServerConfig.protocolVersion`)
+and shows "MCP <revision>" (`mcp-protocol-badge`) next to the verified line.
+The relay forwards `Mcp-*` request headers untouched. Unit:
+`mcp-modern-protocol.test.ts` (in-process stateless server: discover →
+modern path, -32022 retry, legacy fallback, input_required round trip,
+background decline + sampling refusal, listen stream invalidation, cached
+hint vs Re-check, mixed modern + legacy run, header encoding);
+`mcp-conformance.test.ts` asserts the probe precedes initialize against the
+real SDK 1.x server. Live smoke 2026-09-05: DeepWiki → probe → legacy
+2025-11-25, 3 tools.
 
 Protocol core & spec coverage (2026-09-04, `functions/mcp-protocol.ts` — the
 ONE JSON-RPC / Streamable HTTP implementation; `mcp-cloud.ts` is a thin
@@ -1410,16 +1489,51 @@ These are fixture regressions, not a live verification of this user's provider g
 
 Server ownership (2026-09-01): OAuth access/refresh grants, pasted API keys,
 custom headers, refresh single-flight, connection checks, protocol sessions and
-tool calls are owned by the signed-in account's ChatStore shard. `/mcp/oauth-store`
-persists a newly authorized grant before the popup/device flow reports success;
+tool calls are owned by the signed-in account's ChatStore shard. Grants are
+minted only by the server-side flows (`/mcp/oauth-start` → popup →
+`/mcp/oauth/callback` → `/mcp/oauth-complete`; GitHub device flow
+`/mcp/github-device-start|status`) and sealed there in one step;
 `/mcp/check` stores submitted key/header material in the server vault and returns
 only redacted tool/status metadata plus a non-secret `credentialStored` flag. The
 health request sends only connection fields—not cached tool schemas—so large
 servers cannot exceed the control-route body cap. Re-checks always return the full
 tool table (including locally disabled tools), and legacy instance IDs can reuse
 their catalog ID's server-owned key or OAuth grant. Browser profile and local settings serializers
-strip `token`, `headersJson`, and `mcpOAuth`; old local OAuth grants migrate once
-to the shard and are deleted only after its durable acknowledgement.
+strip `token` and `headersJson`; a legacy `mcpOAuth` half of a synced profile is
+ignored by the browser and dropped (never imported) by the shard.
+
+No browser-held grants (2026-09-05, `web/src/lib/mcp-oauth.ts` slimmed to the
+popup driver + non-secret markers; `web/src/lib/mcp-credential-migration.ts`).
+The browser never reads or writes an access/refresh token or a client
+registration: `hasOAuthToken` / `oauthAuthHeader` / `exportOAuthTokens` /
+`adoptProfileOAuthTokens` / rotation adoption are gone, and
+`/mcp/oauth-store` + `/mcp/oauth-refresh` answer 410
+`server_owned_oauth_required` to any old bundle (no silent import of a
+browser token). Boot (`initialAgentState` → `bootSettings`) purges every
+legacy key (`gera.mcp.oauth.tokens.v1`, `gera.mcp.oauth.token.v2.*`,
+`gera.mcp.oauth.clients.v1`); a card that depended on one (OAuth catalog
+server, `authMode: oauth`, custom `auto` server without key/headers, GitHub
+device sign-in) and has no `credentialStored` proof becomes `status: error`
+with `VAULT_RESIGNIN_NOTICE` ("Gera moved sign-ins to the server vault — sign
+in again…"), rendered amber (`mcp-resignin-notice`, catalog badge "Sign-in
+needed again"), Connect reads "Sign in"; vault-backed cards keep their status
+and are verified by the session's health check; pasted keys are untouched.
+The migrated settings are saved at once so React StrictMode's second
+initializer call reads the migrated copy. A non-secret report
+(`gera.mcp.oauth.migration.v1`: counts + ids) feeds the Diagnostics line
+"Browser grants retired · N moved to the vault · M await a fresh sign-in"
+(`credential-migration`). Readiness (`cloudMcpReadiness`) and health retries
+key on `credentialStored`. GitHub from the browser (`resolveGitHubAuth`):
+vault first — `credentialStored` or a green card → `/github-proxy` probe →
+the `gera-account:<id>` sentinel (repo picker, repo previews, repo-access
+diagnostics all ride the proxy; `githubTransportFetch` passes headers as a
+plain object so `X-Gera-GitHub-Accept` survives `authedFetch`); a pasted PAT
+not yet checked in is the only raw value the browser sends. Unit:
+`oauth-clear-safety.test.ts` (purge, no grant API, explicit disconnect
+revokes), `mcp-credential-migration.test.ts`; browser: `oauth-sign-in-vault`
+(stubbed server-side flow ends green with no token / nonce in localStorage,
+`credentialStored: true`), `mcp-vault-migration` (legacy keys gone, amber
+notice, Sign in button, report `moved 0 / awaiting 1`).
 
 Encryption at rest (2026-09-04, `functions/secret-vault.ts`, `secret-rows.ts`).
 Every credential a Durable Object stores is sealed with AES-256-GCM under a
@@ -1729,6 +1843,8 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | elicitation-accept | Send → stream pauses with a `pause` event → card with the `region` field → fill + Accept → `/runs/answer` carries `{action:"accept", content:{region:"eu"}}` → card clears, reply streams |
 | mcp-confirm-card | Settings → Toolkit “Confirm write tools by default” → send → `/runs/start` carries `confirmWriteTools: true` → stream pauses with a `confirmation` request → card names `create_issue` on Tracker with the masked (`•••`) argument preview, Always allow + Decline present → Run once → `/runs/answer` carries `{action:"accept"}` → card clears, reply streams |
 | oauth-step-up | `/mcp?server=scoped` (custom OAuth server, signed in) → boot re-check's `/mcp/check` reports `stepUp` → amber hint names `things:write` + “Sign in again with wider access” → Advanced collapsed → toggle → Scopes + Metadata URL fields |
+| oauth-sign-in-vault | `/mcp?server=vault-oauth` (OAuth server, idle) → Sign in → stubbed `/mcp/oauth-start` + popup stub + `/mcp/oauth-status` completed → `/mcp/check` (no credential in the body) → green card, Re-check, identity; localStorage holds no grant / client registration / browser nonce, card persists `credentialStored: true` |
+| mcp-vault-migration | Legacy `gera.mcp.oauth.*` keys + a green OAuth card without vault proof → boot purges the keys → amber `mcp-resignin-notice` “sign in again”, Connect reads “Sign in” → persisted `status: error`, `credentialStored: false`, report `moved 0 / awaiting 1`, no token text anywhere in storage |
 | objects-have-addresses | Deep links: /automations/new, /skills/new, /profiles/new, /hub?tab= |
 | stop-run-settles-ui | Stop clears the composer when the run node lost the run (hanging stream, `not_running` stop) |
 

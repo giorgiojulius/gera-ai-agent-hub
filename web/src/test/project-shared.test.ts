@@ -9,7 +9,6 @@ import {
   describeAgentAccess,
   ensureUniqueHandle,
   githubToolAllowed,
-  MAX_AGENT_MCP_SERVERS,
   normalizeHandle,
   normalizeStoredMcpSelection,
   parseMcpSelectionPatch,
@@ -224,11 +223,10 @@ describe("agent MCP link", () => {
       action: "error",
       error: "invalid_mcp_selection",
     });
-    const six = Array.from({ length: MAX_AGENT_MCP_SERVERS + 1 }, (_, i) => ({
-      id: `s${i}`,
-      name: `S${i}`,
-    }));
-    expect(parseMcpSelectionPatch(six)).toEqual({ action: "error", error: "too_many_mcp_servers" });
+    // No per-agent server count: twelve linked servers save and load intact.
+    const twelve = Array.from({ length: 12 }, (_, i) => ({ id: `s${i}`, name: `S${i}` }));
+    expect(parseMcpSelectionPatch(twelve)).toEqual({ action: "set", servers: twelve });
+    expect(normalizeStoredMcpSelection({ owner: "a@b.c", servers: twelve })?.servers).toHaveLength(12);
   });
 
   it("normalizeStoredMcpSelection drops junk rows and requires an owner", () => {

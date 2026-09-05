@@ -1,7 +1,8 @@
-// Regression: an expired BROWSER copy of an OAuth grant must never revoke the
-// server-owned grant. Older bundles auto-POSTed /mcp/oauth-clear on local
-// expiry, creating a durable revocation tombstone that destroyed every fresh
-// GitHub device-flow sign-in minutes after it succeeded (server_auth_missing).
+// The browser holds no MCP grant anymore. Legacy keys older bundles left
+// behind are purged on boot and never read for authentication; an explicit
+// disconnect is the only action that revokes the server-owned grant — an
+// expired or missing browser copy must never do so (older bundles auto-POSTed
+// /mcp/oauth-clear on local expiry and destroyed fresh sign-ins).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const authedFetch = vi.fn(
@@ -10,11 +11,13 @@ const authedFetch = vi.fn(
 
 vi.mock("@/lib/backend", () => ({
   authedFetch: (...args: unknown[]) => authedFetch(...args),
+  authedFetchForSession: (...args: unknown[]) => authedFetch(...args),
 }));
 
 const TOKENS_KEY = "gera.mcp.oauth.tokens.v1";
+const CLIENTS_KEY = "gera.mcp.oauth.clients.v1";
 
-describe("oauth clear safety (web/src/lib/mcp-oauth)", () => {
+describe("browser-held MCP grants (web/src/lib/mcp-oauth)", () => {
   let store: Map<string, string>;
 
   beforeEach(() => {
@@ -38,31 +41,64 @@ describe("oauth clear safety (web/src/lib/mcp-oauth)", () => {
     vi.unstubAllGlobals();
   });
 
-  function seedExpiredToken(id: string): void {
+  function seedLegacyGrant(id: string, expired: boolean = true): void {
     const token = {
-      accessToken: "gho_expired",
+      accessToken: "gho_legacy",
+      refreshToken: "ghr_legacy",
       tokenEndpoint: "https://github.com/login/oauth/access_token",
       clientId: "client-1",
-      expiresAt: Date.now() - 60_000,
+      expiresAt: expired ? Date.now() - 60_000 : Date.now() + 60_000,
     };
     store.set(TOKENS_KEY, JSON.stringify({ [id]: token }));
     store.set(`gera.mcp.oauth.token.v2.${encodeURIComponent(id)}`, JSON.stringify(token));
   }
 
-  it("expired local token is dropped locally without revoking the server grant", async () => {
-    seedExpiredToken("github");
-    const { oauthAuthHeader, hasOAuthToken } = await import("@/lib/mcp-oauth");
-    const header = await oauthAuthHeader("github");
-    expect(header).toBeNull();
-    expect(hasOAuthToken("github")).toBe(false);
+  it("purges every legacy grant and client registration, reports the ids, and never writes them back", async () => {
+    seedLegacyGrant("github", false);
+    seedLegacyGrant("linear");
+    store.set("gera.mcp.oauth.token.v2.deleted", "null");
+    store.set(CLIENTS_KEY, JSON.stringify({ "https://auth.example/register": { clientId: "c" } }));
+    store.set("gera.mcp.oauth.flow.v1.github", "attempt-1");
+    const { purgeLegacyOAuthStorage } = await import("@/lib/mcp-oauth");
+
+    const purged = purgeLegacyOAuthStorage();
+    expect(purged.found).toBe(true);
+    expect([...purged.serverIds].sort()).toEqual(["github", "linear"]);
+    expect([...store.keys()].filter((key) => key.startsWith("gera.mcp.oauth.token"))).toEqual([]);
+    expect(store.has(CLIENTS_KEY)).toBe(false);
+    // Non-secret flow markers are not grants and stay untouched.
+    expect(store.get("gera.mcp.oauth.flow.v1.github")).toBe("attempt-1");
+
+    // A second boot finds nothing — and the purge itself never revoked anything server-side.
+    expect(purgeLegacyOAuthStorage()).toEqual({ found: false, serverIds: [] });
     const clearCalls = authedFetch.mock.calls.filter(
       (call) => typeof call[0] === "string" && (call[0] as string).includes("/mcp/oauth-clear"),
     );
     expect(clearCalls).toHaveLength(0);
+    expect(JSON.stringify([...store.entries()])).not.toContain("gho_legacy");
+    expect(JSON.stringify([...store.entries()])).not.toContain("ghr_legacy");
+  });
+
+  it("exposes no API that reads or writes a browser grant", async () => {
+    const oauth = (await import("@/lib/mcp-oauth")) as Record<string, unknown>;
+    for (const gone of [
+      "hasOAuthToken",
+      "hasOAuthRefreshToken",
+      "oauthAuthHeader",
+      "forceRefreshOAuthHeader",
+      "exportOAuthTokens",
+      "adoptProfileOAuthTokens",
+      "applyServerOAuthRotations",
+      "storeExternalOAuthToken",
+      "storeOAuthTokenOnServer",
+      "migrateLegacyOAuthTokensToServer",
+      "dropLocalOAuthToken",
+    ]) {
+      expect(oauth[gone], gone).toBeUndefined();
+    }
   });
 
   it("explicit disconnect revokes server-side with an explicit reason", async () => {
-    seedExpiredToken("github");
     const { clearOAuthToken } = await import("@/lib/mcp-oauth");
     clearOAuthToken("github", "github");
     const clearCall = authedFetch.mock.calls.find(
@@ -70,8 +106,7 @@ describe("oauth clear safety (web/src/lib/mcp-oauth)", () => {
     );
     expect(clearCall).toBeDefined();
     const init = clearCall?.[1] as { body?: string } | undefined;
-    const body = JSON.parse(init?.body ?? "{}") as { reason?: string; serverId?: string };
-    expect(body.reason).toBe("disconnect");
-    expect(body.serverId).toBe("github");
+    const body = JSON.parse(init?.body ?? "{}") as { reason?: string; serverId?: string; catalogId?: string };
+    expect(body).toEqual({ serverId: "github", reason: "disconnect", catalogId: "github" });
   });
 });

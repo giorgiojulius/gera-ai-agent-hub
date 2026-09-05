@@ -1,30 +1,37 @@
 import { authedFetch, relayFetch } from "@/lib/backend";
 import { GitHubAuthError, fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
-import { hasOAuthRefreshToken, hasOAuthToken, oauthAuthHeader } from "@/lib/mcp-oauth";
 import type { McpServerConfig, McpToolInfo } from "@/lib/types";
 
 /**
- * Native GitHub connector — the GitHub REST API straight from the browser.
+ * Native GitHub connector — the GitHub REST API (api.github.com), not the
+ * Copilot MCP endpoint (a moving target with its own auth quirks). "My
+ * repositories" is the deterministic /user/repos listing instead of a global
+ * search that misses private repos.
  *
- * The Copilot MCP endpoint (api.githubcopilot.com/mcp/) is a moving target with
- * its own auth quirks; the plain REST API (api.github.com) answers browsers
- * with `Access-Control-Allow-Origin: *` (verified by live probe), so the
- * device-flow token or a pasted PAT never has to leave the browser. It also
- * lets "my repositories" be the deterministic /user/repos listing instead of
- * a global search that misses private repos.
+ * Credentials: the sign-in (device flow) lives only in the account vault. The
+ * browser addresses it through the `gera-account:<serverId>` sentinel, which
+ * routes every request through the authenticated /github-proxy where the
+ * Worker leases the real token per request. Only a PAT the user has just
+ * pasted — and not yet checked into the vault — travels from the browser.
  */
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
-const GERA_ACCOUNT_AUTH_PREFIX = "gera-account:";
+export const GERA_ACCOUNT_AUTH_PREFIX = "gera-account:";
 
-function accountAuthServerId(auth: string): string | null {
+/** The server id behind a `gera-account:` sentinel, or null for a raw Authorization value. */
+export function accountAuthServerId(auth: string): string | null {
   return auth.startsWith(GERA_ACCOUNT_AUTH_PREFIX)
     ? auth.slice(GERA_ACCOUNT_AUTH_PREFIX.length) || "github"
     : null;
 }
 
-async function githubTransportFetch(auth: string, url: URL, init: RequestInit): Promise<Response> {
+/**
+ * One GitHub REST request: a vault sentinel rides the authenticated
+ * /github-proxy (the Worker attaches the leased token), anything else is a
+ * raw Authorization value sent straight to api.github.com (CORS `*`).
+ */
+export async function githubTransportFetch(auth: string, url: URL, init: RequestInit): Promise<Response> {
   const serverId = accountAuthServerId(auth);
   if (!serverId) {
     return fetch(url.toString(), init);
@@ -35,9 +42,10 @@ async function githubTransportFetch(auth: string, url: URL, init: RequestInit): 
   headers.delete("Authorization");
   headers.delete("X-GitHub-Api-Version");
   headers.set("X-Gera-GitHub-Accept", accept);
+  // authedFetch merges headers as a plain object — a Headers instance would spread to nothing.
   return authedFetch(
     `/github-proxy?serverId=${encodeURIComponent(serverId)}&path=${encodeURIComponent(path)}`,
-    { ...init, headers },
+    { ...init, headers: Object.fromEntries(headers.entries()) },
   );
 }
 
@@ -123,34 +131,19 @@ function stripAnsi(text: string): string {
 }
 
 /**
- * Resolves the Authorization header for the native GitHub connector:
- * a pasted PAT wins, then the stored device-flow sign-in. Throws a
- * user-actionable error when neither exists.
+ * Resolves the Authorization value for the native GitHub connector. The
+ * account vault wins whenever the card proves it holds a credential
+ * (`credentialStored`, or a verified green status): the sentinel is probed
+ * once through /github-proxy so callers get a clean sign-in error instead of
+ * a 401 mid-way. A PAT that was pasted but not yet checked in is the only
+ * raw value the browser ever sends. Throws a user-actionable error when
+ * neither exists.
  */
 export async function resolveGitHubAuth(
   config: Pick<McpServerConfig, "id" | "catalogId" | "token"> &
     Partial<Pick<McpServerConfig, "credentialStored" | "status">>,
 ): Promise<string> {
   const pasted = config.token?.trim();
-  if (pasted) {
-    return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
-  }
-  const oauthIds = [config.id];
-  // Device flow stores the catalog credential under the stable `github` key.
-  // Legacy/imported rows may have a generated instance id plus catalogId.
-  if (config.catalogId && config.catalogId !== config.id) {
-    oauthIds.push(config.catalogId);
-  }
-  for (const oauthId of oauthIds) {
-    const hadRefreshableGrant = hasOAuthToken(oauthId) && hasOAuthRefreshToken(oauthId);
-    const oauth = await oauthAuthHeader(oauthId);
-    if (oauth) {
-      return oauth;
-    }
-    if (hadRefreshableGrant && hasOAuthToken(oauthId)) {
-      throw new Error("Could not refresh GitHub sign-in right now — retry shortly; your session was kept.");
-    }
-  }
   if (config.credentialStored === true || config.status === "connected") {
     const serverId = config.id || config.catalogId || "github";
     const sentinel = `${GERA_ACCOUNT_AUTH_PREFIX}${serverId}`;
@@ -161,22 +154,30 @@ export async function resolveGitHubAuth(
       return sentinel;
     }
     if (probe.status === 401) {
+      if (pasted) {
+        // The vault row is gone but the key is still on the card: check it in
+        // again with Connect; meanwhile the pasted value still works.
+        return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
+      }
       throw new GitHubAuthError('GitHub needs a fresh sign-in — press "Sign in with GitHub" again.');
     }
     throw new Error(`Could not verify the server-owned GitHub sign-in (HTTP ${probe.status}).`);
+  }
+  if (pasted) {
+    return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
   }
   throw new GitHubAuthError('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');
 }
 
 /**
- * Returns the run's copy of the MCP server list with the browser-held GitHub
- * credential injected into the GitHub connector entry (as `token`). Server
- * runs cannot read this browser's sign-in store — the device-flow token
- * lives in localStorage only, and the profile sync that mirrors it
- * server-side is best-effort — so without this hand-off a cloud run can
- * silently lose GitHub tools while the composer's repo picker keeps working.
- * A pasted PAT already rides in `token` and stays untouched; the input array
- * and its entries are never mutated.
+ * Returns the run's copy of the MCP server list with the resolved GitHub
+ * credential reference injected into the GitHub connector entry (as `token`).
+ * With vault-owned sign-ins this is the `gera-account:` sentinel, which the
+ * server treats as "lease from the vault" (never as a credential); only a
+ * PAT that is pasted but not yet checked in rides as a raw value. Without
+ * the hand-off a cloud run could silently lose GitHub tools while the
+ * composer's repo picker keeps working. A pasted PAT already in `token`
+ * stays untouched; the input array and its entries are never mutated.
  */
 export function injectGitHubRunAuth(
   servers: McpServerConfig[],

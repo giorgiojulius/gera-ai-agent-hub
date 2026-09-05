@@ -14,14 +14,6 @@ import {
 } from "@/lib/intercom-native";
 import { findCatalogEntry, isGithubWriteTool } from "@/lib/mcp-catalog";
 import {
-  dropLocalOAuthToken,
-  forceRefreshOAuthHeader,
-  hasOAuthRefreshToken,
-  hasOAuthToken,
-  oauthAuthHeader,
-  oauthTokenFingerprint,
-} from "@/lib/mcp-oauth";
-import {
   SLACK_NATIVE_TOOLS,
   callSlackNativeTool,
   isSlackCredentialError,
@@ -57,8 +49,6 @@ type McpSession = {
   configUrl: string;
   url: string;
   headers: Record<string, string>;
-  usedOAuth: boolean;
-  oauthFingerprint?: string;
   protocolVersion: string;
   /** Skip custom MCP headers for hosts whose CORS preflight rejects them (Google). */
   omitMcpHeaders: boolean;
@@ -185,27 +175,26 @@ function parseCustomHeaders(config: McpServerConfig): Record<string, string> {
  * Pasted keys follow the catalog's token placement (header, query param, or
  * URL template) when the server comes from the catalog.
  */
-async function buildAuth(
+/**
+ * Browser-transport auth for the legacy direct path (pasted keys and custom
+ * headers only). OAuth grants live in the account vault and are used by the
+ * server-owned check/run paths — this transport never sees them.
+ */
+function buildAuth(
   config: McpServerConfig,
-): Promise<{ url: string; headers: Record<string, string>; usedOAuth: boolean; omitMcpHeaders: boolean }> {
+): { url: string; headers: Record<string, string>; omitMcpHeaders: boolean } {
   const entry = findCatalogEntry(config.catalogId ?? config.id);
   const omitMcpHeaders = Boolean(entry?.omitMcpHeaders);
   const mode: McpAuthMode = config.authMode ?? "auto";
   let url = config.url.trim();
 
   if (mode === "none") {
-    return { url, headers: {}, usedOAuth: false, omitMcpHeaders };
+    return { url, headers: {}, omitMcpHeaders };
   }
   if (mode === "oauth") {
-    const hadRefreshableGrant = hasOAuthToken(config.id, url) && hasOAuthRefreshToken(config.id);
-    const oauth = await oauthAuthHeader(config.id, url);
-    if (!oauth) {
-      if (hadRefreshableGrant && hasOAuthToken(config.id, url)) {
-        throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
-      }
-      throw new McpAuthError("Sign-in required — press Sign in to authorize in the browser.");
-    }
-    return { url, headers: { Authorization: oauth }, usedOAuth: true, omitMcpHeaders };
+    throw new McpAuthError(
+      "This server's sign-in lives in your account vault and is used server-side — press Check to verify it.",
+    );
   }
 
   const headers = mode === "bearer" ? {} : parseCustomHeaders(config);
@@ -224,20 +213,8 @@ async function buildAuth(
     } else {
       headers.Authorization = token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}`;
     }
-    return { url, headers, usedOAuth: false, omitMcpHeaders };
   }
-  if (!headers.Authorization) {
-    const hadRefreshableGrant = hasOAuthToken(config.id, url) && hasOAuthRefreshToken(config.id);
-    const oauth = await oauthAuthHeader(config.id, url);
-    if (oauth) {
-      headers.Authorization = oauth;
-      return { url, headers, usedOAuth: true, omitMcpHeaders };
-    }
-    if (hadRefreshableGrant && hasOAuthToken(config.id, url)) {
-      throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
-    }
-  }
-  return { url, headers, usedOAuth: false, omitMcpHeaders };
+  return { url, headers, omitMcpHeaders };
 }
 
 function mcpProtocolHeaders(session: McpSession): Record<string, string> {
@@ -326,24 +303,7 @@ async function readMcpRpcResponse(response: Response, expectedId: number): Promi
 }
 
 async function rpc(session: McpSession, method: string, params?: unknown): Promise<unknown> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    // Sessions are cached across turns; re-resolve the header so a token
-    // refreshed since connect (or by a parallel call) is actually used.
-    if (session.usedOAuth) {
-      const before = oauthTokenFingerprint(session.configId);
-      if (session.oauthFingerprint && before !== session.oauthFingerprint) {
-        sessions.delete(session.configId);
-        throw new McpSessionLostError();
-      }
-      const header = await oauthAuthHeader(session.configId, session.configUrl);
-      if (!header) {
-        sessions.delete(session.configId);
-        throw new McpAuthError("Sign-in is missing or expired — authorize this server again.");
-      }
-      session.headers.Authorization = header;
-      session.oauthFingerprint = oauthTokenFingerprint(session.configId);
-    }
-
+  {
     session.nextId += 1;
     const request: JsonRpcRequest = {
       jsonrpc: "2.0",
@@ -385,28 +345,6 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
         throw new McpSessionLostError();
       }
       if (response.status === 401 || response.status === 403) {
-        if (session.usedOAuth && attempt === 0) {
-          // The access token may have been revoked before its recorded expiry.
-          // Redeem the refresh token once and replay the request.
-          const refreshed = await forceRefreshOAuthHeader(session.configId);
-          if (refreshed) {
-            session.headers.Authorization = refreshed;
-            continue;
-          }
-        }
-        if (session.usedOAuth) {
-          sessions.delete(session.configId);
-          if (hasOAuthToken(session.configId, session.configUrl) && hasOAuthRefreshToken(session.configId)) {
-            // The provider/relay may be temporarily unavailable. The rejected
-            // access token cannot be used now, but its refresh grant may repair
-            // the next attempt; deleting it here caused needless re-logins.
-            throw new Error("Could not refresh this sign-in right now — retry shortly; your session was kept.");
-          }
-          // Only the browser copy is provably dead here; the account shard
-          // may already hold a rotated/fresh grant that server runs still use.
-          dropLocalOAuthToken(session.configId);
-          throw new McpAuthError("Sign-in expired. Press Sign in to authorize again.");
-        }
         throw new McpAuthError("This server needs a key or sign-in before it will talk.");
       }
       throw new Error(
@@ -431,8 +369,6 @@ async function rpc(session: McpSession, method: string, params?: unknown): Promi
     }
     return parsed.result;
   }
-
-  throw new Error("MCP request failed after refreshing sign-in.");
 }
 
 export type McpConnection = {
@@ -444,9 +380,16 @@ export type McpConnection = {
   /** Prompts / resources the handshake listed (generic MCP servers only). */
   promptCount?: number;
   resourceCount?: number;
+  /** The MCP revision the conversation actually runs on (stateless 2026-07-28 or a legacy handshake). */
+  protocolVersion?: string;
   /** A run hit `insufficient_scope`: the next sign-in must ask for wider access. */
   stepUp?: McpStepUp;
 };
+
+/** A protocol revision as the wire spells it (YYYY-MM-DD); anything else is dropped. */
+export function parseMcpProtocolVersion(value: unknown): string | undefined {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : undefined;
+}
 
 /** The server's `stepUp` payload, validated; undefined when absent or malformed. */
 export function parseMcpStepUp(value: unknown): McpStepUp | undefined {
@@ -507,6 +450,7 @@ type McpCheckBody = {
   credentialStored?: unknown;
   promptCount?: unknown;
   resourceCount?: unknown;
+  protocolVersion?: unknown;
   stepUp?: unknown;
   error?: unknown;
   detail?: unknown;
@@ -631,12 +575,14 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
       )
     : [];
   const stepUp = parseMcpStepUp(data.stepUp);
+  const protocolVersion = parseMcpProtocolVersion(data.protocolVersion);
   return {
     tools: serverTools,
     identity: typeof data.identity === "string" && data.identity ? data.identity : "Server verified",
     credentialStored: data.credentialStored === true,
     promptCount: typeof data.promptCount === "number" && data.promptCount >= 0 ? data.promptCount : 0,
     resourceCount: typeof data.resourceCount === "number" && data.resourceCount >= 0 ? data.resourceCount : 0,
+    ...(protocolVersion ? { protocolVersion } : {}),
     ...(stepUp ? { stepUp } : {}),
   };
 }
@@ -681,8 +627,8 @@ export async function connectMcpServerLegacy(config: McpServerConfig): Promise<M
     }
   }
   if (entry?.native === "github") {
-    // Native GitHub: REST API straight from the browser with the device-flow
-    // token or a pasted PAT — verifies who the token belongs to on connect.
+    // Native GitHub: the vault-leased sign-in (through /github-proxy) or a
+    // pasted PAT — verifies who the credential belongs to on connect.
     try {
       const auth = await resolveGitHubAuth(config);
       const verified = await verifyGitHubNative(auth);
@@ -691,31 +637,6 @@ export async function connectMcpServerLegacy(config: McpServerConfig): Promise<M
         identity: verified.identity,
       };
     } catch (error) {
-      if (error instanceof GitHubAuthError && !config.token?.trim()) {
-        // GitHub can revoke an access token before its recorded expiry. Mirror
-        // generic MCP: force one refresh for either the instance or stable
-        // catalog grant, then verify the replacement before declaring it dead.
-        const oauthIds = [config.id];
-        if (config.catalogId && config.catalogId !== config.id) {
-          oauthIds.push(config.catalogId);
-        }
-        for (const oauthId of oauthIds) {
-          if (!hasOAuthRefreshToken(oauthId)) {
-            continue;
-          }
-          const refreshed = await forceRefreshOAuthHeader(oauthId);
-          if (refreshed) {
-            const verified = await verifyGitHubNative(refreshed);
-            return {
-              tools: GITHUB_NATIVE_TOOLS.map((tool) => ({ ...tool })),
-              identity: verified.identity,
-            };
-          }
-          if (hasOAuthToken(oauthId) && hasOAuthRefreshToken(oauthId)) {
-            throw new Error("Could not refresh GitHub sign-in right now — retry shortly; your session was kept.");
-          }
-        }
-      }
       if (error instanceof GitHubAuthError) {
         throw new McpAuthError(error.message);
       }
@@ -723,7 +644,7 @@ export async function connectMcpServerLegacy(config: McpServerConfig): Promise<M
     }
   }
   const generation = sessionGeneration;
-  const auth = await buildAuth(config);
+  const auth = buildAuth(config);
   const session: McpSession = {
     configId: config.id,
     generation,
@@ -731,8 +652,6 @@ export async function connectMcpServerLegacy(config: McpServerConfig): Promise<M
     configUrl: config.url.trim(),
     url: auth.url,
     headers: auth.headers,
-    usedOAuth: auth.usedOAuth,
-    oauthFingerprint: auth.usedOAuth ? oauthTokenFingerprint(config.id) : undefined,
     protocolVersion: MCP_DEFAULT_PROTOCOL_VERSION,
     omitMcpHeaders: auth.omitMcpHeaders,
     nextId: 0,

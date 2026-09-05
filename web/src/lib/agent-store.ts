@@ -48,7 +48,8 @@ import { buildSkillsBlock, filterSkillsByIds, skillPinnedServerIds, skillsForSur
 import { applySkillOps, buildSkillsEditorContext, extractSkillOps } from "@/lib/skill-ops";
 import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerableRun, watchSteering } from "@/lib/steering";
 import { McpAccountAuthError, McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
-import { hasOAuthRefreshToken, hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
+import { migrateBrowserGrantsToVault } from "@/lib/mcp-credential-migration";
+import { runOAuthSignIn } from "@/lib/mcp-oauth";
 import { beginMcpHealthCheck, invalidateMcpHealth, mcpHealthFingerprint, mcpHealthState } from "@/lib/mcp-health";
 import {
   cachedAcceptsImages,
@@ -183,7 +184,7 @@ export function initialAgentState(
   return {
     conversations,
     activeId,
-    settings: loadSettings(),
+    settings: bootSettings(),
     life: loadLife(),
     // Publish-safe: the draft and the follow-up queue survive reloads.
     input: loadComposerDraft(),
@@ -195,6 +196,22 @@ export function initialAgentState(
     julius: false,
     sidebarOpen: false,
   };
+}
+
+/**
+ * Settings for the first render. Legacy browser-held MCP grants are purged
+ * here and the cards that depended on one get the honest re-sign-in notice.
+ * The migrated settings are saved at once, so a second initializer call (React
+ * StrictMode runs state initializers twice) reads the migrated copy instead
+ * of the pre-migration one now that the legacy keys are gone.
+ */
+function bootSettings(): AgentSettings {
+  const loaded = loadSettings();
+  const { settings } = migrateBrowserGrantsToVault(loaded);
+  if (settings !== loaded) {
+    saveSettings(settings);
+  }
+  return settings;
 }
 
 function persist(conversations: Conversation[], activeId: string | null): void {
@@ -1880,6 +1897,7 @@ export async function reconnectMcp(
               credentialStored: connection.credentialStored === true,
               promptCount: connection.promptCount ?? 0,
               resourceCount: connection.resourceCount ?? 0,
+              protocolVersion: connection.protocolVersion,
               error: undefined,
               name: item.name || server.name,
             }
@@ -1968,19 +1986,12 @@ export function revalidateMcpServers(
     if (!server.enabled) {
       continue;
     }
-    const catalogId = server.catalogId ?? server.id;
-    const hasRefreshableOAuth =
-      (hasOAuthToken(server.id, server.url) && hasOAuthRefreshToken(server.id)) ||
-      (catalogId !== server.id &&
-        hasOAuthToken(catalogId, server.url) &&
-        hasOAuthRefreshToken(catalogId));
     const transient = isRecoverableMcpHealthError(server.error);
     // A generic upstream 401 is not the OAuth server's definitive invalid_grant
-    // verdict. A refresh or another device may already have repaired the vault.
+    // verdict. A vault refresh or another device may already have repaired it.
     const storedAuthCanRecover = server.credentialStored === true &&
       /auth rejected \(401\)/i.test(server.error ?? "") && !server.stepUp;
-    const isRecoverableError = server.status === "error" &&
-      (transient || hasRefreshableOAuth || storedAuthCanRecover);
+    const isRecoverableError = server.status === "error" && (transient || storedAuthCanRecover);
     const forced = forceIds.has(server.id);
     if (server.status !== "connected" && !(server.status === "error" && (isRecoverableError || forced))) continue;
     const health = mcpHealthState(server.id);
@@ -2024,6 +2035,7 @@ async function revalidateQuietly(
           item.credentialStored === (connection.credentialStored === true) &&
           (item.promptCount ?? 0) === (connection.promptCount ?? 0) &&
           (item.resourceCount ?? 0) === (connection.resourceCount ?? 0) &&
+          item.protocolVersion === connection.protocolVersion &&
           JSON.stringify(item.stepUp) === JSON.stringify(connection.stepUp) &&
           sameMcpTools(item.tools, connection.tools)
         ) {
@@ -2039,6 +2051,7 @@ async function revalidateQuietly(
           credentialStored: connection.credentialStored === true,
           promptCount: connection.promptCount ?? 0,
           resourceCount: connection.resourceCount ?? 0,
+          protocolVersion: connection.protocolVersion,
           // The server reports a pending insufficient_scope step-up on every
           // check until a wider sign-in completes; absence means cleared.
           stepUp: connection.stepUp,

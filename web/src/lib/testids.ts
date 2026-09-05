@@ -198,6 +198,10 @@ export const TID = {
   /** Step-up hint + "Sign in again with wider access" button on a server card. */
   mcpStepUpHint: "mcp-step-up-hint",
   mcpStepUpSignIn: "mcp-step-up-sign-in",
+  /** Amber status line of a card whose browser-held sign-in was retired into the vault. */
+  mcpResigninNotice: "mcp-resignin-notice",
+  /** Badge with the MCP protocol revision the last check actually spoke. */
+  mcpProtocolBadge: "mcp-protocol-badge",
   /** Local Blender connector: setup guide and protected remote bridge form. */
   mcpCatalogSearch: "mcp-catalog-search",
   blenderSetup: "blender-setup",

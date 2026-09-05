@@ -8,7 +8,6 @@ import {
 import { parseProfilePayload } from "@/lib/chat-sync";
 import { normalizeStoredSettings } from "@/lib/history";
 import { isSessionLostRpcMessage, isSessionLostSignal, mcpCheckServerPayload } from "@/lib/mcp";
-import { adoptProfileOAuthTokens } from "@/lib/mcp-oauth";
 import type { AgentSettings, McpServerConfig } from "@/lib/types";
 
 function storedServer(overrides: Partial<McpServerConfig>): McpServerConfig {
@@ -82,7 +81,7 @@ describe("MCP connection persistence — connect once and forget", () => {
     expect(mcpCheckServerPayload(legacy.mcpServers[0])).not.toHaveProperty("credentialStored");
   });
 
-  it("keeps the OAuth half of a synced profile available to the caller", () => {
+  it("ignores the legacy OAuth half of a synced profile — grants live only in the vault", () => {
     const oauth = {
       github: {
         accessToken: "credential",
@@ -90,8 +89,9 @@ describe("MCP connection persistence — connect once and forget", () => {
         clientId: "client",
       },
     };
-    const parsed = parseProfilePayload(JSON.stringify({ settings: {}, life: {}, mcpOAuth: oauth }));
-    expect(parsed?.mcpOAuth).toEqual(oauth);
+    const parsed = parseProfilePayload(JSON.stringify({ settings: { a: 1 }, life: {}, mcpOAuth: oauth }));
+    expect(parsed).toEqual({ settings: { a: 1 }, life: {} });
+    expect(JSON.stringify(parsed)).not.toContain("credential");
   });
 
   it("keeps verified servers connected across reloads, with proof intact", () => {
@@ -188,25 +188,18 @@ describe("honest MCP auth status", () => {
     expect(isRecoverableMcpHealthError("Authorize this server again.")).toBe(false);
   });
 
-  it("accepts the same card once the synced OAuth grant has been adopted", () => {
-    const adopted = adoptProfileOAuthTokens({
-      github: {
-        accessToken: "credential",
-        tokenEndpoint: "https://github.com/login/oauth/access_token",
-        clientId: "client",
-      },
-    });
+  it("accepts a vault-backed card under a legacy instance id without any browser grant", () => {
     const github = storedServer({
       id: "github-instance",
       catalogId: "github",
       name: "GitHub",
       status: "connected",
+      credentialStored: true,
       verifiedAt: Date.now(),
       tools: [{ name: "get_contents" }],
     });
-
-    expect(adopted).toBe(1);
     expect(mcpCredentialProblem(github)).toBeNull();
+    expect(mcpCheckServerPayload(github)).toMatchObject({ credentialStored: true, token: "" });
   });
 
   it("keeps a connected MCP armed when background revalidation hits a transient relay outage", async () => {

@@ -2,22 +2,22 @@
   "schema": 1,
   "platform": "web",
   "app": "gera-web",
-  "startedAt": "2026-09-05T06:18:32.677Z",
-  "durationMs": 19855,
-  "passed": 27,
+  "startedAt": "2026-09-05T20:19:23.613Z",
+  "durationMs": 20080,
+  "passed": 29,
   "failed": 0,
   "results": [
     {
       "scenarioId": "boot-to-launchpad",
       "title": "Boot lands on the launchpad behind the invite gate",
       "ok": true,
-      "ms": 60,
+      "ms": 63,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 8
+          "ms": 11
         },
         {
           "index": 1,
@@ -29,13 +29,13 @@
           "index": 2,
           "label": "see composer-input",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 3,
           "label": "see sidebar-new-chat",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -43,7 +43,7 @@
       "scenarioId": "starters-hide-while-typing",
       "title": "Starter chips fade away while a prompt is being written",
       "ok": true,
-      "ms": 164,
+      "ms": 163,
       "steps": [
         {
           "index": 0,
@@ -61,7 +61,7 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 65
+          "ms": 67
         },
         {
           "index": 3,
@@ -73,7 +73,7 @@
           "index": 4,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 39
+          "ms": 36
         },
         {
           "index": 5,
@@ -87,7 +87,7 @@
       "scenarioId": "send-chat-message",
       "title": "Sending a message renders the user turn and a streamed reply",
       "ok": true,
-      "ms": 250,
+      "ms": 258,
       "steps": [
         {
           "index": 0,
@@ -105,31 +105,31 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 28
+          "ms": 27
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 163
+          "ms": 171
         },
         {
           "index": 4,
           "label": "see chat-thread",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 5,
           "label": "see \"Ping from the e2e suite\" in message-user",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 6,
           "label": "see \"Gera e2e reply\" in message-assistant",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 7,
@@ -143,13 +143,13 @@
       "scenarioId": "code-changes-preview",
       "title": "Code edits open a live Changes workbench and runnable preview",
       "ok": true,
-      "ms": 270,
+      "ms": 290,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 4
+          "ms": 5
         },
         {
           "index": 1,
@@ -161,43 +161,43 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 18
+          "ms": 17
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 86
+          "ms": 93
         },
         {
           "index": 4,
           "label": "see \"index.html\" in code-change-flow",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 5,
           "label": "tap code-change-changes-tab",
           "ok": true,
-          "ms": 60
+          "ms": 68
         },
         {
           "index": 6,
           "label": "see \"Hello from preview\" in code-change-flow",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 7,
           "label": "tap code-change-preview-tab",
           "ok": true,
-          "ms": 50
+          "ms": 54
         },
         {
           "index": 8,
           "label": "see \"Preview running\" in code-change-flow",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 9,
@@ -211,13 +211,13 @@
       "scenarioId": "new-chat-keeps-history",
       "title": "New chat returns to the launchpad and keeps the thread listed",
       "ok": true,
-      "ms": 331,
+      "ms": 365,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 6
+          "ms": 7
         },
         {
           "index": 1,
@@ -229,13 +229,13 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 26
+          "ms": 30
         },
         {
           "index": 3,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 143
+          "ms": 141
         },
         {
           "index": 4,
@@ -247,7 +247,7 @@
           "index": 5,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 105
+          "ms": 135
         },
         {
           "index": 6,
@@ -259,7 +259,7 @@
           "index": 7,
           "label": "see sidebar-thread",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     },
@@ -267,25 +267,25 @@
       "scenarioId": "github-pin-and-send",
       "title": "GitHub repo picker pins a private repo and carries it into a run",
       "ok": true,
-      "ms": 336,
+      "ms": 320,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 7
+          "ms": 9
         },
         {
           "index": 1,
           "label": "see composer-repo",
           "ok": true,
-          "ms": 51
+          "ms": 50
         },
         {
           "index": 2,
           "label": "tap composer-repo",
           "ok": true,
-          "ms": 81
+          "ms": 78
         },
         {
           "index": 3,
@@ -297,25 +297,25 @@
           "index": 4,
           "label": "tap composer-repo-option",
           "ok": true,
-          "ms": 73
+          "ms": 70
         },
         {
           "index": 5,
           "label": "see \"private-app\" in composer-repo",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 6,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 23
+          "ms": 18
         },
         {
           "index": 7,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 98
+          "ms": 93
         },
         {
           "index": 8,
@@ -329,7 +329,7 @@
       "scenarioId": "github-launch-web-preview",
       "title": "A pinned GitHub web repository launches into a live Rork preview",
       "ok": true,
-      "ms": 2844,
+      "ms": 2873,
       "steps": [
         {
           "index": 0,
@@ -353,19 +353,19 @@
           "index": 3,
           "label": "see composer-repo-panel",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 4,
           "label": "tap composer-repo-option",
           "ok": true,
-          "ms": 47
+          "ms": 62
         },
         {
           "index": 5,
           "label": "tap composer-repo-launch",
           "ok": true,
-          "ms": 59
+          "ms": 61
         },
         {
           "index": 6,
@@ -383,25 +383,25 @@
           "index": 8,
           "label": "tap repo-launch-start",
           "ok": true,
-          "ms": 53
+          "ms": 51
         },
         {
           "index": 9,
           "label": "see \"Preview running\" in repo-preview-flow",
           "ok": true,
-          "ms": 2570
+          "ms": 2585
         },
         {
           "index": 10,
           "label": "see repo-preview-panel",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 11,
           "label": "see repo-preview-frame",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -409,31 +409,31 @@
       "scenarioId": "switch-chat-model",
       "title": "The picker offers Astra and Grok in quick choices and opens the rest under More",
       "ok": true,
-      "ms": 616,
+      "ms": 635,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 7
+          "ms": 8
         },
         {
           "index": 1,
           "label": "see composer-input",
           "ok": true,
-          "ms": 50
+          "ms": 51
         },
         {
           "index": 2,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 60
+          "ms": 64
         },
         {
           "index": 3,
           "label": "tap model-picker-model-row",
           "ok": true,
-          "ms": 49
+          "ms": 47
         },
         {
           "index": 4,
@@ -469,13 +469,13 @@
           "index": 9,
           "label": "see model-option-openai/gpt-5.6-luna",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 10,
           "label": "tap model-option-openai/gpt-6-astra",
           "ok": true,
-          "ms": 61
+          "ms": 59
         },
         {
           "index": 11,
@@ -487,13 +487,13 @@
           "index": 12,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 60
+          "ms": 63
         },
         {
           "index": 13,
           "label": "tap model-picker-model-row",
           "ok": true,
-          "ms": 45
+          "ms": 60
         },
         {
           "index": 14,
@@ -505,7 +505,7 @@
           "index": 15,
           "label": "see \"Grok 4.6\" in model-picker-trigger",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 16,
@@ -517,13 +517,13 @@
           "index": 17,
           "label": "tap model-picker-model-row",
           "ok": true,
-          "ms": 52
+          "ms": 55
         },
         {
           "index": 18,
           "label": "tap model-picker-more-row",
           "ok": true,
-          "ms": 50
+          "ms": 53
         },
         {
           "index": 19,
@@ -547,13 +547,13 @@
           "index": 22,
           "label": "tap model-option-anthropic/claude-opus-5",
           "ok": true,
-          "ms": 63
+          "ms": 57
         },
         {
           "index": 23,
           "label": "see \"Claude Opus 5\" in model-picker-trigger",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -561,13 +561,13 @@
       "scenarioId": "switch-chat-effort",
       "title": "The picker's Effort submenu pins the thinking budget",
       "ok": true,
-      "ms": 227,
+      "ms": 226,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 6
+          "ms": 7
         },
         {
           "index": 1,
@@ -579,13 +579,13 @@
           "index": 2,
           "label": "tap model-picker-trigger",
           "ok": true,
-          "ms": 59
+          "ms": 58
         },
         {
           "index": 3,
           "label": "tap model-picker-effort-row",
           "ok": true,
-          "ms": 50
+          "ms": 49
         },
         {
           "index": 4,
@@ -605,7 +605,45 @@
       "scenarioId": "switch-run-mode",
       "title": "The model-style run-mode picker engages Deep research",
       "ok": true,
-      "ms": 165,
+      "ms": 181,
+      "steps": [
+        {
+          "index": 0,
+          "label": "goto /",
+          "ok": true,
+          "ms": 8
+        },
+        {
+          "index": 1,
+          "label": "see composer-input",
+          "ok": true,
+          "ms": 51
+        },
+        {
+          "index": 2,
+          "label": "tap composer-mode-trigger",
+          "ok": true,
+          "ms": 65
+        },
+        {
+          "index": 3,
+          "label": "tap run-mode-option-research",
+          "ok": true,
+          "ms": 57
+        },
+        {
+          "index": 4,
+          "label": "see \"Deep research\" in composer-mode-trigger",
+          "ok": true,
+          "ms": 0
+        }
+      ]
+    },
+    {
+      "scenarioId": "run-mode-settings-panel",
+      "title": "The engaged run mode's gear opens its settings panel",
+      "ok": true,
+      "ms": 223,
       "steps": [
         {
           "index": 0,
@@ -618,44 +656,6 @@
           "label": "see composer-input",
           "ok": true,
           "ms": 51
-        },
-        {
-          "index": 2,
-          "label": "tap composer-mode-trigger",
-          "ok": true,
-          "ms": 53
-        },
-        {
-          "index": 3,
-          "label": "tap run-mode-option-research",
-          "ok": true,
-          "ms": 54
-        },
-        {
-          "index": 4,
-          "label": "see \"Deep research\" in composer-mode-trigger",
-          "ok": true,
-          "ms": 1
-        }
-      ]
-    },
-    {
-      "scenarioId": "run-mode-settings-panel",
-      "title": "The engaged run mode's gear opens its settings panel",
-      "ok": true,
-      "ms": 222,
-      "steps": [
-        {
-          "index": 0,
-          "label": "goto /",
-          "ok": true,
-          "ms": 7
-        },
-        {
-          "index": 1,
-          "label": "see composer-input",
-          "ok": true,
-          "ms": 50
         },
         {
           "index": 2,
@@ -679,7 +679,7 @@
           "index": 5,
           "label": "see composer-mode-config-panel",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 6,
@@ -693,7 +693,7 @@
       "scenarioId": "skills-rail-panel",
       "title": "The rail Skills button opens the per-mode packs panel",
       "ok": true,
-      "ms": 114,
+      "ms": 112,
       "steps": [
         {
           "index": 0,
@@ -711,7 +711,7 @@
           "index": 2,
           "label": "tap composer-skills",
           "ok": true,
-          "ms": 57
+          "ms": 55
         },
         {
           "index": 3,
@@ -731,7 +731,7 @@
       "scenarioId": "projects-page-opens",
       "title": "Projects page renders with the create action behind the gate",
       "ok": true,
-      "ms": 58,
+      "ms": 57,
       "steps": [
         {
           "index": 0,
@@ -749,7 +749,7 @@
           "index": 2,
           "label": "see project-create",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -757,13 +757,13 @@
       "scenarioId": "studio-pages-navigate",
       "title": "Workspace tabs hop between Automations, Hub, MCP and Settings",
       "ok": true,
-      "ms": 417,
+      "ms": 406,
       "steps": [
         {
           "index": 0,
           "label": "goto /automations",
           "ok": true,
-          "ms": 7
+          "ms": 6
         },
         {
           "index": 1,
@@ -775,7 +775,7 @@
           "index": 2,
           "label": "tap nav-tab-hub",
           "ok": true,
-          "ms": 50
+          "ms": 51
         },
         {
           "index": 3,
@@ -793,19 +793,19 @@
           "index": 5,
           "label": "see page-mcp",
           "ok": true,
-          "ms": 85
+          "ms": 88
         },
         {
           "index": 6,
           "label": "tap nav-tab-settings",
           "ok": true,
-          "ms": 70
+          "ms": 52
         },
         {
           "index": 7,
           "label": "see page-settings",
           "ok": true,
-          "ms": 51
+          "ms": 55
         }
       ]
     },
@@ -813,7 +813,7 @@
       "scenarioId": "connect-open-mcp",
       "title": "An open MCP catalog server handshakes and lists its tools",
       "ok": true,
-      "ms": 223,
+      "ms": 243,
       "steps": [
         {
           "index": 0,
@@ -825,19 +825,19 @@
           "index": 1,
           "label": "see page-mcp",
           "ok": true,
-          "ms": 89
+          "ms": 97
         },
         {
           "index": 2,
           "label": "tap mcp-catalog-connect-deepwiki",
           "ok": true,
-          "ms": 127
+          "ms": 140
         },
         {
           "index": 3,
           "label": "see \"1 tools\" in mcp-server-deepwiki",
           "ok": true,
-          "ms": 1
+          "ms": 0
         }
       ]
     },
@@ -845,7 +845,7 @@
       "scenarioId": "mcp-deploy-recovery",
       "title": "MCP cards recover stored deployment errors without replacing credentials",
       "ok": true,
-      "ms": 4769,
+      "ms": 4745,
       "steps": [
         {
           "index": 0,
@@ -857,19 +857,19 @@
           "index": 1,
           "label": "see \"GitHub · recovered\" in mcp-server-github",
           "ok": true,
-          "ms": 4069
+          "ms": 4061
         },
         {
           "index": 2,
           "label": "see \"Intercom · recovered\" in mcp-server-intercom",
           "ok": true,
-          "ms": 696
+          "ms": 679
         },
         {
           "index": 3,
           "label": "see \"TesterArmy · recovered\" in mcp-server-testerarmy",
           "ok": true,
-          "ms": 1
+          "ms": 2
         }
       ]
     },
@@ -877,25 +877,25 @@
       "scenarioId": "mcp-cancel-check",
       "title": "Disabling an in-flight MCP check leaves Connect usable on re-enable",
       "ok": true,
-      "ms": 559,
+      "ms": 498,
       "steps": [
         {
           "index": 0,
           "label": "goto /mcp",
           "ok": true,
-          "ms": 11
+          "ms": 6
         },
         {
           "index": 1,
           "label": "see mcp-server-cancel-check",
           "ok": true,
-          "ms": 107
+          "ms": 80
         },
         {
           "index": 2,
           "label": "tap mcp-server-connect-cancel-check",
           "ok": true,
-          "ms": 101
+          "ms": 105
         },
         {
           "index": 3,
@@ -907,25 +907,25 @@
           "index": 4,
           "label": "tap mcp-server-enabled-cancel-check",
           "ok": true,
-          "ms": 96
+          "ms": 80
         },
         {
           "index": 5,
           "label": "tap mcp-server-enabled-cancel-check",
           "ok": true,
-          "ms": 97
+          "ms": 80
         },
         {
           "index": 6,
           "label": "see \"Connect\" in mcp-server-connect-cancel-check",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 7,
           "label": "tap mcp-server-connect-cancel-check",
           "ok": true,
-          "ms": 145
+          "ms": 146
         },
         {
           "index": 8,
@@ -939,7 +939,7 @@
       "scenarioId": "blender-mcp-setup",
       "title": "Blender setup explains the local bridge, rejects localhost and never creates a phantom connection",
       "ok": true,
-      "ms": 330,
+      "ms": 381,
       "steps": [
         {
           "index": 0,
@@ -951,19 +951,19 @@
           "index": 1,
           "label": "see mcp-catalog-search",
           "ok": true,
-          "ms": 74
+          "ms": 112
         },
         {
           "index": 2,
           "label": "fill mcp-catalog-search",
           "ok": true,
-          "ms": 23
+          "ms": 26
         },
         {
           "index": 3,
           "label": "tap mcp-catalog-connect-blender",
           "ok": true,
-          "ms": 90
+          "ms": 85
         },
         {
           "index": 4,
@@ -975,7 +975,7 @@
           "index": 5,
           "label": "see \"9876\" in blender-guide",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 6,
@@ -987,25 +987,25 @@
           "index": 7,
           "label": "not see mcp-server-blender",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 8,
           "label": "fill blender-endpoint",
           "ok": true,
-          "ms": 22
+          "ms": 24
         },
         {
           "index": 9,
           "label": "tap blender-connect",
           "ok": true,
-          "ms": 58
+          "ms": 78
         },
         {
           "index": 10,
           "label": "see \"Gera cannot reach localhost\" in blender-setup",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 11,
@@ -1017,13 +1017,13 @@
           "index": 12,
           "label": "tap blender-cancel",
           "ok": true,
-          "ms": 54
+          "ms": 47
         },
         {
           "index": 13,
           "label": "not see blender-setup",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 14,
@@ -1037,13 +1037,13 @@
       "scenarioId": "blender-mcp-connect",
       "title": "A protected Blender bridge is verified through the existing MCP path (stubbed)",
       "ok": true,
-      "ms": 339,
+      "ms": 326,
       "steps": [
         {
           "index": 0,
           "label": "goto /mcp",
           "ok": true,
-          "ms": 6
+          "ms": 5
         },
         {
           "index": 1,
@@ -1061,7 +1061,7 @@
           "index": 3,
           "label": "tap mcp-catalog-connect-blender",
           "ok": true,
-          "ms": 69
+          "ms": 68
         },
         {
           "index": 4,
@@ -1073,25 +1073,25 @@
           "index": 5,
           "label": "fill blender-client-id",
           "ok": true,
-          "ms": 19
+          "ms": 20
         },
         {
           "index": 6,
           "label": "fill blender-client-secret",
           "ok": true,
-          "ms": 20
+          "ms": 21
         },
         {
           "index": 7,
           "label": "tap blender-acknowledge",
           "ok": true,
-          "ms": 64
+          "ms": 55
         },
         {
           "index": 8,
           "label": "tap blender-connect",
           "ok": true,
-          "ms": 77
+          "ms": 73
         },
         {
           "index": 9,
@@ -1103,13 +1103,13 @@
           "index": 10,
           "label": "see \"get_scene_info\" in mcp-server-blender",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 11,
           "label": "see \"2 tools\" in mcp-server-blender",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     },
@@ -1117,13 +1117,13 @@
       "scenarioId": "connect-open-mcp-deferred",
       "title": "Deferred MCP loading rides into the run and its meta calls read like native tools",
       "ok": true,
-      "ms": 327,
+      "ms": 362,
       "steps": [
         {
           "index": 0,
           "label": "goto /settings",
           "ok": true,
-          "ms": 3
+          "ms": 4
         },
         {
           "index": 1,
@@ -1135,19 +1135,19 @@
           "index": 2,
           "label": "see settings-mcp-loading",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 3,
           "label": "tap mcp-loading-option-deferred",
           "ok": true,
-          "ms": 57
+          "ms": 75
         },
         {
           "index": 4,
           "label": "goto /",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 5,
@@ -1159,13 +1159,13 @@
           "index": 6,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 29
+          "ms": 28
         },
         {
           "index": 7,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 135
+          "ms": 152
         },
         {
           "index": 8,
@@ -1191,7 +1191,7 @@
       "scenarioId": "prompt-slash",
       "title": "Slash menu lists MCP prompts, collects arguments, and inserts the prompt text",
       "ok": true,
-      "ms": 274,
+      "ms": 250,
       "steps": [
         {
           "index": 0,
@@ -1203,25 +1203,25 @@
           "index": 1,
           "label": "see composer-input",
           "ok": true,
-          "ms": 50
+          "ms": 51
         },
         {
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 39
+          "ms": 36
         },
         {
           "index": 3,
           "label": "see composer-mcp-menu",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 4,
           "label": "tap composer-mcp-prompt-deepwiki-explain_repo",
           "ok": true,
-          "ms": 81
+          "ms": 70
         },
         {
           "index": 5,
@@ -1239,7 +1239,7 @@
           "index": 7,
           "label": "tap mcp-args-submit",
           "ok": true,
-          "ms": 83
+          "ms": 71
         },
         {
           "index": 8,
@@ -1259,7 +1259,7 @@
       "scenarioId": "resource-mention",
       "title": "@ menu lists MCP resources and attaches the one picked",
       "ok": true,
-      "ms": 185,
+      "ms": 184,
       "steps": [
         {
           "index": 0,
@@ -1277,7 +1277,7 @@
           "index": 2,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 23
+          "ms": 21
         },
         {
           "index": 3,
@@ -1289,7 +1289,7 @@
           "index": 4,
           "label": "tap composer-mcp-resource-deepwiki-wiki-acme-private-app-README",
           "ok": true,
-          "ms": 54
+          "ms": 55
         },
         {
           "index": 5,
@@ -1309,13 +1309,13 @@
       "scenarioId": "elicitation-accept",
       "title": "An MCP elicitation pauses the run on a card; accepting resumes it",
       "ok": true,
-      "ms": 420,
+      "ms": 389,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 3
+          "ms": 4
         },
         {
           "index": 1,
@@ -1327,19 +1327,19 @@
           "index": 2,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 46
+          "ms": 41
         },
         {
           "index": 3,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 22
+          "ms": 14
         },
         {
           "index": 4,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 98
+          "ms": 75
         },
         {
           "index": 5,
@@ -1351,13 +1351,13 @@
           "index": 6,
           "label": "fill run-pause-field-region",
           "ok": true,
-          "ms": 14
+          "ms": 13
         },
         {
           "index": 7,
           "label": "tap run-pause-accept",
           "ok": true,
-          "ms": 134
+          "ms": 139
         },
         {
           "index": 8,
@@ -1377,7 +1377,7 @@
       "scenarioId": "mcp-confirm-card",
       "title": "With confirmations on, a write tool pauses the run on a card; Run once resumes it",
       "ok": true,
-      "ms": 538,
+      "ms": 480,
       "steps": [
         {
           "index": 0,
@@ -1389,13 +1389,13 @@
           "index": 1,
           "label": "see page-settings",
           "ok": true,
-          "ms": 53
+          "ms": 55
         },
         {
           "index": 2,
           "label": "tap settings-confirm-writes",
           "ok": true,
-          "ms": 72
+          "ms": 65
         },
         {
           "index": 3,
@@ -1413,25 +1413,25 @@
           "index": 5,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 78
+          "ms": 35
         },
         {
           "index": 6,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 25
+          "ms": 26
         },
         {
           "index": 7,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 119
+          "ms": 107
         },
         {
           "index": 8,
           "label": "see run-confirm-card",
           "ok": true,
-          "ms": 52
+          "ms": 51
         },
         {
           "index": 9,
@@ -1461,13 +1461,13 @@
           "index": 13,
           "label": "tap run-confirm-once",
           "ok": true,
-          "ms": 80
+          "ms": 83
         },
         {
           "index": 14,
           "label": "see \"Gera e2e reply\" in message-assistant",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 15,
@@ -1481,7 +1481,7 @@
       "scenarioId": "oauth-step-up",
       "title": "A scope challenge shows “Sign in again with wider access” and the Advanced OAuth fields",
       "ok": true,
-      "ms": 4109,
+      "ms": 4115,
       "steps": [
         {
           "index": 0,
@@ -1499,31 +1499,31 @@
           "index": 2,
           "label": "see mcp-server-scoped",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 3,
           "label": "see \"things:write\" in mcp-step-up-hint",
           "ok": true,
-          "ms": 3986
+          "ms": 3989
         },
         {
           "index": 4,
           "label": "see mcp-step-up-sign-in",
           "ok": true,
-          "ms": 2
+          "ms": 1
         },
         {
           "index": 5,
           "label": "not see mcp-scopes-input",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 6,
           "label": "tap mcp-advanced-toggle",
           "ok": true,
-          "ms": 49
+          "ms": 51
         },
         {
           "index": 7,
@@ -1540,28 +1540,116 @@
       ]
     },
     {
+      "scenarioId": "oauth-sign-in-vault",
+      "title": "OAuth sign-in ends with a verified green card and no token in this browser",
+      "ok": true,
+      "ms": 287,
+      "steps": [
+        {
+          "index": 0,
+          "label": "goto /mcp?server=vault-oauth",
+          "ok": true,
+          "ms": 7
+        },
+        {
+          "index": 1,
+          "label": "see page-mcp",
+          "ok": true,
+          "ms": 94
+        },
+        {
+          "index": 2,
+          "label": "see mcp-server-vault-oauth",
+          "ok": true,
+          "ms": 1
+        },
+        {
+          "index": 3,
+          "label": "see \"Sign in\" in mcp-server-connect-vault-oauth",
+          "ok": true,
+          "ms": 1
+        },
+        {
+          "index": 4,
+          "label": "tap mcp-server-connect-vault-oauth",
+          "ok": true,
+          "ms": 182
+        },
+        {
+          "index": 5,
+          "label": "see \"Re-check\" in mcp-server-connect-vault-oauth",
+          "ok": true,
+          "ms": 1
+        },
+        {
+          "index": 6,
+          "label": "see \"Vault Things · server verified\" in mcp-server-vault-oauth",
+          "ok": true,
+          "ms": 1
+        }
+      ]
+    },
+    {
+      "scenarioId": "mcp-vault-migration",
+      "title": "A browser-held sign-in is retired on boot: the card asks to sign in again instead of failing red",
+      "ok": true,
+      "ms": 62,
+      "steps": [
+        {
+          "index": 0,
+          "label": "goto /mcp?server=legacy-oauth",
+          "ok": true,
+          "ms": 5
+        },
+        {
+          "index": 1,
+          "label": "see page-mcp",
+          "ok": true,
+          "ms": 55
+        },
+        {
+          "index": 2,
+          "label": "see mcp-server-legacy-oauth",
+          "ok": true,
+          "ms": 1
+        },
+        {
+          "index": 3,
+          "label": "see \"sign in again\" in mcp-resignin-notice",
+          "ok": true,
+          "ms": 0
+        },
+        {
+          "index": 4,
+          "label": "see \"Sign in\" in mcp-server-connect-legacy-oauth",
+          "ok": true,
+          "ms": 1
+        }
+      ]
+    },
+    {
       "scenarioId": "objects-have-addresses",
       "title": "Editors and studio objects open straight from their URLs",
       "ok": true,
-      "ms": 210,
+      "ms": 209,
       "steps": [
         {
           "index": 0,
           "label": "goto /automations/new",
           "ok": true,
-          "ms": 6
+          "ms": 4
         },
         {
           "index": 1,
           "label": "see automation-editor",
           "ok": true,
-          "ms": 50
+          "ms": 51
         },
         {
           "index": 2,
           "label": "goto /skills/new",
           "ok": true,
-          "ms": 1
+          "ms": 0
         },
         {
           "index": 3,
@@ -1573,7 +1661,7 @@
           "index": 4,
           "label": "goto /profiles/new",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 5,
@@ -1599,13 +1687,13 @@
       "scenarioId": "stop-run-settles-ui",
       "title": "Stop settles the composer even when the run node lost the run",
       "ok": true,
-      "ms": 345,
+      "ms": 259,
       "steps": [
         {
           "index": 0,
           "label": "goto /",
           "ok": true,
-          "ms": 6
+          "ms": 4
         },
         {
           "index": 1,
@@ -1617,37 +1705,37 @@
           "index": 2,
           "label": "tap sidebar-new-chat",
           "ok": true,
-          "ms": 61
+          "ms": 43
         },
         {
           "index": 3,
           "label": "fill composer-input",
           "ok": true,
-          "ms": 25
+          "ms": 14
         },
         {
           "index": 4,
           "label": "tap composer-send",
           "ok": true,
-          "ms": 120
+          "ms": 76
         },
         {
           "index": 5,
           "label": "see composer-stop",
           "ok": true,
-          "ms": 0
+          "ms": 1
         },
         {
           "index": 6,
           "label": "tap composer-stop",
           "ok": true,
-          "ms": 82
+          "ms": 69
         },
         {
           "index": 7,
           "label": "see composer-send",
           "ok": true,
-          "ms": 0
+          "ms": 1
         }
       ]
     }

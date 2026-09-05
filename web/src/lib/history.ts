@@ -853,6 +853,10 @@ function normalizeServer(server: McpServerConfig): McpServerConfig {
     verifiedAt: typeof server.verifiedAt === "number" ? server.verifiedAt : undefined,
     credentialStored:
       typeof server.credentialStored === "boolean" ? server.credentialStored : undefined,
+    protocolVersion:
+      typeof server.protocolVersion === "string" && /^\d{4}-\d{2}-\d{2}$/.test(server.protocolVersion)
+        ? server.protocolVersion
+        : undefined,
     oauthScopes: typeof server.oauthScopes === "string" && server.oauthScopes.trim() ? server.oauthScopes.trim().slice(0, 2_000) : undefined,
     authServerMetadataUrl:
       typeof server.authServerMetadataUrl === "string" && server.authServerMetadataUrl.trim()

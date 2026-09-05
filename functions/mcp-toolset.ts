@@ -69,6 +69,7 @@ import {
   normalizeServerCapabilities,
   normalizeToolAnnotations,
   openMcpNotificationStream,
+  sessionWireInfo,
   validateElicitationContent,
   type McpElicitationAnswer,
   type McpElicitationRequest,
@@ -82,6 +83,7 @@ import {
   type McpServerRequest,
   type McpServerRequestReply,
   type McpToolAnnotations,
+  type McpWireInfo,
 } from "./mcp-protocol";
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
 import { callIntercomNativeTool, INTERCOM_NATIVE_TOOLS } from "./native-intercom";
@@ -140,16 +142,24 @@ export function normalizeMcpToolLoading(value: unknown): McpToolLoadingMode {
   return value === "native" || value === "deferred" ? value : "auto";
 }
 
-/** Auto flips to deferred above this many visible generic MCP tools. */
-export const DEFERRED_AUTO_TOOL_THRESHOLD = 24;
-/** …or when the tool schemas would take more than this share of the context window. */
-export const DEFERRED_AUTO_CONTEXT_SHARE = 0.08;
+/**
+ * Auto flips to deferred when the visible tool schemas would take more than
+ * this share of the model's context window. The tool count alone does not
+ * matter — forty tiny schemas cost less than three sprawling ones.
+ */
+export const DEFERRED_AUTO_CONTEXT_SHARE = 0.15;
 /** Context window assumed when the gateway catalog did not say. */
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
-/** Soft cap of inline MCP functions per run (native mode only). */
-export const NATIVE_TOOL_CAP = 90;
-/** Soft cap of inline MCP functions per server (native mode only). */
+/** Soft cap of inline MCP functions per server (native mode only) — the one remaining fuse against a runaway server. */
 export const NATIVE_TOOLS_PER_SERVER = 500;
+/**
+ * Wall-clock budget for all handshakes of one run (they run in parallel).
+ * Servers still connecting when it lapses are reported honestly and finish
+ * in the background — a deferred call that arrives later waits for them.
+ */
+export const CONNECT_BUDGET_MS = 20_000;
+/** Combined tool-table JSON of every server in one run; servers past this stay out with an honest record. */
+export const RUN_CATALOG_CHARS = 24_000_000;
 /** Deferred catalogs list up to this many tools per server. */
 export const DEFERRED_TOOLS_PER_SERVER = 5_000;
 /** Deferred catalogs refuse servers whose tool JSON exceeds this many characters. */
@@ -239,7 +249,31 @@ export type McpCatalogEntry = {
   resources?: McpResourceInfo[];
   resourceTemplates?: McpResourceTemplateInfo[];
   capabilities?: McpServerCapabilities;
+  /** The wire the last handshake settled on — the next run skips the `server/discover` probe. */
+  wire?: McpWireInfo;
 };
+
+/** Revives a cached wire negotiation; anything malformed means "probe again". */
+export function normalizeCatalogWire(value: unknown): McpWireInfo | undefined {
+  if (!isRecord(value) || (value.era !== "modern" && value.era !== "legacy") || typeof value.protocolVersion !== "string" || !value.protocolVersion) {
+    return undefined;
+  }
+  const rawInfo = isRecord(value.serverInfo) ? value.serverInfo : {};
+  return {
+    era: value.era,
+    protocolVersion: value.protocolVersion,
+    ...(isRecord(value.capabilities) ? { capabilities: normalizeServerCapabilities(value.capabilities) } : {}),
+    ...(Object.keys(rawInfo).length > 0
+      ? {
+          serverInfo: {
+            name: typeof rawInfo.name === "string" ? rawInfo.name : undefined,
+            title: typeof rawInfo.title === "string" ? rawInfo.title : undefined,
+            version: typeof rawInfo.version === "string" ? rawInfo.version : undefined,
+          },
+        }
+      : {}),
+  };
+}
 
 /** True when the entry carries an inventory (not just the tool table). */
 export function catalogHasInventory(entry: McpCatalogEntry | null): entry is McpCatalogEntry & { prompts: McpPromptInfo[] } {
@@ -344,12 +378,14 @@ export function createSqlMcpCatalogStore(sql: ChatSql, owner: string): McpCatalo
         if (!isRecord(parsed)) {
           return null;
         }
+        const wire = normalizeCatalogWire(parsed.wire);
         return {
           serverId,
           serverName: typeof parsed.serverName === "string" ? parsed.serverName : serverId,
           tools: normalizeCatalogTools(parsed.tools),
           fetchedAt: row.updated_at,
           ...normalizeCatalogInventory(parsed),
+          ...(wire ? { wire } : {}),
         };
       } catch {
         return null;
@@ -360,6 +396,7 @@ export function createSqlMcpCatalogStore(sql: ChatSql, owner: string): McpCatalo
         v: 2,
         serverName: entry.serverName,
         tools: entry.tools,
+        ...(entry.wire ? { wire: entry.wire } : {}),
         ...(entry.prompts
           ? {
               prompts: entry.prompts,
@@ -396,12 +433,14 @@ export function normalizeMcpCatalogEntries(raw: unknown): McpCatalogEntry[] {
     if (!isRecord(item) || typeof item.serverId !== "string" || !item.serverId) {
       continue;
     }
+    const wire = normalizeCatalogWire(item.wire);
     out.push({
       serverId: item.serverId,
       serverName: typeof item.serverName === "string" && item.serverName ? item.serverName : item.serverId,
       tools: normalizeCatalogTools(item.tools),
       fetchedAt: typeof item.fetchedAt === "number" && Number.isFinite(item.fetchedAt) ? item.fetchedAt : 0,
       ...normalizeCatalogInventory(item),
+      ...(wire ? { wire } : {}),
     });
   }
   return out;
@@ -526,8 +565,9 @@ export function searchMcpTools(
 
 /**
  * Decides the run's loading mode. "auto" prefers native while the visible
- * tools are few and their schemas small; beyond the thresholds the model gets
- * the two meta functions instead of one function per tool.
+ * tool schemas fit comfortably in the model's context window; beyond the
+ * share threshold the model gets the two meta functions instead of one
+ * function per tool.
  */
 export function decideMcpToolLoading(
   mode: McpToolLoadingMode,
@@ -545,10 +585,7 @@ export function decideMcpToolLoading(
       ? contextWindowTokens
       : DEFAULT_CONTEXT_WINDOW_TOKENS;
   const schemaTokens = visible.schemaChars / CHARS_PER_TOKEN;
-  if (visible.toolCount > DEFERRED_AUTO_TOOL_THRESHOLD || schemaTokens > window * DEFERRED_AUTO_CONTEXT_SHARE) {
-    return "deferred";
-  }
-  return "native";
+  return schemaTokens > window * DEFERRED_AUTO_CONTEXT_SHARE ? "deferred" : "native";
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +598,7 @@ const NATIVE_TOOL_TABLES = {
 } as const;
 
 /** Arms one native connector from its static tool table (allowlisted tools only). */
-function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, cap: number, policy: McpRunPolicy): void {
+function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, policy: McpRunPolicy): void {
   if (server.kind === "mcp") {
     return;
   }
@@ -577,9 +614,6 @@ function armNativeServer(runtime: McpRuntime, server: CloudMcpServer, cap: numbe
       : credential;
   let added = 0;
   for (const tool of NATIVE_TOOL_TABLES[server.kind]) {
-    if (runtime.routes.size >= cap) {
-      break;
-    }
     if (server.disabledTools.includes(tool.name) || !mcpToolAllowed(policy, server.id, tool.name)) {
       continue;
     }
@@ -658,6 +692,8 @@ export type McpToolsetServerInfo = {
   /** Inventory counts when the handshake listed them (`inventory: true`). */
   promptCount?: number;
   resourceCount?: number;
+  /** The protocol revision the conversation actually runs on (health checks show it on the card). */
+  protocolVersion?: string;
 };
 
 /** An elicitation the toolset asks the surface to answer (interactive runs pause on it). */
@@ -736,10 +772,12 @@ export type ResolveMcpToolsetOptions = {
   /** Context window of the run's model; unknown → 128k. */
   contextWindowTokens?: number;
   catalog?: McpCatalogStore;
-  /** Lift the native soft caps (health checks want the complete table). */
+  /** Lift the per-server native cap and the run budgets (health checks want the complete table). */
   uncapped?: boolean;
-  /** Override the per-run inline cap — callers that already registered other functions pass what is left. */
-  nativeCap?: number;
+  /** Wall-clock budget for the run's parallel handshakes (default CONNECT_BUDGET_MS; tests shorten it). */
+  connectBudgetMs?: number;
+  /** Combined tool-table budget of the run in JSON characters (default RUN_CATALOG_CHARS; tests shrink it). */
+  catalogBudgetChars?: number;
   persist?: (rotation: RefreshedOAuth) => Promise<void>;
   reportFailure?: (serverId: string, outcome: CloudOAuthRefreshFailure) => Promise<void>;
   beginRefresh?: BeginCloudOAuthRefresh;
@@ -779,7 +817,11 @@ type ServerState = {
   catalog: CloudMcpTool[] | null;
   session: CloudMcpSession | null;
   connecting: Promise<void> | null;
+  /** True while a handshake is in flight (the run's connect budget may lapse before it settles). */
+  pending: boolean;
   failure: string | null;
+  /** Left out by the run's combined catalog budget (reported as mcp_limit, not as a connect failure). */
+  leftOut: boolean;
   /** A list_changed notification arrived — the next search/call re-lists tools. */
   stale: boolean;
   stream: McpNotificationStream | null;
@@ -787,6 +829,8 @@ type ServerState = {
   stepUp: { scopes: string[]; code: string } | null;
   promptCount?: number;
   resourceCount?: number;
+  /** Cached negotiation from the catalog — the handshake skips the `server/discover` probe. */
+  wireHint?: McpWireInfo;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -850,10 +894,9 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const now = options.now ?? (() => Date.now());
   const runtime = emptyMcpRuntime();
   const requested = normalizeMcpToolLoading(options.mode);
-  const nativeCap = options.uncapped
-    ? Number.POSITIVE_INFINITY
-    : Math.max(0, Math.floor(options.nativeCap ?? NATIVE_TOOL_CAP));
   const perServerCap = options.uncapped ? Number.POSITIVE_INFINITY : NATIVE_TOOLS_PER_SERVER;
+  const catalogBudgetChars = options.uncapped ? Number.POSITIVE_INFINITY : Math.max(0, options.catalogBudgetChars ?? RUN_CATALOG_CHARS);
+  const connectBudgetMs = Math.max(0, options.connectBudgetMs ?? CONNECT_BUDGET_MS);
   const policy = options.policy ?? OPEN_MCP_POLICY;
   /** Tools approved for the rest of this chat ("Always allow"), seeded from the run config. */
   const approved = new Set<string>((policy.approved ?? []).map((item) => mcpApprovalKey(item.serverId, item.toolName)));
@@ -895,7 +938,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       continue;
     }
     const before = runtime.routes.size;
-    armNativeServer(runtime, server, nativeCap, policy);
+    armNativeServer(runtime, server, policy);
     infos.push({ id: server.id, name: server.name, kind: server.kind, toolCount: runtime.routes.size - before, deferred: false });
   }
 
@@ -924,11 +967,14 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         catalog: fresh ? cached.tools : null,
         session: null,
         connecting: null,
+        pending: false,
         failure: null,
+        leftOut: false,
         stale: false,
         stream: null,
         stepUp: null,
         ...(fresh && cached.prompts ? { promptCount: cached.prompts.length, resourceCount: cached.resources?.length ?? 0 } : {}),
+        ...(fresh && cached.wire ? { wireHint: cached.wire } : {}),
       };
     });
 
@@ -1112,16 +1158,20 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       inventory: options.inventory === true,
       lease: () => state.lease.get(),
       ...(options.fetch ? { fetch: options.fetch } : {}),
+      // A Re-check (uncapped health check) always probes afresh; runs reuse the cached wire.
+      ...(state.wireHint && !options.uncapped ? { wireHint: state.wireHint } : {}),
       onServerRequest: serverRequestHandler(state),
       onNotification: notificationHandler(state),
     });
 
   const writeCatalog = (state: ServerState, connection: Pick<CloudMcpConnection, "tools"> & Partial<CloudMcpConnection>): void => {
+    const wire = connection.wire ?? (state.session ? sessionWireInfo(state.session) : undefined);
     options.catalog?.write({
       serverId: state.server.id,
       serverName: state.server.name,
       tools: connection.tools,
       fetchedAt: now(),
+      ...(wire ? { wire } : {}),
       ...(options.inventory && connection.prompts
         ? {
             prompts: connection.prompts,
@@ -1138,6 +1188,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     if (state.connecting) {
       return state.connecting;
     }
+    state.pending = true;
     state.connecting = (async () => {
       const attempt = async (): Promise<CloudMcpConnection> => {
         try {
@@ -1204,6 +1255,8 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       } catch (error) {
         const raw = error instanceof Error ? error.message : "connect failed";
         state.failure = redactCloudMcpText(raw, cloudServerRedactions(state.server));
+      } finally {
+        state.pending = false;
       }
     })();
     return state.connecting;
@@ -1239,13 +1292,74 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     }
   };
 
-  const connectMissing = (predicate: (state: ServerState) => boolean): Promise<void[]> =>
-    Promise.all(states.filter((state) => !state.failure && predicate(state)).map((state) => connect(state)));
+  /**
+   * Connects every server the predicate selects, in parallel, inside the
+   * run's connect budget. The clock starts at the first handshake of the run,
+   * so auto's two rounds (tables, then sessions) share one budget. Servers
+   * still pending when it lapses get an honest failure now; their handshake
+   * finishes in the background and `awaitLate` picks it up on first use.
+   */
+  let connectDeadline: number | null = null;
+  const connectMissing = async (predicate: (state: ServerState) => boolean): Promise<void> => {
+    const wanted = states.filter((state) => !state.failure && predicate(state));
+    if (wanted.length === 0) {
+      return;
+    }
+    connectDeadline ??= Date.now() + connectBudgetMs;
+    const all = Promise.all(wanted.map((state) => connect(state))).then(() => true);
+    const remaining = connectDeadline - Date.now();
+    const inTime = remaining > 0
+      ? await Promise.race([all, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), remaining))])
+      : await Promise.race([all, Promise.resolve(false)]);
+    if (inTime) {
+      return;
+    }
+    const seconds = Math.round(connectBudgetMs / 1_000);
+    for (const state of wanted) {
+      if (state.pending && !state.failure) {
+        state.failure = `did not connect within the run's ${seconds} s connection budget (the handshake continues in the background)`;
+      }
+    }
+  };
+
+  /** A call to a server the budget left pending waits for that handshake to settle (bounded by its own timeouts). */
+  const awaitLate = async (state: ServerState): Promise<void> => {
+    if (state.pending && state.connecting) {
+      await state.connecting;
+    }
+  };
+
+  /**
+   * The run's combined catalog budget: tables are admitted in server order
+   * until their JSON would exceed the budget; the rest stay out with an honest
+   * mcp_limit record that names them. Idempotent — auto calls it before it
+   * decides, every mode calls it before it arms.
+   */
+  const enforceCatalogBudget = (): void => {
+    let total = 0;
+    for (const state of states) {
+      if (state.failure || state.catalog === null) {
+        continue;
+      }
+      const chars = jsonText(state.catalog).length;
+      if (total + chars > catalogBudgetChars) {
+        state.leftOut = true;
+        state.failure = `left out of this run: its ${state.catalog.length} tools would push the run's combined tool catalogs past ${Math.round(catalogBudgetChars / 1_000_000)} MB (${(total / 1_000_000).toFixed(1)} MB already admitted). Disable it or trim other servers' tools to bring it back.`;
+        state.catalog = null;
+        state.session = null;
+        state.stream?.close();
+        state.stream = null;
+        continue;
+      }
+      total += chars;
+    }
+  };
 
   // Auto needs the tables before it can choose; cold caches connect now.
   let mode: McpToolsetMode;
   if (requested === "auto") {
     await connectMissing((state) => state.catalog === null);
+    enforceCatalogBudget();
     const tools = states.flatMap((state) => visibleTools(state, policy));
     mode = decideMcpToolLoading(
       "auto",
@@ -1259,25 +1373,32 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const revealed = new Set<string>();
   const revealKey = (serverId: string, toolName: string): string => `${serverId}\u0000${toolName}`;
 
+  /** Honest record + info row for a server that contributes nothing this run. */
+  const recordUnavailable = (state: ServerState, deferred: boolean): void => {
+    const server = state.server;
+    const reason = state.failure ?? "connect failed";
+    runtime.failures.push(
+      state.leftOut
+        ? { name: "mcp_limit", arguments: server.name, result: `MCP server "${server.name}" was ${reason}` }
+        : { name: "mcp_connect", arguments: server.name, result: `Could not connect MCP server "${server.name}": ${reason}` },
+    );
+    infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: 0, deferred, unavailable: reason });
+  };
+
   if (mode === "native") {
     await connectMissing((state) => state.session === null);
+    enforceCatalogBudget();
     for (const state of states) {
       const server = state.server;
       if (state.failure || !state.session) {
-        const reason = state.failure ?? "connect failed";
-        runtime.failures.push({
-          name: "mcp_connect",
-          arguments: server.name,
-          result: `Could not connect MCP server "${server.name}": ${reason}`,
-        });
-        infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: 0, deferred: false, unavailable: reason });
+        recordUnavailable(state, false);
         continue;
       }
       const visible = visibleTools(state, policy);
       let added = 0;
       let skipped = 0;
       for (const tool of visible) {
-        if (added >= perServerCap || runtime.routes.size >= nativeCap) {
+        if (added >= perServerCap) {
           skipped += 1;
           continue;
         }
@@ -1313,12 +1434,13 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         // UI-only tools included, so McpStudio can show every switch and badge.
         ...(options.uncapped ? { tools: state.catalog ?? [] } : {}),
         ...(state.promptCount !== undefined ? { promptCount: state.promptCount, resourceCount: state.resourceCount ?? 0 } : {}),
+        ...(state.session.protocolVersion ? { protocolVersion: state.session.protocolVersion } : {}),
       });
       if (skipped > 0) {
         runtime.failures.push({
           name: "mcp_limit",
           arguments: server.name,
-          result: `${skipped} of ${visible.length} tools on MCP server "${server.name}" did not fit the native limit (${NATIVE_TOOL_CAP} MCP functions per run, ${NATIVE_TOOLS_PER_SERVER} per server) and are unavailable this run. Switch "MCP tool loading" to Deferred in Settings → Toolkit to make every tool searchable.`,
+          result: `${skipped} of ${visible.length} tools on MCP server "${server.name}" did not fit the native per-server limit (${NATIVE_TOOLS_PER_SERVER} inline functions per server) and are unavailable this run. Switch "MCP tool loading" to Deferred in Settings → Toolkit to make every tool searchable.`,
         });
       }
     }
@@ -1326,20 +1448,16 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     // Deferred: a searchable table is all the start needs — cold caches
     // connect once; everything else waits for the first call.
     await connectMissing((state) => state.catalog === null);
+    enforceCatalogBudget();
     for (const state of states) {
       const server = state.server;
       if (state.failure || !state.catalog) {
-        const reason = state.failure ?? "connect failed";
-        runtime.failures.push({
-          name: "mcp_connect",
-          arguments: server.name,
-          result: `Could not connect MCP server "${server.name}": ${reason}`,
-        });
-        infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: 0, deferred: true, unavailable: reason });
+        recordUnavailable(state, true);
         continue;
       }
       const count = visibleTools(state, policy).length;
       runtime.summary.push(`${server.name} (${count} tools · deferred)`);
+      const wireVersion = state.session?.protocolVersion ?? state.wireHint?.protocolVersion;
       infos.push({
         id: server.id,
         name: server.name,
@@ -1347,6 +1465,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         toolCount: count,
         deferred: true,
         ...(state.promptCount !== undefined ? { promptCount: state.promptCount, resourceCount: state.resourceCount ?? 0 } : {}),
+        ...(wireVersion ? { protocolVersion: wireVersion } : {}),
       });
     }
     if (states.some((state) => state.catalog !== null)) {
@@ -1402,8 +1521,11 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         isError: true,
       };
     }
-    // A list_changed notification since the last look means the table may be
-    // outdated — re-list before ranking so the model never sees a ghost tool.
+    // Handshakes the connect budget left pending may have settled since —
+    // wait for them once so their tables take part; then a list_changed
+    // notification since the last look means the table may be outdated —
+    // re-list before ranking so the model never sees a ghost tool.
+    await Promise.all(states.map((state) => awaitLate(state)));
     await Promise.all(states.filter((state) => state.stale).map((state) => refreshIfStale(state)));
     const scopeId = serverId ? findState(serverId)?.server.id : undefined;
     const hits = searchMcpTools(searchable(), query, { serverId: scopeId, limit });
@@ -1460,6 +1582,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       return { text: `No MCP server "${serverId}" is connected in this run. Known servers: ${serverList()}.`, isError: true };
     }
     const server = state.server;
+    await awaitLate(state);
     await refreshIfStale(state);
     if (state.failure || !state.catalog) {
       return { text: `MCP server "${server.name}" is unavailable this run: ${state.failure ?? "connect failed"}.`, isError: true };

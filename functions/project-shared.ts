@@ -214,7 +214,6 @@ export const MAX_SCREEN_WIDGETS = 6;
 export const SCREEN_CHAT_KEEP = 200;
 /** Prior desk-chat turns handed to one assistant run. */
 export const SCREEN_CHAT_CONTEXT_MESSAGES = 24;
-export const MAX_AGENT_MCP_SERVERS = 5;
 export const AGENT_MCP_NAME_LIMIT = 40;
 /** Allowlisted tool names per linked server (deferred catalogs can be large; the editor lists what the check saw). */
 export const MAX_AGENT_MCP_TOOLS = 300;
@@ -351,9 +350,6 @@ export function normalizeStoredMcpSelection(raw: unknown): AgentMcpSelection | u
   const servers: AgentMcpServerRef[] = [];
   const seen = new Set<string>();
   for (const item of record.servers) {
-    if (servers.length >= MAX_AGENT_MCP_SERVERS) {
-      break;
-    }
     const ref = mcpServerRefFrom(item);
     if (ref && !seen.has(ref.id)) {
       seen.add(ref.id);
@@ -401,13 +397,15 @@ export function parseMcpWritesPatch(raw: unknown): McpWritesPatch {
 export type McpSelectionPatch =
   | { action: "keep" }
   | { action: "set"; servers: AgentMcpServerRef[] }
-  | { action: "error"; error: "too_many_mcp_servers" | "invalid_mcp_selection" };
+  | { action: "error"; error: "invalid_mcp_selection" };
 
 /**
  * The editor sends the full desired selection — ids + names picked from the
  * saving admin's connected servers (same list as chat). Omitting the field
  * keeps the stored link untouched; null or [] unlinks. Every non-empty save
- * re-links the selection to the saving admin's account.
+ * re-links the selection to the saving admin's account. Any number of
+ * servers may be linked — runs are bounded by the toolset's connect and
+ * catalog budgets, not by a count.
  */
 export function parseMcpSelectionPatch(raw: unknown): McpSelectionPatch {
   if (raw === undefined) {
@@ -418,9 +416,6 @@ export function parseMcpSelectionPatch(raw: unknown): McpSelectionPatch {
   }
   if (!Array.isArray(raw)) {
     return { action: "error", error: "invalid_mcp_selection" };
-  }
-  if (raw.length > MAX_AGENT_MCP_SERVERS) {
-    return { action: "error", error: "too_many_mcp_servers" };
   }
   const servers: AgentMcpServerRef[] = [];
   const seen = new Set<string>();

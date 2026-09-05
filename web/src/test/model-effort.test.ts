@@ -76,7 +76,7 @@ describe("chatBaseModels", () => {
 });
 
 describe("groupChatModels", () => {
-  it("keeps Astra, Sol, Fable and Luna first and moves Grok under More", () => {
+  it("keeps Astra and Grok together up front alongside Sol, Fable and Luna", () => {
     const catalog = [
       gatewayModel("google/gemini-3.7-flash"),
       gatewayModel("openai/gpt-6-astra"),
@@ -91,6 +91,7 @@ describe("groupChatModels", () => {
 
     expect(groups.primary.map((model) => model.id)).toEqual([
       "openai/gpt-6-astra",
+      "spacexai/grok-4.6",
       "openai/gpt-5.6-sol",
       "anthropic/claude-fable-5.1",
       "openai/gpt-5.6-luna",
@@ -98,7 +99,6 @@ describe("groupChatModels", () => {
     expect(groups.more.map((model) => model.id)).toEqual([
       "google/gemini-3.7-flash",
       "anthropic/claude-opus-5",
-      "spacexai/grok-4.6",
     ]);
   });
 });

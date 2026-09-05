@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-05 · commit `1fa1784` (+ Astra primary picker / Fast retirement,
+Last synced: 2026-09-05 · commit `85fe6b4` (+ Astra and Grok together in quick choices / Fast retirement,
   Blender MCP secured-bridge setup; previous Phase 6 engineering, behaviour
   unchanged under the existing suites: Worker MCP/OAuth relays moved
   verbatim to `functions/mcp-relay.ts` (`/mcp/oauth/callback`, `/mcp/oauth-rotations`,
@@ -65,7 +65,7 @@ inbox ranking, home & composer shortcut strips, settings redesign,
 attachment image shrink, stop/steering hardening, GitHub run credential
 hand-off + pin/access fixes, truthful MCP health + OAuth/account-session/
 sleep/deploy-resume hardening, authenticated file reads, Intercom
-attachments, full 98-entry MCP audit, the four-model primary picker with
+attachments, full 98-entry MCP audit, the five-model primary picker with
 More, fixed-position screen assistant panels, and the live code Changes /
 Preview workbench)
 Drift check: `git log --oneline 32e3559..HEAD`, then compare against
@@ -578,9 +578,9 @@ effort + blended cost; effort label and cost hide on narrow screens — the
 picker itself always shows them). Chat mode opens a root menu:
 
 - **Model** (`model-picker-model-row`) → searchable catalog submenu. Its main
-  view contains exactly GPT-6 Astra, GPT-5.6 Sol, Claude Fable 5.1 and GPT-5.6 Luna,
-  in that order; Grok 4.6 moved under **More** (`model-picker-more-row`), which opens every other curated
-  base model. A selected secondary model is summarized on the More row, while
+  view contains exactly GPT-6 Astra, Grok 4.6, GPT-5.6 Sol, Claude Fable 5.1 and
+  GPT-5.6 Luna, in that order. **More** (`model-picker-more-row`) opens every other
+  curated base model. A selected secondary model is summarized on the More row, while
   searching from the main view still scans the full catalog. Model rows use
   `model-option-<id>`, show cost badge + tier, and dedupe effort variants.
 - **Effort** (`model-picker-effort-row`) → `effort-option-default|low|medium|high|xhigh`;
@@ -593,8 +593,9 @@ GPT-6 Astra Fast is excluded from all curated pickers; persisted Fast IDs
 migrate to ordinary Astra with their effort preserved (`MODEL_SUCCESSORS`),
 including restored composer settings, profiles and Julius panel selections.
 Existing Grok selections and the Reset default are unchanged. Unit
-`model-effort.test.ts`; browser `switch-chat-model` checks Astra first,
-Grok in More, and Fast absent even when the gateway offers it.
+`model-effort.test.ts`; browser `switch-chat-model` checks Astra and Grok
+visible and selectable in quick choices (neither duplicated in More), with
+Fast absent even when the gateway offers it.
 
 ## Threads & sidebar
 

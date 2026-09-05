@@ -9,9 +9,10 @@ import type {
 } from "@/lib/types";
 
 export const DEFAULT_CHAT_MODEL = "spacexai/grok-4.6:xhigh";
-/** Four everyday choices shown before the chat picker's full catalog. */
+/** Everyday choices shown before the chat picker's full catalog. */
 export const PRIMARY_CHAT_MODEL_IDS = [
   "openai/gpt-6-astra",
+  "spacexai/grok-4.6",
   "openai/gpt-5.6-sol",
   "anthropic/claude-fable-5.1",
   "openai/gpt-5.6-luna",
@@ -543,7 +544,7 @@ export function chatBaseModels(models: GatewayModel[]): GatewayModel[] {
   return models.filter((model) => model.type === "language").slice(0, 12);
 }
 
-/** Splits the chat catalog into the four primary choices and the More submenu. */
+/** Splits the chat catalog into the primary choices and the More submenu. */
 export function groupChatModels(models: GatewayModel[]): {
   primary: GatewayModel[];
   more: GatewayModel[];

@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-04 · commit `98e1d2d` (+ Phase 6 engineering, behaviour
+Last synced: 2026-09-05 · commit `9636b14` (+ Phase 6 engineering, behaviour
   unchanged under the existing suites: Worker MCP/OAuth relays moved
   verbatim to `functions/mcp-relay.ts` (`/mcp/oauth/callback`, `/mcp/oauth-rotations`,
   `/mcp/oauth-refresh`, account `/mcp/*` control routes, `/mcp-proxy`) behind
@@ -17,9 +17,18 @@ Last synced: 2026-09-04 · commit `98e1d2d` (+ Phase 6 engineering, behaviour
   the account scope like every other grant row; the browser transport
   (`web/src/lib/mcp.ts`) parses and flattens through the same protocol core
   (`functions/mcp-protocol.ts`) the Worker uses — two fetch adapters, one
-  parser. Size guideline: chat-store 91 KB (< 100 met); project-store 171 KB
-  and index.ts 104 KB still above their 130 / 80 KB guidelines (next verbatim
-  extractions: desk-stats + Intercom clusters, project relays) — MCP secrets & results: vault
+  parser. Size guidelines met: chat-store 91 KB (< 100), project-store 109 KB
+  (< 130 — every desk route of the shard: screens, Intercom inbox / thread /
+  details / reply / mention-admins / suggest / action / ask-gera, tracking +
+  pv-ingest, desk ↔ Slack, stats + link, screen chat now lives in
+  `functions/desk-routes.ts` over `DeskContext` (sql, workerEnv, metaValue,
+  loadMember, memberRole, loadAgent, loadScreen, screenIntercomToken,
+  screenSlackToken); shared row types and row → wire mappers in
+  `functions/project-rows.ts`), index.ts 75 KB (< 80 — `/projects/*`, Slack
+  events, the Slack install callback and `/pv/*` relays in
+  `functions/project-relay.ts` over `ProjectRelayContext`; `/repo-previews`,
+  `/repo-preview/*` hooks, archive upload and registry sweep in
+  `functions/repo-preview-relay.ts` over `RepoPreviewRelayContext`) — MCP secrets & results: vault
   scopes bound to the Rork Auth account (`vault-scope.ts` one-time sweep,
   `/diag/vault` reports `scope` + `unreadable`), per-request credential leases
   on cloud MCP sessions (`mcp-credentials.ts` — no token strings on session or
@@ -1499,10 +1508,13 @@ Only the spec HTTP-404 stale-session signal is replayed — a JSON-RPC message t
 says "session expired" cannot duplicate a write. Function names are stable,
 valid and hash-disambiguated when normalization/truncation could collide.
 Regressions: `auth-boundary.test.ts`, `mcp-security.test.ts` plus the
-OAuth/session/file-content suites. Full verification on 2026-09-04 (Phase 6
-close): 973 unit checks in 86 files (~4.3 s, conformance server in-process), 45
-browser checks in 8 files (~20 s), web build/deploy, Worker deploy, `/ping`
-(`secretVault: enabled`), relay auth gates (401 without a session) and a real
+OAuth/session/file-content suites. Full verification on 2026-09-05 (Phase 6
+close, size targets met): 973 unit checks in 86 files (~4.3 s, conformance
+server in-process), 45 browser checks in 8 files (~19 s), web build/deploy,
+Worker deploy, `/ping` (`secretVault: enabled`), the moved relays live —
+`/projects` and `/repo-previews` 401 without a session, `/repo-preview/<bad>`
+404, `/pv/<x>` 404 `tracking_not_configured` through the moved
+`handlePageViewIngest`, `/slack/oauth/callback` 400 HTML page — and a real
 `/mcp/check` against DeepWiki through the moved handler (3 tools) passed.
 
 ## Settings (`/settings`)

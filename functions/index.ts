@@ -56,9 +56,7 @@ import { AccessRegistry } from "./access-registry";
 import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute, probeRorkStorage } from "./knowledge-storage";
-import { REPO_PREVIEW_MAX_ARCHIVE_BYTES, verifyRepoPreviewId } from "./repo-preview-shared";
 import { githubRequestHeaders } from "./native-github";
-import { decodeSlackInstallState } from "./native-slack";
 import {
   relayAccountMcp,
   relayBrowserOAuthRefresh,
@@ -67,6 +65,13 @@ import {
   relayOAuthRotations,
   type McpRelayContext,
 } from "./mcp-relay";
+import { relayPageViews, relayProjects, relaySlackEvents, relaySlackOAuthCallback, type ProjectRelayContext } from "./project-relay";
+import {
+  relayRepoPreviewPublic,
+  relayRepoPreviews,
+  type RepoPreviewRelayContext,
+  sweepRepoPreviewRegistry,
+} from "./repo-preview-relay";
 import { fetchPublicHttps, isForbiddenHost } from "./network-safety";
 import { SecretVault } from "./secret-vault";
 import { performSurf, type SurfCommand, type SurfJar } from "./selfsurf";
@@ -1121,515 +1126,6 @@ async function relayArena(request: Request, url: URL, env: Env): Promise<Respons
   }
 }
 
-/** Project route bodies: messages are 8k chars; agent configs stay small. */
-const PROJECT_BODY_LIMIT = 300_000;
-
-/** Allow-listed project shard sub-routes and their methods. */
-const PROJECT_SUB_ROUTES: Record<string, "GET" | "POST"> = {
-  "/overview": "GET",
-  "/messages": "GET",
-  "/message": "POST",
-  "/read": "POST",
-  "/channels/create": "POST",
-  "/members/add": "POST",
-  "/members/remove": "POST",
-  "/members/role": "POST",
-  "/agents/upsert": "POST",
-  "/agents/delete": "POST",
-  "/agents/slack-create-app": "POST",
-  "/agents/slack-install-url": "POST",
-  "/slack-config": "POST",
-  "/screens/upsert": "POST",
-  "/screens/delete": "POST",
-  "/intercom/inbox": "POST",
-  "/intercom/thread": "POST",
-  "/intercom/details": "POST",
-  "/intercom/reply": "POST",
-  "/intercom/suggest": "POST",
-  "/intercom/suggest/rate": "POST",
-  "/intercom/action": "POST",
-  "/intercom/ask-gera": "POST",
-  "/intercom/stats": "POST",
-  "/intercom/stats/refresh": "POST",
-  "/intercom/stats/clear": "POST",
-  "/intercom/stats/link": "POST",
-  "/intercom/slack-related": "POST",
-  "/intercom/ask-status": "POST",
-  "/tracking/setup": "POST",
-  "/screen-chat": "GET",
-  "/screen-chat/send": "POST",
-  "/project/rename": "POST",
-  "/project/delete": "POST",
-};
-
-/** Dispatches one call to a ProjectStore DO instance (registry or shard). */
-function projectStoreFetch(
-  env: Env,
-  requestUrl: string,
-  doId: string,
-  path: string,
-  options: { method: "GET" | "POST"; body?: string; email?: string; headers?: Record<string, string> },
-): Promise<Response> {
-  const target = new URL(path, new URL(requestUrl).origin);
-  const headers = new Headers();
-  headers.set("X-Rork-DO-Class", "ProjectStore");
-  headers.set("X-Rork-DO-Id", doId);
-  if (options.email) {
-    headers.set("X-Gera-Email", encodeURIComponent(options.email));
-  }
-  if (options.body !== undefined) {
-    headers.set("Content-Type", "application/json");
-  }
-  for (const [key, value] of Object.entries(options.headers ?? {})) {
-    headers.set(key, value);
-  }
-  return env.DO.fetch(new Request(target.toString(), { method: options.method, headers, body: options.body }));
-}
-
-/**
- * Post-commit side effects of project writes, run via waitUntil so the
- * response returns instantly:
- * - /message: fire the queued agent replies (the shard runs the engine and
- *   fills the placeholder; polling clients pick the text up when it lands);
- * - membership / rename / delete: mirror the change into the registry
- *   singleton so GET /projects stays correct for everyone involved.
- */
-async function projectPostEffects(
-  env: Env,
-  requestUrl: string,
-  projectId: string,
-  email: string,
-  sub: string,
-  requestBody: string,
-  responseText: string,
-): Promise<void> {
-  try {
-    if (sub === "/message") {
-      const data = JSON.parse(responseText) as { jobs?: unknown };
-      const jobs = Array.isArray(data.jobs) ? data.jobs.filter((id): id is string => typeof id === "string") : [];
-      for (const jobId of jobs.slice(0, 3)) {
-        const run = await projectStoreFetch(env, requestUrl, `proj:${projectId}`, "/agent-run", {
-          method: "POST",
-          email,
-          body: JSON.stringify({ jobId }),
-        });
-        if (!run.ok) {
-          console.error("project agent-run failed", run.status);
-        }
-      }
-      return;
-    }
-    if (sub === "/screen-chat/send" || sub === "/intercom/ask-gera") {
-      // The desk assistant reply (and "Ask Gera" research) runs inside the
-      // shard, same as channel jobs.
-      const data = JSON.parse(responseText) as { jobs?: unknown };
-      const jobs = Array.isArray(data.jobs) ? data.jobs.filter((id): id is string => typeof id === "string") : [];
-      for (const jobId of jobs.slice(0, 1)) {
-        const run = await projectStoreFetch(env, requestUrl, `proj:${projectId}`, "/screen-run", {
-          method: "POST",
-          email,
-          body: JSON.stringify({ jobId }),
-        });
-        if (!run.ok) {
-          console.error("project screen-run failed", run.status);
-        }
-      }
-      return;
-    }
-    const upsert = (payload: unknown): Promise<Response> =>
-      projectStoreFetch(env, requestUrl, "registry", "/reg/upsert", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-    if (sub === "/members/add" || sub === "/members/role") {
-      const body = JSON.parse(requestBody) as { email?: unknown; role?: unknown };
-      const target = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-      if (target) {
-        await upsert({
-          projectId,
-          rows: [{ email: target, role: body.role === "admin" ? "admin" : "member" }],
-        });
-      }
-      return;
-    }
-    if (sub === "/members/remove") {
-      const body = JSON.parse(requestBody) as { email?: unknown };
-      const target = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-      if (target) {
-        await upsert({ projectId, drop: [target] });
-      }
-      return;
-    }
-    if (sub === "/project/rename") {
-      const data = JSON.parse(responseText) as { name?: unknown };
-      if (typeof data.name === "string" && data.name.length > 0) {
-        await upsert({ projectId, name: data.name });
-      }
-      return;
-    }
-    if (sub === "/project/delete") {
-      await projectStoreFetch(env, requestUrl, "registry", "/reg/drop-project", {
-        method: "POST",
-        body: JSON.stringify({ projectId }),
-      });
-    }
-  } catch (error) {
-    console.error("project post-effects failed", sub, error instanceof Error ? error.message : "error");
-  }
-}
-
-const SLACK_EVENT_BODY_LIMIT = 64_000;
-
-/**
- * /slack/events/:projectId/:agentId — the public Slack Events API endpoint
- * that turns a project agent into a mentionable Slack bot. No Gera identity
- * here by design (Slack is the caller): the project shard proves authenticity
- * with the per-agent signing secret (v0 HMAC over the raw body + 5-minute
- * timestamp window + event-id dedup). The relay answers Slack within its 3s
- * budget and fires the queued mention run via waitUntil — the same pattern
- * as channel agent replies. Bodies and tokens are never logged.
- */
-async function relaySlackEvents(request: Request, url: URL, env: Env, ctx: ExecutionCtx): Promise<Response> {
-  try {
-    if (request.method !== "POST") {
-      return corsJson({ error: "method_not_allowed" }, 405);
-    }
-    const segments = url.pathname.split("/").filter(Boolean);
-    const projectId = (segments[2] ?? "").slice(0, 64);
-    const agentId = (segments[3] ?? "").slice(0, 64);
-    if (segments.length !== 4 || !/^[a-zA-Z0-9]+$/.test(projectId) || !/^[a-zA-Z0-9]+$/.test(agentId)) {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    const body = await request.text();
-    if (body.length > SLACK_EVENT_BODY_LIMIT) {
-      return corsJson({ error: "body_too_large" }, 413);
-    }
-    const upstream = await projectStoreFetch(env, request.url, `proj:${projectId}`, "/slack-event", {
-      method: "POST",
-      body,
-      headers: {
-        "X-Gera-Slack-Agent": agentId,
-        "X-Slack-Signature": request.headers.get("X-Slack-Signature") ?? "",
-        "X-Slack-Request-Timestamp": request.headers.get("X-Slack-Request-Timestamp") ?? "",
-      },
-    });
-    const text = await upstream.text();
-    console.log("slack events relay", upstream.status);
-    if (upstream.ok) {
-      try {
-        const data = JSON.parse(text) as { jobs?: unknown };
-        const jobs = Array.isArray(data.jobs)
-          ? data.jobs.filter((id): id is string => typeof id === "string")
-          : [];
-        for (const jobId of jobs.slice(0, 1)) {
-          ctx.waitUntil(
-            projectStoreFetch(env, request.url, `proj:${projectId}`, "/slack-run", {
-              method: "POST",
-              body: JSON.stringify({ jobId }),
-            }).then((run) => {
-              if (!run.ok) {
-                console.error("slack bot run dispatch failed", run.status);
-              }
-            }),
-          );
-        }
-      } catch {
-        // non-JSON upstream body — pass it through untouched
-      }
-    }
-    return new Response(text, {
-      status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
-  } catch (error) {
-    console.error("slack events relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "internal" }, 500);
-  }
-}
-
-const PAGE_VIEW_BODY_LIMIT = 16_000;
-
-/**
- * POST /pv/:projectId — the public "Recent page views" beacon. The caller is
- * the customer's website (Gera's pv.js snippet), so there is no Gera identity
- * by design; the project shard verifies the write-only tracking key inside
- * the payload. Bodies are size-capped and never logged.
- */
-async function relayPageViews(request: Request, url: URL, env: Env): Promise<Response> {
-  try {
-    if (request.method !== "POST") {
-      return corsJson({ error: "method_not_allowed" }, 405);
-    }
-    const segments = url.pathname.split("/").filter(Boolean);
-    const projectId = (segments[1] ?? "").slice(0, 64);
-    if (segments.length !== 2 || !/^[a-zA-Z0-9]+$/.test(projectId)) {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    const body = await request.text();
-    if (body.length > PAGE_VIEW_BODY_LIMIT) {
-      return corsJson({ error: "body_too_large" }, 413);
-    }
-    const upstream = await projectStoreFetch(env, request.url, `proj:${projectId}`, "/pv-ingest", {
-      method: "POST",
-      body,
-    });
-    const text = await upstream.text();
-    return new Response(text, {
-      status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
-  } catch (error) {
-    console.error("pv relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "internal" }, 500);
-  }
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-/** Tiny human-readable page for the Slack install tab — no assets, honest copy. */
-function slackCallbackPage(ok: boolean, title: string, message: string): Response {
-  const body = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(title)}</title>
-<style>
-  body{margin:0;display:grid;place-items:center;min-height:100vh;background:#141210;color:#f4eee3;font:15px/1.6 ui-sans-serif,system-ui,sans-serif}
-  main{max-width:26rem;padding:2.5rem 1.5rem;text-align:center}
-  .dot{display:inline-flex;width:3rem;height:3rem;border-radius:9999px;align-items:center;justify-content:center;font-size:1.35rem;background:${ok ? "rgba(16,185,129,.16)" : "rgba(245,158,11,.16)"}}
-  h1{font-size:1.15rem;margin:1rem 0 .5rem}
-  p{margin:0;color:#b5ac9c}
-</style></head>
-<body><main>
-  <span class="dot">${ok ? "\u2713" : "!"}</span>
-  <h1>${escapeHtml(title)}</h1>
-  <p>${escapeHtml(message)}</p>
-</main></body></html>`;
-  return new Response(body, {
-    status: ok ? 200 : 400,
-    headers: { "Content-Type": "text/html; charset=utf-8" },
-  });
-}
-
-/**
- * GET /slack/oauth/callback — Slack lands here after the admin authorizes the
- * bot install. The state's plain part only routes to the project shard; the
- * shard verifies the HMAC (keyed by the app's client secret) and swaps the
- * code for the bot token server-side. Renders a small human page — this tab
- * was opened from the agent editor, which picks the result up by polling.
- */
-async function relaySlackOAuthCallback(request: Request, url: URL, env: Env): Promise<Response> {
-  try {
-    if (request.method !== "GET") {
-      return corsJson({ error: "method_not_allowed" }, 405);
-    }
-    const denied = url.searchParams.get("error");
-    if (denied) {
-      return slackCallbackPage(
-        false,
-        "Install cancelled",
-        `Slack reported "${denied}" — nothing was installed. Close this tab and retry from Gera.`,
-      );
-    }
-    const code = url.searchParams.get("code") ?? "";
-    const state = url.searchParams.get("state") ?? "";
-    const payload = decodeSlackInstallState(state);
-    if (!code || !payload) {
-      return slackCallbackPage(
-        false,
-        "Invalid install link",
-        "This link is malformed or expired — go back to Gera and click Install again.",
-      );
-    }
-    const upstream = await projectStoreFetch(env, request.url, `proj:${payload.projectId}`, "/slack-oauth", {
-      method: "POST",
-      body: JSON.stringify({ agentId: payload.agentId, code, state }),
-    });
-    const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
-    console.log("slack oauth callback", upstream.status);
-    if (!upstream.ok) {
-      const message =
-        typeof data.message === "string" && data.message.length > 0
-          ? data.message
-          : `The install could not be completed (${typeof data.error === "string" ? data.error : upstream.status}). Retry from Gera.`;
-      return slackCallbackPage(false, "Install failed", message);
-    }
-    const team = typeof data.team === "string" && data.team.length > 0 ? data.team : "your workspace";
-    return slackCallbackPage(
-      true,
-      "Slack bot installed",
-      `The bot is now in ${team}. Back in Gera the editor updates by itself — /invite the bot to a channel and @mention it.`,
-    );
-  } catch (error) {
-    console.error("slack oauth callback failed", error instanceof Error ? error.message : "error");
-    return slackCallbackPage(false, "Install failed", "Unexpected error — try again from Gera.");
-  }
-}
-
-/**
- * /projects/* — team workspaces: scoped agents (e.g. read-only repo guides,
- * Intercom support desks) plus Slack-style channels with threads. Identity +
- * invite gate here; membership and roles are enforced inside each project's
- * ProjectStore shard. Agent replies fire via waitUntil after the message
- * commits, so posting never blocks on an LLM run.
- */
-async function relayProjects(request: Request, url: URL, env: Env, ctx: ExecutionCtx): Promise<Response> {
-  try {
-    const account = await requireInvitedAccount(request, env);
-    if (account instanceof Response) {
-      return account;
-    }
-    const email = account.storageOwner;
-
-    if (request.method === "GET" && url.pathname === "/projects") {
-      const upstream = await projectStoreFetch(
-        env,
-        request.url,
-        "registry",
-        `/reg/list?email=${encodeURIComponent(email)}`,
-        { method: "GET" },
-      );
-      const text = await upstream.text();
-      return new Response(text, {
-        status: upstream.status,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
-
-    if (request.method === "POST" && url.pathname === "/projects/create") {
-      const raw = await request.text();
-      if (raw.length > 4_096) {
-        return corsJson({ error: "body_too_large" }, 413);
-      }
-      let parsed: { name?: unknown; ownerName?: unknown };
-      try {
-        parsed = JSON.parse(raw) as typeof parsed;
-      } catch {
-        return corsJson({ error: "invalid_json" }, 400);
-      }
-      const name = typeof parsed.name === "string" ? parsed.name.trim().slice(0, 60) : "";
-      if (!name) {
-        return corsJson({ error: "invalid_name" }, 400);
-      }
-      const projectId = `p${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
-      const init = await projectStoreFetch(env, request.url, `proj:${projectId}`, "/init", {
-        method: "POST",
-        email,
-        body: JSON.stringify({
-          projectId,
-          name,
-          ownerName: typeof parsed.ownerName === "string" ? parsed.ownerName.slice(0, 60) : "",
-        }),
-      });
-      if (!init.ok) {
-        const text = await init.text();
-        return new Response(text, {
-          status: init.status,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
-      }
-      await projectStoreFetch(env, request.url, "registry", "/reg/upsert", {
-        method: "POST",
-        body: JSON.stringify({ projectId, name, rows: [{ email, role: "owner" }] }),
-      });
-      console.log("project created");
-      return corsJson({ ok: true, id: projectId, name }, 200);
-    }
-
-    const match = /^\/projects\/(p[a-f0-9]{20})(\/.+)$/.exec(url.pathname);
-    if (!match) {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    const projectId = match[1];
-    const sub = match[2];
-    const expected = PROJECT_SUB_ROUTES[sub];
-    if (!expected || request.method !== expected) {
-      return corsJson({ error: "not_found" }, 404);
-    }
-    let body: string | undefined;
-    if (expected === "POST") {
-      body = await request.text();
-      if (body.length > PROJECT_BODY_LIMIT) {
-        return corsJson({ error: "body_too_large" }, 413);
-      }
-      if (sub === "/agents/upsert") {
-        try {
-          const parsed = JSON.parse(body) as Record<string, unknown>;
-          const incomingSecrets =
-            parsed.secrets && typeof parsed.secrets === "object" && !Array.isArray(parsed.secrets)
-              ? { ...(parsed.secrets as Record<string, unknown>) }
-              : {};
-          const fromAccount = incomingSecrets.githubFromAccount === true;
-          delete incomingSecrets.githubFromAccount;
-          delete incomingSecrets.githubAccount;
-          if (fromAccount) {
-            const proof = await accountAuthorizationLease(env, request.url, account, "github", false);
-            if (!proof) {
-              return corsJson({ error: "github_sign_in_required" }, 409);
-            }
-            incomingSecrets.githubAccount = { owner: email, serverId: "github" };
-          } else if (incomingSecrets.githubToken === null) {
-            incomingSecrets.githubAccount = null;
-          }
-          parsed.secrets = incomingSecrets;
-          body = JSON.stringify(parsed);
-        } catch {
-          return corsJson({ error: "invalid_json" }, 400);
-        }
-      }
-    }
-    const upstream = await projectStoreFetch(env, request.url, `proj:${projectId}`, `${sub}${url.search}`, {
-      method: expected,
-      email,
-      body,
-    });
-    const text = await upstream.text();
-    if (upstream.ok && expected === "POST") {
-      ctx.waitUntil(projectPostEffects(env, request.url, projectId, email, sub, body ?? "", text));
-    }
-    if (upstream.ok && sub === "/members/add") {
-      // Honest hint: project membership does not grant Gera access — the
-      // added email still needs an app invite to sign in at all.
-      try {
-        const data = JSON.parse(text) as Record<string, unknown>;
-        const added = typeof data.email === "string" ? data.email : "";
-        const invited = added ? await isInvitedCached(env, request.url, added) : false;
-        return corsJson({ ...data, invited }, upstream.status);
-      } catch {
-        // fall through to the raw response
-      }
-    }
-    const quiet =
-      sub === "/messages" ||
-      sub === "/overview" ||
-      sub === "/read" ||
-      sub === "/message" ||
-      sub === "/screen-chat" ||
-      sub === "/screen-chat/send" ||
-      sub === "/intercom/inbox" ||
-      sub === "/intercom/thread" ||
-      sub === "/intercom/details" ||
-      sub === "/intercom/suggest" ||
-      sub === "/intercom/stats" ||
-      sub === "/intercom/slack-related" ||
-      sub === "/intercom/ask-status";
-    if (!quiet) {
-      console.log("projects", request.method, sub, upstream.status);
-    }
-    return new Response(text, {
-      status: upstream.status,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
-  } catch (error) {
-    console.error("projects relay failed", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "upstream_unreachable" }, 502);
-  }
-}
-
 /** Surf command bodies (URL + fields + cookie jar) stay small by design. */
 const SURF_BODY_LIMIT = 160_000;
 
@@ -1817,6 +1313,31 @@ function mcpRelayContext(env: Env): McpRelayContext<AccountPrincipal> {
     requireInvitedAccount: (request) => requireInvitedAccount(request, env),
     shardCall: (requestUrl, account, path, options) => shardCall(env, requestUrl, account, path, options),
     relayAccessProblem: (request) => relayAccessProblem(request, env),
+  };
+}
+
+function projectRelayContext(env: Env): ProjectRelayContext<AccountPrincipal> {
+  return {
+    durable: env.DO,
+    corsHeaders: CORS_HEADERS,
+    corsJson,
+    requireInvitedAccount: (request) => requireInvitedAccount(request, env),
+    isInvitedCached: (requestUrl, email) => isInvitedCached(env, requestUrl, email),
+    accountAuthorizationLease: (requestUrl, account, serverId, force) =>
+      accountAuthorizationLease(env, requestUrl, account, serverId, force),
+  };
+}
+
+function repoPreviewRelayContext(env: Env): RepoPreviewRelayContext<AccountPrincipal> {
+  return {
+    durable: env.DO,
+    authSecretKey: env.RORK_AUTH_SECRET_KEY,
+    corsHeaders: CORS_HEADERS,
+    corsJson,
+    readBoundedText,
+    requireInvitedAccount: (request) => requireInvitedAccount(request, env),
+    accountAuthorizationLease: (requestUrl, account, serverId, force) =>
+      accountAuthorizationLease(env, requestUrl, account, serverId, force),
   };
 }
 
@@ -2173,274 +1694,6 @@ async function relayRunNow(request: Request, url: URL, env: Env, ctx: ExecutionC
   }
 }
 
-async function repoPreviewHmac(secret: string, value: string): Promise<string> {
-  if (!secret) throw new Error("repo_preview_shard_secret_unavailable");
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-/** Stable opaque account shard for repository preview jobs. */
-async function repoPreviewOwnerKey(email: string, env: Env): Promise<string> {
-  return (await repoPreviewHmac(env.RORK_AUTH_SECRET_KEY ?? "", email)).slice(0, 24);
-}
-
-function repoPreviewStoreRequest(
-  env: Env,
-  requestUrl: string,
-  ownerKey: string,
-  path: string,
-  init: { method: string; headers?: Headers; body?: BodyInit | null },
-): Promise<Response> {
-  const headers = new Headers(init.headers);
-  headers.set("X-Rork-DO-Class", "RepoPreviewStore");
-  headers.set("X-Rork-DO-Id", `repo-preview:${ownerKey}`);
-  return env.DO.fetch(
-    new Request(new URL(path, new URL(requestUrl).origin).toString(), {
-      method: init.method,
-      headers,
-      body: init.body,
-    }),
-  );
-}
-
-async function touchRepoPreviewRegistry(
-  env: Env,
-  requestUrl: string,
-  ownerKey: string,
-  nextAt: number,
-): Promise<void> {
-  if (!env.RORK_AUTH_SECRET_KEY) throw new Error("repo_preview_registry_secret_unavailable");
-  const headers = new Headers({
-    "Content-Type": "application/json",
-    "X-Gera-Internal-Secret": env.RORK_AUTH_SECRET_KEY,
-  });
-  const response = await repoPreviewStoreRequest(env, requestUrl, "registry", "/internal/touch", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ownerKey, nextAt }),
-  });
-  if (!response.ok) {
-    throw new Error(`repo_preview_registry_touch_${response.status}`);
-  }
-}
-
-async function sweepRepoPreviewRegistry(env: Env, origin: string): Promise<void> {
-  if (!env.RORK_AUTH_SECRET_KEY) return;
-  const headers = new Headers({ "X-Gera-Internal-Secret": env.RORK_AUTH_SECRET_KEY });
-  const response = await repoPreviewStoreRequest(env, origin, "registry", "/internal/sweep", {
-    method: "POST",
-    headers,
-  });
-  if (!response.ok) {
-    console.error("repo preview registry sweep failed", response.status);
-  }
-}
-
-/** Authenticated control plane: inspect, setup PR, launch, status, cancel. */
-async function relayRepoPreviews(request: Request, url: URL, env: Env): Promise<Response> {
-  const account = await requireInvitedAccount(request, env);
-  if (account instanceof Response) {
-    return account;
-  }
-  const email = account.storageOwner;
-  const path = url.pathname.slice("/repo-previews".length) || "/";
-  const allowed =
-    (request.method === "GET" && path === "/status") ||
-    (request.method === "POST" && ["/inspect", "/install", "/start", "/cancel"].includes(path));
-  if (!allowed) {
-    return corsJson({ error: "not_found" }, 404);
-  }
-  let body: string | undefined;
-  if (request.method === "POST") {
-    const bounded = await readBoundedText(request, 32_000);
-    if (bounded === null) {
-      return corsJson({ error: "body_too_large" }, 413);
-    }
-    body = bounded;
-  }
-  let ownerKey: string;
-  try {
-    ownerKey = await repoPreviewOwnerKey(email, env);
-  } catch {
-    return corsJson({ error: "preview_backend_unavailable" }, 503);
-  }
-  const headers = new Headers();
-  headers.set("X-Gera-Email", encodeURIComponent(email));
-  headers.set("X-Gera-Preview-Owner-Key", ownerKey);
-  if (body !== undefined) {
-    headers.set("Content-Type", "application/json");
-  }
-  let github = request.headers.get("X-Gera-Upstream-Authorization") ?? "";
-  if (github.startsWith("gera-account:")) {
-    const serverId = github.slice("gera-account:".length) || "github";
-    github = (await accountAuthorizationLease(env, request.url, account, serverId, false)) ?? "";
-  }
-  if (github) {
-    headers.set("X-Gera-GitHub-Authorization", github);
-  }
-  if (path === "/start") {
-    try {
-      await touchRepoPreviewRegistry(env, request.url, ownerKey, Date.now() + 10 * 60_000);
-    } catch {
-      return corsJson({ error: "preview_maintenance_unavailable" }, 503);
-    }
-  }
-  const upstream = await repoPreviewStoreRequest(
-    env,
-    request.url,
-    ownerKey,
-    `${path}${url.search}`,
-    { method: request.method, headers, body },
-  );
-  const text = await upstream.text();
-  if (path !== "/status") {
-    console.log("repo previews", request.method, path, upstream.status);
-  }
-  return new Response(text, {
-    status: upstream.status,
-    headers: { ...CORS_HEADERS, "Content-Type": upstream.headers.get("Content-Type") ?? "application/json" },
-  });
-}
-
-/**
- * Public artifact/hook plane. Signed ids route to an existing account shard;
- * hooks require GitHub OIDC and assets require a separate DO-checked read capability.
- */
-async function relayRepoPreviewPublic(request: Request, url: URL, env: Env): Promise<Response> {
-  const isHook = url.pathname.startsWith("/repo-preview-hook/");
-  const prefix = isHook ? "/repo-preview-hook/" : "/repo-preview/";
-  const rest = url.pathname.slice(prefix.length);
-  const id = rest.split("/", 1)[0] ?? "";
-  if (!(await verifyRepoPreviewId(id, env.RORK_AUTH_SECRET_KEY ?? ""))) {
-    return new Response("Preview not found", { status: 404 });
-  }
-  const ownerKey = id.split(".", 1)[0] ?? "";
-  const targetPath = `${isHook ? "/hook/" : "/asset/"}${rest}${url.search}`;
-  const headers = new Headers(request.headers);
-  const hookAuthorization = isHook ? headers.get("Authorization") ?? "" : "";
-  headers.delete("X-Gera-GitHub-OIDC");
-  if (hookAuthorization.startsWith("Bearer ") && hookAuthorization.length <= 20_007) {
-    headers.set("X-Gera-GitHub-OIDC", hookAuthorization.slice("Bearer ".length));
-  }
-  headers.delete("Authorization");
-  headers.delete("X-Rork-User-Id");
-  headers.delete("X-Rork-User-Email");
-  headers.delete("X-Rork-User-Name");
-  if (isHook && request.method === "PUT" && rest === `${id}/archive`) {
-    return relayRepoPreviewArchive(request, env, ownerKey, id, headers);
-  }
-  const upstream = await repoPreviewStoreRequest(env, request.url, ownerKey, targetPath, {
-    method: request.method,
-    headers,
-    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
-  });
-  return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
-}
-
-type FixedLengthStreamConstructor = new (
-  expectedLength: number,
-) => { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
-
-/**
- * Gives the outgoing PUT an exact Content-Length (R2 rejects chunked bodies)
- * and fails the transfer if the runner sends more or fewer bytes than declared.
- */
-function fixedLengthBody(body: ReadableStream<Uint8Array>, length: number): ReadableStream<Uint8Array> {
-  const FixedLength = (globalThis as { FixedLengthStream?: FixedLengthStreamConstructor }).FixedLengthStream;
-  if (!FixedLength) {
-    return body;
-  }
-  const { readable, writable } = new FixedLength(length);
-  // A length mismatch or an aborted client surfaces on the fetch side.
-  body.pipeTo(writable).catch(() => undefined);
-  return readable;
-}
-
-function hookJson(data: unknown, status: number): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-  });
-}
-
-/**
- * Runner artifact upload. The Durable Object stays a control plane: it
- * authenticates the runner (GitHub OIDC), claims the row and mints a
- * short-lived presigned PUT; this entrypoint streams the tar straight into
- * R2 without buffering and reports the outcome back. The multi-megabyte
- * body therefore never rides the DO transport, and any storage failure is
- * persisted as a specific preview error instead of surfacing as an opaque 5xx.
- */
-async function relayRepoPreviewArchive(
-  request: Request,
-  env: Env,
-  ownerKey: string,
-  id: string,
-  hookHeaders: Headers,
-): Promise<Response> {
-  const contentType = (request.headers.get("Content-Type") ?? "").split(";", 1)[0].trim().toLowerCase();
-  if (contentType !== "application/x-tar") {
-    return hookJson({ error: "unsupported_content_type" }, 415);
-  }
-  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
-  const body = request.body;
-  if (!body || !Number.isInteger(contentLength) || contentLength <= 0 || contentLength > REPO_PREVIEW_MAX_ARCHIVE_BYTES) {
-    return hookJson({ error: "invalid_archive_size" }, 413);
-  }
-  const control = new Headers({ "Content-Type": "application/json" });
-  const oidc = hookHeaders.get("X-Gera-GitHub-OIDC");
-  if (oidc) {
-    control.set("X-Gera-GitHub-OIDC", oidc);
-  }
-  const claim = await repoPreviewStoreRequest(env, request.url, ownerKey, `/hook/${id}/archive-claim`, {
-    method: "POST",
-    headers: control,
-    body: JSON.stringify({ contentLength }),
-  });
-  if (!claim.ok) {
-    await body.cancel().catch(() => undefined);
-    console.error("repo preview archive claim refused", claim.status);
-    return new Response(claim.body, { status: claim.status, headers: claim.headers });
-  }
-  const granted = (await claim.json().catch(() => null)) as { uploadUrl?: unknown; stagingKey?: unknown } | null;
-  const uploadUrl = typeof granted?.uploadUrl === "string" ? granted.uploadUrl : "";
-  const stagingKey = typeof granted?.stagingKey === "string" ? granted.stagingKey : "";
-  let status = 0;
-  let failure = "";
-  if (!uploadUrl || !stagingKey) {
-    failure = "The preview store returned an invalid upload grant.";
-    await body.cancel().catch(() => undefined);
-  } else {
-    try {
-      const upload = await fetch(uploadUrl, {
-        method: "PUT",
-        headers: { "Content-Type": "application/x-tar" },
-        body: fixedLengthBody(body, contentLength),
-      });
-      status = upload.status;
-      await upload.body?.cancel().catch(() => undefined);
-    } catch (error) {
-      failure = error instanceof Error ? error.message.slice(0, 200) : "transfer failed";
-    }
-  }
-  if (status < 200 || status >= 300 || failure) {
-    console.error("repo preview archive transfer failed", status, failure ? "transfer_error" : "rejected");
-  }
-  const commit = await repoPreviewStoreRequest(env, request.url, ownerKey, `/hook/${id}/archive-commit`, {
-    method: "POST",
-    headers: control,
-    body: JSON.stringify({ stagingKey, contentLength, status, failure }),
-  });
-  return new Response(commit.body, { status: commit.status, headers: commit.headers });
-}
-
 /**
  * /knowledge/* — per-account cloud storage for large knowledge files. The
  * client keeps a short excerpt in the synced profile blob and stores the
@@ -2476,7 +1729,7 @@ export default {
         (async () => {
           // Preview cleanup is bounded and resource-protecting, so it runs
           // before automation work that may legitimately occupy the tick.
-          await sweepRepoPreviewRegistry(env, url.origin);
+          await sweepRepoPreviewRegistry(repoPreviewRelayContext(env), url.origin);
           await sweepGlobalMigrations(env, url.origin);
           await fireDueAutomations(env, url.origin);
         })().catch((error) =>
@@ -2535,10 +1788,10 @@ export default {
       });
     }
     if (url.pathname.startsWith("/repo-preview/") || url.pathname.startsWith("/repo-preview-hook/")) {
-      return relayRepoPreviewPublic(request, url, env);
+      return relayRepoPreviewPublic(repoPreviewRelayContext(env), request, url);
     }
     if (url.pathname === "/repo-previews" || url.pathname.startsWith("/repo-previews/")) {
-      return relayRepoPreviews(request, url, env);
+      return relayRepoPreviews(repoPreviewRelayContext(env), request, url);
     }
     if (url.pathname === "/access/bootstrap-principal") {
       return relayPrincipalBootstrap(request, env);
@@ -2592,7 +1845,7 @@ export default {
       return relayRunNow(request, url, env, ctx);
     }
     if (url.pathname === "/projects" || url.pathname.startsWith("/projects/")) {
-      return relayProjects(request, url, env, ctx);
+      return relayProjects(projectRelayContext(env), request, url, ctx);
     }
     if (url.pathname.startsWith("/hooks/")) {
       return relayHook(request, url, env, ctx);
@@ -2613,10 +1866,10 @@ export default {
       return relayIntercom(request, url, env);
     }
     if (url.pathname === "/slack/oauth/callback") {
-      return relaySlackOAuthCallback(request, url, env);
+      return relaySlackOAuthCallback(projectRelayContext(env), request, url);
     }
     if (url.pathname.startsWith("/slack/events/")) {
-      return relaySlackEvents(request, url, env, ctx);
+      return relaySlackEvents(projectRelayContext(env), request, url, ctx);
     }
     if (url.pathname === "/pv.js") {
       // The page-view tracker for customer sites — static, cacheable, CORS-open.
@@ -2629,7 +1882,7 @@ export default {
       });
     }
     if (url.pathname.startsWith("/pv/")) {
-      return relayPageViews(request, url, env);
+      return relayPageViews(projectRelayContext(env), request, url);
     }
     if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
       return corsJson({ ok: true, service: "gera-functions" }, 200);

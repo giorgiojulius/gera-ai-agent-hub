@@ -2180,7 +2180,7 @@ export function addBlankMcpServer(settings: AgentSettings): AgentSettings {
 
 export function addCatalogMcp(settings: AgentSettings, catalogId: string): AgentSettings {
   const entry = findCatalogEntry(catalogId);
-  if (!entry) {
+  if (!entry || entry.setup) {
     return settings;
   }
   if (settings.mcpServers.some((item) => item.catalogId === entry.id || item.id === entry.id)) {

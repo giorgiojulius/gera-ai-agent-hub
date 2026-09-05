@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_CHAT_MODEL,
+  MODE_MODEL_IDS,
   REASONING_EFFORTS,
   chatBaseModels,
   effortLabel,
@@ -14,6 +15,7 @@ import {
   withEffort,
 } from "@/lib/models";
 import type { GatewayModel } from "@/lib/types";
+import { normalizeStoredSettings } from "@/lib/history";
 
 function gatewayModel(id: string): GatewayModel {
   return {
@@ -74,9 +76,10 @@ describe("chatBaseModels", () => {
 });
 
 describe("groupChatModels", () => {
-  it("keeps Grok, Sol, Fable and Luna first and puts every other model under More", () => {
+  it("keeps Astra, Sol, Fable and Luna first and moves Grok under More", () => {
     const catalog = [
       gatewayModel("google/gemini-3.7-flash"),
+      gatewayModel("openai/gpt-6-astra"),
       gatewayModel("openai/gpt-5.6-sol"),
       gatewayModel("openai/gpt-5.6-luna"),
       gatewayModel("anthropic/claude-opus-5"),
@@ -87,7 +90,7 @@ describe("groupChatModels", () => {
     const groups = groupChatModels(catalog);
 
     expect(groups.primary.map((model) => model.id)).toEqual([
-      "spacexai/grok-4.6",
+      "openai/gpt-6-astra",
       "openai/gpt-5.6-sol",
       "anthropic/claude-fable-5.1",
       "openai/gpt-5.6-luna",
@@ -95,7 +98,33 @@ describe("groupChatModels", () => {
     expect(groups.more.map((model) => model.id)).toEqual([
       "google/gemini-3.7-flash",
       "anthropic/claude-opus-5",
+      "spacexai/grok-4.6",
     ]);
+  });
+});
+
+describe("Astra catalog", () => {
+  it("migrates actual persisted composer, profile and Julius selections with effort intact", () => {
+    const stored = normalizeStoredSettings({
+      modelId: "openai/gpt-6-astra-fast:high",
+      agents: [{ id: "artist", modelId: "openai/gpt-6-astra-fast:medium" }, { id: "default", modelId: "" }],
+      julius: { candidateModelIds: ["openai/gpt-6-astra-fast", "anthropic/claude-opus-5"], chairmanModelId: "openai/gpt-6-astra-fast:xhigh" },
+    });
+    expect(stored.modelId).toBe("openai/gpt-6-astra:high");
+    expect(stored.agents[0].modelId).toBe("openai/gpt-6-astra:medium");
+    expect(stored.agents[1].modelId).toBe("");
+    expect(stored.julius.candidateModelIds).toContain("openai/gpt-6-astra");
+    expect(stored.julius.chairmanModelId).toBe("openai/gpt-6-astra:xhigh");
+  });
+
+  it("removes Fast from pickers and migrates stored Fast choices to ordinary Astra", () => {
+    expect(MODE_MODEL_IDS.chat).not.toContain("openai/gpt-6-astra-fast");
+    const bases = chatBaseModels([gatewayModel("openai/gpt-6-astra"), gatewayModel("openai/gpt-6-astra-fast")]);
+    expect(bases.map((model) => model.id)).toEqual(["openai/gpt-6-astra"]);
+    for (const effort of [undefined, ...REASONING_EFFORTS]) {
+      expect(sanitizeChatModel(withEffort("openai/gpt-6-astra-fast", effort))).toBe(withEffort("openai/gpt-6-astra", effort));
+    }
+    expect(sanitizeChatModel("spacexai/grok-4.6:xhigh")).toBe("spacexai/grok-4.6:xhigh");
   });
 });
 

@@ -8,7 +8,7 @@ import { MAX_DOCS_PER_AGENT, MAX_FILE_CHARS } from "@/lib/knowledge";
 import { defaultJuliusSettings, JULIUS_MAX_CANDIDATES, JULIUS_MIN_CANDIDATES } from "@/lib/julius";
 import { findCatalogEntry, keepUserMcpServers, unlockGithubChatWrites } from "@/lib/mcp-catalog";
 import { normalizeSkills } from "@/lib/skills";
-import { DEFAULT_CHAT_MODEL, isCreateMode, MODE_MODEL_IDS, modeOfModelId, sanitizeModeModel } from "@/lib/models";
+import { DEFAULT_CHAT_MODEL, isCreateMode, modeOfModelId, sanitizeChatModel, sanitizeModeModel } from "@/lib/models";
 import type {
   AgentProfile,
   AgentSettings,
@@ -734,12 +734,10 @@ function normalizeJulius(stored: unknown): JuliusSettings {
     return defaults;
   }
   const raw = stored as Partial<JuliusSettings>;
-  const chatIds = MODE_MODEL_IDS.chat;
   const sanitize = (id: unknown, fallback: string): string =>
-    typeof id === "string" && chatIds.includes(id) ? id : fallback;
+    sanitizeChatModel(typeof id === "string" ? id : undefined, fallback);
   const candidates = Array.isArray(raw.candidateModelIds)
-    ? raw.candidateModelIds
-        .filter((id): id is string => typeof id === "string" && chatIds.includes(id))
+    ? [...new Set(raw.candidateModelIds.map((id) => sanitize(id, "")).filter(Boolean))]
         .slice(0, JULIUS_MAX_CANDIDATES)
     : [];
   return {
@@ -794,7 +792,7 @@ function normalizeAgent(agent: Partial<AgentProfile>): AgentProfile {
     systemPrompt: typeof agent.systemPrompt === "string" ? agent.systemPrompt : "",
     // Removed catalog models (e.g. retired generations) fall back to the composer pick.
     modelId:
-      typeof agent.modelId === "string" && MODE_MODEL_IDS.chat.includes(agent.modelId) ? agent.modelId : "",
+      sanitizeChatModel(typeof agent.modelId === "string" ? agent.modelId : undefined, ""),
     builtins: Array.isArray(agent.builtins)
       ? agent.builtins.filter((id): id is BuiltinToolId => BUILTIN_IDS.includes(id as BuiltinToolId))
       : null,

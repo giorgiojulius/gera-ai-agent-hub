@@ -11,7 +11,7 @@ import type {
 export const DEFAULT_CHAT_MODEL = "spacexai/grok-4.6:xhigh";
 /** Four everyday choices shown before the chat picker's full catalog. */
 export const PRIMARY_CHAT_MODEL_IDS = [
-  "spacexai/grok-4.6",
+  "openai/gpt-6-astra",
   "openai/gpt-5.6-sol",
   "anthropic/claude-fable-5.1",
   "openai/gpt-5.6-luna",
@@ -57,7 +57,6 @@ export const MODE_MODEL_IDS: Record<CreateMode, string[]> = {
   chat: [
     "google/gemini-3.7-flash",
     "openai/gpt-6-astra",
-    "openai/gpt-6-astra-fast",
     "openai/gpt-5.6-sol",
     "openai/gpt-5.6-terra",
     "openai/gpt-5.6-luna",
@@ -237,6 +236,9 @@ export function defaultModelForMode(mode: CreateMode): string {
 
 /** Keeps only curated model ids; anything old/unknown falls back to the mode default. */
 export function sanitizeModeModel(mode: CreateMode, id: string | undefined): string {
+  if (mode === "chat") {
+    return sanitizeChatModel(id);
+  }
   return id && MODE_MODEL_IDS[mode].includes(id) ? id : defaultModelForMode(mode);
 }
 
@@ -269,6 +271,7 @@ const CHAT_CATALOG_IDS = new Set(MODE_MODEL_IDS.chat.map((id) => parseModelSelec
  * newer Anthropic model they actually wanted.
  */
 const MODEL_SUCCESSORS: Record<string, string> = {
+  "openai/gpt-6-astra-fast": "openai/gpt-6-astra",
   "anthropic/claude-fable-5": "anthropic/claude-fable-5.1",
 };
 
@@ -277,9 +280,9 @@ const MODEL_SUCCESSORS: Record<string, string> = {
  * otherwise persist in settings forever and silently degrade every answer —
  * upgrade them to their successor, or snap them to the current default.
  */
-export function sanitizeChatModel(id: string | undefined): string {
+export function sanitizeChatModel(id: string | undefined, fallback: string = DEFAULT_CHAT_MODEL): string {
   if (!id) {
-    return DEFAULT_CHAT_MODEL;
+    return fallback;
   }
   const parsed = parseModelSelection(id);
   if (CHAT_CATALOG_IDS.has(parsed.catalogId)) {
@@ -289,7 +292,7 @@ export function sanitizeChatModel(id: string | undefined): string {
   if (successor && CHAT_CATALOG_IDS.has(successor)) {
     return withEffort(successor, parsed.reasoningEffort);
   }
-  return DEFAULT_CHAT_MODEL;
+  return fallback;
 }
 
 /** The model selection id driving the given creation tab. */

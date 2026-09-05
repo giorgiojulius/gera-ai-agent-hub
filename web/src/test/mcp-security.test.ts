@@ -80,12 +80,14 @@ function requestBody(init?: RequestInit): { id?: number; method?: string; params
 }
 
 describe("MCP catalog contract", () => {
-  it("keeps all 98 entries unique and every featured id real", () => {
-    expect(MCP_CATALOG).toHaveLength(98);
+  it("keeps all 99 entries unique, fixed URLs public and setup entries endpoint-free", () => {
+    expect(MCP_CATALOG).toHaveLength(99);
     expect(new Set(MCP_CATALOG.map((entry) => entry.id)).size).toBe(MCP_CATALOG.length);
-    expect(new Set(MCP_CATALOG.map((entry) => entry.url.replace(/\/$/, ""))).size).toBe(MCP_CATALOG.length);
+    const fixed = MCP_CATALOG.filter((entry) => !entry.setup);
+    expect(new Set(fixed.map((entry) => entry.url.replace(/\/$/, ""))).size).toBe(fixed.length);
     expect(FEATURED_MCP_IDS.every((id) => Boolean(findCatalogEntry(id)))).toBe(true);
-    expect(MCP_CATALOG.every((entry) => safePublicHttpsUrl(entry.url) !== null)).toBe(true);
+    expect(fixed.every((entry) => safePublicHttpsUrl(entry.url) !== null)).toBe(true);
+    expect(MCP_CATALOG.filter((entry) => entry.setup).every((entry) => entry.url === "" && Boolean(entry.docsUrl))).toBe(true);
   });
 
   it("keeps native Slack and Intercom browser/Worker tool contracts identical", () => {

@@ -1,6 +1,7 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-05 · commit `9636b14` (+ Phase 6 engineering, behaviour
+Last synced: 2026-09-05 · commit `1fa1784` (+ Astra primary picker / Fast retirement,
+  Blender MCP secured-bridge setup; previous Phase 6 engineering, behaviour
   unchanged under the existing suites: Worker MCP/OAuth relays moved
   verbatim to `functions/mcp-relay.ts` (`/mcp/oauth/callback`, `/mcp/oauth-rotations`,
   `/mcp/oauth-refresh`, account `/mcp/*` control routes, `/mcp-proxy`) behind
@@ -577,8 +578,8 @@ effort + blended cost; effort label and cost hide on narrow screens — the
 picker itself always shows them). Chat mode opens a root menu:
 
 - **Model** (`model-picker-model-row`) → searchable catalog submenu. Its main
-  view contains exactly Grok 4.6, GPT-5.6 Sol, Claude Fable 5 and GPT-5.6 Luna,
-  in that order; **More** (`model-picker-more-row`) opens every other curated
+  view contains exactly GPT-6 Astra, GPT-5.6 Sol, Claude Fable 5.1 and GPT-5.6 Luna,
+  in that order; Grok 4.6 moved under **More** (`model-picker-more-row`), which opens every other curated
   base model. A selected secondary model is summarized on the More row, while
   searching from the main view still scans the full catalog. Model rows use
   `model-option-<id>`, show cost badge + tier, and dedupe effort variants.
@@ -588,6 +589,12 @@ picker itself always shows them). Chat mode opens a root menu:
 
 Model and effort are orthogonal — switching one keeps the other. Media modes
 open the flat catalog directly. Selection persists per mode in settings.
+GPT-6 Astra Fast is excluded from all curated pickers; persisted Fast IDs
+migrate to ordinary Astra with their effort preserved (`MODEL_SUCCESSORS`),
+including restored composer settings, profiles and Julius panel selections.
+Existing Grok selections and the Reset default are unchanged. Unit
+`model-effort.test.ts`; browser `switch-chat-model` checks Astra first,
+Grok in More, and Fast absent even when the gateway offers it.
 
 ## Threads & sidebar
 
@@ -1108,6 +1115,45 @@ Connector studio: add MCP servers from a catalog or by URL, OAuth/device
 sign-in, per-server tool listing and health, and native GitHub / Slack / Intercom
 connectors. Connected servers appear in the composer Studio popover, Profiles,
 and Skills.
+
+Blender MCP (2026-09-05): catalog → Popular or Design / search “Blender”
+(`mcp-catalog-search`) → **Set up** (`mcp-catalog-connect-blender`) →
+`BlenderMcpSetupDialog` (`blender-setup`). This is the third-party
+ahujasid/blender-mcp integration, NOT an official hosted Blender endpoint.
+The catalog entry explicitly has `setup: blender` and no shared URL; it
+cannot be auto-added by the fixed-endpoint or bulk catalog factories.
+Guide: install the add-on in local Blender, start its TCP socket (9876),
+run `uvx mcp-proxy --host 127.0.0.1 --port 8000 -e DISABLE_TELEMETRY true -- uvx blender-mcp`
+on the same machine, protect a named HTTPS tunnel with Cloudflare Access
+Service Auth (service-token Client ID/Secret) or an authenticated Bearer
+reverse proxy. Never tunnel the raw 9876 socket or expose an unauthenticated
+bridge. The web app does not install software or run Blender locally.
+Form uses `blenderSetupSchema`: public HTTPS only, no localhost/private
+hosts, website/stdio URLs, port 9876, URL credentials/query/fragment;
+selected auth fields + explicit risk acknowledgement required. Cloudflare
+credentials become `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers,
+not an OAuth popup. Connect keeps `catalogId: blender` through the existing
+`/mcp/check` → vault → generic MCP path; no backend transport or network
+exceptions. Cancel/invalid input sends nothing and adds no phantom row.
+The connected card offers setup/credential replacement; existing disabled
+tools are preserved. Before verification, the stored-credential flag is
+unknown, not false (false would request vault deletion on a later retry).
+Secrets are excluded from persisted browser settings.
+Verification here means MCP handshake + tools/list, NOT that Blender is
+open or a scene operation succeeded: the guide asks the user to run
+`get_scene_info` without changes as the first actual scene check. Requires
+the user's running Blender and reachable secured bridge; real-device scene
+operations are not covered by the hermetic tests.
+Unit `blender-mcp.test.ts`: endpoint rejection, auth mapping, cloud tool
+eligibility, catalog guards and profile preservation. Browser scenarios
+`blender-mcp-setup` (guide, bad URL, cancel, zero checks) and
+`blender-mcp-connect` (explicit fixture bridge, verified tools, no persisted
+service credentials). Testids: `blender-guide`, `blender-endpoint`,
+`blender-auth`, `blender-client-id`, `blender-client-secret`, `blender-token`,
+`blender-acknowledge`, `blender-connect`, `blender-cancel`, `blender-errors`.
+Verification 2026-09-05: unit 87 files / 994 checks; browser 8 files / 47
+checks (18.59 s). Browser config prebundles form dependencies to prevent a
+mid-test Vite reload / duplicate React hooks.
 
 Deferred tools (2026-09-04, `functions/mcp-toolset.ts` — the ONE resolver
 every run kind uses: chat/resume/Julius in `run-manager.ts`, cloud automations
@@ -1651,6 +1697,8 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | projects-page-opens | Projects page renders + create action behind the gate |
 | studio-pages-navigate | Tabs automations → hub → mcp → settings |
 | connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
+| blender-mcp-setup | Search Blender → Set up → local/secured-bridge guide → localhost rejected → Cancel → no request or phantom connector |
+| blender-mcp-connect | Secured bridge form → explicit stubbed `/mcp/check` → Blender identity + tools → service credentials absent from browser persistence (not a real Blender operation) |
 | connect-open-mcp-deferred | Settings → Toolkit “Always deferred” → send → `/runs/start` carries `mcpToolLoading` + `contextWindow` → `mcp_search_tools` / `mcp_call_tool` rows read “MCP · deepwiki · ask_question · done” → reply |
 | prompt-slash | Connected DeepWiki → type `/expl` → prompts menu → pick `explain_repo` → required-argument dialog → submit → `/mcp/prompt-get` text lands in the composer input, dialog gone |
 | resource-mention | Type `@READ` → resources menu → pick the README → `/mcp/resource-read` becomes an attachment chip, `@deepwiki/wiki://…` mention stays in the input |

@@ -17,7 +17,10 @@ export type McpCategory =
 export type McpCatalogEntry = {
   id: string;
   name: string;
+  /** Fixed endpoint; empty for setup entries requiring the user's own bridge URL. */
   url: string;
+  /** Local software with a guided, user-hosted HTTPS bridge instead of a fixed endpoint. */
+  setup?: "blender";
   category: McpCategory;
   auth: McpAuthKind;
   hint: string;
@@ -120,6 +123,7 @@ export const FEATURED_MCP_IDS: string[] = [
   "intercom-mcp",
   "klaviyo",
   "figma",
+  "blender",
   "higgsfield",
   "mobbin",
   "clickup",
@@ -151,7 +155,7 @@ export const FEATURED_MCP_IDS: string[] = [
 ];
 
 /**
- * Every connectable entry below passed a live probe from this project: the
+ * Every fixed-endpoint entry below passed a live probe from this project: the
  * endpoint answers MCP initialize over Streamable HTTP. All MCP traffic
  * flows through the Gera backend relay, so browser CORS restrictions never
  * apply — any spec-compliant server works. Open servers connect
@@ -161,7 +165,8 @@ export const FEATURED_MCP_IDS: string[] = [
  * take a pasted token. Entries with `blocked` exist but reject outside
  * clients for policy reasons — listed for transparency with the probed
  * reason. A large batch below was imported from the GitHub MCP Registry
- * (github.com/mcp) and re-probed individually.
+ * (github.com/mcp) and re-probed individually. Local `setup` entries have no
+ * shared endpoint: the user's bridge is verified only when they connect it.
  */
 export const MCP_CATALOG: McpCatalogEntry[] = [
   {
@@ -297,6 +302,17 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     docsUrl: "https://docs.zapier.com/mcp/get-started/authentication",
   },
 
+  {
+    id: "blender",
+    name: "Blender MCP",
+    url: "",
+    setup: "blender",
+    category: "design",
+    auth: "token",
+    icon: "blender.org",
+    hint: "Control your Blender scenes, objects and materials — local add-on + secured HTTPS bridge required",
+    docsUrl: "https://github.com/ahujasid/blender-mcp#installation",
+  },
   { id: "figma", name: "Figma", url: "https://mcp.figma.com/mcp", category: "design", auth: "oauth", icon: "figma.com", hint: "Design files and components" },
   { id: "higgsfield", name: "Higgsfield", url: "https://mcp.higgsfield.ai/mcp", category: "design", auth: "oauth", icon: "higgsfield.ai", hint: "Generate images & video — 30+ models (Kling, Veo, Sora, Seedance, Soul). Spends your Higgsfield plan credits", docsUrl: "https://higgsfield.ai/mcp" },
   { id: "canva", name: "Canva", url: "https://mcp.canva.com/mcp", category: "design", auth: "oauth", icon: "canva.com", hint: "Designs and assets" },
@@ -362,6 +378,9 @@ export function unlockGithubChatWrites(catalogKey: string, disabledTools: string
 }
 
 export function catalogEntryToServer(entry: McpCatalogEntry): McpServerConfig {
+  if (entry.setup || !entry.url) {
+    throw new Error(`${entry.name} requires setup with your own HTTPS bridge.`);
+  }
   return {
     id: entry.id,
     name: entry.name,
@@ -386,6 +405,9 @@ export function missingCatalogEntries(servers: McpServerConfig[]): McpCatalogEnt
     taken.add(server.url.replace(/\/$/, ""));
   }
   return MCP_CATALOG.filter((entry) => {
+    if (entry.setup) {
+      return false;
+    }
     const url = entry.url.replace(/\/$/, "");
     return !taken.has(entry.id) && !taken.has(url);
   });

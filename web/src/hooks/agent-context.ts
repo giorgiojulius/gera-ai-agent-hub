@@ -96,6 +96,8 @@ export type AgentContextValue = {
   addCatalogMcpServer: (catalogId: string) => void;
   connectCatalog: (catalogId: string) => void;
   addCustomMcp: (input: {
+    /** Preserves the identity of a catalog entry that requires a user-hosted bridge. */
+    catalogId?: string;
     name: string;
     url: string;
     token?: string;

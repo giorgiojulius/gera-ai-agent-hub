@@ -101,7 +101,7 @@ export const TID = {
   modelPickerTrigger: "model-picker-trigger",
   /** "Model" row in the chat picker's root menu — opens the catalog submenu. */
   modelPickerModelRow: "model-picker-model-row",
-  /** "More" row after Grok, Sol, Fable and Luna — opens the rest of the chat catalog. */
+  /** "More" row after Astra, Sol, Fable and Luna — opens the rest of the chat catalog. */
   modelPickerMoreRow: "model-picker-more-row",
   /** "Effort" row in the chat picker's root menu — opens the thinking-budget submenu. */
   modelPickerEffortRow: "model-picker-effort-row",
@@ -198,6 +198,19 @@ export const TID = {
   /** Step-up hint + "Sign in again with wider access" button on a server card. */
   mcpStepUpHint: "mcp-step-up-hint",
   mcpStepUpSignIn: "mcp-step-up-sign-in",
+  /** Local Blender connector: setup guide and protected remote bridge form. */
+  mcpCatalogSearch: "mcp-catalog-search",
+  blenderSetup: "blender-setup",
+  blenderGuide: "blender-guide",
+  blenderEndpoint: "blender-endpoint",
+  blenderAuth: "blender-auth",
+  blenderToken: "blender-token",
+  blenderClientId: "blender-client-id",
+  blenderClientSecret: "blender-client-secret",
+  blenderAcknowledge: "blender-acknowledge",
+  blenderConnect: "blender-connect",
+  blenderCancel: "blender-cancel",
+  blenderErrors: "blender-errors",
 } as const;
 
 /** All registry values, for uniqueness checks in tests. */

@@ -3,6 +3,9 @@
 // sign-in, token toggle, removal). All state flows through the provider's
 // setSettings, so behavior and persistence are unchanged.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+
+import { blenderEndpointError } from "@/lib/blender-mcp";
 
 import {
   addBlankMcpServer,
@@ -157,7 +160,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
 
   const connectCatalog = useCallback((catalogId: string) => {
     const entry = findCatalogEntry(catalogId);
-    if (!entry || entry.blocked) {
+    if (!entry || entry.blocked || entry.setup) {
       return;
     }
     const existing = stateRef.current.settings.mcpServers.find(
@@ -186,6 +189,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
   }, [setSettings, stateRef]);
 
   const addCustomMcp = useCallback((input: {
+    catalogId?: string;
     name: string;
     url: string;
     token?: string;
@@ -194,14 +198,30 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
   }) => {
     const mode = input.authMode ?? "auto";
     const url = input.url.trim();
+    const entry = input.catalogId ? findCatalogEntry(input.catalogId) : undefined;
+    if (input.catalogId && !entry?.setup) {
+      return;
+    }
+    if (entry?.setup === "blender") {
+      const error = blenderEndpointError(url);
+      if (error || (mode !== "bearer" && mode !== "headers")) {
+        toast.error(error ?? "Blender requires an authenticated HTTPS bridge.");
+        return;
+      }
+    }
     let host = "";
     try {
       host = new URL(url).host;
     } catch {
       host = "";
     }
+    const existing = entry?.setup ? stateRef.current.settings.mcpServers.find(
+      (item) => item.catalogId === entry.id || item.id === entry.id,
+    ) : undefined;
     const server = {
-      ...newMcpServer(),
+      ...(existing ?? newMcpServer()),
+      // Unknown until the check answers. false means explicit vault deletion on retry.
+      ...(entry?.setup ? { id: existing?.id ?? entry.id, catalogId: entry.id, credentialStored: undefined } : {}),
       name: input.name.trim() || host || "Custom MCP",
       url,
       token: mode === "bearer" || mode === "auto" ? (input.token?.trim() ?? "") : "",
@@ -216,7 +236,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
       return;
     }
     void reconnectMcp(server, setSettings);
-  }, [setSettings]);
+  }, [setSettings, stateRef]);
 
   const removeMcp = useCallback((id: string) => {
     const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);

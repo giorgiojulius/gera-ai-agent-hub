@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import { GitHubSignInDialog } from "@/components/gera/GitHubSignInDialog";
+import { BlenderMcpSetupDialog } from "@/components/gera/BlenderMcpSetupDialog";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -100,6 +101,7 @@ export function McpStudio() {
     [setSearchParams],
   );
   const [githubOpen, setGithubOpen] = useState<boolean>(false);
+  const [blenderOpen, setBlenderOpen] = useState<boolean>(false);
   const githubReady = githubDeviceClientId() !== null;
 
   const added = state.settings.mcpServers;
@@ -171,6 +173,10 @@ export function McpStudio() {
   const liveCount = added.filter((item) => item.status === "connected").length;
 
   function handleCatalogConnect(entry: McpCatalogEntry) {
+    if (entry.setup === "blender") {
+      setBlenderOpen(true);
+      return;
+    }
     connectCatalog(entry.id);
     if (entry.auth === "token" && !entry.tokenOptional) {
       setFocusId(entry.id);
@@ -252,6 +258,7 @@ export function McpStudio() {
                 onConnect={() => connectMcp(server.id)}
                 onSignIn={() => signInMcp(server.id)}
                 onToggleTool={(name) => toggleMcpTool(server.id, name)}
+                onSetup={findCatalogEntry(server.catalogId ?? server.id)?.setup === "blender" ? () => setBlenderOpen(true) : undefined}
                 onDeviceSignIn={
                   findCatalogEntry(server.catalogId ?? server.id)?.deviceFlow && githubReady
                     ? () => setGithubOpen(true)
@@ -270,6 +277,8 @@ export function McpStudio() {
         <div className="mt-2 flex items-center gap-2 rounded-full border border-border/70 bg-card px-3">
           <Search className="h-3.5 w-3.5 text-muted-foreground" />
           <input
+            data-testid={TID.mcpCatalogSearch}
+            aria-label="Search MCP catalog"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search GitHub, Linear, Notion…"
@@ -416,6 +425,13 @@ export function McpStudio() {
         ))}
       </div>
 
+      {blenderOpen ? (
+        <BlenderMcpSetupDialog
+          initialUrl={addedByKey.get("blender")?.url}
+          onClose={() => setBlenderOpen(false)}
+          onConnect={(input) => { addCustomMcp(input); setFocusId("blender"); }}
+        />
+      ) : null}
       <GitHubSignInDialog open={githubOpen} onOpenChange={setGithubOpen} onSignedIn={handleGitHubSignedIn} />
     </section>
   );
@@ -524,7 +540,7 @@ function CatalogRow({
               entry.blocked ? "bg-amber-500/15 text-amber-700" : "bg-foreground/5 text-muted-foreground",
             )}
           >
-            {entry.blocked ? "Server-side" : onDeviceSignIn ? "Sign in · key" : MCP_AUTH_LABEL[entry.auth]}
+            {entry.setup ? "Local bridge" : entry.blocked ? "Server-side" : onDeviceSignIn ? "Sign in · key" : MCP_AUTH_LABEL[entry.auth]}
           </span>
         </span>
         <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{entry.hint}</span>
@@ -586,7 +602,7 @@ function CatalogRow({
           ) : (
             <Plug className="h-3.5 w-3.5" />
           )}
-          {entry.auth === "oauth" || onDeviceSignIn ? "Sign in" : "Connect"}
+          {entry.setup ? "Set up" : entry.auth === "oauth" || onDeviceSignIn ? "Sign in" : "Connect"}
         </Button>
       )}
     </div>
@@ -603,6 +619,7 @@ function ConnectedCard({
   onSignIn,
   onToggleTool,
   onDeviceSignIn,
+  onSetup,
 }: {
   server: McpServerConfig;
   expanded: boolean;
@@ -614,6 +631,7 @@ function ConnectedCard({
   onSignIn: () => void;
   onToggleTool: (name: string) => void;
   onDeviceSignIn?: () => void;
+  onSetup?: () => void;
 }) {
   const entry = findCatalogEntry(server.catalogId ?? server.id);
   const authMode: McpAuthMode = server.authMode ?? "auto";
@@ -643,7 +661,7 @@ function ConnectedCard({
     !signedIn &&
     !server.credentialStored &&
     !(server.token ?? "").trim();
-  const needsKey = entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";
+  const needsKey = entry?.setup ? false : entry ? entry.auth === "token" : authMode === "auto" || authMode === "bearer";
   const blockedReason = entry?.blocked;
   const inventoryLabel = [
     `${server.tools.length} tools`,
@@ -785,6 +803,15 @@ function ConnectedCard({
                 </>
               ) : null}
             </p>
+          ) : null}
+          {entry?.setup ? (
+            <div className="space-y-2 rounded-xl border border-border p-3">
+              <p className="break-all text-[11px] text-muted-foreground">{server.url}</p>
+              <p className="text-[11px] text-muted-foreground">
+                Keep Blender and its protected bridge running. Verification checks MCP, not the scene — ask Gera to call get_scene_info first.
+              </p>
+              <Button type="button" size="sm" variant="outline" onClick={onSetup}>Setup / change bridge credentials</Button>
+            </div>
           ) : null}
           {!entry ? (
             <>

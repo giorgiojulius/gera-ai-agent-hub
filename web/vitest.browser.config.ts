@@ -38,6 +38,10 @@ async function saveE2eReport(_ctx: unknown, report: unknown): Promise<{ savedTo:
 
 export default defineConfig({
   plugins: [react()],
+  // Prebundle the setup form before tests start; late discovery reloads React mid-suite.
+  optimizeDeps: {
+    include: ["@hookform/resolvers/zod", "react-hook-form", "zod", "@radix-ui/react-checkbox", "@radix-ui/react-label"],
+  },
   // Match the production Vite build: Rork's shared public envs include auth
   // configuration used by browser-only session-expiry regression tests.
   envPrefix: ["VITE_", "EXPO_PUBLIC_"],
@@ -57,6 +61,7 @@ export default defineConfig({
     },
   },
   resolve: {
+    dedupe: ["react", "react-dom"],
     alias: { "@": path.resolve(__dirname, "./src") },
   },
 });

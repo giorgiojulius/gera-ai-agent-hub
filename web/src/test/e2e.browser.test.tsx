@@ -61,6 +61,7 @@ const commands = browserCommands as unknown as {
 const REPLY_TEXT = `${STUB_REPLY_SNIPPET} — deterministic stub for click tests.`;
 const THREAD_TITLE = "Gera E2E Thread";
 const ROUTER_PLAN = '{"builtins":[],"mcp":[],"queries":[]}';
+let blenderCheckCount: number = 0;
 
 type GatewayModelStub = {
   id: string;
@@ -73,6 +74,9 @@ type GatewayModelStub = {
 /** Mirrors the curated chat catalog so every picker entry resolves. */
 const GATEWAY_MODEL_STUBS: GatewayModelStub[] = [
   { id: "google/gemini-3.7-flash", name: "Gemini 3.7 Flash", owned_by: "google" },
+  { id: "openai/gpt-6-astra", name: "GPT-6 Astra", owned_by: "openai" },
+  // The live gateway still offers Fast; Gera must hide it from its curated pickers.
+  { id: "openai/gpt-6-astra-fast", name: "GPT-6 Astra (Fast)", owned_by: "openai" },
   { id: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol", owned_by: "openai" },
   { id: "openai/gpt-5.6-terra", name: "GPT-5.6 Terra", owned_by: "openai" },
   { id: "openai/gpt-5.6-luna", name: "GPT-5.6 Luna", owned_by: "openai" },
@@ -501,7 +505,31 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
       return jsonResponse({ email: "e2e@gera.app", status: "invited", role: "member", requestedAt: null });
     }
     if (url.includes("/mcp/check")) {
-      const body = JSON.parse(String(init?.body ?? "{}")) as { server?: { id?: string; token?: string } };
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        server?: { id?: string; token?: string; url?: string; catalogId?: string; authMode?: string; headersJson?: string; credentialStored?: boolean };
+      };
+      if (body.server?.id === "blender") {
+        blenderCheckCount += 1;
+        // false would request vault deletion after a failed check + reload stripped local fields.
+        expect(body.server.credentialStored).not.toBe(false);
+        expect(body.server.url).toBe("https://blender.example.com/mcp");
+        expect(body.server.catalogId).toBe("blender");
+        expect(body.server.authMode).toBe("headers");
+        if (body.server.headersJson) {
+          expect(JSON.parse(body.server.headersJson)).toEqual({
+            "CF-Access-Client-Id": "test-client.access",
+            "CF-Access-Client-Secret": "test-service-credential",
+          });
+        }
+        return jsonResponse({
+          tools: [
+            { name: "get_scene_info", description: "Inspect the current scene", inputSchema: { type: "object", properties: {} } },
+            { name: "execute_blender_code", description: "Run Blender Python", inputSchema: { type: "object", properties: { code: { type: "string" } } } },
+          ],
+          identity: "Blender MCP · fixture bridge",
+          credentialStored: true,
+        });
+      }
       if (body.server?.id === "github") {
         return jsonResponse({
           tools: [{ name: "get_contents", inputSchema: { type: "object", properties: {} } }],
@@ -814,6 +842,7 @@ beforeEach(() => {
   sessionStorage.clear();
   lastStubRun = null;
   lastStubRunBody = null;
+  blenderCheckCount = 0;
   hangStubRun = false;
   codeStubRun = false;
   mcpStubRun = false;
@@ -940,6 +969,16 @@ for (const scenario of E2E_SCENARIOS) {
     results.push(result);
     if (!result.ok) {
       expect.fail(`[${result.scenarioId}] ${result.error ?? "scenario did not finish"}`);
+    }
+    if (scenario.id === "blender-mcp-setup") {
+      expect(blenderCheckCount).toBe(0);
+    }
+    if (scenario.id === "blender-mcp-connect") {
+      expect(blenderCheckCount).toBeGreaterThan(0);
+      await expect.poll(() => localStorage.getItem("gera.settings.v1") ?? "").toContain("blender.example.com");
+      const persisted = localStorage.getItem("gera.settings.v1") ?? "";
+      expect(persisted).not.toContain("test-service-credential");
+      expect(persisted).not.toContain("test-client.access");
     }
     if (scenario.id === "elicitation-accept") {
       // The card's Accept sent exactly the validated form values through /runs/answer.

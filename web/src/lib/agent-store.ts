@@ -49,6 +49,7 @@ import { applySkillOps, buildSkillsEditorContext, extractSkillOps } from "@/lib/
 import { drainSteering, registerSteerableRun, stripSteerFlags, unregisterSteerableRun, watchSteering } from "@/lib/steering";
 import { McpAccountAuthError, McpAuthError, connectMcpServer, newMcpServer } from "@/lib/mcp";
 import { hasOAuthRefreshToken, hasOAuthToken, runOAuthSignIn } from "@/lib/mcp-oauth";
+import { beginMcpHealthCheck, invalidateMcpHealth, mcpHealthFingerprint, mcpHealthState } from "@/lib/mcp-health";
 import {
   cachedAcceptsImages,
   cachedContextWindow,
@@ -1851,6 +1852,7 @@ export async function reconnectMcp(
   server: McpServerConfig,
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void,
 ): Promise<void> {
+  const check = beginMcpHealthCheck(server);
   setSettings((prev) => {
     const exists = prev.mcpServers.some((item) => item.id === server.id);
     const list = exists ? prev.mcpServers : [...prev.mcpServers, server];
@@ -1863,10 +1865,12 @@ export async function reconnectMcp(
   });
   try {
     const connection = await connectMcpServer(server);
+    if (!check.isCurrent()) return;
+    check.markHealthy();
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((item) =>
-        item.id === server.id
+        check.matches(item)
           ? {
               ...item,
               status: "connected",
@@ -1886,21 +1890,28 @@ export async function reconnectMcp(
       description: `${connection.tools.length} tools listed${connection.promptCount ? ` · ${connection.promptCount} prompts` : ""}${connection.resourceCount ? ` · ${connection.resourceCount} resources` : ""}${connection.identity ? ` · ${connection.identity}` : ""}`,
     });
   } catch (error) {
+    if (!check.isCurrent()) return;
     const message = errorFromUnknown(error);
+    const keepVerified = server.status === "connected" &&
+      (error instanceof McpAccountAuthError || (!(error instanceof McpAuthError) && isRecoverableMcpHealthError(error)));
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((item) =>
-        item.id === server.id
+        check.matches(item)
           ? {
               ...item,
-              status: "error",
-              error: message,
-              identity: undefined,
-              verifiedAt: undefined,
+              status: keepVerified ? "connected" : "error",
+              error: keepVerified ? undefined : message,
+              identity: keepVerified ? server.identity : undefined,
+              verifiedAt: keepVerified ? server.verifiedAt : undefined,
             }
           : item,
       ),
     }));
+    if (keepVerified) {
+      toast.message(`${server.name}: check delayed`, { description: message });
+      return;
+    }
     toast.error(`${server.name} did not connect`, { description: message });
     if (!(error instanceof McpAccountAuthError)) {
       logDiagnostic("mcp", error, {
@@ -1912,13 +1923,13 @@ export async function reconnectMcp(
         credentialStored: server.credentialStored,
       });
     }
+  } finally {
+    check.finish();
   }
 }
 
-/** Re-verify a persisted green status after this age, and always once auth disappears. */
+/** Re-verify a persisted green status after this age. */
 const MCP_REVERIFY_AFTER_MS = 10 * 60_000;
-const mcpLastHealthyAt = new Map<string, number>();
-const mcpRevalidationInFlight = new Set<string>();
 
 /**
  * Shared auth, relay, network, rate-limit, and provider-outage failures do not
@@ -1927,7 +1938,7 @@ const mcpRevalidationInFlight = new Set<string>();
  */
 export function isRecoverableMcpHealthError(error: unknown): boolean {
   const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  return /(?:gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response|sign-in is missing)/i.test(
+  return /(?:identity_unavailable|account_shard_unavailable|mcp_check_failed|server check failed inside Gera|gera (?:relay|account)|sign in to gera|external connectors|could not reach|unreachable|network|failed to fetch|load failed|time(?:d)? out|aborted|retry|rate limit|temporar|server returned 5\d\d|unexpected response|sign-in is missing)/i.test(
     message,
   );
 }
@@ -1942,19 +1953,16 @@ export function mcpCredentialProblem(_server: McpServerConfig): string | null {
 }
 
 /**
- * Re-validates persisted connection state after boot and after a synced profile
- * arrives. Missing auth bypasses the freshness window, so a remote green flag
- * can never mask an absent local grant. Stale cards visibly enter Checking and
- * end in either a fresh verified green state or an honest error state.
+ * Re-validates persisted state after boot/sync and on health ticks. Old errors
+ * stay visible until a real check succeeds; retry eligibility never proves a
+ * connection. Provider 401s may recover from a server-owned grant, but are
+ * bounded to one health attempt per ten minutes, not every profile update.
  */
 export function revalidateMcpServers(
   servers: McpServerConfig[],
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void,
   forceIds: ReadonlySet<string> = new Set<string>(),
 ): void {
-  const candidates: McpServerConfig[] = [];
-  const problems = new Map<string, string>();
-  const recoverableIds = new Set<string>();
   const now = Date.now();
   for (const server of servers) {
     if (!server.enabled) {
@@ -1966,63 +1974,27 @@ export function revalidateMcpServers(
       (catalogId !== server.id &&
         hasOAuthToken(catalogId, server.url) &&
         hasOAuthRefreshToken(catalogId));
-    const isRecoverableError =
-      server.status === "error" &&
-      (isRecoverableMcpHealthError(server.error) || hasRefreshableOAuth);
-    if (server.status !== "connected" && !isRecoverableError) {
-      continue;
+    const transient = isRecoverableMcpHealthError(server.error);
+    // A generic upstream 401 is not the OAuth server's definitive invalid_grant
+    // verdict. A refresh or another device may already have repaired the vault.
+    const storedAuthCanRecover = server.credentialStored === true &&
+      /auth rejected \(401\)/i.test(server.error ?? "") && !server.stepUp;
+    const isRecoverableError = server.status === "error" &&
+      (transient || hasRefreshableOAuth || storedAuthCanRecover);
+    const forced = forceIds.has(server.id);
+    if (server.status !== "connected" && !(server.status === "error" && (isRecoverableError || forced))) continue;
+    const health = mcpHealthState(server.id);
+    if (health.inFlight) continue;
+    // Recovery changes the hook's error→connected fingerprint bookkeeping. It
+    // must not force a duplicate handshake that just succeeded in this session.
+    if (health.healthyFingerprint === mcpHealthFingerprint(server) &&
+        health.lastHealthyAt > 0 && now - health.lastHealthyAt < MCP_REVERIFY_AFTER_MS) continue;
+    const retryDelay = transient ? 60_000 : MCP_REVERIFY_AFTER_MS;
+    if (!forced && health.lastAttemptAt > 0 && now - health.lastAttemptAt < retryDelay) continue;
+    const lastHealthyAt = Math.max(server.verifiedAt ?? 0, health.lastHealthyAt);
+    if (isRecoverableError || forced || lastHealthyAt === 0 || now - lastHealthyAt >= MCP_REVERIFY_AFTER_MS) {
+      void revalidateQuietly(server, setSettings);
     }
-    const problem = mcpCredentialProblem(server);
-    if (problem) {
-      problems.set(server.id, problem);
-      continue;
-    }
-    const lastHealthyAt = Math.max(
-      server.verifiedAt ?? 0,
-      mcpLastHealthyAt.get(server.id) ?? 0,
-    );
-    if (
-      isRecoverableError ||
-      forceIds.has(server.id) ||
-      lastHealthyAt === 0 ||
-      now - lastHealthyAt >= MCP_REVERIFY_AFTER_MS
-    ) {
-      candidates.push(server);
-      if (isRecoverableError) {
-        recoverableIds.add(server.id);
-      }
-    }
-  }
-  if (problems.size > 0 || recoverableIds.size > 0) {
-    setSettings((prev) => ({
-      ...prev,
-      mcpServers: prev.mcpServers.map((server) => {
-        const problem = problems.get(server.id);
-        if (problem) {
-          return {
-            ...server,
-            status: "error" as const,
-            error: problem,
-            identity: undefined,
-            verifiedAt: undefined,
-          };
-        }
-        // Repair profiles poisoned by an old shared-relay outage. A background
-        // check never moves a healthy connector through persisted "connecting".
-        return recoverableIds.has(server.id)
-          ? { ...server, status: "connected" as const, error: undefined }
-          : server;
-      }),
-    }));
-  }
-  for (const server of candidates) {
-    if (mcpRevalidationInFlight.has(server.id)) {
-      continue;
-    }
-    mcpRevalidationInFlight.add(server.id);
-    void revalidateQuietly(server, setSettings).finally(() => {
-      mcpRevalidationInFlight.delete(server.id);
-    });
   }
 }
 
@@ -2034,13 +2006,15 @@ async function revalidateQuietly(
   server: McpServerConfig,
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void,
 ): Promise<void> {
+  const check = beginMcpHealthCheck(server);
   try {
     const connection = await connectMcpServer(server);
-    mcpLastHealthyAt.set(server.id, Date.now());
+    if (!check.isCurrent()) return;
+    check.markHealthy();
     setSettings((prev) => {
       let changed = false;
       const mcpServers = prev.mcpServers.map((item) => {
-        if (item.id !== server.id) {
+        if (!check.matches(item)) {
           return item;
         }
         if (
@@ -2050,6 +2024,7 @@ async function revalidateQuietly(
           item.credentialStored === (connection.credentialStored === true) &&
           (item.promptCount ?? 0) === (connection.promptCount ?? 0) &&
           (item.resourceCount ?? 0) === (connection.resourceCount ?? 0) &&
+          JSON.stringify(item.stepUp) === JSON.stringify(connection.stepUp) &&
           sameMcpTools(item.tools, connection.tools)
         ) {
           return item;
@@ -2073,6 +2048,7 @@ async function revalidateQuietly(
       return changed ? { ...prev, mcpServers } : prev;
     });
   } catch (error) {
+    if (!check.isCurrent()) return;
     // A failed Gera refresh, relay outage, sleeping network, provider 5xx, or
     // rate limit says nothing about the saved provider credential. Keep the
     // connector armed and retry on a later health tick.
@@ -2086,7 +2062,7 @@ async function revalidateQuietly(
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((item) =>
-        item.id === server.id
+        check.matches(item)
           ? { ...item, status: "error", error: message, identity: undefined, verifiedAt: undefined }
           : item,
       ),
@@ -2098,11 +2074,13 @@ async function revalidateQuietly(
       name: server.name,
       authMode: server.authMode,
       credentialStored: server.credentialStored,
-      lastHealthyAt: mcpLastHealthyAt.get(server.id),
+      lastHealthyAt: check.state.lastHealthyAt,
     });
-    if (error instanceof McpAuthError) {
+    if (error instanceof McpAuthError && server.status !== "error") {
       toast.error(`${server.name} disconnected`, { description: message });
     }
+  } finally {
+    check.finish();
   }
 }
 
@@ -2122,6 +2100,7 @@ export async function oauthConnectMcp(
   popup: Window | null,
   setSettings: (updater: (prev: AgentSettings) => AgentSettings) => void,
 ): Promise<void> {
+  invalidateMcpHealth(server.id);
   const attempt = Symbol("mcp-oauth-attempt");
   oauthAttempts.set(server.id, attempt);
   setSettings((prev) => {

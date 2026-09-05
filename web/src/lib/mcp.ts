@@ -1,5 +1,5 @@
 import { AuthSessionChangedError, RelayAccessError, relayFetch } from "@/lib/backend";
-import { authedFetch } from "@/lib/backend";
+import { authedFetch, authedFetchForSession } from "@/lib/backend";
 import { authSessionSnapshot, getAccessToken } from "@/lib/auth-tokens";
 import { withDiagnosticContext } from "@/lib/diagnostic-context";
 import { newId } from "@/lib/env";
@@ -496,6 +496,7 @@ const MCP_CHECK_RETRY_DELAY_MS = 600;
  */
 const INFRA_CHECK_CODES: ReadonlySet<string> = new Set([
   "account_shard_unavailable",
+  "identity_unavailable",
   "upstream_unreachable",
   "mcp_check_failed",
 ]);
@@ -529,6 +530,8 @@ export function describeMcpCheckFailure(code: string, body: Pick<McpCheckBody, "
       return describeMcpStepUp(parseMcpStepUp(body.stepUp));
     case "reauth_required":
       return "The saved sign-in was rejected by the provider — press “Sign in” to authorize again.";
+    case "identity_unavailable":
+      return "Gera's account service is temporarily unavailable — your saved connections are unchanged; the check will retry automatically.";
     case "account_shard_unavailable": {
       const why =
         body.reason === "redeploy"
@@ -541,14 +544,15 @@ export function describeMcpCheckFailure(code: string, body: Pick<McpCheckBody, "
     case "upstream_unreachable":
       return "The MCP server did not answer — it may be down or unreachable.";
     case "mcp_check_failed":
-      return `The server check failed inside Gera${typeof body.detail === "string" && body.detail ? `: ${body.detail}` : "."}`;
+      return `The server check temporarily failed inside Gera${typeof body.detail === "string" && body.detail ? `: ${body.detail}` : "."} — it will retry automatically.`;
     default:
       return null;
   }
 }
 
 export async function connectMcpServer(config: McpServerConfig): Promise<McpConnection> {
-  const geraSessionKey = `${authSessionSnapshot()}:${getAccessToken() ?? "signed-out"}`;
+  const sessionNonce = authSessionSnapshot();
+  const geraSessionKey = `${sessionNonce}:${getAccessToken() ?? "signed-out"}`;
   if (rejectedGeraSessionKey === geraSessionKey) {
     throw new McpAccountAuthError();
   }
@@ -558,13 +562,13 @@ export async function connectMcpServer(config: McpServerConfig): Promise<McpConn
     body: JSON.stringify({ server: mcpCheckServerPayload(config) }),
   };
   const attempt = async (): Promise<{ response: Response; data: McpCheckBody }> => {
-    const response = await authedFetch("/mcp/check", init);
+    const response = await authedFetchForSession("/mcp/check", sessionNonce, init);
     const data = (await response.json().catch(() => ({}))) as McpCheckBody;
     return { response, data };
   };
   let attempts = 1;
   let { response, data } = await attempt();
-  if (!response.ok && response.status >= 500 && data.retryable === true) {
+  if (!response.ok && response.status >= 500 && (data.retryable === true || data.error === "identity_unavailable")) {
     // The Worker vouches this failure is safe to retry — its own call into
     // the account shard threw, typically a deploy reset mid-check. One short
     // pause absorbs it instead of flipping the card red for a blip the next

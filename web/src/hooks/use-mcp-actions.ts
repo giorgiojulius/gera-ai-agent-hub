@@ -18,6 +18,7 @@ import {
 } from "@/lib/agent-store";
 import { catalogEntryToServer, findCatalogEntry } from "@/lib/mcp-catalog";
 import { clearMcpServerSession } from "@/lib/mcp";
+import { invalidateMcpHealth } from "@/lib/mcp-health";
 import {
   clearOAuthToken,
   openOAuthPopup,
@@ -133,6 +134,9 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
     if (connectionChanged) {
       clearMcpServerSession(id);
     }
+    if (connectionChanged || patch.enabled !== undefined) {
+      invalidateMcpHealth(id);
+    }
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((item) =>
@@ -141,9 +145,10 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
               ...item,
               ...patch,
               ...(connectionChanged ? { credentialStored: false } : {}),
-              ...(oauthSettingsChanged
-                ? { status: "idle" as const, error: undefined, identity: undefined, verifiedAt: undefined, stepUp: undefined }
+              ...(connectionChanged || (patch.enabled !== undefined && item.status === "connecting")
+                ? { status: "idle" as const, error: undefined, identity: undefined, verifiedAt: undefined }
                 : {}),
+              ...(oauthSettingsChanged ? { stepUp: undefined } : {}),
             }
           : item,
       ),
@@ -239,6 +244,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
   }, [setSettings, stateRef]);
 
   const removeMcp = useCallback((id: string) => {
+    invalidateMcpHealth(id);
     const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);
     clearMcpServerSession(id);
     clearOAuthToken(id, current?.catalogId);

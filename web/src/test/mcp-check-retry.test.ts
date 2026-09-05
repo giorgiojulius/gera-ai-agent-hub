@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { shardFailureReason } from "../../../functions/chat-shared";
+import { invalidateAuthSession } from "@/lib/auth-tokens";
+import { AuthSessionChangedError } from "@/lib/backend";
 import { isRecoverableMcpHealthError } from "@/lib/agent-store";
 import { diagnosticContextOf } from "@/lib/diagnostic-context";
 import { McpAuthError, connectMcpServer, describeMcpCheckFailure } from "@/lib/mcp";
@@ -56,8 +58,11 @@ describe("describeMcpCheckFailure", () => {
       "The MCP server did not answer — it may be down or unreachable.",
     );
     expect(describeMcpCheckFailure("mcp_check_failed", { detail: "stale OAuth refresh result" })).toBe(
-      "The server check failed inside Gera: stale OAuth refresh result",
+      "The server check temporarily failed inside Gera: stale OAuth refresh result — it will retry automatically.",
     );
+    expect(isRecoverableMcpHealthError(describeMcpCheckFailure("mcp_check_failed", {}))).toBe(true);
+    expect(isRecoverableMcpHealthError(describeMcpCheckFailure("identity_unavailable", {}))).toBe(true);
+    expect(describeMcpCheckFailure("identity_unavailable", {})).toContain("saved connections are unchanged");
     expect(describeMcpCheckFailure("server_auth_missing", {})).toBeNull();
   });
 
@@ -69,6 +74,40 @@ describe("describeMcpCheckFailure", () => {
 });
 
 describe("/mcp/check when Gera's own backend fails", () => {
+  it.each([false, true])("retries an identity-registry reset with legacy/current retry metadata (%s)", async (hasFlag) => {
+    const fetchMock = vi.fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(jsonResponse({ error: "identity_unavailable", ...(hasFlag ? { retryable: true } : {}) }, 503))
+      .mockResolvedValueOnce(jsonResponse({ tools: [{ name: "list_teams" }], credentialStored: true }, 200));
+    vi.stubGlobal("fetch", fetchMock);
+    const connection = await connectMcpServer(testerArmy());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(connection.credentialStored).toBe(true);
+  });
+
+  it("never replays the old credential body after an account switch during the retry pause", async () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    });
+    const fetchMock = vi.fn(async () => {
+      setTimeout(() => invalidateAuthSession(), 0);
+      return jsonResponse({ error: "identity_unavailable", retryable: true }, 503);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const caught: unknown = await connectMcpServer({ ...testerArmy(), token: "fixture-old-account-key" }).catch((error: unknown) => error);
+    expect(caught).toBeInstanceOf(AuthSessionChangedError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reinterpret an identity conflict as a retryable outage", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ error: "principal_conflict" }, 409));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(connectMcpServer(testerArmy())).rejects.toThrow("principal_conflict");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isRecoverableMcpHealthError("principal_conflict")).toBe(false);
+  });
   it("retries once when the Worker flags the failure as retryable and returns the healthy answer", async () => {
     const fetchMock = vi
       .fn<() => Promise<Response>>()
@@ -136,6 +175,6 @@ describe("/mcp/check when Gera's own backend fails", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(caught).toBeInstanceOf(Error);
     expect(caught).not.toBeInstanceOf(McpAuthError);
-    expect((caught as Error).message).toBe("The server check failed inside Gera: stale OAuth refresh result");
+    expect((caught as Error).message).toBe("The server check temporarily failed inside Gera: stale OAuth refresh result — it will retry automatically.");
   });
 });

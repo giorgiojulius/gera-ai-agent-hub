@@ -241,6 +241,15 @@ export function mcpLoadingOptionTid(mode: string): string {
   return `mcp-loading-option-${mode}`;
 }
 
+/** Re-check/connect and enable controls on an existing MCP card. */
+export function mcpServerConnectTid(serverId: string): string {
+  return `mcp-server-connect-${serverId}`;
+}
+
+export function mcpServerEnabledTid(serverId: string): string {
+  return `mcp-server-enabled-${serverId}`;
+}
+
 /** Connected/configured MCP card in "Your tools". */
 export function mcpServerCardTid(serverId: string): string {
   return `mcp-server-${serverId}`;

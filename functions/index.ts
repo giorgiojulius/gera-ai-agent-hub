@@ -625,11 +625,11 @@ async function resolveAccountPrincipal(request: Request, env: Env): Promise<Acco
     }
   } catch (error) {
     console.error("principal registry unreachable", error instanceof Error ? error.message : "error");
-    return corsJson({ error: "identity_unavailable" }, 503);
+    return corsJson({ error: "identity_unavailable", transient: true, retryable: true }, 503);
   }
   if (!response.ok) {
     return corsJson(
-      { error: typeof raw.error === "string" ? raw.error : "identity_unavailable" },
+      { error: typeof raw.error === "string" ? raw.error : "identity_unavailable", ...(response.status >= 500 ? { transient: true, retryable: true } : {}) },
       response.status,
     );
   }
@@ -644,7 +644,7 @@ async function resolveAccountPrincipal(request: Request, env: Env): Promise<Acco
     !raw.accessEmail ||
     (raw.status !== "invited" && raw.status !== "none")
   ) {
-    return corsJson({ error: "identity_unavailable" }, 503);
+    return corsJson({ error: "identity_unavailable", transient: true, retryable: true }, 503);
   }
   const account: AccountPrincipal = {
     userId,

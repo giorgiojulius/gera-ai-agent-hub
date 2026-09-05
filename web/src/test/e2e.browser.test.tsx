@@ -62,6 +62,10 @@ const REPLY_TEXT = `${STUB_REPLY_SNIPPET} — deterministic stub for click tests
 const THREAD_TITLE = "Gera E2E Thread";
 const ROUTER_PLAN = '{"builtins":[],"mcp":[],"queries":[]}';
 let blenderCheckCount: number = 0;
+let deployRecovery: boolean = false;
+let resolveCancelledCheck: (() => void) | null = null;
+let cancelledCheckCount: number = 0;
+const recoveryChecks = new Map<string, number>();
 
 type GatewayModelStub = {
   id: string;
@@ -475,7 +479,7 @@ function hangingRunStreamResponse(signal?: AbortSignal | null): Response {
 }
 
 /** Returns a stubbed response for app backends, or null to hit the real network. */
-function handleStubbed(url: string, init?: RequestInit): Response | null {
+function handleStubbed(url: string, init?: RequestInit): Response | Promise<Response> | null {
   const toolkit = getToolkitUrl();
 
   if (url.startsWith("https://api.github.com")) {
@@ -508,6 +512,32 @@ function handleStubbed(url: string, init?: RequestInit): Response | null {
       const body = JSON.parse(String(init?.body ?? "{}")) as {
         server?: { id?: string; token?: string; url?: string; catalogId?: string; authMode?: string; headersJson?: string; credentialStored?: boolean };
       };
+      if (body.server?.id === "cancel-check") {
+        cancelledCheckCount += 1;
+        if (cancelledCheckCount === 1) {
+          return new Promise<void>((resolve) => { resolveCancelledCheck = resolve; }).then(() =>
+            new Response(JSON.stringify({ error: "auth rejected (401)" }), { status: 502, headers: { "Content-Type": "application/json" } }),
+          );
+        }
+        resolveCancelledCheck?.();
+        resolveCancelledCheck = null;
+        return jsonResponse({ tools: [{ name: "read_fixture" }], identity: "Fresh check verified", credentialStored: true });
+      }
+      if (deployRecovery && body.server?.id && ["github", "intercom", "testerarmy"].includes(body.server.id)) {
+        const id = body.server.id;
+        const count = (recoveryChecks.get(id) ?? 0) + 1;
+        recoveryChecks.set(id, count);
+        expect(body.server.credentialStored).toBe(true);
+        expect(body.server.token ?? "").toBe("");
+        expect(body.server.headersJson ?? "").toBe("");
+        if (id === "intercom" && count === 1) {
+          return new Response(JSON.stringify({ error: "identity_unavailable", retryable: true }), {
+            status: 503, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const name = id === "github" ? "GitHub" : id === "intercom" ? "Intercom" : "TesterArmy";
+        return jsonResponse({ tools: [{ name: "read_fixture" }], identity: `${name} · recovered`, credentialStored: true });
+      }
       if (body.server?.id === "blender") {
         blenderCheckCount += 1;
         // false would request vault deletion after a failed check + reload stripped local fields.
@@ -843,6 +873,11 @@ beforeEach(() => {
   lastStubRun = null;
   lastStubRunBody = null;
   blenderCheckCount = 0;
+  deployRecovery = false;
+  resolveCancelledCheck?.();
+  resolveCancelledCheck = null;
+  cancelledCheckCount = 0;
+  recoveryChecks.clear();
   hangStubRun = false;
   codeStubRun = false;
   mcpStubRun = false;
@@ -941,6 +976,22 @@ for (const scenario of E2E_SCENARIOS) {
         }),
       );
     }
+    if (scenario.id === "mcp-cancel-check") {
+      localStorage.setItem("gera.settings.v1", JSON.stringify({ mcpServers: [{
+        id: "cancel-check", name: "Held check", url: "https://example.com/mcp", headersJson: "",
+        authMode: "none", enabled: true, status: "idle", credentialStored: true, tools: [], disabledTools: [],
+      }] }));
+    }
+    if (scenario.id === "mcp-deploy-recovery") {
+      deployRecovery = true;
+      localStorage.setItem("gera.settings.v1", JSON.stringify({ mcpServers: ["github", "intercom", "testerarmy"].map((id) => ({
+        id, catalogId: id, name: id === "github" ? "GitHub" : id === "intercom" ? "Intercom" : "TesterArmy",
+        url: id === "testerarmy" ? "https://tester.army/mcp" : "https://example.com/mcp",
+        headersJson: "", enabled: true, status: "error", credentialStored: true,
+        error: id === "testerarmy" ? 'Could not connect MCP server "TesterArmy": auth rejected (401) — the synced sign-in or key was rejected' : "identity_unavailable",
+        tools: [{ name: "read_fixture" }], disabledTools: ["write_fixture"],
+      })) }));
+    }
     if (scenario.id === "oauth-step-up") {
       // A custom OAuth server signed in earlier; the shard now reports a step-up.
       localStorage.setItem(
@@ -969,6 +1020,15 @@ for (const scenario of E2E_SCENARIOS) {
     results.push(result);
     if (!result.ok) {
       expect.fail(`[${result.scenarioId}] ${result.error ?? "scenario did not finish"}`);
+    }
+    if (scenario.id === "mcp-deploy-recovery") {
+      expect(recoveryChecks.get("github")).toBe(1);
+      expect(recoveryChecks.get("intercom")).toBe(2);
+      expect(recoveryChecks.get("testerarmy")).toBe(1);
+      await expect.poll(() => {
+        const persisted = JSON.parse(localStorage.getItem("gera.settings.v1") ?? "{}");
+        return persisted.mcpServers?.filter((item: { status: string; credentialStored?: boolean }) => item.status === "connected" && item.credentialStored === true).length;
+      }).toBe(3);
     }
     if (scenario.id === "blender-mcp-setup") {
       expect(blenderCheckCount).toBe(0);

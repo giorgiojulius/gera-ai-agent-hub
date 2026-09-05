@@ -268,9 +268,11 @@ describe("honest MCP auth status", () => {
     revalidateMcpServers(settings.mcpServers, (updater) => {
       settings = updater(settings);
     });
+    // Retry eligibility is not verification: the old error clears only on success.
+    expect(settings.mcpServers[0]?.status).toBe("error");
+    await vi.waitFor(() => expect(settings.mcpServers[0]?.identity).toBe("Recovered MCP v1"));
     expect(settings.mcpServers[0]?.status).toBe("connected");
     expect(settings.mcpServers[0]?.error).toBeUndefined();
-    await vi.waitFor(() => expect(settings.mcpServers[0]?.identity).toBe("Recovered MCP v1"));
   });
 
   it("keeps every connector armed when the Gera account gate asks for sign-in", async () => {

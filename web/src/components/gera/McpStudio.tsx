@@ -31,7 +31,7 @@ import {
   type McpCategory,
 } from "@/lib/mcp-catalog";
 import { githubDeviceClientId, githubOrgAccessUrl } from "@/lib/github-device";
-import { mcpCatalogConnectTid, mcpServerCardTid, TID } from "@/lib/testids";
+import { mcpCatalogConnectTid, mcpServerCardTid, mcpServerConnectTid, mcpServerEnabledTid, TID } from "@/lib/testids";
 import type { McpAuthMode, McpServerConfig, McpToolInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -708,11 +708,12 @@ function ConnectedCard({
             {statusLabel}
           </span>
         </button>
-        <Switch checked={server.enabled} onCheckedChange={(checked) => onUpdate({ enabled: checked })} />
+        <Switch data-testid={mcpServerEnabledTid(server.id)} checked={server.enabled} onCheckedChange={(checked) => onUpdate({ enabled: checked })} />
         <Button
           size="sm"
           variant="outline"
           className="h-8 gap-1 rounded-full border-border"
+          data-testid={mcpServerConnectTid(server.id)}
           onClick={() => {
             if (showSignIn && onDeviceSignIn) {
               onDeviceSignIn();

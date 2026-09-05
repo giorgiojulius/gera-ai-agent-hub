@@ -1,6 +1,7 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-05 · commit `85fe6b4` (+ Astra and Grok together in quick choices / Fast retirement,
+Last synced: 2026-09-05 · commit `0f24731` (+ MCP deploy-error recovery / account-pinned retries and stale-check guards;
+  Astra and Grok together in quick choices / Fast retirement,
   Blender MCP secured-bridge setup; previous Phase 6 engineering, behaviour
   unchanged under the existing suites: Worker MCP/OAuth relays moved
   verbatim to `functions/mcp-relay.ts` (`/mcp/oauth/callback`, `/mcp/oauth-rotations`,
@@ -1387,6 +1388,26 @@ bodies over 2M chars refused.
   union + clearing, toolset parking in deferred and native mode, blocked-run
   records); browser: `oauth-step-up`.
 
+Deployment recovery (2026-09-05): a reset of AccessRegistry now returns
+`identity_unavailable` / 503 with `transient` + `retryable`, not a provider-auth
+verdict. `/mcp/check` retries it once, including old responses without the flag;
+both attempts use `authedFetchForSession` pinned to the original account.
+Saved `identity_unavailable` and old internal-check errors can self-heal. A
+stored generic upstream `auth rejected (401)` with `credentialStored: true`
+is rechecked against the vault on boot and at most every ten minutes; explicit
+reauth/step-up/missing-key/conflict verdicts are not auto-retried. Errors remain
+visible until a real successful check (no optimistic green). Already verified
+cards stay armed through transient manual/background failures. Account-scoped
+in-memory `mcp-health.ts` bookkeeping prevents a late check from overwriting a
+newer success, config edit, removal, disable or account switch, and suppresses
+the duplicate forced check after recovery. Cancelling an in-flight check by
+editing/disabling returns the card to idle so Connect stays usable. Unit:
+`mcp-health.test.ts`, `mcp-check-retry.test.ts`, `mcp-session.test.ts`. Browser:
+`mcp-deploy-recovery` (GitHub/Intercom stored identity errors + TesterArmy stored
+401; unchanged credentials, bounded request counts, persisted success),
+`mcp-cancel-check` (Connect → disable/enable → Connect, old failure cannot win).
+These are fixture regressions, not a live verification of this user's provider grants.
+
 Server ownership (2026-09-01): OAuth access/refresh grants, pasted API keys,
 custom headers, refresh single-flight, connection checks, protocol sessions and
 tool calls are owned by the signed-in account's ChatStore shard. `/mcp/oauth-store`
@@ -1698,6 +1719,8 @@ Scenarios in `web/e2e/scenarios.ts` (run: `cd web && bun run e2e`):
 | projects-page-opens | Projects page renders + create action behind the gate |
 | studio-pages-navigate | Tabs automations → hub → mcp → settings |
 | connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
+| mcp-deploy-recovery | Reload saved identity/401 errors → server-owned checks (Intercom retries 503) → three verified cards, credentials preserved, no duplicate checks |
+| mcp-cancel-check | Connect (held request) → disable/enable → Connect remains usable → newer verification beats old failing response |
 | blender-mcp-setup | Search Blender → Set up → local/secured-bridge guide → localhost rejected → Cancel → no request or phantom connector |
 | blender-mcp-connect | Secured bridge form → explicit stubbed `/mcp/check` → Blender identity + tools → service credentials absent from browser persistence (not a real Blender operation) |
 | connect-open-mcp-deferred | Settings → Toolkit “Always deferred” → send → `/runs/start` carries `mcpToolLoading` + `contextWindow` → `mcp_search_tools` / `mcp_call_tool` rows read “MCP · deepwiki · ask_question · done” → reply |

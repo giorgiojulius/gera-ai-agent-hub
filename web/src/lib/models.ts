@@ -56,6 +56,8 @@ export function withEffort(catalogId: string, effort?: ReasoningEffort): string 
 export const MODE_MODEL_IDS: Record<CreateMode, string[]> = {
   chat: [
     "google/gemini-3.7-flash",
+    "openai/gpt-6-astra",
+    "openai/gpt-6-astra-fast",
     "openai/gpt-5.6-sol",
     "openai/gpt-5.6-terra",
     "openai/gpt-5.6-luna",

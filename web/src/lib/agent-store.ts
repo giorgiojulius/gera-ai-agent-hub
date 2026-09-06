@@ -1117,7 +1117,7 @@ export async function sendPrompt(params: {
           // deterministic preload below, but its council Verifier still needs
           // the same credential to check repository claims independently.
           mcpServers:
-            wantJulius && githubServer ? injectGitHubRunAuth([githubServer], githubAuth) : [],
+            wantJulius ? (githubServer ? injectGitHubRunAuth([githubServer], githubAuth) : []) : scoped.mcpServers,
           ...mcpRunConfig(settings, selectionId, seeded),
           githubRepo: pinnedRepo || undefined,
           ...(wantResearch
@@ -1883,7 +1883,7 @@ export async function reconnectMcp(
   try {
     const connection = await connectMcpServer(server);
     if (!check.isCurrent()) return;
-    check.markHealthy();
+    check.markHealthy(connection.credentialStored ? { ...server, token: "", headersJson: "" } : server);
     setSettings((prev) => ({
       ...prev,
       mcpServers: prev.mcpServers.map((item) =>
@@ -1895,6 +1895,8 @@ export async function reconnectMcp(
               identity: connection.identity,
               verifiedAt: Date.now(),
               credentialStored: connection.credentialStored === true,
+              token: "",
+              headersJson: "",
               promptCount: connection.promptCount ?? 0,
               resourceCount: connection.resourceCount ?? 0,
               protocolVersion: connection.protocolVersion,
@@ -2021,7 +2023,7 @@ async function revalidateQuietly(
   try {
     const connection = await connectMcpServer(server);
     if (!check.isCurrent()) return;
-    check.markHealthy();
+    check.markHealthy(connection.credentialStored ? { ...server, token: "", headersJson: "" } : server);
     setSettings((prev) => {
       let changed = false;
       const mcpServers = prev.mcpServers.map((item) => {
@@ -2030,6 +2032,7 @@ async function revalidateQuietly(
         }
         if (
           item.status === "connected" &&
+          !item.token && !item.headersJson &&
           item.error === undefined &&
           item.identity === connection.identity &&
           item.credentialStored === (connection.credentialStored === true) &&
@@ -2049,6 +2052,8 @@ async function revalidateQuietly(
           identity: connection.identity,
           verifiedAt: Date.now(),
           credentialStored: connection.credentialStored === true,
+          token: "",
+          headersJson: "",
           promptCount: connection.promptCount ?? 0,
           resourceCount: connection.resourceCount ?? 0,
           protocolVersion: connection.protocolVersion,

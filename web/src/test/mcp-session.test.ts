@@ -7,7 +7,7 @@ import {
 } from "@/lib/agent-store";
 import { parseProfilePayload } from "@/lib/chat-sync";
 import { normalizeStoredSettings } from "@/lib/history";
-import { isSessionLostRpcMessage, isSessionLostSignal, mcpCheckServerPayload } from "@/lib/mcp";
+import { mcpCheckServerPayload } from "@/lib/mcp";
 import type { AgentSettings, McpServerConfig } from "@/lib/types";
 
 function storedServer(overrides: Partial<McpServerConfig>): McpServerConfig {
@@ -23,36 +23,6 @@ function storedServer(overrides: Partial<McpServerConfig>): McpServerConfig {
     ...overrides,
   };
 }
-
-describe("session-lost detection", () => {
-  it("replays only the spec-defined HTTP 404 session-expiry signal", () => {
-    expect(isSessionLostSignal(404, "", true)).toBe(true);
-    expect(isSessionLostSignal(400, "Mcp-Session-Id invalid or expired", true)).toBe(false);
-  });
-
-  it("never fires before a session id was issued — a 404 then means wrong URL", () => {
-    expect(isSessionLostSignal(404, "", false)).toBe(false);
-    expect(isSessionLostSignal(400, "session missing", false)).toBe(false);
-  });
-
-  it("ignores unrelated failures", () => {
-    expect(isSessionLostSignal(500, "boom", true)).toBe(false);
-    expect(isSessionLostSignal(400, "bad params", true)).toBe(false);
-    expect(isSessionLostSignal(401, "unauthorized", true)).toBe(false);
-  });
-
-  it("recognizes JSON-RPC session-expiry phrasings, and only those", () => {
-    expect(isSessionLostRpcMessage("Session not found", true)).toBe(true);
-    expect(isSessionLostRpcMessage("session expired", true)).toBe(true);
-    expect(isSessionLostRpcMessage("Invalid session ID", true)).toBe(true);
-    expect(isSessionLostRpcMessage("Session terminated by server", true)).toBe(true);
-    // Tool-level errors that merely mention a session must not trigger a replay.
-    expect(isSessionLostRpcMessage("no active browser session for tab", true)).toBe(false);
-    expect(isSessionLostRpcMessage("rate limit exceeded", true)).toBe(false);
-    // Without an issued session id there is nothing to have lost.
-    expect(isSessionLostRpcMessage("Session not found", false)).toBe(false);
-  });
-});
 
 describe("MCP connection persistence — connect once and forget", () => {
   it("keeps health-check payloads small even after a server listed huge tool schemas", () => {

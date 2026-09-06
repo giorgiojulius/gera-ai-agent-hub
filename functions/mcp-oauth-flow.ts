@@ -1,6 +1,7 @@
 import { bearerChallenge, mergeScopes, parseScopeString, type BearerChallenge } from "./mcp-auth-challenge";
 import { fetchPublicHttps, safePublicHttpsUrl } from "./network-safety";
 import type { CloudOAuthToken } from "./mcp-cloud";
+import { mcpConnect, McpAuthRejectedError } from "./mcp-protocol";
 
 /** Where the authorize `scope` came from — shown in diagnostics, asserted in tests. */
 export type OAuthScopeSource = "explicit" | "challenge" | "resource" | "authorization_server" | "none";
@@ -94,40 +95,18 @@ async function fetchJson(url: string): Promise<Record<string, unknown> | null> {
 }
 
 /**
- * Unauthenticated probe of the MCP endpoint: an `initialize` without a
- * credential should answer 401 with a Bearer challenge whose `scope` names
+ * Unauthenticated negotiation through the shared protocol core; an auth
+ * refusal returns a Bearer challenge whose `scope` names
  * what the server wants and whose `resource_metadata` points at its
  * protected-resource document (RFC 9728 §5.1). Any other answer — or no
  * answer — simply means "no hint"; discovery falls back to the metadata.
  */
 export async function probeMcpAuthChallenge(mcpUrl: string): Promise<BearerChallenge | null> {
   try {
-    const response = await fetchPublicHttps(mcpUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-11-25",
-          capabilities: {},
-          clientInfo: { name: "Gera AI", version: "1.0.0" },
-        },
-      }),
-      signal: AbortSignal.timeout(8_000),
-    });
-    // The body is never needed — release the connection.
-    await response.body?.cancel().catch(() => undefined);
-    if (response.status !== 401 && response.status !== 403) {
-      return null;
-    }
-    return bearerChallenge(response.headers.get("www-authenticate"));
-  } catch {
+    await mcpConnect({ url: mcpUrl, headers: {}, omitMcpHeaders: false, nextId: 0, signal: AbortSignal.timeout(8_000) }, { timeoutMs: 8_000, discoverTimeoutMs: 5_000 });
     return null;
+  } catch (error) {
+    return error instanceof McpAuthRejectedError ? bearerChallenge(error.wwwAuthenticate) : null;
   }
 }
 

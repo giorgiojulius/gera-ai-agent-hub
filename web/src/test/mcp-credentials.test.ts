@@ -13,6 +13,9 @@ import {
 } from "../../../functions/mcp-credentials";
 import type { McpFetch } from "../../../functions/mcp-protocol";
 import { resolveMcpToolset } from "../../../functions/mcp-toolset";
+import { mcpAccountFixture } from "./fixtures/mcp-account";
+import { mcpConfigsWithSecrets } from "../../../functions/mcp-oauth-store";
+import { sealServerSecret } from "../../../functions/secret-rows";
 
 const TOKEN = "secret-token-123";
 
@@ -62,6 +65,16 @@ function fakeServer(): { fetch: McpFetch; requests: Array<{ method: string; auth
 }
 
 describe("credential lease helpers", () => {
+  it("the common account reader decrypts sealed PAT/custom headers and refuses another account's scope", async () => {
+    const owner = "owner@example.com";
+    const { ctx, rows } = mcpAccountFixture(owner, []);
+    const payload = await sealServerSecret(ctx.vault, owner, "srv", { token: "pat-secret", headersJson: '{"X-Key":"header-secret"}' });
+    rows.set("mcp_server_secrets", [{ owner_email: owner, server_id: "srv", payload }]);
+    const configs = [{ id: "srv", token: "untrusted-profile-copy", headersJson: "" }];
+    expect(await mcpConfigsWithSecrets(ctx, owner, configs)).toEqual([{ id: "srv", token: "pat-secret", headersJson: '{"X-Key":"header-secret"}' }]);
+    expect(await mcpConfigsWithSecrets(ctx, "other@example.com", configs)).toEqual([{ id: "srv", token: "", headersJson: "" }]);
+    await expect(mcpConfigsWithSecrets({ ...ctx, subject: () => "other-account" }, owner, configs)).rejects.toThrow();
+  });
   it("strips every credential from the kept server copy and redacts the URL", () => {
     const stripped = stripCloudMcpCredentials(
       server({ oauth: { accessToken: "at", refreshToken: "rt", tokenEndpoint: "https://as/token", clientId: "c" }, token: "pat" }),

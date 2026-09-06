@@ -1,7 +1,11 @@
 // Projects contracts: handles, @mentions, and — the core promise — that an
 // agent's access level maps to exactly the right tool surface (read-only
 // GitHub literally has no write tools).
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { buildAgentToolset } from "../../../functions/agent-toolset";
+import { handleMcpResolve, handleMcpCatalogWrite } from "../../../functions/mcp-routes";
+import { createSqlMcpCatalogStore } from "../../../functions/mcp-catalog";
+import { mcpAccountFixture } from "./fixtures/mcp-account";
 
 import { normalizeCloudMcpServer } from "../../../functions/mcp-cloud";
 import {
@@ -185,6 +189,60 @@ describe("planAgentTools", () => {
 });
 
 describe("agent MCP link", () => {
+  it("twelve saved links reach owner resolve and execute; warmup persists and revoked delegation blocks further leases", async () => {
+    const owner = "admin@example.com";
+    const refs = Array.from({ length: 12 }, (_, i) => ({ id: `s${i}`, name: `S${i}` }));
+    const patch = parseMcpSelectionPatch(refs);
+    if (patch.action !== "set") throw new Error("expected valid selection");
+    const saved = JSON.stringify({ owner, servers: patch.servers });
+    let liveSelection = normalizeStoredMcpSelection(JSON.parse(saved));
+    const remoteConfigs = refs.map((ref) => ({ ...ref, url: `https://${ref.id}.fixture.dev/mcp`, enabled: true, status: "connected", authMode: "none" }));
+    const { ctx } = mcpAccountFixture(owner, remoteConfigs);
+    const requests: string[][] = [];
+    let isAdmin = true;
+    const upstream = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const frame = JSON.parse(String(init?.body)) as { id: number; method: string };
+      const result = frame.method === "initialize" ? { protocolVersion: "2025-11-25", capabilities: { tools: {} } }
+        : frame.method === "tools/list" ? { tools: [{ name: "read", description: "read", inputSchema: { type: "object", properties: {} } }] }
+        : frame.method === "tools/call" ? { content: [{ type: "text", text: "last server read" }] } : null;
+      return frame.method === "notifications/initialized" ? new Response(null, { status: 202 }) : Response.json(result ? { jsonrpc: "2.0", id: frame.id, result } : { jsonrpc: "2.0", id: frame.id, error: { code: -32601, message: "unsupported" } });
+    });
+    vi.stubGlobal("fetch", upstream);
+    const agent = { name: "Reader" };
+    const context = {
+      durable: { fetch: async (request: Request) => {
+        expect(decodeURIComponent(request.headers.get("X-Gera-Email") ?? "")).toBe(owner);
+        if (new URL(request.url).pathname === "/mcp/catalog-write") return handleMcpCatalogWrite(ctx, request, owner);
+        requests.push((await request.clone().json() as { ids: string[] }).ids);
+        return handleMcpResolve(ctx, request, owner);
+      } },
+      waitUntil: (_task: Promise<unknown>) => undefined,
+      agentAccess: () => access({ mcp: true }), currentAgent: () => agent,
+      revealAgentSecrets: async () => ({ mcpSelection: liveSelection }), secretFlags: () => flags(), canManage: () => isAdmin,
+    };
+    try {
+      const first = await buildAgentToolset(context, agent);
+      expect(requests[0]).toEqual(refs.map((ref) => ref.id));
+      expect(first.toolset?.servers).toHaveLength(12);
+      expect(upstream).not.toHaveBeenCalled();
+      await first.toolset?.execute("mcp_search_tools", { serverId: "s11", query: "read" });
+      expect(requests.slice(1).every((ids) => ids.length === 1 && ids[0] === "s11")).toBe(true);
+      expect(createSqlMcpCatalogStore(ctx.sql, owner).read("s11")?.wire?.protocolVersion).toBe("2025-11-25");
+      expect((await first.toolset?.execute("mcp_call_tool", { serverId: "s11", toolName: "read" }))?.text).toBe("last server read");
+      first.toolset?.close();
+      const warm = await buildAgentToolset(context, agent);
+      expect(warm.toolset?.servers.find((server) => server.id === "s11")?.toolCount).toBe(1);
+      await warm.toolset?.execute("mcp_search_tools", { serverId: "s11", query: "read" });
+      isAdmin = false;
+      expect((await warm.toolset?.execute("mcp_call_tool", { serverId: "s11", toolName: "read" }))?.isError).toBe(true);
+      warm.toolset?.close();
+      isAdmin = true;
+      liveSelection = normalizeStoredMcpSelection({ owner, servers: refs.slice(0, 11) });
+      const unlinked = await buildAgentToolset(context, agent);
+      expect(unlinked.toolset?.servers).toHaveLength(11);
+      unlinked.toolset?.close();
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("keeps the stored link when the patch field is absent", () => {
     expect(parseMcpSelectionPatch(undefined)).toEqual({ action: "keep" });
   });

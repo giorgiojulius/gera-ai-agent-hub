@@ -21,9 +21,6 @@ import { normalizeStoredSettings } from "@/lib/history";
 import { INTERCOM_NATIVE_TOOLS as BROWSER_INTERCOM_TOOLS } from "@/lib/intercom-native";
 import { FEATURED_MCP_IDS, MCP_CATALOG, findCatalogEntry } from "@/lib/mcp-catalog";
 import {
-  callMcpTool,
-  clearMcpSessionCache,
-  connectMcpServerLegacy,
   mcpFunctionName,
 } from "@/lib/mcp";
 import { safeOAuthEndpoint } from "@/lib/mcp-oauth";
@@ -202,7 +199,6 @@ describe("MCP OAuth boundaries", () => {
   });
 
   afterEach(() => {
-    clearMcpSessionCache();
     vi.unstubAllGlobals();
   });
 
@@ -349,46 +345,7 @@ describe("browser/cloud MCP auth parity", () => {
 
 describe("MCP protocol compatibility", () => {
   afterEach(() => {
-    clearMcpSessionCache();
     vi.unstubAllGlobals();
-  });
-
-  it("paginates tools and uses the server-negotiated protocol in the browser", async () => {
-    const seen: Array<{ method: string; protocol: string | null; session: string | null }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const body = requestBody(init);
-        const headers = new Headers(init?.headers);
-        seen.push({
-          method: body.method ?? "",
-          protocol: headers.get("MCP-Protocol-Version"),
-          session: headers.get("Mcp-Session-Id"),
-        });
-        if (body.method === "initialize") {
-          return rpcJson(body.id, {
-            protocolVersion: "2025-03-26",
-            serverInfo: { name: "Paged", version: "1" },
-          }, { "Mcp-Session-Id": "session-1" });
-        }
-        if (body.method === "notifications/initialized") {
-          return new Response(null, { status: 202 });
-        }
-        if (body.method === "tools/list" && body.params?.cursor === "next") {
-          return rpcJson(body.id, { tools: [{ name: "second" }] });
-        }
-        if (body.method === "tools/list") {
-          return rpcJson(body.id, { tools: [{ name: "first" }], nextCursor: "next" });
-        }
-        throw new Error(`unexpected ${body.method}`);
-      }),
-    );
-    const connection = await connectMcpServerLegacy(config({ id: "paged-browser", authMode: "none" }));
-    expect(connection.tools.map((tool) => tool.name)).toEqual(["first", "second"]);
-    expect(seen.find((item) => item.method === "tools/list")).toMatchObject({
-      protocol: "2025-03-26",
-      session: "session-1",
-    });
   });
 
   // Cloud pagination, version negotiation, the MCP-Protocol-Version header,
@@ -449,9 +406,9 @@ describe("MCP protocol compatibility", () => {
         throw new Error(`unexpected ${body.method}`);
       }),
     );
-    const server = config({ id: "no-rpc-replay", authMode: "none" });
-    await connectMcpServerLegacy(server);
-    await expect(callMcpTool(server, "mutate", {})).rejects.toThrow(/Session expired/);
+    const server = cloudMcpServersForAutomation([config({ id: "no-rpc-replay", authMode: "none" })], null)[0];
+    const connection = await connectCloudMcp(server, { wireHint: { era: "legacy", protocolVersion: "2025-06-18" } });
+    await expect(callCloudMcpTool(connection.session, "mutate", {})).rejects.toThrow(/Session expired/);
     expect({ initializeCalls, toolCalls }).toEqual({ initializeCalls: 1, toolCalls: 1 });
   });
 

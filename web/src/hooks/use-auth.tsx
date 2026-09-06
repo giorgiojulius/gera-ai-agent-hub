@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { clearLocalAccountState } from "@/lib/history";
-import { clearMcpSessionCache } from "@/lib/mcp";
+import { invalidateConnectorCaches } from "@/lib/connector-cache-scope";
 import { invalidateOAuthOperations } from "@/lib/mcp-oauth";
 import {
   ACCESS_TOKEN_KEY,
@@ -144,7 +144,7 @@ function bindLocalStateToAccount(nextUser: AuthUser): void {
   if (previousOwner && previousOwner !== nextUser.id) {
     invalidateAuthSession();
     invalidateOAuthOperations();
-    clearMcpSessionCache();
+    invalidateConnectorCaches();
     clearLocalAccountState();
   }
   localStorage.setItem(ACCOUNT_OWNER_KEY, nextUser.id);
@@ -187,7 +187,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // are account-scoped. Nothing from this identity may survive into the next.
     invalidateAuthSession();
     invalidateOAuthOperations();
-    clearMcpSessionCache();
+    invalidateConnectorCaches();
     clearLocalAccountState();
     localStorage.removeItem(ACCOUNT_OWNER_KEY);
     clearTokens();
@@ -271,7 +271,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const onStorage = (event: StorageEvent): void => {
       if (event.key === AUTH_SESSION_NONCE_KEY) {
         invalidateOAuthOperations();
-        clearMcpSessionCache();
+        invalidateConnectorCaches();
       }
       if (event.key === ACCESS_TOKEN_KEY) {
         setUser(event.newValue ? userFromToken(event.newValue) : null);
@@ -337,7 +337,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearAuthFlowIfCurrent(attemptId);
     invalidateAuthSession();
     invalidateOAuthOperations();
-    clearMcpSessionCache();
+    invalidateConnectorCaches();
     if (previousOwner !== nextUser.id) {
       clearLocalAccountState();
     }

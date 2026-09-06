@@ -29,6 +29,7 @@ import {
 import { composerMcpItemTid, mcpArgsFieldTid, TID } from "@/lib/testids";
 import type { McpServerConfig } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { connectorCacheKey, subscribeConnectorCaches } from "@/lib/connector-cache-scope";
 
 export type ComposerMcpItem =
   | { kind: "prompt"; server: McpServerConfig; prompt: McpPromptInfo; key: string; label: string; hint: string }
@@ -85,6 +86,7 @@ export function useComposerMcpMenu(params: {
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [highlight, setHighlight] = useState<number>(0);
   const [inventories, setInventories] = useState<Record<string, InventoryState>>({});
+  useEffect(() => subscribeConnectorCaches(() => setInventories({})), []);
 
   const trigger = useMemo(() => (enabled ? detectComposerMenuTrigger(input, caret) : null), [enabled, input, caret]);
   const eligible = useMemo(
@@ -102,15 +104,11 @@ export function useComposerMcpMenu(params: {
       if (inventories[server.id]) {
         continue;
       }
+      const scope = connectorCacheKey(server.id);
       setInventories((prev) => ({ ...prev, [server.id]: { status: "loading" } }));
       fetchMcpInventory(server.id)
-        .then((value) => setInventories((prev) => ({ ...prev, [server.id]: { status: "ready", value } })))
-        .catch((error: unknown) =>
-          setInventories((prev) => ({
-            ...prev,
-            [server.id]: { status: "error", message: error instanceof Error ? error.message : "Could not list this server" },
-          })),
-        );
+        .then((value) => { if (scope === connectorCacheKey(server.id)) setInventories((prev) => ({ ...prev, [server.id]: { status: "ready", value } })); })
+        .catch((error: unknown) => { if (scope === connectorCacheKey(server.id)) setInventories((prev) => ({ ...prev, [server.id]: { status: "error", message: error instanceof Error ? error.message : "Could not list this server" } })); });
     }
   }, [open, eligible, inventories]);
 

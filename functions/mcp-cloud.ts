@@ -951,6 +951,10 @@ const MAX_INVENTORY_RESOURCES = 300;
 const MAX_INVENTORY_TEMPLATES = 100;
 
 export type ConnectCloudMcpOptions = {
+  /** Request-scoped modern logging; omitted by default. */
+  logLevel?: import("./mcp-protocol-shared").McpLogLevel;
+  /** Run/connection deadline, including credential acquisition and all catalog pages. */
+  signal?: AbortSignal;
   /** Stop listing after this many tools (default 500). */
   maxTools?: number;
   /** Keep tools the user disabled — catalog caches store the full remote table. */
@@ -1092,6 +1096,8 @@ export async function connectCloudMcp(
     protocolVersion: MCP_DEFAULT_PROTOCOL_VERSION,
     nextId: 0,
     redactions: options.lease ? [] : serverCredentialValues(server),
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.logLevel ? { logLevel: options.logLevel } : {}),
     ...(options.lease ? { lease: options.lease } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
     ...(options.onServerRequest ? { onServerRequest: options.onServerRequest } : {}),

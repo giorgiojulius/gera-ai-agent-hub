@@ -761,6 +761,11 @@ export async function runServerDeepResearch(
             const toolName = typeof args.toolName === "string" ? args.toolName : "?";
             const step = addStep("read", toolName.slice(0, 90), `MCP · ${serverName(serverId)}`);
             const outcome = await toolset.execute(name, args);
+            if (outcome.executed === false) {
+              calls -= 1;
+              finishStep(step, "done", "Schema loaded — tool not executed; no source added");
+              return outcome;
+            }
             if (outcome.isError || outcome.text.trim().length === 0) {
               finishStep(step, "error", outcome.isError ? outcome.text.slice(0, 120) : "empty result");
               return outcome;

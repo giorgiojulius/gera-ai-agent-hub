@@ -101,6 +101,8 @@ function parseOAuthScopes(header: string | null): string[] | null {
 export async function fetchGitHubViewer(authorization: string): Promise<GitHubViewer> {
   const response = await fetch(`${GITHUB_API}/user`, {
     headers: githubRequestHeaders(authorization),
+    signal: AbortSignal.timeout(15_000),
+    redirect: "error",
   });
   if (!response.ok) {
     throw githubApiError(response, await githubErrorMessage(response));

@@ -1,4 +1,5 @@
-import { authedFetch, relayFetch } from "@/lib/backend";
+import { githubTransportFetch, accountAuthServerId, githubAccountReference, githubWireReference } from "@/lib/github-transport";
+export { githubTransportFetch, accountAuthServerId, GERA_ACCOUNT_AUTH_PREFIX } from "@/lib/github-transport";
 import { GitHubAuthError, fetchGitHubViewer, githubIdentityLabel } from "@/lib/github-device";
 import type { McpServerConfig, McpToolInfo } from "@/lib/types";
 
@@ -11,43 +12,12 @@ import type { McpServerConfig, McpToolInfo } from "@/lib/types";
  * Credentials: the sign-in (device flow) lives only in the account vault. The
  * browser addresses it through the `gera-account:<serverId>` sentinel, which
  * routes every request through the authenticated /github-proxy where the
- * Worker leases the real token per request. Only a PAT the user has just
- * pasted — and not yet checked into the vault — travels from the browser.
+ * Worker leases the real token per request. PATs are submitted only to
+ * explicit server save/check routes, never to provider REST operations.
  */
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
-export const GERA_ACCOUNT_AUTH_PREFIX = "gera-account:";
-
-/** The server id behind a `gera-account:` sentinel, or null for a raw Authorization value. */
-export function accountAuthServerId(auth: string): string | null {
-  return auth.startsWith(GERA_ACCOUNT_AUTH_PREFIX)
-    ? auth.slice(GERA_ACCOUNT_AUTH_PREFIX.length) || "github"
-    : null;
-}
-
-/**
- * One GitHub REST request: a vault sentinel rides the authenticated
- * /github-proxy (the Worker attaches the leased token), anything else is a
- * raw Authorization value sent straight to api.github.com (CORS `*`).
- */
-export async function githubTransportFetch(auth: string, url: URL, init: RequestInit): Promise<Response> {
-  const serverId = accountAuthServerId(auth);
-  if (!serverId) {
-    return fetch(url.toString(), init);
-  }
-  const path = `${url.pathname}${url.search}`;
-  const headers = new Headers(init.headers);
-  const accept = headers.get("Accept") ?? "application/vnd.github+json";
-  headers.delete("Authorization");
-  headers.delete("X-GitHub-Api-Version");
-  headers.set("X-Gera-GitHub-Accept", accept);
-  // authedFetch merges headers as a plain object — a Headers instance would spread to nothing.
-  return authedFetch(
-    `/github-proxy?serverId=${encodeURIComponent(serverId)}&path=${encodeURIComponent(path)}`,
-    { ...init, headers: Object.fromEntries(headers.entries()) },
-  );
-}
 
 /** Max characters of file content returned to the agent per read. */
 const MAX_FILE_CHARS = 12_000;
@@ -135,18 +105,16 @@ function stripAnsi(text: string): string {
  * account vault wins whenever the card proves it holds a credential
  * (`credentialStored`, or a verified green status): the sentinel is probed
  * once through /github-proxy so callers get a clean sign-in error instead of
- * a 401 mid-way. A PAT that was pasted but not yet checked in is the only
- * raw value the browser ever sends. Throws a user-actionable error when
- * neither exists.
+ * a 401 mid-way. Raw PATs never serve as a fallback; they must be explicitly
+ * saved/checked first. The returned reference is pinned to this account session.
  */
 export async function resolveGitHubAuth(
   config: Pick<McpServerConfig, "id" | "catalogId" | "token"> &
     Partial<Pick<McpServerConfig, "credentialStored" | "status">>,
 ): Promise<string> {
-  const pasted = config.token?.trim();
   if (config.credentialStored === true || config.status === "connected") {
     const serverId = config.id || config.catalogId || "github";
-    const sentinel = `${GERA_ACCOUNT_AUTH_PREFIX}${serverId}`;
+    const sentinel = githubAccountReference(serverId);
     const probe = await githubTransportFetch(sentinel, new URL(`${GITHUB_API}/user`), {
       headers: { Accept: "application/vnd.github+json" },
     });
@@ -154,17 +122,9 @@ export async function resolveGitHubAuth(
       return sentinel;
     }
     if (probe.status === 401) {
-      if (pasted) {
-        // The vault row is gone but the key is still on the card: check it in
-        // again with Connect; meanwhile the pasted value still works.
-        return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
-      }
       throw new GitHubAuthError('GitHub needs a fresh sign-in — press "Sign in with GitHub" again.');
     }
     throw new Error(`Could not verify the server-owned GitHub sign-in (HTTP ${probe.status}).`);
-  }
-  if (pasted) {
-    return pasted.toLowerCase().startsWith("bearer ") ? pasted : `Bearer ${pasted}`;
   }
   throw new GitHubAuthError('GitHub needs a sign-in — press "Sign in with GitHub", or paste a PAT.');
 }
@@ -172,28 +132,25 @@ export async function resolveGitHubAuth(
 /**
  * Returns the run's copy of the MCP server list with the resolved GitHub
  * credential reference injected into the GitHub connector entry (as `token`).
- * With vault-owned sign-ins this is the `gera-account:` sentinel, which the
- * server treats as "lease from the vault" (never as a credential); only a
- * PAT that is pasted but not yet checked in rides as a raw value. Without
- * the hand-off a cloud run could silently lose GitHub tools while the
- * composer's repo picker keeps working. A pasted PAT already in `token`
- * stays untouched; the input array and its entries are never mutated.
+ * The run payload already carries ids only. Keep an eligible GitHub row,
+ * clear legacy provider material, and filter it out when sign-in is missing.
+ * The input array and its entries are never mutated.
  */
 export function injectGitHubRunAuth(
   servers: McpServerConfig[],
   auth: string | undefined,
 ): McpServerConfig[] {
-  if (!auth) {
+  if (!auth || !accountAuthServerId(auth)) {
     const filtered = servers.filter((server) => (server.catalogId ?? server.id) !== "github");
     return filtered.length === servers.length ? servers : filtered;
   }
   let changed = false;
   const next = servers.map((server) => {
-    if ((server.catalogId ?? server.id) !== "github" || server.token?.trim()) {
+    if ((server.catalogId ?? server.id) !== "github") {
       return server;
     }
     changed = true;
-    return { ...server, token: auth };
+    return { ...server, token: "", headersJson: "", credentialStored: true };
   });
   return changed ? next : servers;
 }
@@ -537,7 +494,9 @@ async function ghFetch(
   }
 
   if (response.ok) {
-    return (await response.json()) as unknown;
+    const data = await response.json() as unknown;
+    githubWireReference(auth);
+    return data;
   }
 
   let message = "";
@@ -1347,9 +1306,7 @@ async function fetchJobLogText(auth: string, owner: string, repo: string, jobId:
   };
   let response: Response;
   try {
-    response = accountAuthServerId(auth)
-      ? await githubTransportFetch(auth, new URL(target), { headers })
-      : await relayFetch("/mcp-proxy", target, { headers });
+    response = await githubTransportFetch(auth, new URL(target), { headers });
   } catch {
     throw new Error("Could not reach GitHub logs through the relay.");
   }

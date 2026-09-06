@@ -62,10 +62,10 @@ export function beginMcpHealthCheck(server: McpServerConfig) {
   return {
     state,
     isCurrent,
-    markHealthy(): void {
+    markHealthy(verified: McpServerConfig = server): void {
       if (isCurrent()) {
         state.lastHealthyAt = Date.now();
-        state.healthyFingerprint = mcpHealthFingerprint(server);
+        state.healthyFingerprint = mcpHealthFingerprint(verified);
       }
     },
     matches(item: McpServerConfig): boolean {

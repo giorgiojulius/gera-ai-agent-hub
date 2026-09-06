@@ -22,6 +22,7 @@ import {
 } from "@/lib/chat-sync";
 import { normalizeStoredSettings, saveActiveId, saveConversations } from "@/lib/history";
 import { normalizeLife } from "@/lib/life";
+import { migrateBrowserGrantsToVault } from "@/lib/mcp-credential-migration";
 
 type CloudSyncArgs = {
   state: AgentState;
@@ -122,7 +123,7 @@ export function useCloudSync(args: CloudSyncArgs): {
         if (parsed) {
           // Grants never ride in the profile anymore: the vault is their only
           // home and `credentialStored` on each card is the non-secret proof.
-          const nextSettings = normalizeStoredSettings(parsed.settings);
+          const nextSettings = migrateBrowserGrantsToVault(normalizeStoredSettings(parsed.settings)).settings;
           const nextLife = normalizeLife(parsed.life);
           applyingProfileRef.current = true;
           setState((prev) => ({ ...prev, settings: nextSettings, life: nextLife }));

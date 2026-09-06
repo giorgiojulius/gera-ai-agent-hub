@@ -8,6 +8,7 @@
 // because github.com's OAuth endpoints send no CORS headers; the relay
 // forwards them verbatim and never stores tokens.
 import { authedFetch } from "@/lib/backend";
+import { invalidateConnectorCaches } from "@/lib/connector-cache-scope";
 import { withDiagnosticContext } from "@/lib/diagnostic-context";
 import {
   beginOAuthGrantFlow,
@@ -15,13 +16,8 @@ import {
   type OAuthGrantFlow,
 } from "@/lib/mcp-oauth";
 
-/** A credential is absent or definitively rejected; only a fresh sign-in/key can repair it. */
-export class GitHubAuthError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "GitHubAuthError";
-  }
-}
+import { GitHubAuthError, githubTransportFetch, accountAuthServerId, githubWireReference } from "@/lib/github-transport";
+export { GitHubAuthError } from "@/lib/github-transport";
 
 /** The workspace's GitHub OAuth app client ID, or null when not configured. */
 export function githubDeviceClientId(): string | null {
@@ -88,28 +84,10 @@ export function githubOrgAccessUrl(): string | null {
   return clientId ? `https://github.com/settings/connections/applications/${clientId}` : null;
 }
 
-/**
- * Asks api.github.com who the token belongs to and which scopes it carries.
- * GitHub's REST API sends CORS headers (Access-Control-Allow-Origin: * with
- * X-OAuth-Scopes in the expose list — verified live), so this runs directly
- * in the browser and the token never leaves it.
- */
+/** Reads viewer identity/scopes through Gera's account proxy without browser provider tokens. */
 export async function fetchGitHubViewer(authorization: string): Promise<GitHubViewer> {
-  const accountPrefix = "gera-account:";
-  const serverId = authorization.startsWith(accountPrefix)
-    ? authorization.slice(accountPrefix.length) || "github"
-    : null;
-  const response = serverId
-    ? await authedFetch(
-        `/github-proxy?serverId=${encodeURIComponent(serverId)}&path=${encodeURIComponent("/user")}`,
-        { headers: { "X-Gera-GitHub-Accept": "application/vnd.github+json" } },
-      )
-    : await fetch("https://api.github.com/user", {
-        headers: {
-          Authorization: authorization,
-          Accept: "application/vnd.github+json",
-        },
-      });
+  const serverId = accountAuthServerId(authorization);
+  const response = await githubTransportFetch(authorization, new URL("https://api.github.com/user"), { headers: { Accept: "application/vnd.github+json" } });
   if (!response.ok) {
     // GitHub's own words ("Bad credentials", "Request forbidden by administrative
     // rules…", rate-limit notices) or the relay's code — the journal needs the
@@ -148,6 +126,7 @@ export async function fetchGitHubViewer(authorization: string): Promise<GitHubVi
     );
   }
   const data = (await response.json()) as { login?: unknown; name?: unknown };
+  githubWireReference(authorization);
   const login = typeof data.login === "string" ? data.login : "";
   if (!login) {
     throw new Error("GitHub returned no account for this token.");
@@ -244,6 +223,7 @@ export async function pollGitHubDeviceToken(
         return false;
       }
       if (data.status === "completed") {
+        invalidateConnectorCaches();
         return true;
       }
       if (data.status === "pending") {

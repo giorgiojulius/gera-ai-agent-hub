@@ -56,10 +56,11 @@ const TOOLS: CloudMcpTool[] = [
  * request; `strict` enforces the spec's required headers and `_meta` keys and
  * answers protocol faults with the spec's error codes on 400/404.
  */
-function modernServer(options: { rejectFirstDiscover?: boolean; listenEvents?: string[] } = {}) {
+function modernServer(options: { rejectFirstDiscover?: boolean; listenEvents?: string[]; manualListen?: boolean } = {}) {
   const url = "https://modern.gera-fixture.dev/mcp";
   const requests: Recorded[] = [];
   let discovers = 0;
+  let notifyListChanged: () => void = () => undefined;
   const fetch: McpFetch = async (target, init) => {
     if (target !== url) {
       return new Response("not found", { status: 404 });
@@ -161,6 +162,12 @@ function modernServer(options: { rejectFirstDiscover?: boolean; listenEvents?: s
       return rpcError(body.id, -32602, `unknown tool ${name}`, 400);
     }
     if (body.method === "subscriptions/listen") {
+      if (options.manualListen) {
+        const encoder = new TextEncoder();
+        return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+          notifyListChanged = () => controller.enqueue(encoder.encode(`data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed", params: { _meta: { [MCP_META_SUBSCRIPTION_ID]: body.id } } })}\n\n`));
+        }, cancel() { notifyListChanged = () => undefined; } }), { headers: { "Content-Type": "text/event-stream" } });
+      }
       const events = [
         { jsonrpc: "2.0", method: "notifications/subscriptions/acknowledged", params: { _meta: { [MCP_META_SUBSCRIPTION_ID]: body.id }, notifications: body.params?.notifications } },
         ...(options.listenEvents ?? ["notifications/tools/list_changed"]).map((method) => ({
@@ -176,7 +183,7 @@ function modernServer(options: { rejectFirstDiscover?: boolean; listenEvents?: s
     // Legacy methods do not exist on this wire.
     return rpcError(body.id, -32601, "Method not found", 404);
   };
-  return { url, requests, fetch, discovers: () => discovers };
+  return { url, requests, fetch, discovers: () => discovers, notifyListChanged: () => notifyListChanged() };
 }
 
 /** A legacy (initialize / session) server behind the same injected fetch. */
@@ -325,7 +332,7 @@ describe("MCP 2026-07-28 · stateless wire", () => {
   });
 
   it("subscriptions/listen replaces the GET stream and its list_changed invalidates the catalog", async () => {
-    const server = modernServer();
+    const server = modernServer({ manualListen: true });
     const catalog = createMemoryMcpCatalogStore();
     const toolset = await resolveMcpToolset({
       servers: [cloud("modern", server.url)],
@@ -333,6 +340,8 @@ describe("MCP 2026-07-28 · stateless wire", () => {
       fetch: server.fetch,
       catalog,
     });
+    expect(server.requests).toHaveLength(0);
+    await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "deploy", serverId: "modern" });
     // The stream is consumed asynchronously; give the fixture's SSE body a tick.
     await new Promise((resolve) => setTimeout(resolve, 20));
     const listen = server.requests.find((request) => request.method === "subscriptions/listen");
@@ -342,11 +351,12 @@ describe("MCP 2026-07-28 · stateless wire", () => {
     expect(listen?.body.params?._meta).toMatchObject({ [MCP_META_PROTOCOL_VERSION]: MCP_MODERN_PROTOCOL_VERSION });
     // No legacy GET stream was ever opened (the fixture answers GET with 405 and records nothing).
     expect(server.requests.every((request) => request.method !== "")).toBe(true);
-    // The fixture's list_changed arrived on the listen stream: the account cache is dropped …
-    expect(catalog.read("modern")).toBeNull();
+    server.notifyListChanged();
+    // The notification invalidates the cache without a background catalog fetch.
+    await expect.poll(() => catalog.read("modern")).toBeNull();
     // … and the next search re-lists before ranking.
     const before = server.requests.filter((request) => request.method === "tools/list").length;
-    const found = JSON.parse((await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "deploy" })).text) as { matches: Array<{ toolName: string }> };
+    const found = JSON.parse((await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "deploy", serverId: "modern" })).text) as { matches: Array<{ toolName: string }> };
     expect(found.matches[0]?.toolName).toBe("deploy");
     expect(server.requests.filter((request) => request.method === "tools/list").length).toBe(before + 1);
     expect(catalog.read("modern")?.tools).toHaveLength(3);

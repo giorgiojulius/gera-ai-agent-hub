@@ -17,7 +17,7 @@ import {
   type AgentState,
 } from "@/lib/agent-store";
 import { catalogEntryToServer, findCatalogEntry } from "@/lib/mcp-catalog";
-import { clearMcpServerSession } from "@/lib/mcp";
+import { invalidateConnectorCaches } from "@/lib/connector-cache-scope";
 import { invalidateMcpHealth } from "@/lib/mcp-health";
 import {
   clearOAuthToken,
@@ -132,7 +132,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
       clearOAuthToken(id, current?.catalogId);
     }
     if (connectionChanged) {
-      clearMcpServerSession(id);
+      invalidateConnectorCaches(id);
     }
     if (connectionChanged || patch.enabled !== undefined) {
       invalidateMcpHealth(id);
@@ -246,7 +246,7 @@ export function useMcpActions({ stateRef, servers, canValidate, setSettings }: M
   const removeMcp = useCallback((id: string) => {
     invalidateMcpHealth(id);
     const current = stateRef.current.settings.mcpServers.find((server) => server.id === id);
-    clearMcpServerSession(id);
+    invalidateConnectorCaches(id);
     clearOAuthToken(id, current?.catalogId);
     setSettings((prev) => ({ ...prev, mcpServers: prev.mcpServers.filter((item) => item.id !== id) }));
   }, [setSettings, stateRef]);

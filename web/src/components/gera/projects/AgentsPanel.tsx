@@ -32,7 +32,9 @@ import {
   Wand2,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
+import { githubAccountReference } from "@/lib/github-transport";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
 
@@ -75,6 +77,7 @@ import {
   slackEventsUrl,
   saveProjectSlackConfig,
   upsertProjectAgent,
+  validateProjectGitHubToken,
   type AgentMcpServer,
   type AgentMcpWrites,
   type AgentUpsertPayload,
@@ -315,6 +318,11 @@ export function AgentsPanel({
   const [saving, setSaving] = useState<boolean>(false);
   const [githubSignInOpen, setGithubSignInOpen] = useState<boolean>(false);
   const [githubCheck, setGithubCheck] = useState<GithubCheck>({ state: "idle" });
+  const githubOperation = useRef<number>(0);
+  const draftRef = useRef<Draft | null>(draft);
+  draftRef.current = draft;
+  useEffect(() => { if (!draft) { githubOperation.current += 1; setGithubCheck({ state: "idle" }); } }, [draft === null]);
+  useEffect(() => () => { githubOperation.current += 1; }, []);
   const [githubPasteOpen, setGithubPasteOpen] = useState<boolean>(false);
   const [slackConfigToken, setSlackConfigToken] = useState<string>("");
   const [slackCreating, setSlackCreating] = useState<boolean>(false);
@@ -326,6 +334,7 @@ export function AgentsPanel({
 
   /** Opens the editor with fresh per-dialog credential state. */
   const openEditor = (agent: ProjectAgent | null) => {
+    githubOperation.current += 1;
     setDraft(draftFrom(agent));
     setGithubCheck({ state: "idle" });
     setGithubPasteOpen(false);
@@ -347,19 +356,24 @@ export function AgentsPanel({
     }
   };
 
-  /** Asks api.github.com who the token belongs to — runs in the browser, token never leaves it. */
+  /** The draft PAT is sent only to this project's server-side validation route. */
   const verifyGithub = (token: string) => {
     const normalized = normalizeGithubToken(token);
     if (!normalized) {
       setGithubCheck({ state: "bad", token: "", error: "Paste a GitHub token first." });
       return;
     }
+    const operation = ++githubOperation.current;
+    const session = authSessionSnapshot();
+    const current = () => githubOperation.current === operation && isAuthSessionCurrent(session) && normalizeGithubToken(draftRef.current?.githubToken.value ?? "") === normalized;
     setGithubCheck({ state: "checking", token: normalized });
     void (async () => {
       try {
-        const viewer = await fetchGitHubViewer(`Bearer ${normalized}`);
+        const viewer = await validateProjectGitHubToken(projectId, normalized);
+        if (!current()) return;
         setGithubCheck({ state: "ok", token: normalized, viewer });
       } catch (error) {
+        if (!current()) return;
         setGithubCheck({
           state: "bad",
           token: normalized,
@@ -392,13 +406,18 @@ export function AgentsPanel({
           }
         : prev,
     );
+    const operation = ++githubOperation.current;
+    const session = authSessionSnapshot();
+    const current = () => githubOperation.current === operation && isAuthSessionCurrent(session) && Boolean(draftRef.current);
     setGithubCheck({ state: "checking", token: "gera-account:github" });
-    void fetchGitHubViewer("gera-account:github")
+    void fetchGitHubViewer(githubAccountReference("github"))
       .then((viewer) => {
+        if (!current()) return;
         setGithubCheck({ state: "ok", token: "gera-account:github", viewer });
         toast.success("GitHub connected through your account — no token was copied.");
       })
       .catch((error) => {
+        if (!current()) return;
         setGithubCheck({
           state: "bad",
           token: "gera-account:github",
@@ -577,6 +596,10 @@ export function AgentsPanel({
       toast.error("Verify this GitHub credential before saving the agent");
       return;
     }
+    if (draft.githubFromAccount && !(githubCheck.state === "ok" && githubCheck.token === "gera-account:github")) {
+      toast.error("Wait for the server to verify your GitHub account before saving");
+      return;
+    }
     setSaving(true);
     try {
       const payload: AgentUpsertPayload = {
@@ -606,6 +629,9 @@ export function AgentsPanel({
         },
       };
       const saved = await upsertProjectAgent(projectId, payload);
+      githubOperation.current += 1;
+      setGithubCheck({ state: "idle" });
+      setDraft((prev) => prev ? { ...prev, githubToken: { value: "", clear: false } } : null);
       await queryClient.invalidateQueries({ queryKey: ["project", projectId] });
       if (options?.stay) {
         setDraft(draftFrom(saved));
@@ -642,7 +668,7 @@ export function AgentsPanel({
 
   // Check result only counts while it matches the token currently in the draft.
   const ghCheck =
-    draft && githubCheck.state !== "idle" && githubCheck.token === draft.githubToken.value
+    draft && githubCheck.state !== "idle" && githubCheck.token === (draft.githubFromAccount ? "gera-account:github" : draft.githubToken.value)
       ? githubCheck
       : null;
 
@@ -696,6 +722,7 @@ export function AgentsPanel({
             <button
               key={agent.id}
               type="button"
+              data-testid={TID.projectAgentEdit}
               onClick={() => (canManage ? openEditor(agent) : setViewing(agent))}
               className="gera-card group rounded-3xl p-4 text-left transition-all hover:-translate-y-0.5 hover:border-ember/50"
             >
@@ -1855,7 +1882,7 @@ function McpServerPicker({
           </div>
         </div>
       ) : null}
-      <p className="text-[11px] leading-relaxed text-muted-foreground">
+      <p data-testid={TID.agentMcpLinkCount} className="text-[11px] leading-relaxed text-muted-foreground">
         {selection.length} linked. Runs resolve these through your account —
         keys and sign-ins stay there (synced and refreshed like cloud automations) and never reach
         members. Missing a server? Add it on the{" "}

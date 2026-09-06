@@ -417,8 +417,9 @@ describe("MCP conformance against @modelcontextprotocol/sdk", () => {
       },
     });
     try {
+      expect(toolset.servers[0].toolCount).toBe(-1);
+      const search = await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "", serverId: "conf" });
       expect(toolset.servers[0].toolCount).toBe(4); // dashboard is UI-only → invisible
-      const search = await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "" });
       expect(search.text).not.toContain("dashboard");
       const refused = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "conf", toolName: "dashboard", arguments: {} });
       expect(refused.isError).toBe(true);
@@ -453,7 +454,7 @@ describe("MCP conformance against @modelcontextprotocol/sdk", () => {
       notificationStreams: false,
     });
     try {
-      await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "ask" });
+      await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "ask", serverId: "conf" });
       const outcome = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "conf", toolName: "ask", arguments: {} });
       expect(JSON.parse(outcome.text)).toEqual({ action: "decline" });
       expect(toolset.journal.map((entry) => entry.kind)).toEqual(["elicitation_declined"]);
@@ -472,7 +473,7 @@ describe("MCP conformance against @modelcontextprotocol/sdk", () => {
       catalog,
     });
     try {
-      const first = await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "later" });
+      const first = await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "later", serverId: "live" });
       expect(first.text).not.toContain('"toolName": "later"');
       expect(catalog.read("live")).not.toBeNull();
       // Wait for the standalone GET stream to be registered on the server side.
@@ -486,7 +487,7 @@ describe("MCP conformance against @modelcontextprotocol/sdk", () => {
       });
       await harness.sessions.get(sessionId)!.sendToolListChanged();
       await expect.poll(() => catalog.read("live") === null, { timeout: 3_000 }).toBe(true);
-      const second = await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "later" });
+      const second = await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "later", serverId: "live" });
       expect(second.text).toContain('"toolName": "later"');
       const call = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "live", toolName: "later", arguments: {} });
       expect(call.text).toBe("added after list_changed");

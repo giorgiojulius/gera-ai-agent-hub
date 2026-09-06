@@ -27,6 +27,7 @@ import {
   buildAgentToolset,
 } from "./agent-toolset";
 import { asNum, asStr, isRecord, json, readEmail } from "./chat-shared";
+import { handleProjectGitHubValidate, validateProjectGitHubToken } from "./project-github-credentials";
 import {
   type DeskContext,
   handleAskGera,
@@ -823,6 +824,9 @@ export class ProjectStore extends DurableObject {
       if (request.method === "POST" && path === "/members/role") {
         return this.handleMemberRole(me, await request.json());
       }
+      if (request.method === "POST" && path === "/agents/github-validate") {
+        return handleProjectGitHubValidate(await request.json(), canManageProject(this.memberRole(me)));
+      }
       if (request.method === "POST" && path === "/agents/upsert") {
         return this.handleAgentUpsert(me, await request.json());
       }
@@ -1516,6 +1520,10 @@ export class ProjectStore extends DurableObject {
     // is sealed on the way in (`sealedAgentSecrets` below).
     const secrets: AgentSecrets = existing ? parseSecrets(existing.secrets) : {};
     const incoming = isRecord(body.secrets) ? body.secrets : {};
+    if (typeof incoming.githubToken === "string" && incoming.githubToken.trim()) {
+      try { await validateProjectGitHubToken(incoming.githubToken); }
+      catch (error) { return json({ error: error instanceof Error ? error.message : "GitHub verification failed" }, 400); }
+    }
     // Disconnecting a Gera-created Slack app forgets everything minted with
     // it: the registration, its signing secret, and the installed bot token.
     // Runs first so a manual token pasted in the same save still lands.
@@ -2187,6 +2195,7 @@ export class ProjectStore extends DurableObject {
       durable: this.workerEnv.DO,
       waitUntil: (promise) => this.ctx.waitUntil(promise),
       agentAccess: (agent) => normalizeAccess(JSON.parse(agent.access || "{}") as unknown),
+      currentAgent: (agent) => this.loadAgent(agent.id) ?? null,
       revealAgentSecrets: (agent) => this.revealAgentSecrets(agent),
       secretFlags,
       canManage: (email) => {
@@ -2238,7 +2247,7 @@ export class ProjectStore extends DurableObject {
       .toArray()[0];
 
     const { tools, routes, plan, access, mcpNote, toolset } = await this.buildAgentToolset(agent);
-
+    try {
     // Thread transcript: root + settled replies, oldest first, capped.
     const threadRows = sql
       .exec<MessageRow>(
@@ -2339,6 +2348,7 @@ export class ProjectStore extends DurableObject {
     });
     this.finishPlaceholder(job.placeholder_id, `${content}${sourcesBlock}`, execution);
     return execution;
+    } finally { toolset?.close(); }
   }
 
   // --- Screen assistant runs ----------------------------------------------
@@ -2422,7 +2432,7 @@ export class ProjectStore extends DurableObject {
     const screen = this.loadScreen(job.screen_id);
 
     const { tools, routes, plan, access, mcpNote, toolset } = await this.buildAgentToolset(agent);
-
+    try {
     // Private desk history — settled rows; the fresh member message is last.
     const historyRows = sql
       .exec<ScreenChatRow>(
@@ -2555,6 +2565,7 @@ export class ProjectStore extends DurableObject {
     });
     this.finishScreenPlaceholder(job.placeholder_id, `${content}${sourcesBlock}`, execution);
     return execution;
+    } finally { toolset?.close(); }
   }
 
   // --- Inbound Slack bot runs -----------------------------------------------
@@ -2724,7 +2735,7 @@ export class ProjectStore extends DurableObject {
       return execution;
     }
     const { tools, routes, plan, access, mcpNote, toolset } = await this.buildAgentToolset(agent, "slack");
-
+    try {
     // Bot identity — used to strip self-mentions; failures are non-fatal.
     let botUserId = "";
     let workspace = "";
@@ -2829,5 +2840,6 @@ export class ProjectStore extends DurableObject {
       capText(`${content}${sourcesBlock}\n\n---\n${executionOutcomeSlackFooter(execution)}`, SLACK_REPLY_LIMIT),
     );
     return execution;
+    } finally { toolset?.close(); }
   }
 }

@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import {
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -110,6 +111,7 @@ import {
 import { runModeOptionTid, TID } from "@/lib/testids";
 import type { BuiltinToolId, CreateMode, ImageSize, JuliusSettings, McpServerConfig, ResearchDepth, SkillSurface, VideoAspect } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { connectorCacheKey, subscribeConnectorCaches } from "@/lib/connector-cache-scope";
 
 const MODES: { id: CreateMode; label: string; icon: typeof MessageSquare }[] = [
   { id: "chat", label: "Chat", icon: MessageSquare },
@@ -1480,6 +1482,7 @@ function SkillsRailButton() {
 
 /** Repo listing cache, isolated by connector and non-secret credential fingerprint. */
 let repoPickCache: { serverId: string; credential: string; at: number; repos: RepoOption[] } | null = null;
+subscribeConnectorCaches(() => { repoPickCache = null; });
 
 /**
  * GitHub repo pin — rendered only while the GitHub connector is on. Pins one
@@ -1497,6 +1500,12 @@ function GitHubRepoPin() {
   const [error, setError] = useState<string>("");
   const [launchOpen, setLaunchOpen] = useState<boolean>(false);
   const [launchConversationId, setLaunchConversationId] = useState<string>("");
+  const loadRevision = useRef<number>(0);
+  useEffect(() => subscribeConnectorCaches(() => {
+    loadRevision.current += 1;
+    setRepos(null); setError(""); setLoading(false);
+  }), []);
+  useEffect(() => () => { loadRevision.current += 1; }, []);
 
   const active = state.conversations.find((item) => item.id === state.activeId);
   const activeAgent = active?.agentId
@@ -1543,11 +1552,15 @@ function GitHubRepoPin() {
   }
 
   const load = async (force?: boolean) => {
+    const revision = ++loadRevision.current;
+    const scope = connectorCacheKey(server.id);
+    const current = () => loadRevision.current === revision && connectorCacheKey(server.id) === scope;
     setLoading(true);
     setError("");
     try {
       const auth = await resolveGitHubAuth(server);
-      const credential = githubAuthorizationFingerprint(auth);
+      if (!current()) return;
+      const credential = `${scope}:${githubAuthorizationFingerprint(auth)}`;
       if (
         !force &&
         repoPickCache &&
@@ -1559,13 +1572,13 @@ function GitHubRepoPin() {
         return;
       }
       const list = await listRepoOptions(auth);
+      if (!current()) return;
       repoPickCache = { serverId: server.id, credential, at: Date.now(), repos: list };
       setRepos(list);
     } catch (err) {
-      setRepos(null);
-      setError(errorFromUnknown(err));
+      if (current()) { setRepos(null); setError(errorFromUnknown(err)); }
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   };
 

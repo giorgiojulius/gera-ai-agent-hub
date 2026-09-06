@@ -10,6 +10,7 @@
 
 import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
 import { authedFetch, authedFetchForSession } from "@/lib/backend";
+import { invalidateConnectorCaches } from "@/lib/connector-cache-scope";
 
 export const OAUTH_RESULT_KEY = "gera.mcp.oauth.result.v1";
 
@@ -217,6 +218,7 @@ export function purgeLegacyOAuthStorage(): { found: boolean; serverIds: string[]
 
 /** Explicit user disconnect: revokes the server-owned grant (the browser holds none). */
 export function clearOAuthToken(serverId: string, catalogId?: string): void {
+  invalidateConnectorCaches(serverId);
   void authedFetch("/mcp/oauth-clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -281,6 +283,7 @@ export async function runOAuthSignIn(
   if (!popup) {
     throw new Error("Popup was blocked. Allow popups for this site and press Sign in again.");
   }
+  invalidateConnectorCaches(server.id);
   const flow = beginOAuthGrantFlow(server.id);
   const ensureCurrentAccount = (): void => {
     if (!isOAuthGrantFlowCurrent(flow)) {
@@ -336,6 +339,7 @@ export async function runOAuthSignIn(
       };
       ensureCurrentAccount();
       if (statusResponse.ok && status.status === "completed") {
+        invalidateConnectorCaches(server.id);
         return;
       }
       if (status.status === "failed" || status.status === "missing") {

@@ -27,11 +27,12 @@ import { clearLocalAccountState, normalizeStoredSettings } from "@/lib/history";
 import { findCatalogEntry, catalogEntryToServer, GITHUB_WRITE_TOOLS } from "@/lib/mcp-catalog";
 import { findServerForTool, mcpFunctionName } from "@/lib/mcp";
 import type { McpServerConfig } from "@/lib/types";
+import { githubTestTarget } from "./fixtures/github-proxy";
 
 type NativeCall = (auth: string, name: string, args: unknown) => Promise<string>;
 
 const nativeCalls: Array<{ label: string; call: NativeCall }> = [
-  { label: "browser", call: callBrowserGitHub },
+  { label: "browser", call: (_auth, name, args) => callBrowserGitHub("gera-account:github", name, args) },
   { label: "worker", call: callServerGitHub },
 ];
 
@@ -158,7 +159,11 @@ describe("all 30 GitHub tool dispatchers", () => {
         vi.stubGlobal(
           "fetch",
           vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-            const requestUrl = String(input);
+            const requestUrl = githubTestTarget(input).toString();
+            if (label === "browser") {
+              expect(new URL(String(input)).pathname).toBe("/github-proxy");
+              expect(new Headers(init?.headers).get("Authorization")).not.toBe("Bearer x");
+            }
             const headers = new Headers(init?.headers);
             const target = headers.get("X-Gera-Upstream-Url") ?? requestUrl;
             const url = new URL(requestUrl);
@@ -352,7 +357,7 @@ describe("GitHub write concurrency rails", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = new URL(String(input));
+        const url = githubTestTarget(input);
         const method = init?.method ?? "GET";
         methods.push(method);
         if (url.pathname === "/repos/acme/app") {
@@ -391,7 +396,7 @@ describe("GitHub write concurrency rails", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-          const url = new URL(String(input));
+          const url = githubTestTarget(input);
           const method = init?.method ?? "GET";
           methods.push(method);
           if (url.pathname === "/repos/acme/app") {
@@ -425,7 +430,7 @@ describe("GitHub write concurrency rails", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-          const url = new URL(String(input));
+          const url = githubTestTarget(input);
           const method = init?.method ?? "GET";
           if (url.pathname === "/repos/acme/app") {
             return json({ full_name: "acme/app", default_branch: "main" });
@@ -463,7 +468,7 @@ describe("GitHub reads, diffs, and logs", () => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
-          const url = new URL(String(input));
+          const url = githubTestTarget(input);
           const page = Number(url.searchParams.get("page") ?? "1");
           pages.push(page);
           const count = page === 1 ? 100 : 1;
@@ -666,7 +671,7 @@ describe("GitHub account isolation and diagnostics", () => {
             );
       }),
     );
-    const probe = await probeRepoAccess("Bearer x", { owner: "acme", repo: "private" });
+    const probe = await probeRepoAccess("gera-account:github", { owner: "acme", repo: "private" });
     expect(probe.contentsStatus).toBe(403);
     expect(probe.sso).toContain("authorization_request=x");
     expect(probe.message).toContain("SAML enforcement");

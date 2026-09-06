@@ -1,4 +1,6 @@
-import { authedFetch } from "@/lib/backend";
+import { authedFetchForSession, AuthSessionChangedError } from "@/lib/backend";
+import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
+import { githubWireReference } from "@/lib/github-transport";
 import type {
   RepoPreviewFramework,
   RepoPreviewInspection,
@@ -231,10 +233,13 @@ async function requestJson(
     headers.set("Content-Type", "application/json");
   }
   if (githubAuthorization) {
-    headers.set("X-Gera-Upstream-Authorization", githubAuthorization);
+    headers.set("X-Gera-Upstream-Authorization", githubWireReference(githubAuthorization));
   }
-  const response = await authedFetch(path, { ...init, headers: Object.fromEntries(headers.entries()) });
+  const session = authSessionSnapshot();
+  const response = await authedFetchForSession(path, session, { ...init, headers: Object.fromEntries(headers.entries()) });
   const body = object(await response.json().catch(() => null)) ?? {};
+  if (!isAuthSessionCurrent(session)) throw new AuthSessionChangedError();
+  if (githubAuthorization) githubWireReference(githubAuthorization);
   if (!response.ok) {
     const code = text(body.error, 500) ?? `Repository preview request failed (${response.status}).`;
     throw new RepoPreviewApiError(code, response.status, normalizeRepoPreviewInspection(body.inspection));

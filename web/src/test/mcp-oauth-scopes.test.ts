@@ -498,7 +498,7 @@ describe("toolset · insufficient_scope → step_up_required without a second ca
         reported.push([id, outcome]);
       },
     });
-    await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing" });
+    await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing", serverId: "scoped" });
     const first = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "scoped", toolName: "write_thing", arguments: {} });
     expect(first.isError).toBe(true);
     expect(first.text).toMatch(/wider access/);
@@ -528,7 +528,7 @@ describe("toolset · insufficient_scope → step_up_required without a second ca
     expect(remote.calls()).toHaveLength(1);
     expect(reported).toHaveLength(1);
     // Search stays honest about the parked server.
-    const search = JSON.parse((await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing" })).text) as { servers: Array<{ unavailable?: string }> };
+    const search = JSON.parse((await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing", serverId: "scoped" })).text) as { servers: Array<{ unavailable?: string }> };
     expect(search.servers[0].unavailable).toMatch(/wider access/);
     toolset.close();
   });

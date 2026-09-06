@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { listRepoOptions, pinnedRepoPromptBlock } from "@/lib/github-native";
+import { githubTestTarget } from "./fixtures/github-proxy";
 
 describe("pinnedRepoPromptBlock", () => {
   it("names owner and repo and defaults GitHub tools to the pin", () => {
@@ -37,7 +38,7 @@ describe("pinnedRepoPromptBlock", () => {
 describe("listRepoOptions", () => {
   it("maps /user/repos rows, drops nameless ones, stops on a short page", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = githubTestTarget(input);
       expect(url.pathname).toBe("/user/repos");
       expect(url.searchParams.get("sort")).toBe("pushed");
       expect(url.searchParams.get("affiliation")).toBe("owner,collaborator,organization_member");
@@ -57,7 +58,7 @@ describe("listRepoOptions", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     try {
-      const repos = await listRepoOptions("Bearer t");
+      const repos = await listRepoOptions("gera-account:github");
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(repos).toEqual([
         { fullName: "acme/site", private: true, description: "Marketing site", pushedAt: "2026-08-29T10:00:00Z" },
@@ -72,7 +73,7 @@ describe("listRepoOptions", () => {
     const fullPage = (page: number) =>
       Array.from({ length: 100 }, (_, index) => ({ full_name: `o/r${page}-${index}` }));
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input));
+      const url = githubTestTarget(input);
       const page = Number.parseInt(url.searchParams.get("page") ?? "1", 10);
       return new Response(JSON.stringify(fullPage(page)), {
         status: 200,
@@ -81,7 +82,7 @@ describe("listRepoOptions", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     try {
-      const repos = await listRepoOptions("Bearer t");
+      const repos = await listRepoOptions("gera-account:github");
       expect(fetchMock).toHaveBeenCalledTimes(3);
       expect(repos).toHaveLength(300);
     } finally {
@@ -95,7 +96,7 @@ describe("listRepoOptions", () => {
       vi.fn(async () => new Response("{}", { status: 401 })),
     );
     try {
-      await expect(listRepoOptions("Bearer bad")).rejects.toThrow(/Sign in with GitHub/);
+      await expect(listRepoOptions("gera-account:github")).rejects.toThrow(/Sign in with GitHub/);
     } finally {
       vi.unstubAllGlobals();
     }

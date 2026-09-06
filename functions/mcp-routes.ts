@@ -59,7 +59,11 @@ import {
   createSqlMcpCatalogStore,
   resolveMcpToolset,
 } from "./mcp-toolset";
-import type { McpFetch } from "./mcp-protocol";
+import { sessionWireInfo, type McpFetch } from "./mcp-protocol";
+import { normalizeCatalogWire } from "./mcp-catalog-wire";
+import { ownerCatalogGeneration } from "./mcp-owner-catalog";
+export { handleMcpCatalogWrite } from "./mcp-owner-catalog";
+import { stripCloudMcpCredentials } from "./mcp-credentials";
 import { oauthPendingFieldScope, sealServerSecret, type ServerSecret } from "./secret-rows";
 
 export type McpRouteContext = {
@@ -159,6 +163,7 @@ export async function handleMcpInventory(ctx: McpRouteContext, request: Request,
       resources: connection.resources,
       resourceTemplates: connection.resourceTemplates,
       capabilities: connection.session.capabilities ?? {},
+      wire: normalizeCatalogWire(connection.wire ?? sessionWireInfo(connection.session)),
     });
     return json({
       prompts: connection.prompts,
@@ -170,6 +175,11 @@ export async function handleMcpInventory(ctx: McpRouteContext, request: Request,
   } catch (error) {
     return json({ error: failure(server, error, "MCP server did not answer") }, 502);
   }
+}
+
+function freshInventoryWire(ctx: McpRouteContext, owner: string, serverId: string) {
+  const entry = createSqlMcpCatalogStore(ctx.sql, owner).read(serverId);
+  return entry && (ctx.now?.() ?? Date.now()) - entry.fetchedAt < CATALOG_TTL_MS ? normalizeCatalogWire(entry.wire) : undefined;
 }
 
 const PROMPT_ARG_CHARS = 20_000;
@@ -200,6 +210,7 @@ export async function handleMcpPromptGet(ctx: McpRouteContext, request: Request,
     const connection = await connectCloudMcp(server, {
       maxTools: 1,
       includeDisabled: true,
+      wireHint: freshInventoryWire(ctx, owner, serverId),
       ...(ctx.fetch ? { fetch: ctx.fetch } : {}),
     });
     if (!connection.session.capabilities?.prompts) {
@@ -685,23 +696,25 @@ export async function handleMcpResolve(ctx: OAuthStoreContext, request: Request,
   }
   const ids =
     isRecord(body) && Array.isArray(body.ids)
-      ? body.ids.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, 8)
+      ? [...new Set(body.ids.filter((item): item is string => typeof item === "string" && isValidId(item)))]
       : [];
   const force = new Set(
     isRecord(body) && Array.isArray(body.force)
-      ? body.force.filter((item): item is string => typeof item === "string")
+      ? body.force.filter((item): item is string => typeof item === "string" && ids.includes(item))
       : [],
   );
   if (ids.length === 0) {
     return json({ servers: [] });
   }
-  const resolved = await resolveOwnerMcpServers(ctx, owner, ids, force);
+  const bootstrap = isRecord(body) && body.bootstrap === true;
+  const resolved = await resolveOwnerMcpServers(ctx, owner, ids, force, { refresh: !bootstrap });
   if (!resolved) {
     return json({ servers: [] });
   }
   const catalog = createSqlMcpCatalogStore(ctx.sql, owner);
   return json({
-    servers: resolved.servers,
+    servers: bootstrap ? resolved.servers.map(stripCloudMcpCredentials) : resolved.servers,
+    generations: Object.fromEntries(await Promise.all(resolved.servers.map(async (server) => [server.id, await ownerCatalogGeneration(ctx, owner, server.id)]))),
     toolLoading: resolved.toolLoading,
     catalog: resolved.servers.flatMap((server) => {
       const entry = catalog.read(server.id);
@@ -726,6 +739,7 @@ export async function handleMcpResourceRead(ctx: McpRouteContext, request: Reque
     const connection = await connectCloudMcp(server, {
       maxTools: 1,
       includeDisabled: true,
+      wireHint: freshInventoryWire(ctx, owner, serverId),
       ...(ctx.fetch ? { fetch: ctx.fetch } : {}),
     });
     if (!connection.session.capabilities?.resources) {

@@ -1,93 +1,22 @@
-// MCP protocol core — the ONE JSON-RPC / Streamable HTTP implementation every
-// Gera transport builds on (cloud runs in mcp-cloud.ts today; the browser
-// legacy transport in Phase 6). Pure protocol: no credentials of its own, no
-// storage, and `fetch` is injected so a conformance test can talk to an
-// in-process server on 127.0.0.1 while production keeps the public-HTTPS guard.
-//
-// Covered here: request/notification/response framing, incremental SSE
-// reading (a server may send notifications and server→client requests such
-// as `elicitation/create` before the response lands), protocol version
-// negotiation with the `MCP-Protocol-Version` header on every request after
-// initialize, paginated `*/list` walks, the standalone GET notification
-// stream, tool annotations + MCP Apps (UI-only) markers, elicitation schema
-// validation, and result flattening for the model.
-
+/** JSON-RPC/SSE transport and legacy handshake; modern policy is injected without circular imports. */
 import { fetchPublicHttps } from "./network-safety";
-
-/** Injected transport — production passes the public-HTTPS guard, tests a plain fetch. */
-export type McpFetch = (url: string, init: RequestInit) => Promise<Response>;
-
-/**
- * The stateless revision (no initialize, no sessions, `_meta` on every
- * request, `server/discover`). Probed first; every server that answers the
- * probe is spoken to on this wire.
- */
-export const MCP_MODERN_PROTOCOL_VERSION = "2026-07-28";
-/** Stateless revisions Gera speaks (newest first) — the `-32022` retry picks from these. */
-export const MCP_MODERN_PROTOCOL_VERSIONS: readonly string[] = [MCP_MODERN_PROTOCOL_VERSION];
-/** Newest legacy revision Gera speaks; proposed in every initialize. */
-export const MCP_LATEST_PROTOCOL_VERSION = "2025-11-25";
-/** Legacy revisions accepted from a server's initialize result (newest first). */
-export const MCP_SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
-  "2025-11-25",
-  "2025-06-18",
-  "2025-03-26",
-  "2024-11-05",
-];
-/** Legacy header default before negotiation completes (servers that skip initialize). */
-export const MCP_DEFAULT_PROTOCOL_VERSION = "2025-06-18";
-
-/** Which wire a session speaks: the stateless 2026-07-28 revision or the initialize/session family. */
-export type McpWireEra = "modern" | "legacy";
-
-/** Non-secret negotiation outcome (cached with the tool catalog so the next run skips the probe). */
-export type McpWireInfo = {
-  era: McpWireEra;
-  protocolVersion: string;
-  capabilities?: McpServerCapabilities;
-  serverInfo?: McpServerInfo;
-};
-
-/** `_meta` keys of the stateless revision (client → server on params, server → client on results). */
-export const MCP_META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
-export const MCP_META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
-export const MCP_META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo";
-export const MCP_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
-export const MCP_META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId";
-
-/** Spec-reserved error codes of the stateless revision. */
-export const MCP_ERROR_HEADER_MISMATCH = -32020;
-export const MCP_ERROR_MISSING_CLIENT_CAPABILITY = -32021;
-export const MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION = -32022;
-
-/** How many `input_required` rounds one call may take before Gera gives up honestly. */
-export const MCP_MAX_INPUT_ROUNDS = 3;
-
-/** Response bodies (JSON or a whole SSE stream) never exceed this many characters. */
-export const MCP_MAX_RESPONSE_CHARS = 2_000_000;
-
-export type JsonRpcId = number | string;
-
-export type JsonRpcError = { code?: number; message?: string; data?: unknown };
-
-/** Any JSON-RPC 2.0 frame: request (method + id), notification (method), or response (result | error). */
-export type JsonRpcMessage = {
-  jsonrpc?: string;
-  id?: JsonRpcId;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: JsonRpcError;
-};
-
-/** JSON-RPC error codes this client emits toward servers. */
-export const JSON_RPC_METHOD_NOT_FOUND = -32601;
-export const JSON_RPC_INVALID_PARAMS = -32602;
-export const JSON_RPC_INTERNAL_ERROR = -32603;
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+import {
+  isRecord, normalizeServerCapabilities, defaultClientCapabilities, credentialVariants,
+  redactMcpText, redactMcpValue, sessionRedactions,
+  MCP_MAX_RESPONSE_CHARS, MCP_LATEST_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, MCP_MODERN_PROTOCOL_VERSIONS,
+  JSON_RPC_INTERNAL_ERROR, JSON_RPC_METHOD_NOT_FOUND,
+  McpAuthRejectedError, McpSessionLostError, McpRpcError,
+  type JsonRpcId, type JsonRpcError, type JsonRpcMessage, type McpFetch,
+  type McpProtocolSession, type McpLeasedCredential, type McpServerRequestReply,
+  type McpInitializeOptions, type McpServerCapabilities, type McpServerInfo, type McpWireInfo,
+} from "./mcp-protocol-shared";
+import { protocolHeaders, credentialHeaders } from "./mcp-headers";
+import { discoverModern, requestWithModernInput, wireParams, withModernNegotiation, type McpDiscovery } from "./mcp-modern";
+import { openNotificationStream, type McpNotificationStream } from "./mcp-notifications";
+export type { McpNotificationStream } from "./mcp-notifications";
+export * from "./mcp-protocol-shared";
+export { mcpHeaderValue } from "./mcp-headers";
+export { modernRequestMeta, sessionWireInfo, isInputRequiredResult, type McpDiscovery } from "./mcp-modern";
 
 export function isRpcResponse(message: JsonRpcMessage): boolean {
   return "result" in message || "error" in message;
@@ -166,269 +95,8 @@ export function selectRpcResponse(messages: JsonRpcMessage[], expectedId: JsonRp
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Server metadata.
-
-export type McpServerCapabilities = {
-  tools?: { listChanged?: boolean };
-  prompts?: { listChanged?: boolean };
-  resources?: { subscribe?: boolean; listChanged?: boolean };
-  logging?: Record<string, unknown>;
-  completions?: Record<string, unknown>;
-  experimental?: Record<string, unknown>;
-};
-
-export type McpServerInfo = { name?: string; title?: string; version?: string };
-
-export function normalizeServerCapabilities(value: unknown): McpServerCapabilities {
-  if (!isRecord(value)) {
-    return {};
-  }
-  const flag = (record: unknown, key: string): boolean | undefined =>
-    isRecord(record) && typeof record[key] === "boolean" ? (record[key] as boolean) : undefined;
-  const out: McpServerCapabilities = {};
-  if (isRecord(value.tools)) {
-    out.tools = { listChanged: flag(value.tools, "listChanged") };
-  }
-  if (isRecord(value.prompts)) {
-    out.prompts = { listChanged: flag(value.prompts, "listChanged") };
-  }
-  if (isRecord(value.resources)) {
-    out.resources = { subscribe: flag(value.resources, "subscribe"), listChanged: flag(value.resources, "listChanged") };
-  }
-  if (isRecord(value.logging)) {
-    out.logging = value.logging;
-  }
-  if (isRecord(value.completions)) {
-    out.completions = value.completions;
-  }
-  if (isRecord(value.experimental)) {
-    out.experimental = value.experimental;
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Session.
-
-/** Answer to a server → client request; the error branch becomes a JSON-RPC error. */
-export type McpServerRequestReply = { result: unknown } | { error: { code: number; message: string } };
-
-export type McpServerRequest = { id: JsonRpcId; method: string; params: unknown };
-export type McpNotification = { method: string; params: unknown };
-
-/**
- * Credential material for exactly one HTTP request. Produced by a session's
- * lease right before the request and dropped right after it: the headers ride
- * on the wire, the redactions scrub that request's response, and neither is
- * kept on the session object.
- */
-export type McpLeasedCredential = {
-  /** Request URL when the credential lives in it (token path/query); the session URL otherwise. */
-  url?: string;
-  headers: Record<string, string>;
-  /** Exact credential values to strip from this request's response and errors. */
-  redactions: string[];
-};
-
-/** Opens the current credential on demand (vault row, refreshed grant) — called once per request. */
-export type McpCredentialLease = () => Promise<McpLeasedCredential>;
-
-/**
- * One Streamable HTTP session. Field names stay compatible with the historical
- * CloudMcpSession literal (url, headers, omitMcpHeaders, protocolVersion,
- * sessionId, nextId, redactions) so existing callers and tests keep working.
- */
-export type McpProtocolSession = {
-  url: string;
-  /** Fully resolved request headers (Authorization included when a key is set). */
-  headers: Record<string, string>;
-  /**
-   * Per-request credential source. When set, `headers` and `redactions` carry
-   * no credential material — every request leases what it needs and forgets it.
-   */
-  lease?: McpCredentialLease;
-  /** Google hosts reject the MCP protocol headers — skip them there. */
-  omitMcpHeaders: boolean;
-  /** Negotiated revision; sent as MCP-Protocol-Version after initialize. */
-  protocolVersion?: string;
-  sessionId?: string;
-  nextId: number;
-  /** Exact server-owned values stripped from every provider-originated surface. */
-  redactions?: string[];
-  /** Injected transport; defaults to the public-HTTPS guard. */
-  fetch?: McpFetch;
-  /** True once negotiation (discover or initialize) completed on this session. */
-  initialized?: boolean;
-  /** Wire family in use; undefined until negotiation (requests then default to the legacy shape). */
-  wire?: McpWireEra;
-  /** What every stateless request declares about this client (`_meta`). */
-  clientInfo?: { name: string; version: string; title?: string };
-  clientCapabilities?: Record<string, unknown>;
-  capabilities?: McpServerCapabilities;
-  serverInfo?: McpServerInfo;
-  instructions?: string;
-  /** Answers server → client requests arriving on any stream (elicitation/create, ping, roots/list…). */
-  onServerRequest?: (request: McpServerRequest) => Promise<McpServerRequestReply>;
-  /** Receives notifications arriving on any stream (list_changed, progress, logging…). */
-  onNotification?: (notification: McpNotification) => void;
-};
-
-/** The server refused our credential (401/403). Phase 3 reads the challenge for step-up scopes. */
-export class McpAuthRejectedError extends Error {
-  readonly status: number;
-  readonly wwwAuthenticate: string | null;
-
-  constructor(status: number, wwwAuthenticate: string | null) {
-    super(
-      `auth rejected (${status}) — the synced sign-in or key was refused; open Gera and reconnect this server so a fresh credential syncs`,
-    );
-    this.name = "McpAuthRejectedError";
-    this.status = status;
-    this.wwwAuthenticate = wwwAuthenticate;
-  }
-}
-
-/** The server does not know our Mcp-Session-Id any more (idle expiry). */
-export class McpSessionLostError extends Error {
-  constructor() {
-    super("MCP session expired");
-    this.name = "McpSessionLostError";
-  }
-}
-
-/**
- * A JSON-RPC error frame from the server (on a 2xx body or, in the stateless
- * revision, on a 400/404 body). `rpcCode`/`rpcData` keep the names older
- * callers read off plain Errors.
- */
-export class McpRpcError extends Error {
-  readonly rpcCode: number | undefined;
-  readonly rpcData: unknown;
-  readonly httpStatus: number;
-
-  constructor(message: string, code: number | undefined, data: unknown, httpStatus: number) {
-    super(message);
-    this.name = "McpRpcError";
-    this.rpcCode = code;
-    this.rpcData = data;
-    this.httpStatus = httpStatus;
-  }
-}
-
-/** Modern servers ask for input through the result itself (MRTR); this run could not answer. */
-export class McpInputRequiredError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "McpInputRequiredError";
-  }
-}
-
-function credentialVariants(values: string[]): string[] {
-  const variants = new Set<string>();
-  for (const raw of values) {
-    const value = raw.trim();
-    if (!value) continue;
-    variants.add(value);
-    const bearer = /^Bearer\s+(.+)$/i.exec(value)?.[1]?.trim();
-    if (bearer) variants.add(bearer);
-    try {
-      variants.add(encodeURIComponent(value));
-      if (bearer) variants.add(encodeURIComponent(bearer));
-    } catch {
-      // Exact raw replacement still applies.
-    }
-  }
-  return [...variants].filter(Boolean).sort((left, right) => right.length - left.length);
-}
-
-/** Redacts exact server-owned credentials before output reaches an LLM, log, or row. */
-export function redactMcpText(text: string, credentials: string[]): string {
-  let redacted = text;
-  for (const credential of credentialVariants(credentials)) {
-    redacted = redacted.split(credential).join("[REDACTED_CREDENTIAL]");
-  }
-  return redacted;
-}
-
-/** Deep string redaction for provider-controlled schemas and structured output. */
-export function redactMcpValue(value: unknown, credentials: string[], depth: number = 0): unknown {
-  if (typeof value === "string") {
-    return redactMcpText(value, credentials);
-  }
-  if (depth >= 20) {
-    return "[REDACTED_DEEP_PROVIDER_VALUE]";
-  }
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactMcpValue(item, credentials, depth + 1));
-  }
-  const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    output[redactMcpText(key, credentials)] = redactMcpValue(item, credentials, depth + 1);
-  }
-  return output;
-}
-
-/** Every credential-shaped value the session carries — for redacting provider-originated text. */
-export function sessionRedactions(session: McpProtocolSession): string[] {
-  return session.redactions ?? [];
-}
-
 function isModern(session: McpProtocolSession): boolean {
   return session.wire === "modern";
-}
-
-/** Header values must be ASCII; the stateless revision wraps anything else as `=?base64?…?=`. */
-export function mcpHeaderValue(value: string): string {
-  if (/^[\x20-\x7e]*$/.test(value)) {
-    return value;
-  }
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return `=?base64?${btoa(binary)}?=`;
-}
-
-/** `Mcp-Name` carries the addressed tool / resource / prompt so proxies can route without parsing the body. */
-function modernNameHeader(method: string, params: unknown): Record<string, string> {
-  if (!isRecord(params)) {
-    return {};
-  }
-  const value =
-    method === "resources/read"
-      ? params.uri
-      : method === "tools/call" || method === "prompts/get"
-        ? params.name
-        : undefined;
-  return typeof value === "string" && value ? { "Mcp-Name": mcpHeaderValue(value) } : {};
-}
-
-function protocolHeaders(
-  session: McpProtocolSession,
-  includeVersion: boolean,
-  method?: string,
-  params?: unknown,
-): Record<string, string> {
-  if (session.omitMcpHeaders) {
-    return {};
-  }
-  if (isModern(session)) {
-    // Stateless: version + method on every request, never a session id.
-    return {
-      "MCP-Protocol-Version": session.protocolVersion ?? MCP_MODERN_PROTOCOL_VERSION,
-      ...(method ? { "Mcp-Method": method } : {}),
-      ...(method ? modernNameHeader(method, params) : {}),
-    };
-  }
-  return {
-    ...(includeVersion ? { "MCP-Protocol-Version": session.protocolVersion ?? MCP_DEFAULT_PROTOCOL_VERSION } : {}),
-    ...(session.sessionId ? { "Mcp-Session-Id": session.sessionId } : {}),
-  };
 }
 
 function requestHeaders(
@@ -441,29 +109,9 @@ function requestHeaders(
   return {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
+    ...credentialHeaders(session.headers, leased.headers),
     ...protocolHeaders(session, includeVersion, method, params),
-    ...session.headers,
-    ...leased.headers,
   };
-}
-
-/** The `_meta` every stateless request must carry: protocol version, client capabilities, client identity. */
-export function modernRequestMeta(session: McpProtocolSession): Record<string, unknown> {
-  return {
-    [MCP_META_PROTOCOL_VERSION]: session.protocolVersion ?? MCP_MODERN_PROTOCOL_VERSION,
-    [MCP_META_CLIENT_CAPABILITIES]: session.clientCapabilities ?? defaultClientCapabilities(),
-    [MCP_META_CLIENT_INFO]: session.clientInfo ?? { name: "Gera AI", version: "1.0.0" },
-  };
-}
-
-/** Request params for the wire in use: the stateless revision merges the required `_meta` in. */
-function wireParams(session: McpProtocolSession, params: unknown): unknown {
-  if (!isModern(session)) {
-    return params ?? {};
-  }
-  const base = isRecord(params) ? params : {};
-  const existing = isRecord(base._meta) ? base._meta : {};
-  return { ...base, _meta: { ...existing, ...modernRequestMeta(session) } };
 }
 
 /** A JSON-RPC error frame carried on a non-2xx body (400/404 in the stateless revision), if any. */
@@ -479,10 +127,14 @@ function rpcErrorFromBody(text: string): JsonRpcError | null {
 
 /** The credential for one request: leased on demand, or the static session headers (already redacted via `session.redactions`). */
 async function leaseCredential(session: McpProtocolSession): Promise<McpLeasedCredential> {
+  session.signal?.throwIfAborted();
   if (!session.lease) {
     return { headers: {}, redactions: [] };
   }
-  return session.lease();
+  session.signal?.throwIfAborted();
+  const credential = await session.lease();
+  session.signal?.throwIfAborted();
+  return credential;
 }
 
 /** Redactions for one request's provider-originated text: session-level values plus the leased credential. */
@@ -688,7 +340,11 @@ function describeHttpFailure(status: number): string {
  * McpAuthRejectedError; a stale session (404 with an issued session id) becomes
  * McpSessionLostError.
  */
-export async function mcpRequest(
+export function mcpRequest(session: McpProtocolSession, method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+  return withModernNegotiation(session, () => mcpRequestOnce(session, method, params, timeoutMs));
+}
+
+async function mcpRequestOnce(
   session: McpProtocolSession,
   method: string,
   params: unknown,
@@ -706,7 +362,7 @@ export async function mcpRequest(
       method: "POST",
       headers: requestHeaders(session, method !== "initialize", leased, method, sentParams),
       body: JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params: sentParams }),
-      signal: idle.signal,
+      signal: session.signal ? AbortSignal.any([session.signal, idle.signal]) : idle.signal,
     });
   } catch (error) {
     idle.clear();
@@ -764,6 +420,7 @@ export async function mcpRequest(
         response.status,
       );
     }
+    session.signal?.throwIfAborted();
     // A leased credential is gone after this call — its redaction happens here,
     // deep, so no caller needs to hold the credential to scrub the result.
     return leased.redactions.length > 0 ? redactMcpValue(parsed.result, leased.redactions) : parsed.result;
@@ -804,18 +461,6 @@ export async function mcpRespond(session: McpProtocolSession, id: JsonRpcId, rep
   });
   adoptSessionId(session, response);
   await response.body?.cancel().catch(() => undefined);
-}
-
-export type McpInitializeOptions = {
-  clientInfo?: { name: string; version: string; title?: string };
-  /** Extra client capabilities merged over the defaults (elicitation form mode). */
-  capabilities?: Record<string, unknown>;
-  timeoutMs?: number;
-};
-
-/** Client capabilities Gera declares: elicitation in form mode (URL mode is declined honestly). */
-export function defaultClientCapabilities(): Record<string, unknown> {
-  return { elicitation: { form: {} } };
 }
 
 /**
@@ -867,108 +512,9 @@ export async function mcpInitialize(
 // ---------------------------------------------------------------------------
 // Stateless revision (2026-07-28): discover, negotiation, input rounds.
 
-/** Outcome of `server/discover` on a modern server. */
-export type McpDiscovery = {
-  protocolVersion: string;
-  capabilities: McpServerCapabilities;
-  serverInfo: McpServerInfo;
-  instructions?: string;
-};
-
-function serverInfoFrom(value: unknown): McpServerInfo {
-  const raw = isRecord(value) ? value : {};
-  return {
-    name: typeof raw.name === "string" ? raw.name : undefined,
-    title: typeof raw.title === "string" ? raw.title : undefined,
-    version: typeof raw.version === "string" ? raw.version : undefined,
-  };
-}
-
-/** Newest revision both sides speak, or null. */
-function pickModernVersion(offered: unknown): string | null {
-  if (!Array.isArray(offered)) {
-    return null;
-  }
-  const versions = new Set(offered.filter((item): item is string => typeof item === "string"));
-  return MCP_MODERN_PROTOCOL_VERSIONS.find((version) => versions.has(version)) ?? null;
-}
-
-function applyDiscovery(session: McpProtocolSession, version: string, result: Record<string, unknown> | null): McpDiscovery {
-  const meta = isRecord(result?._meta) ? result._meta : {};
-  session.wire = "modern";
-  session.protocolVersion = version;
-  session.sessionId = undefined;
-  session.capabilities = normalizeServerCapabilities(result?.capabilities);
-  session.serverInfo = serverInfoFrom(meta[MCP_META_SERVER_INFO]);
-  session.instructions = typeof result?.instructions === "string" ? result.instructions : undefined;
-  session.initialized = true;
-  return {
-    protocolVersion: version,
-    capabilities: session.capabilities,
-    serverInfo: session.serverInfo,
-    instructions: session.instructions,
-  };
-}
-
-/**
- * Probes `server/discover` on the stateless wire. Resolves to the negotiated
- * discovery when the server speaks 2026-07-28 (an `UnsupportedProtocolVersion`
- * answer is retried once with a version from its list), null when it is a
- * legacy server (method unknown, non-JSON-RPC 4xx/5xx, silence, transport
- * fault — the caller falls back to initialize, whose own errors stay honest).
- * Credential rejections propagate: they are true whatever the wire.
- */
-export async function mcpDiscover(
-  session: McpProtocolSession,
-  options: { timeoutMs?: number } = {},
-): Promise<McpDiscovery | null> {
-  const timeoutMs = options.timeoutMs ?? 5_000;
-  const previous = { wire: session.wire, protocolVersion: session.protocolVersion };
-  const restore = (): void => {
-    session.wire = previous.wire;
-    session.protocolVersion = previous.protocolVersion;
-  };
-  session.wire = "modern";
-  session.protocolVersion = MCP_MODERN_PROTOCOL_VERSION;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const result = (await mcpRequest(session, "server/discover", {}, timeoutMs)) as Record<string, unknown> | null;
-      const version = pickModernVersion(result?.supportedVersions);
-      if (!version) {
-        restore();
-        return null;
-      }
-      return applyDiscovery(session, version, result);
-    } catch (error) {
-      if (error instanceof McpAuthRejectedError) {
-        restore();
-        throw error;
-      }
-      if (error instanceof McpRpcError) {
-        if (error.rpcCode === MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION && attempt === 0) {
-          const supported = isRecord(error.rpcData) ? error.rpcData.supported : undefined;
-          const retryWith = pickModernVersion(supported);
-          if (retryWith) {
-            session.protocolVersion = retryWith;
-            continue;
-          }
-        }
-        if (error.rpcCode === MCP_ERROR_MISSING_CLIENT_CAPABILITY) {
-          restore();
-          throw new Error(`this server requires a client capability Gera does not offer (${redactedCapabilityList(error.rpcData)})`);
-        }
-      }
-      restore();
-      return null;
-    }
-  }
-  restore();
-  return null;
-}
-
-function redactedCapabilityList(data: unknown): string {
-  const required = isRecord(data) && isRecord(data.requiredCapabilities) ? Object.keys(data.requiredCapabilities) : [];
-  return required.length > 0 ? required.join(", ") : "unspecified";
+/** Binds the modern discovery policy to the shared HTTP transport. */
+export function mcpDiscover(session: McpProtocolSession, options: { timeoutMs?: number } = {}): Promise<McpDiscovery | null> {
+  return discoverModern(session, mcpRequest, options);
 }
 
 export type McpConnectOptions = McpInitializeOptions & {
@@ -986,6 +532,7 @@ export type McpConnectOptions = McpInitializeOptions & {
 export async function mcpConnect(session: McpProtocolSession, options: McpConnectOptions = {}): Promise<McpDiscovery> {
   session.clientInfo = options.clientInfo ?? session.clientInfo ?? { name: "Gera AI", version: "1.0.0" };
   session.clientCapabilities = { ...defaultClientCapabilities(), ...(options.capabilities ?? {}) };
+  session.logLevel = options.logLevel ?? session.logLevel;
   const hint = options.wireHint;
   if (hint?.era === "modern" && MCP_MODERN_PROTOCOL_VERSIONS.includes(hint.protocolVersion)) {
     session.wire = "modern";
@@ -1000,7 +547,7 @@ export async function mcpConnect(session: McpProtocolSession, options: McpConnec
       serverInfo: session.serverInfo,
     };
   }
-  if (hint?.era !== "legacy") {
+  if (hint?.era !== "legacy" || !MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(hint.protocolVersion)) {
     const discovered = await mcpDiscover(session, { timeoutMs: options.discoverTimeoutMs });
     if (discovered) {
       return discovered;
@@ -1010,88 +557,9 @@ export async function mcpConnect(session: McpProtocolSession, options: McpConnec
   return mcpInitialize(session, options);
 }
 
-/** The non-secret negotiation summary a catalog cache keeps for the next run. */
-export function sessionWireInfo(session: McpProtocolSession): McpWireInfo | undefined {
-  if (!session.initialized || !session.protocolVersion) {
-    return undefined;
-  }
-  return {
-    era: session.wire ?? "legacy",
-    protocolVersion: session.protocolVersion,
-    ...(session.capabilities ? { capabilities: session.capabilities } : {}),
-    ...(session.serverInfo ? { serverInfo: session.serverInfo } : {}),
-  };
-}
-
-/** True for a stateless-revision result that asks the client for input before it can complete. */
-export function isInputRequiredResult(result: unknown): result is Record<string, unknown> & { resultType: "input_required" } {
-  return isRecord(result) && result.resultType === "input_required";
-}
-
-/**
- * Answers the `inputRequests` of an `input_required` result through the
- * session's server-request handler (the same one that answers legacy
- * `elicitation/create`), so interactive surfaces pause on their card and
- * background surfaces decline honestly. Roots are empty; sampling is not offered.
- */
-async function answerInputRequests(session: McpProtocolSession, result: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const requests = isRecord(result.inputRequests) ? result.inputRequests : {};
-  const answers: Record<string, unknown> = {};
-  for (const [key, raw] of Object.entries(requests)) {
-    if (!isRecord(raw) || typeof raw.method !== "string") {
-      continue;
-    }
-    if (raw.method === "roots/list") {
-      answers[key] = { roots: [] };
-      continue;
-    }
-    if (raw.method === "sampling/createMessage") {
-      throw new McpInputRequiredError("the server asked Gera to run a model on its behalf (sampling), which Gera does not offer to servers");
-    }
-    if (raw.method !== "elicitation/create") {
-      throw new McpInputRequiredError(`the server asked for input of an unsupported kind (${raw.method})`);
-    }
-    if (!session.onServerRequest) {
-      answers[key] = { action: "decline" };
-      continue;
-    }
-    try {
-      const reply = await session.onServerRequest({ id: key, method: raw.method, params: raw.params });
-      answers[key] = "result" in reply && isRecord(reply.result) ? reply.result : { action: "decline" };
-    } catch {
-      answers[key] = { action: "decline" };
-    }
-  }
-  return answers;
-}
-
-/**
- * `mcpRequest` plus the stateless revision's input rounds: an `input_required`
- * result is answered and the same request is re-sent (new id) with
- * `inputResponses` and the opaque `requestState`, up to MCP_MAX_INPUT_ROUNDS
- * times. Legacy results pass straight through.
- */
-export async function mcpRequestWithInput(
-  session: McpProtocolSession,
-  method: string,
-  params: Record<string, unknown>,
-  timeoutMs: number,
-): Promise<unknown> {
-  let extra: Record<string, unknown> = {};
-  for (let round = 0; ; round += 1) {
-    const result = await mcpRequest(session, method, { ...params, ...extra }, timeoutMs);
-    if (!isInputRequiredResult(result)) {
-      return result;
-    }
-    if (round >= MCP_MAX_INPUT_ROUNDS) {
-      throw new McpInputRequiredError(`the server kept asking for more input after ${MCP_MAX_INPUT_ROUNDS} rounds`);
-    }
-    const inputResponses = await answerInputRequests(session, result);
-    extra = {
-      inputResponses,
-      ...(typeof result.requestState === "string" ? { requestState: result.requestState } : {}),
-    };
-  }
+/** Shared requests with bounded stateless input continuations; legacy results pass through. */
+export function mcpRequestWithInput(session: McpProtocolSession, method: string, params: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
+  return requestWithModernInput(session, method, params, timeoutMs, mcpRequest);
 }
 
 export type McpListOptions = {
@@ -1137,131 +605,12 @@ export async function mcpListAll(
 // ---------------------------------------------------------------------------
 // Standalone GET notification stream.
 
-export type McpNotificationStream = {
-  close: () => void;
-  /** Resolves when the stream ended (closed by us, by the server, or by an error). */
-  done: Promise<void>;
-};
-
-/** The `subscriptions/listen` filter for everything the server's capabilities can change. */
-function listenFilter(session: McpProtocolSession): Record<string, unknown> {
-  const capabilities = session.capabilities ?? {};
-  return {
-    ...(capabilities.tools?.listChanged ? { toolsListChanged: true } : {}),
-    ...(capabilities.prompts?.listChanged ? { promptsListChanged: true } : {}),
-    ...(capabilities.resources?.listChanged ? { resourcesListChanged: true } : {}),
-  };
-}
-
-/**
- * Opens the server-initiated notification stream: the Streamable HTTP GET
- * stream on the legacy wire, a `subscriptions/listen` POST whose SSE response
- * stays open on the stateless wire (its first frame is the acknowledgement; a
- * final `result` frame means the server closed it). Servers that offer none
- * answer 405 — that is not an error, the caller just gets null.
- */
-export async function openMcpNotificationStream(
-  session: McpProtocolSession,
-  options: { connectTimeoutMs?: number } = {},
-): Promise<McpNotificationStream | null> {
-  const controller = new AbortController();
-  // Only the handshake is bounded — once headers arrive the stream stays open
-  // until close() (the caller ties it to the run's lifetime).
-  const connectTimer = setTimeout(
-    () => controller.abort(new Error("MCP notification stream timed out")),
-    Math.max(1_000, options.connectTimeoutMs ?? 8_000),
-  );
-  let response: Response;
-  try {
-    const leased = await leaseCredential(session);
-    if (isModern(session)) {
-      const filter = listenFilter(session);
-      if (Object.keys(filter).length === 0) {
-        clearTimeout(connectTimer);
-        return null;
-      }
-      session.nextId += 1;
-      const params = wireParams(session, { notifications: filter });
-      response = await sessionFetch(session)(leased.url ?? session.url, {
-        method: "POST",
-        headers: requestHeaders(session, true, leased, "subscriptions/listen", params),
-        body: JSON.stringify({ jsonrpc: "2.0", id: session.nextId, method: "subscriptions/listen", params }),
-        signal: controller.signal,
-      });
-    } else {
-      response = await sessionFetch(session)(leased.url ?? session.url, {
-        method: "GET",
-        headers: {
-          Accept: "text/event-stream",
-          ...protocolHeaders(session, true),
-          ...session.headers,
-          ...leased.headers,
-        },
-        signal: controller.signal,
-      });
-    }
-  } catch {
-    clearTimeout(connectTimer);
-    return null;
-  }
-  clearTimeout(connectTimer);
-  if (!response.ok || !response.body || !isEventStream(response)) {
-    await response.body?.cancel().catch(() => undefined);
-    return null;
-  }
-  adoptSessionId(session, response);
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const done = (async () => {
-    let buffer = "";
-    try {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) {
-          return;
-        }
-        buffer += decoder.decode(chunk.value, { stream: true });
-        if (buffer.length > MCP_MAX_RESPONSE_CHARS) {
-          return; // a runaway stream is abandoned, not buffered forever
-        }
-        let boundary = buffer.search(/\r?\n\r?\n/);
-        while (boundary >= 0) {
-          const separator = /\r?\n\r?\n/.exec(buffer.slice(boundary))?.[0] ?? "\n\n";
-          const event = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + separator.length);
-          for (const payload of parseSseEvents(`${event}\n\n`)) {
-            let messages: JsonRpcMessage[] = [];
-            try {
-              messages = jsonRpcMessages(payload);
-            } catch {
-              continue;
-            }
-            for (const message of messages) {
-              if (isRpcResponse(message)) {
-                if (isModern(session)) {
-                  return; // the server closed the listen subscription gracefully
-                }
-                continue;
-              }
-              await dispatchServerFrame(session, message);
-            }
-          }
-          boundary = buffer.search(/\r?\n\r?\n/);
-        }
-      }
-    } catch {
-      // closed by us or dropped by the server — either way the stream is over
-    } finally {
-      await reader.cancel().catch(() => undefined);
-    }
-  })();
-  return {
-    close: () => {
-      controller.abort();
-      void reader.cancel().catch(() => undefined);
-    },
-    done,
-  };
+/** Opens a run-owned modern subscription or legacy notification stream. */
+export function openMcpNotificationStream(session: McpProtocolSession, options: { connectTimeoutMs?: number } = {}): Promise<McpNotificationStream | null> {
+  return openNotificationStream(session, {
+    lease: leaseCredential, fetch: sessionFetch, headers: requestHeaders, adoptSessionId, isEventStream, readText: readLimitedText,
+    parseEvents: parseSseEvents, parseMessages: jsonRpcMessages, isResponse: isRpcResponse, dispatch: dispatchServerFrame,
+  }, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -1735,99 +1084,4 @@ export function stringifyMcpPromptContent(content: unknown): string {
 // Binary parts of a tool result (images, audio, blobs) — bounded, as data URLs.
 
 /** Images shipped per tool call; the rest is described in text. */
-export const MCP_MEDIA_MAX_IMAGES = 5;
-/** Total bytes of images per tool call, and the cap for one audio/blob attachment. */
-export const MCP_MEDIA_MAX_BYTES = 4 * 1024 * 1024;
-
-export type McpResultImage = { dataUrl: string; mimeType: string; bytes: number };
-
-/** An audio part or an embedded binary resource small enough to ship. */
-export type McpResultFile = { name: string; mimeType: string; dataUrl: string; bytes: number };
-
-export type McpResultMedia = {
-  images: McpResultImage[];
-  files: McpResultFile[];
-  /** Human notes for parts left out (over the caps), appended to the model text. */
-  omitted: string[];
-};
-
-function base64Bytes(data: string): number {
-  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
-}
-
-function describeBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024) {
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  }
-  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-}
-
-function fileNameFor(mimeType: string, uri: string, index: number): string {
-  const fromUri = uri.split(/[/\\]/).pop()?.split("?")[0] ?? "";
-  if (fromUri && fromUri.length <= 120) {
-    return fromUri;
-  }
-  const subtype = mimeType.split("/")[1]?.split(";")[0]?.replace(/[^a-z0-9.+-]/gi, "") ?? "";
-  const ext = subtype === "mpeg" ? "mp3" : subtype || "bin";
-  return `${mimeType.startsWith("audio/") ? "audio" : "file"}-${index + 1}.${ext}`;
-}
-
-/**
- * Collects the binary content parts of a `tools/call` result as data URLs:
- * `type: "image"` parts (image/*, up to MCP_MEDIA_MAX_IMAGES and
- * MCP_MEDIA_MAX_BYTES in total), `type: "audio"` parts and embedded
- * `resource` blobs (each up to MCP_MEDIA_MAX_BYTES). Errors ship nothing.
- */
-export function extractMcpResultMedia(result: unknown): McpResultMedia {
-  const media: McpResultMedia = { images: [], files: [], omitted: [] };
-  if (!isRecord(result) || result.isError === true || !Array.isArray(result.content)) {
-    return media;
-  }
-  let imageBytes = 0;
-  let imagesOver = 0;
-  let fileIndex = 0;
-  for (const part of result.content) {
-    if (!isRecord(part)) {
-      continue;
-    }
-    if (part.type === "image" && typeof part.data === "string" && part.data.length > 0) {
-      const mimeType = typeof part.mimeType === "string" && /^image\//i.test(part.mimeType) ? part.mimeType : "image/png";
-      const bytes = base64Bytes(part.data);
-      if (media.images.length >= MCP_MEDIA_MAX_IMAGES || imageBytes + bytes > MCP_MEDIA_MAX_BYTES) {
-        imagesOver += 1;
-        continue;
-      }
-      imageBytes += bytes;
-      media.images.push({ dataUrl: `data:${mimeType};base64,${part.data}`, mimeType, bytes });
-      continue;
-    }
-    let blob = "";
-    let mimeType = "";
-    let uri = "";
-    if (part.type === "audio" && typeof part.data === "string" && part.data.length > 0) {
-      blob = part.data;
-      mimeType = typeof part.mimeType === "string" && part.mimeType ? part.mimeType : "audio/wav";
-    } else if (part.type === "resource" && isRecord(part.resource) && typeof part.resource.blob === "string" && part.resource.blob.length > 0) {
-      blob = part.resource.blob;
-      mimeType = typeof part.resource.mimeType === "string" && part.resource.mimeType ? part.resource.mimeType : "application/octet-stream";
-      uri = typeof part.resource.uri === "string" ? part.resource.uri : "";
-    } else {
-      continue;
-    }
-    const bytes = base64Bytes(blob);
-    const name = fileNameFor(mimeType, uri, fileIndex);
-    fileIndex += 1;
-    if (bytes > MCP_MEDIA_MAX_BYTES) {
-      media.omitted.push(`${name} (${mimeType}, ${describeBytes(bytes)}) exceeds the 4 MB attachment limit and was not attached`);
-      continue;
-    }
-    media.files.push({ name, mimeType, dataUrl: `data:${mimeType};base64,${blob}`, bytes });
-  }
-  if (imagesOver > 0) {
-    media.omitted.push(
-      `${imagesOver} more image${imagesOver === 1 ? "" : "s"} omitted (limit ${MCP_MEDIA_MAX_IMAGES} images / 4 MB per call)`,
-    );
-  }
-  return media;
-}
+export { MCP_MEDIA_MAX_IMAGES, MCP_MEDIA_MAX_BYTES, extractMcpResultMedia, type McpResultImage, type McpResultFile, type McpResultMedia } from "./mcp-result-media";

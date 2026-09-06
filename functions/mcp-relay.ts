@@ -7,6 +7,8 @@
 // gate, shard dispatch) so this module never sees the Env type.
 
 import { shardFailureReason } from "./chat-shared";
+import { MCP_PROTOCOL_HEADERS } from "./mcp-headers";
+import { MCP_MODERN_PROTOCOL_VERSIONS } from "./mcp-protocol-shared";
 import { isForbiddenHost, safePublicHttpsUrl } from "./network-safety";
 
 /** What the relays need to know about an authenticated account. */
@@ -358,11 +360,12 @@ export async function relayMcp(ctx: McpRelayContext, request: Request, url: URL)
     return ctx.corsJson({ error: "body_too_large" }, 413);
   }
 
+  const modern = MCP_MODERN_PROTOCOL_VERSIONS.includes(request.headers.get("MCP-Protocol-Version") ?? "");
   const headers: Record<string, string> = {};
   const upstreamAuthorization = request.headers.get("X-Gera-Upstream-Authorization");
   request.headers.forEach((value, name) => {
     const lower = name.toLowerCase();
-    if (MCP_DROP_HEADERS.has(lower) || MCP_DROP_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+    if ((modern && lower === "mcp-session-id") || MCP_DROP_HEADERS.has(lower) || MCP_DROP_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
       return;
     }
     headers[lower] = value;
@@ -439,13 +442,10 @@ export async function relayMcp(ctx: McpRelayContext, request: Request, url: URL)
     ...ctx.corsHeaders,
     "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
   };
-  const sessionId = upstream.headers.get("Mcp-Session-Id");
-  if (sessionId) {
-    responseHeaders["Mcp-Session-Id"] = sessionId;
-  }
-  const protocolVersion = upstream.headers.get("MCP-Protocol-Version");
-  if (protocolVersion) {
-    responseHeaders["MCP-Protocol-Version"] = protocolVersion;
+  for (const name of MCP_PROTOCOL_HEADERS) {
+    if (modern && name === "Mcp-Session-Id") continue;
+    const value = upstream.headers.get(name);
+    if (value) responseHeaders[name] = value;
   }
   const challenge = upstream.headers.get("WWW-Authenticate");
   if (challenge) {

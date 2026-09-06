@@ -75,25 +75,28 @@ describe("one-time move of sign-ins into the vault (web/src/lib/mcp-credential-m
     for (const id of ["gh-1", "linear", "custom-auto"]) {
       expect(byId.get(id)?.status, id).toBe("error");
       expect(byId.get(id)?.error, id).toBe(VAULT_RESIGNIN_NOTICE);
-      expect(byId.get(id)?.credentialStored, id).toBe(false);
+      expect(byId.get(id)?.credentialStored, id).toBeUndefined();
       expect(byId.get(id)?.identity, id).toBeUndefined();
       expect(byId.get(id)?.verifiedAt, id).toBeUndefined();
     }
     expect(byId.get("vaulted")?.status).toBe("connected");
-    expect(byId.get("keyed")?.status).toBe("connected");
-    expect(byId.get("keyed")?.token).toBe("sk-live");
+    expect(byId.get("keyed")?.status).toBe("error");
+    expect(byId.get("keyed")?.error).toContain("retry the server check");
+    expect(byId.get("keyed")?.token).toBe("");
+    expect(byId.get("keyed")?.credentialStored).toBeUndefined();
     expect(byId.get("asleep")?.status).toBe("idle");
     expect(byId.get("open")?.status).toBe("connected");
     expect(report).toEqual({
       at: 1_800_000_000_000,
       moved: 1,
       awaiting: 3,
-      serverIds: ["gh-1", "linear", "custom-auto", "vaulted", "asleep"],
+      serverIds: ["gh-1", "linear", "custom-auto", "vaulted", "keyed", "asleep"],
+      checking: 1,
     });
     expect(store.has(TOKENS_KEY)).toBe(false);
     expect(loadMcpCredentialMigrationReport()).toEqual(report);
     expect(describeMcpCredentialMigration(report)).toBe(
-      "Browser grants retired · 1 sign-in moved to the vault · 3 await a fresh sign-in",
+      "Browser grants retired · 1 sign-in moved to the vault · 3 await a fresh sign-in · 1 saved connections need a server check",
     );
     // The stored report carries ids and counts only — never a token.
     expect(store.get("gera.mcp.oauth.migration.v1")).not.toContain("accessToken");

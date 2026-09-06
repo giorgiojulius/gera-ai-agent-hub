@@ -843,10 +843,8 @@ function normalizeServer(server: McpServerConfig): McpServerConfig {
     headersJson: typeof server.headersJson === "string" ? server.headersJson : "",
     token: typeof server.token === "string" ? server.token : "",
     catalogId,
-    // "Connect once and forget": a verified server stays connected across
-    // reloads — auth material persists too (tokens in this config, sign-ins
-    // in localStorage) and every call re-handshakes lazily. Boot re-verifies
-    // in the background and flips truly dead sign-ins to an honest error.
+    // Preserve verified metadata. Boot/cloud hydration purges old provider
+    // fields before state is used; subsequent checks lease the account vault.
     status: server.status === "connected" ? "connected" : server.status === "error" ? "error" : "idle",
     error: typeof server.error === "string" ? server.error : undefined,
     identity: typeof server.identity === "string" ? server.identity : undefined,

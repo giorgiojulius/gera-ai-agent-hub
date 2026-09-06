@@ -1,6 +1,5 @@
 import { DEFAULT_CHAT_MODEL, parseModelSelection, type ReasoningEffort } from "@/lib/models";
 import type { Grounding } from "@/lib/grounding";
-import { callMcpTool, findServerForTool } from "@/lib/mcp";
 import { createSurfSession } from "@/lib/selfsurf";
 import { chatGatewayOptions, createSourceLedger, executeBuiltinTool } from "@/lib/tools";
 import { readErrorMessage, toolkitFetch } from "@/lib/toolkit";
@@ -8,7 +7,6 @@ import { reportUsage } from "@/lib/usage";
 import type {
   Attachment,
   ChatMessage,
-  McpServerConfig,
   OpenAiChatMessage,
   OpenAiContentPart,
   OpenAiTool,
@@ -616,7 +614,6 @@ export async function runAgentTurn(params: {
   modelId: string;
   history: ChatMessage[];
   tools: OpenAiTool[];
-  mcpServers: McpServerConfig[];
   /** Pass false to disable gateway backup models for every call in this turn. */
   fallbacks?: boolean;
   systemPrompt?: string;
@@ -827,28 +824,11 @@ export async function runAgentTurn(params: {
           repeatedCalls += 1;
         }
         try {
-          const mcp = findServerForTool(params.mcpServers, record.name);
-          if (mcp) {
-            let parsed: unknown = {};
-            try {
-              parsed = JSON.parse(record.arguments || "{}");
-            } catch {
-              parsed = {};
-            }
-            record.result = await callMcpTool(mcp.server, mcp.toolName, parsed);
-          } else {
-            const result = await executeBuiltinTool(record.name, record.arguments, ledger, surfSession);
-            record.result = result.text;
-            if (result.images) {
-              images.push(...result.images);
-            }
-            if (result.videos) {
-              videos.push(...result.videos);
-            }
-            if (result.audios) {
-              audios.push(...result.audios);
-            }
-          }
+          const result = await executeBuiltinTool(record.name, record.arguments, ledger, surfSession);
+          record.result = result.text;
+          if (result.images) images.push(...result.images);
+          if (result.videos) videos.push(...result.videos);
+          if (result.audios) audios.push(...result.audios);
           record.status = "done";
         } catch (error) {
           record.status = "error";

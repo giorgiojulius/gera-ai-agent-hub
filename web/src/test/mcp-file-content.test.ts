@@ -15,12 +15,9 @@ import { cloudMcpServersForAutomation } from "../../../functions/mcp-cloud";
 import { callGitHubNativeTool as callServerGitHubNativeTool } from "../../../functions/native-github";
 import { callGitHubNativeTool as callBrowserGitHubNativeTool } from "@/lib/github-native";
 import {
-  callMcpTool,
-  connectMcpServerLegacy,
   parseMcpRpcResponse,
   stringifyMcpResult,
 } from "@/lib/mcp";
-import type { McpServerConfig } from "@/lib/types";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -108,9 +105,9 @@ describe("GitHub MCP file bodies", () => {
       "fetch",
       vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
         const headers = new Headers(init?.headers);
-        accepts.push(headers.get("accept"));
-        if (headers.get("accept") === "application/vnd.github.raw+json") {
-          expect(headers.get("authorization")).toBe("Bearer browser-token");
+        accepts.push(headers.get("X-Gera-GitHub-Accept"));
+        expect(headers.get("authorization")).not.toBe("Bearer browser-token");
+        if (headers.get("X-Gera-GitHub-Accept") === "application/vnd.github.raw+json") {
           return new Response("const FILE_BODY = 'browser';\n", { status: 200 });
         }
         return jsonResponse({ type: "file", path: "src/app.ts", size: 1_100_000, encoding: "none", content: "" });
@@ -118,7 +115,7 @@ describe("GitHub MCP file bodies", () => {
     );
 
     await expect(
-      callBrowserGitHubNativeTool("Bearer browser-token", "get_contents", {
+      callBrowserGitHubNativeTool("gera-account:github", "get_contents", {
         owner: "acme",
         repo: "app",
         path: "src/app.ts",
@@ -188,76 +185,4 @@ describe("generic MCP file-content transport", () => {
   // the same authenticated session) runs against the real SDK server in
   // mcp-conformance.test.ts.
 
-  it("follows resource links in the browser MCP client as well", async () => {
-    const methods: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { id?: number; method: string };
-        methods.push(body.method);
-        if (body.method === "notifications/initialized") {
-          return new Response(null, { status: 202 });
-        }
-        if (body.method === "initialize") {
-          return jsonResponse({ jsonrpc: "2.0", id: body.id, result: { serverInfo: { name: "Files" } } });
-        }
-        if (body.method === "tools/list") {
-          return jsonResponse({
-            jsonrpc: "2.0",
-            id: body.id,
-            result: {
-              tools: [
-                {
-                  name: "read_file",
-                  description: "Read one file",
-                  inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-                },
-              ],
-            },
-          });
-        }
-        if (body.method === "tools/call") {
-          return sseResponse([
-            { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } },
-            {
-              jsonrpc: "2.0",
-              id: body.id,
-              result: { content: [{ type: "resource_link", uri: "file:///project/README.md", name: "README.md" }] },
-            },
-          ]);
-        }
-        if (body.method === "resources/read") {
-          return jsonResponse({
-            jsonrpc: "2.0",
-            id: body.id,
-            result: { contents: [{ uri: "file:///project/README.md", mimeType: "text/markdown", text: "BROWSER_RESOURCE_BODY" }] },
-          });
-        }
-        throw new Error(`Unexpected method ${body.method}`);
-      }),
-    );
-    const server: McpServerConfig = {
-      id: "file-content-test-server",
-      name: "Files",
-      url: "https://mcp.example.com",
-      headersJson: "",
-      authMode: "none",
-      enabled: true,
-      status: "connected",
-      tools: [],
-      disabledTools: [],
-    };
-
-    await connectMcpServerLegacy(server);
-    await expect(callMcpTool(server, "read_file", { path: "README.md" })).resolves.toContain(
-      "BROWSER_RESOURCE_BODY",
-    );
-    expect(methods).toEqual([
-      "initialize",
-      "notifications/initialized",
-      "tools/list",
-      "tools/call",
-      "resources/read",
-    ]);
-  });
 });

@@ -77,7 +77,7 @@ export function stripCloudMcpCredentials(server: CloudMcpServer): CloudMcpServer
  */
 export function createCredentialLease(
   initial: CloudMcpServer,
-  options: { resolve?: CredentialResolver; repairGrant?: GrantRepair } = {},
+  options: { resolve?: CredentialResolver; repairGrant?: GrantRepair; beforeUse?: (server: CloudMcpServer) => Promise<void> } = {},
 ): CredentialLease {
   const name = initial.name;
   if (options.resolve) {
@@ -100,6 +100,7 @@ export function createCredentialLease(
   const repairGrant = options.repairGrant;
   return {
     async get() {
+      await options.beforeUse?.(material);
       return leasedCredentialFor(material);
     },
     async repair() {

@@ -490,25 +490,7 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
   const toolkit = getToolkitUrl();
 
   if (url.startsWith("https://api.github.com")) {
-    const path = new URL(url).pathname;
-    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer ghp_e2e_fixture");
-    if (path === "/user") {
-      return jsonResponse({ login: "e2e-octocat", name: "E2E GitHub" });
-    }
-    if (path === "/user/orgs") {
-      return jsonResponse([{ login: "acme" }]);
-    }
-    if (path === "/user/repos") {
-      return jsonResponse([
-        {
-          full_name: "acme/private-app",
-          private: true,
-          description: "Private fixture repository",
-          pushed_at: "2026-08-30T10:00:00Z",
-        },
-      ]);
-    }
-    throw new Error(`Unstubbed GitHub request: ${url}`);
+    throw new Error("Browser provider fetch is forbidden; GitHub operations must use the account proxy");
   }
 
   if (url.startsWith(FUNCTIONS_URL)) {
@@ -598,6 +580,7 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
         return jsonResponse({
           tools: [{ name: "get_contents", inputSchema: { type: "object", properties: {} } }],
           identity: "GitHub · server verified",
+          credentialStored: true,
         });
       }
       if (body.server?.id === STUB_VAULT_OAUTH_SERVER_ID) {
@@ -695,44 +678,8 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
         contents: [{ uri: STUB_MCP_RESOURCE_URI, mimeType: "text/markdown", text: "# acme/private-app\n\nFixture README body." }],
       });
     }
-    if (url.includes("/mcp-proxy")) {
-      const headers = new Headers(init?.headers);
-      expect(headers.get("Authorization")).toMatch(/^Bearer /);
-      expect(headers.get("X-Gera-Upstream-Url")).toBe("https://mcp.deepwiki.com/mcp");
-      const raw = typeof init?.body === "string" ? init.body : "{}";
-      const body = JSON.parse(raw) as { id?: number; method?: string };
-      if (body.method === "notifications/initialized") {
-        return new Response(null, { status: 202 });
-      }
-      if (body.method === "initialize") {
-        return new Response(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: body.id,
-            result: {
-              protocolVersion: "2025-06-18",
-              serverInfo: { name: "DeepWiki", version: "e2e" },
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json", "Mcp-Session-Id": "e2e-mcp" } },
-        );
-      }
-      if (body.method === "tools/list") {
-        return jsonResponse({
-          jsonrpc: "2.0",
-          id: body.id,
-          result: {
-            tools: [
-              {
-                name: "ask_question",
-                description: "Ask about a public repository",
-                inputSchema: { type: "object", properties: { question: { type: "string" } } },
-              },
-            ],
-          },
-        });
-      }
-      throw new Error(`Unstubbed MCP method: ${body.method ?? "missing"}`);
+    if (url.includes("/mcp-proxy") || url.includes("/mcp/resolve")) {
+      throw new Error("Browser MCP transport is forbidden: execution must stay in cloud runs");
     }
     if (url.includes("/repo-previews/inspect")) {
       const headers = new Headers(init?.headers);
@@ -1004,6 +951,20 @@ test("e2e · Dropping a file onto the composer attaches it", { timeout: 90_000 }
   expect(document.querySelector(`[data-testid="${TID.composerDropZone}"]`)).toBeNull();
 });
 
+test("e2e · A legacy settings PAT is removed and the saved server credential is rechecked", { timeout: 25_000 }, async () => {
+  localStorage.setItem("gera.settings.v1", JSON.stringify({ mcpServers: [{
+    id: "github", catalogId: "github", name: "GitHub", url: "", enabled: true,
+    status: "connected", token: "legacy-browser-pat", headersJson: "", tools: [], disabledTools: [],
+  }] }));
+  const driver = webDriver();
+  await driver.goto("/mcp?server=github");
+  await expect.poll(() => {
+    const settings = JSON.parse(localStorage.getItem("gera.settings.v1") ?? "{}");
+    return settings.mcpServers?.find((server: { id: string }) => server.id === "github");
+  }, { timeout: 15_000 }).toMatchObject({ status: "connected", credentialStored: true });
+  expect(JSON.stringify(Object.entries(localStorage))).not.toContain("legacy-browser-pat");
+});
+
 for (const scenario of E2E_SCENARIOS) {
   test(`e2e · ${scenario.title}`, { timeout: 90_000 }, async () => {
     if (scenario.id === "github-pin-and-send" || scenario.id === "github-launch-web-preview") {
@@ -1017,7 +978,8 @@ for (const scenario of E2E_SCENARIOS) {
               name: "GitHub",
               url: "",
               headersJson: "",
-              token: "ghp_e2e_fixture",
+              token: "",
+              credentialStored: true,
               enabled: true,
               status: "connected",
               tools: [],
@@ -1173,7 +1135,8 @@ for (const scenario of E2E_SCENARIOS) {
       const persisted = JSON.parse(localStorage.getItem("gera.settings.v1") ?? "{}") as {
         mcpServers?: Array<{ id: string; status: string; credentialStored?: boolean; error?: string }>;
       };
-      expect(persisted.mcpServers?.[0]).toMatchObject({ status: "error", credentialStored: false });
+      expect(persisted.mcpServers?.[0]).toMatchObject({ status: "error" });
+      expect(persisted.mcpServers?.[0]?.credentialStored).toBeUndefined();
       expect(persisted.mcpServers?.[0]?.error).toContain("sign in again");
       const report = JSON.parse(localStorage.getItem("gera.mcp.oauth.migration.v1") ?? "{}") as { moved?: number; awaiting?: number };
       expect(report).toMatchObject({ moved: 0, awaiting: 1 });

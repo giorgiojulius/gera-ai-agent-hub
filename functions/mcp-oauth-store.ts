@@ -123,7 +123,11 @@ export async function mcpConfigsWithSecrets(ctx: OAuthStoreContext, owner: strin
       out.push(item);
       continue;
     }
-    out.push({ ...item, ...(await mcpServerSecret(ctx, owner, item.id)) });
+    const saved = await mcpServerSecret(ctx, owner, item.id);
+    const legacy = typeof item.catalogId === "string" && item.catalogId !== item.id && !saved.token && !saved.headersJson
+      ? await mcpServerSecret(ctx, owner, item.catalogId) : {};
+    const credential = saved.token || saved.headersJson ? saved : legacy;
+    out.push({ ...item, token: credential.token ?? "", headersJson: credential.headersJson ?? "" });
   }
   return out;
 }
@@ -431,6 +435,7 @@ export async function resolveOwnerMcpServers(
   owner: string,
   ids: string[],
   force: Set<string>,
+  options: { refresh?: boolean } = {},
 ): Promise<OwnerMcpServers | null> {
   const profileRow = ctx.sql.exec<{ payload: string }>("SELECT payload FROM profiles WHERE owner_email = ?", owner).toArray()[0];
   let parsed: unknown = null;
@@ -468,7 +473,7 @@ export async function resolveOwnerMcpServers(
     appliedChains.set(rotated.serverId, bases);
   };
   for (const server of servers) {
-    if (!server.oauth) {
+    if (options.refresh === false || !server.oauth) {
       continue;
     }
     const outcome = force.has(server.id)

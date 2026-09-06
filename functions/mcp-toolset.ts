@@ -10,8 +10,8 @@
 //   a server does not fit;
 // - deferred: the model sees two meta functions, `mcp_search_tools` and
 //   `mcp_call_tool`. Tool tables come from the account's catalog cache (or a
-//   handshake when the cache is cold), servers connect lazily on the first
-//   call, and a tool may only be called after a search returned it in this
+//   unloaded marker when cold), servers connect only on addressed use,
+//   and a tool may only be called after a search returned it in this
 //   run. Schemas never reach the prompt until they are needed.
 //
 // The native GitHub / Slack / Intercom connectors always register inline:
@@ -27,64 +27,31 @@
 // Credentials never appear in records, prompt notes, or search results — the
 // tool tables are already redacted by the transport (mcp-cloud.ts).
 
-import type { ChatSql } from "./chat-shared";
-import { classifyMcpAuthRejection, describeStepUp } from "./mcp-auth-challenge";
-import {
-  CONFIRMATION_TIMEOUT_MS,
-  describeMcpWritePolicy,
-  mcpApprovalKey,
-  mcpPolicyVerdict,
-  mcpServerAllowed,
-  mcpToolAllowed,
-  OPEN_MCP_POLICY,
-  previewToolArguments,
-  type McpConfirmationAction,
-  type McpRunPolicy,
-  type McpToolRisk,
-  type NativeConnectorKind,
-} from "./mcp-policy";
+import { describeStepUp } from "./mcp-auth-challenge";
+import { describeMcpWritePolicy, mcpServerAllowed, mcpToolAllowed, OPEN_MCP_POLICY, type McpConfirmationAction, type McpRunPolicy, type McpToolRisk } from "./mcp-policy";
+import { CONNECT_BUDGET_MS, RUN_CATALOG_CHARS, CATALOG_TTL_MS, type McpCatalogStore, type McpCatalogEntry } from "./mcp-catalog";
+import { createMcpConnections, type McpServerState as ServerState } from "./mcp-lazy-connect";
+import { createMcpInteraction } from "./mcp-interaction";
+export * from "./mcp-catalog";
+export { normalizeCatalogWire } from "./mcp-catalog-wire";
+export { ELICITATION_TIMEOUT_MS } from "./mcp-interaction";
 import {
   callCloudMcpToolRich,
   cloudMcpFunctionName,
   cloudServerRedactions,
-  connectCloudMcp,
   ensureFreshCloudOAuth,
   forceRefreshCloudOAuthOutcome,
-  listCloudMcpTools,
   redactCloudMcpText,
   type BeginCloudOAuthRefresh,
-  type CloudMcpConnection,
   type CloudMcpServer,
   type CloudMcpSession,
   type CloudMcpTool,
   type CloudOAuthRefreshFailure,
   type RefreshedOAuth,
 } from "./mcp-cloud";
-import { createCredentialLease, stripCloudMcpCredentials, type CredentialLease } from "./mcp-credentials";
-import {
-  JSON_RPC_INVALID_PARAMS,
-  JSON_RPC_METHOD_NOT_FOUND,
-  McpAuthRejectedError,
-  normalizeElicitationRequest,
-  normalizeServerCapabilities,
-  normalizeToolAnnotations,
-  openMcpNotificationStream,
-  sessionWireInfo,
-  validateElicitationContent,
-  type McpElicitationAnswer,
-  type McpElicitationRequest,
-  type McpFetch,
-  type McpNotificationStream,
-  type McpPromptInfo,
-  type McpResourceInfo,
-  type McpResourceTemplateInfo,
-  type McpResultFile,
-  type McpServerCapabilities,
-  type McpServerRequest,
-  type McpServerRequestReply,
-  type McpToolAnnotations,
-  type McpWireInfo,
-} from "./mcp-protocol";
+import { createCredentialLease, stripCloudMcpCredentials } from "./mcp-credentials";
+import { McpSignInRequiredError } from "./mcp-protocol-shared";
+import type { McpElicitationAnswer, McpElicitationRequest, McpFetch, McpResultFile } from "./mcp-protocol";
 import { callGitHubNativeTool, GITHUB_NATIVE_TOOLS } from "./native-github";
 import { callIntercomNativeTool, INTERCOM_NATIVE_TOOLS } from "./native-intercom";
 import { callSlackNativeTool, SLACK_NATIVE_TOOLS } from "./native-slack";
@@ -152,26 +119,10 @@ export const DEFERRED_AUTO_CONTEXT_SHARE = 0.15;
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
 /** Soft cap of inline MCP functions per server (native mode only) — the one remaining fuse against a runaway server. */
 export const NATIVE_TOOLS_PER_SERVER = 500;
-/**
- * Wall-clock budget for all handshakes of one run (they run in parallel).
- * Servers still connecting when it lapses are reported honestly and finish
- * in the background — a deferred call that arrives later waits for them.
- */
-export const CONNECT_BUDGET_MS = 20_000;
-/** Combined tool-table JSON of every server in one run; servers past this stay out with an honest record. */
-export const RUN_CATALOG_CHARS = 24_000_000;
-/** Deferred catalogs list up to this many tools per server. */
-export const DEFERRED_TOOLS_PER_SERVER = 5_000;
-/** Deferred catalogs refuse servers whose tool JSON exceeds this many characters. */
-export const DEFERRED_SCHEMA_CHARS = 6_000_000;
-/** Catalog cache freshness window. */
-export const CATALOG_TTL_MS = 10 * 60_000;
 export const SEARCH_DEFAULT_LIMIT = 10;
 export const SEARCH_MAX_LIMIT = 20;
 /** Rendered search results never exceed this many characters. */
 const SEARCH_RESULT_CHARS = 60_000;
-/** Cloud SQLite rows have a hard size limit; larger catalogs stay uncached. */
-const CATALOG_ROW_CHARS = 1_500_000;
 /** Rough tokens-per-character estimate for schema JSON. */
 const CHARS_PER_TOKEN = 4;
 
@@ -186,7 +137,7 @@ export function mcpMetaToolDefinitions(): ToolDef[] {
       function: {
         name: MCP_SEARCH_TOOL_NAME,
         description:
-          "Search the tools of the user's connected MCP servers (deferred loading — their schemas are not preloaded). Full-text over tool names, descriptions and input fields. Returns up to `limit` tool descriptors with complete input schemas plus every server with its tool count. Always search before mcp_call_tool; only tools returned here can be called.",
+          "Search MCP tool names, descriptions and input fields. An unaddressed search reads cached catalogs only and lists unloaded servers honestly. Pass serverId to connect just that server and load its catalog. Returns complete input schemas; only descriptors actually returned can be called.",
         parameters: {
           type: "object",
           properties: {
@@ -211,7 +162,7 @@ export function mcpMetaToolDefinitions(): ToolDef[] {
       function: {
         name: MCP_CALL_TOOL_NAME,
         description:
-          "Run one MCP tool that mcp_search_tools returned in this conversation. Pass the exact serverId and toolName from the search result and an arguments object matching the tool's inputSchema. The result is the tool's text output.",
+          "Run a previously revealed MCP tool with exact serverId, toolName and arguments matching its inputSchema. On a cold server the first call only connects that server and returns matching schemas with executed:false; it NEVER executes the tool. Read the schema and call again to execute, subject to policy and confirmation.",
         parameters: {
           type: "object",
           properties: {
@@ -233,217 +184,6 @@ export function mcpMetaToolDefinitions(): ToolDef[] {
 /** True for the deferred-mode meta functions. */
 export function isMcpMetaToolName(name: string): boolean {
   return name === MCP_SEARCH_TOOL_NAME || name === MCP_CALL_TOOL_NAME;
-}
-
-// ---------------------------------------------------------------------------
-// Catalog cache.
-
-export type McpCatalogEntry = {
-  serverId: string;
-  serverName: string;
-  /** The full remote table (disabled tools included) — filtering happens per run. */
-  tools: CloudMcpTool[];
-  fetchedAt: number;
-  /** Inventory (prompts / resources / templates) when the writing handshake listed it. */
-  prompts?: McpPromptInfo[];
-  resources?: McpResourceInfo[];
-  resourceTemplates?: McpResourceTemplateInfo[];
-  capabilities?: McpServerCapabilities;
-  /** The wire the last handshake settled on — the next run skips the `server/discover` probe. */
-  wire?: McpWireInfo;
-};
-
-/** Revives a cached wire negotiation; anything malformed means "probe again". */
-export function normalizeCatalogWire(value: unknown): McpWireInfo | undefined {
-  if (!isRecord(value) || (value.era !== "modern" && value.era !== "legacy") || typeof value.protocolVersion !== "string" || !value.protocolVersion) {
-    return undefined;
-  }
-  const rawInfo = isRecord(value.serverInfo) ? value.serverInfo : {};
-  return {
-    era: value.era,
-    protocolVersion: value.protocolVersion,
-    ...(isRecord(value.capabilities) ? { capabilities: normalizeServerCapabilities(value.capabilities) } : {}),
-    ...(Object.keys(rawInfo).length > 0
-      ? {
-          serverInfo: {
-            name: typeof rawInfo.name === "string" ? rawInfo.name : undefined,
-            title: typeof rawInfo.title === "string" ? rawInfo.title : undefined,
-            version: typeof rawInfo.version === "string" ? rawInfo.version : undefined,
-          },
-        }
-      : {}),
-  };
-}
-
-/** True when the entry carries an inventory (not just the tool table). */
-export function catalogHasInventory(entry: McpCatalogEntry | null): entry is McpCatalogEntry & { prompts: McpPromptInfo[] } {
-  return entry !== null && Array.isArray(entry.prompts);
-}
-
-export type McpCatalogStore = {
-  read(serverId: string): McpCatalogEntry | null;
-  write(entry: McpCatalogEntry): void;
-  invalidate(serverId: string): void;
-};
-
-/** In-memory store — tests and one-off probes. */
-export function createMemoryMcpCatalogStore(): McpCatalogStore {
-  const entries = new Map<string, McpCatalogEntry>();
-  return {
-    read: (serverId) => entries.get(serverId) ?? null,
-    write: (entry) => {
-      entries.set(entry.serverId, entry);
-    },
-    invalidate: (serverId) => {
-      entries.delete(serverId);
-    },
-  };
-}
-
-const CATALOG_TABLE_READY = new WeakSet<object>();
-
-function ensureCatalogTable(sql: ChatSql): void {
-  if (CATALOG_TABLE_READY.has(sql)) {
-    return;
-  }
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS mcp_tool_catalog (
-      owner_email TEXT NOT NULL,
-      server_id TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (owner_email, server_id)
-    )
-  `);
-  CATALOG_TABLE_READY.add(sql);
-}
-
-function normalizeCatalogTools(value: unknown): CloudMcpTool[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const tools: CloudMcpTool[] = [];
-  for (const raw of value) {
-    if (!isRecord(raw) || typeof raw.name !== "string" || !raw.name) {
-      continue;
-    }
-    const annotations = normalizeToolAnnotations(raw.annotations);
-    tools.push({
-      name: raw.name,
-      description: typeof raw.description === "string" ? raw.description : raw.name,
-      inputSchema: isRecord(raw.inputSchema) ? raw.inputSchema : { type: "object", properties: {} },
-      ...(typeof raw.title === "string" && raw.title ? { title: raw.title } : {}),
-      ...(annotations ? { annotations } : {}),
-      ...(raw.uiOnly === true ? { uiOnly: true } : {}),
-    });
-  }
-  return tools;
-}
-
-function normalizeCatalogInventory(parsed: Record<string, unknown>): Pick<McpCatalogEntry, "prompts" | "resources" | "resourceTemplates" | "capabilities"> {
-  if (!Array.isArray(parsed.prompts)) {
-    return {};
-  }
-  const list = <T>(value: unknown, key: string): T[] =>
-    Array.isArray(value) ? (value.filter((item) => isRecord(item) && typeof item[key] === "string") as T[]) : [];
-  return {
-    prompts: list<McpPromptInfo>(parsed.prompts, "name"),
-    resources: list<McpResourceInfo>(parsed.resources, "uri"),
-    resourceTemplates: list<McpResourceTemplateInfo>(parsed.resourceTemplates, "uriTemplate"),
-    capabilities: normalizeServerCapabilities(parsed.capabilities),
-  };
-}
-
-/**
- * Account-shard catalog table (`mcp_tool_catalog`). Interactive runs live
- * inside the ChatStore and read it directly; `/mcp/check` refreshes it on
- * every Re-check; project agents receive entries through `/mcp/resolve`.
- */
-export function createSqlMcpCatalogStore(sql: ChatSql, owner: string): McpCatalogStore {
-  ensureCatalogTable(sql);
-  return {
-    read(serverId) {
-      const row = sql
-        .exec<{ payload: string; updated_at: number }>(
-          "SELECT payload, updated_at FROM mcp_tool_catalog WHERE owner_email = ? AND server_id = ?",
-          owner,
-          serverId,
-        )
-        .toArray()[0];
-      if (!row) {
-        return null;
-      }
-      try {
-        const parsed = JSON.parse(row.payload) as unknown;
-        if (!isRecord(parsed)) {
-          return null;
-        }
-        const wire = normalizeCatalogWire(parsed.wire);
-        return {
-          serverId,
-          serverName: typeof parsed.serverName === "string" ? parsed.serverName : serverId,
-          tools: normalizeCatalogTools(parsed.tools),
-          fetchedAt: row.updated_at,
-          ...normalizeCatalogInventory(parsed),
-          ...(wire ? { wire } : {}),
-        };
-      } catch {
-        return null;
-      }
-    },
-    write(entry) {
-      const payload = JSON.stringify({
-        v: 2,
-        serverName: entry.serverName,
-        tools: entry.tools,
-        ...(entry.wire ? { wire: entry.wire } : {}),
-        ...(entry.prompts
-          ? {
-              prompts: entry.prompts,
-              resources: entry.resources ?? [],
-              resourceTemplates: entry.resourceTemplates ?? [],
-              capabilities: entry.capabilities ?? {},
-            }
-          : {}),
-      });
-      if (payload.length > CATALOG_ROW_CHARS) {
-        return; // oversized tables stay uncached — the run still connects live
-      }
-      sql.exec(
-        "INSERT OR REPLACE INTO mcp_tool_catalog (owner_email, server_id, payload, updated_at) VALUES (?, ?, ?, ?)",
-        owner,
-        entry.serverId,
-        payload,
-        entry.fetchedAt,
-      );
-    },
-    invalidate(serverId) {
-      sql.exec("DELETE FROM mcp_tool_catalog WHERE owner_email = ? AND server_id = ?", owner, serverId);
-    },
-  };
-}
-
-/** Revives catalog entries shipped over an internal JSON hop (`/mcp/resolve`). */
-export function normalizeMcpCatalogEntries(raw: unknown): McpCatalogEntry[] {
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-  const out: McpCatalogEntry[] = [];
-  for (const item of raw) {
-    if (!isRecord(item) || typeof item.serverId !== "string" || !item.serverId) {
-      continue;
-    }
-    const wire = normalizeCatalogWire(item.wire);
-    out.push({
-      serverId: item.serverId,
-      serverName: typeof item.serverName === "string" && item.serverName ? item.serverName : item.serverId,
-      tools: normalizeCatalogTools(item.tools),
-      fetchedAt: typeof item.fetchedAt === "number" && Number.isFinite(item.fetchedAt) ? item.fetchedAt : 0,
-      ...normalizeCatalogInventory(item),
-      ...(wire ? { wire } : {}),
-    });
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +411,8 @@ export type McpToolFile = { name: string; mime: string; dataUrl: string; bytes: 
 
 export type McpToolOutcome = {
   text: string;
+  /** Schema-only cold calls must not be recorded as executed tools or research sources. */
+  executed?: false;
   isError?: boolean;
   /** `type: "image"` parts of the result as data URLs (up to 5 / 4 MB per call). */
   images?: string[];
@@ -751,10 +493,9 @@ export type McpToolset = McpRuntime & {
   journal: McpToolsetJournalEntry[];
 };
 
-/** Elicitation waits this long for the user before Gera answers `cancel` honestly. */
-export const ELICITATION_TIMEOUT_MS = 5 * 60_000;
-
 export type ResolveMcpToolsetOptions = {
+  /** Optional modern request log level; no logging is requested by default. */
+  logLevel?: import("./mcp-protocol-shared").McpLogLevel;
   /** Resolved connectors (auth already attached) — see cloudMcpServersForAutomation. */
   servers: CloudMcpServer[];
   /** Account setting; unknown values behave as "auto". */
@@ -772,6 +513,8 @@ export type ResolveMcpToolsetOptions = {
   /** Context window of the run's model; unknown → 128k. */
   contextWindowTokens?: number;
   catalog?: McpCatalogStore;
+  /** Project runs write redacted full catalogs back to the owner, before publishing them locally. */
+  persistCatalog?: (entry: McpCatalogEntry, signal: AbortSignal) => Promise<void>;
   /** Lift the per-server native cap and the run budgets (health checks want the complete table). */
   uncapped?: boolean;
   /** Wall-clock budget for the run's parallel handshakes (default CONNECT_BUDGET_MS; tests shorten it). */
@@ -810,29 +553,6 @@ export type ResolveMcpToolsetOptions = {
   inventory?: boolean;
 };
 
-type ServerState = {
-  /** Credential-free copy — the material lives behind `lease`. */
-  server: CloudMcpServer;
-  lease: CredentialLease;
-  catalog: CloudMcpTool[] | null;
-  session: CloudMcpSession | null;
-  connecting: Promise<void> | null;
-  /** True while a handshake is in flight (the run's connect budget may lapse before it settles). */
-  pending: boolean;
-  failure: string | null;
-  /** Left out by the run's combined catalog budget (reported as mcp_limit, not as a connect failure). */
-  leftOut: boolean;
-  /** A list_changed notification arrived — the next search/call re-lists tools. */
-  stale: boolean;
-  stream: McpNotificationStream | null;
-  /** insufficient_scope arrived: the server is not contacted again this run. */
-  stepUp: { scopes: string[]; code: string } | null;
-  promptCount?: number;
-  resourceCount?: number;
-  /** Cached negotiation from the catalog — the handshake skips the `server/discover` probe. */
-  wireHint?: McpWireInfo;
-};
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -867,22 +587,6 @@ function richOutcome(result: { text: string; media: { images: Array<{ dataUrl: s
   };
 }
 
-function withTimeout<T>(task: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
-  return new Promise<T>((resolve) => {
-    const timer = setTimeout(() => resolve(onTimeout()), ms);
-    task.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      () => {
-        clearTimeout(timer);
-        resolve(onTimeout());
-      },
-    );
-  });
-}
-
 /**
  * Builds the toolset for one run. Expiring synced sign-ins refresh first,
  * native connectors register from their static tables, and generic MCP servers
@@ -898,15 +602,13 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const catalogBudgetChars = options.uncapped ? Number.POSITIVE_INFINITY : Math.max(0, options.catalogBudgetChars ?? RUN_CATALOG_CHARS);
   const connectBudgetMs = Math.max(0, options.connectBudgetMs ?? CONNECT_BUDGET_MS);
   const policy = options.policy ?? OPEN_MCP_POLICY;
-  /** Tools approved for the rest of this chat ("Always allow"), seeded from the run config. */
-  const approved = new Set<string>((policy.approved ?? []).map((item) => mcpApprovalKey(item.serverId, item.toolName)));
   // Servers outside a set allowlist take no part in the run at all.
   const servers = options.servers.filter((server) => mcpServerAllowed(policy, server.id));
 
-  // 1. Expiring grants refresh before anything connects.
+  // Native connectors remain inline. Generic grants are refreshed only when their lease is used.
   const unavailable = new Set<string>();
   for (const server of servers) {
-    if (!server.oauth) {
+    if (server.kind === "mcp" || !server.oauth) {
       continue;
     }
     try {
@@ -952,14 +654,21 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     }
     return outcome?.ok === true;
   };
+  const beforeUse = async (server: CloudMcpServer): Promise<void> => {
+    const outcome = await ensureFreshCloudOAuth(server, runtime.refreshed, options.persist, options.beginRefresh);
+    if (outcome?.ok === false) {
+      await options.reportFailure?.(server.id, outcome);
+      if (!outcome.transient) throw new McpSignInRequiredError();
+    }
+  };
   const states: ServerState[] = servers
     .filter((server) => server.kind === "mcp" && !unavailable.has(server.id))
     .map((server) => {
       const cached = options.catalog?.read(server.id) ?? null;
-      const fresh = cached !== null && now() - cached.fetchedAt < CATALOG_TTL_MS;
+      const fresh = cached !== null && now() >= cached.fetchedAt && now() - cached.fetchedAt < CATALOG_TTL_MS;
       const credentials = options.credentials;
       const lease = createCredentialLease(server, {
-        ...(credentials ? { resolve: (force: boolean) => credentials(server.id, { force }) } : { repairGrant }),
+        ...(credentials ? { resolve: (force: boolean) => credentials(server.id, { force }) } : { repairGrant, beforeUse }),
       });
       return {
         server: stripCloudMcpCredentials(server),
@@ -978,399 +687,27 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       };
     });
 
-  const journal: McpToolsetJournalEntry[] = [];
-  const note = (entry: McpToolsetJournalEntry): void => {
-    journal.push(entry);
-    options.onJournal?.(entry);
-  };
+  const { journal, note, gate, parkForStepUp, serverRequestHandler } = createMcpInteraction(options, policy);
 
-  /**
-   * Policy gate in front of every call: outside the allowlist → honest
-   * refusal; read-only, auto-run, or already approved → proceed; otherwise
-   * the user confirms on a card (interactive) or the call is declined
-   * (background). "Always allow in this chat" lands in `approved`, so the
-   * next call of that tool runs straight away. Journal entries never carry
-   * argument values; the card gets a redacted, capped preview. Returns the
-   * outcome that replaces the call, or null to proceed.
-   */
-  const gate = async (
-    server: { id: string; name: string },
-    tool: { name: string; description?: string; annotations?: McpToolAnnotations },
-    native: NativeConnectorKind | undefined,
-    args: Record<string, unknown>,
-    redactions: string[],
-  ): Promise<McpToolOutcome | null> => {
-    const verdict = mcpPolicyVerdict(policy, approved, server.id, tool, native);
-    if (verdict.kind === "run") {
-      return null;
-    }
-    const base = { serverId: server.id, serverName: server.name, toolName: tool.name };
-    if (verdict.kind === "blocked") {
-      note({ kind: "policy_blocked", ...base, detail: `Not run: ${verdict.reason}.` });
-      return {
-        text: `Tool "${tool.name}" on "${server.name}" is not allowed by this agent's MCP policy (${verdict.reason}). Do not retry it.`,
-        isError: true,
-      };
-    }
-    const label = verdict.risk === "destructive" ? "destructive" : "write";
-    if (!options.confirm) {
-      note({
-        kind: "confirmation_declined",
-        ...base,
-        detail: `${label} tool needs the user's confirmation; this unattended run cannot ask, so the call was declined.`,
-      });
-      return {
-        text: `Tool "${tool.name}" on "${server.name}" is a ${label} tool and this run's MCP policy requires the user's confirmation before it runs. This unattended run cannot ask, so the call was declined — do not retry it; tell the user what you wanted to do so they can run it from chat or switch the policy to auto-run.`,
-        isError: true,
-      };
-    }
-    const answer = await withTimeout<McpConfirmationAnswer | { action: "timeout" }>(
-      options.confirm({
-        ...base,
-        risk: verdict.risk,
-        description: (tool.description ?? "").slice(0, 400),
-        argumentsPreview: previewToolArguments(args, (text) => redactCloudMcpText(text, redactions)),
-      }),
-      CONFIRMATION_TIMEOUT_MS,
-      () => ({ action: "timeout" }),
-    );
-    switch (answer.action) {
-      case "accept":
-        note({ kind: "confirmation_granted", ...base, detail: `The user confirmed this ${label} call once.` });
-        return null;
-      case "always":
-        approved.add(mcpApprovalKey(server.id, tool.name));
-        note({ kind: "confirmation_always", ...base, detail: `The user allowed this ${label} tool for the rest of the chat.` });
-        return null;
-      case "timeout":
-        note({ kind: "confirmation_timeout", ...base, detail: "No decision within 10 minutes; the call was declined." });
-        return {
-          text: `No decision on running "${tool.name}" on "${server.name}" arrived within 10 minutes, so the call was declined. Do not retry it; ask the user how to proceed.`,
-          isError: true,
-        };
-      default:
-        note({ kind: "confirmation_declined", ...base, detail: `The user declined this ${label} call.` });
-        return {
-          text: `The user declined running "${tool.name}" on "${server.name}". Do not retry it; ask the user how to proceed.`,
-          isError: true,
-        };
-    }
-  };
+  const { connect, refreshIfStale, connectMissing, awaitLate, enforceCatalogBudget, close, isClosed } = createMcpConnections({
+    options, states, now, connectBudgetMs, catalogBudgetChars, repairGrant, parkForStepUp, serverRequestHandler, note,
+  });
 
-  /**
-   * 403 `insufficient_scope` (RFC 6750 §3.1): the grant works but is too
-   * narrow for this tool. The server is parked for the rest of the run (no
-   * retries with the same token), the account records the demanded scopes so
-   * the next sign-in asks for pin ∪ granted ∪ required, and the tool result
-   * tells the model exactly what to do. Returns the honest text, or null when
-   * the error was not a step-up.
-   */
-  const parkForStepUp = async (state: ServerState, error: unknown): Promise<string | null> => {
-    if (!(error instanceof McpAuthRejectedError)) {
-      return null;
-    }
-    const rejection = classifyMcpAuthRejection(error.status, error.wwwAuthenticate);
-    if (rejection.kind !== "step_up") {
-      return null;
-    }
-    const server = state.server;
-    const text = describeStepUp(server.name, rejection.scopes);
-    state.stepUp = { scopes: rejection.scopes, code: rejection.code };
-    state.failure = text;
-    state.session = null;
-    state.stream?.close();
-    state.stream = null;
-    note({ kind: "step_up_required", serverId: server.id, serverName: server.name, detail: text });
-    await options.reportFailure?.(server.id, {
-      ok: false,
-      status: error.status,
-      code: rejection.code,
-      ...(rejection.description ? { detail: rejection.description.slice(0, 300) } : {}),
-      transient: false,
-      ambiguous: false,
-      requiredScopes: rejection.scopes,
-    });
-    return text;
-  };
-
-  /**
-   * Server → client requests. Elicitation pauses interactive surfaces for the
-   * user (bounded), is declined honestly everywhere else; the answer is
-   * validated against the requested schema before it leaves; values are never
-   * journaled. Roots are empty; sampling is not offered.
-   */
-  const serverRequestHandler =
-    (state: ServerState) =>
-    async (request: McpServerRequest): Promise<McpServerRequestReply> => {
-      const server = state.server;
-      if (request.method === "elicitation/create") {
-        const parsed = normalizeElicitationRequest(request.params);
-        if (!parsed) {
-          return { error: { code: JSON_RPC_INVALID_PARAMS, message: "elicitation/create params were not understood" } };
-        }
-        if (parsed.mode === "url") {
-          note({ kind: "elicitation_declined", serverId: server.id, serverName: server.name, detail: "URL-mode elicitation is not supported by Gera; declined." });
-          return { result: { action: "decline" } };
-        }
-        if (!options.elicit) {
-          note({ kind: "elicitation_declined", serverId: server.id, serverName: server.name, detail: `Server asked for input (“${parsed.message.slice(0, 120)}”); this run cannot ask the user, so it declined.` });
-          return { result: { action: "decline" } };
-        }
-        const answer = await withTimeout(
-          options.elicit({ ...parsed, serverId: server.id, serverName: server.name }),
-          ELICITATION_TIMEOUT_MS,
-          (): McpElicitationAnswer => {
-            note({ kind: "elicitation_timeout", serverId: server.id, serverName: server.name, detail: "No answer within 5 minutes; cancelled." });
-            return { action: "cancel" };
-          },
-        );
-        if (answer.action !== "accept") {
-          return { result: { action: answer.action } };
-        }
-        const valid = validateElicitationContent(parsed, answer.content ?? {});
-        if (valid.ok === false) {
-          note({ kind: "elicitation_invalid", serverId: server.id, serverName: server.name, detail: valid.errors.join("; ") });
-          return { result: { action: "cancel" } };
-        }
-        return { result: { action: "accept", content: valid.content } };
-      }
-      if (request.method === "roots/list") {
-        return { result: { roots: [] } };
-      }
-      if (request.method === "sampling/createMessage") {
-        return { error: { code: JSON_RPC_METHOD_NOT_FOUND, message: "Gera does not offer sampling to servers" } };
-      }
-      return { error: { code: JSON_RPC_METHOD_NOT_FOUND, message: `Unsupported request ${request.method}` } };
-    };
-
-  /** list_changed → the account cache is dropped and this run re-lists before its next search/call. */
-  const notificationHandler = (state: ServerState) => (notification: { method: string }): void => {
-    if (/^notifications\/(tools|prompts|resources)\/list_changed$/.test(notification.method)) {
-      options.catalog?.invalidate(state.server.id);
-      state.stale = true;
-    }
-  };
-
-  const connectRaw = async (state: ServerState, server: CloudMcpServer): Promise<CloudMcpConnection> =>
-    connectCloudMcp(server, {
-      maxTools: DEFERRED_TOOLS_PER_SERVER,
-      includeDisabled: true,
-      inventory: options.inventory === true,
-      lease: () => state.lease.get(),
-      ...(options.fetch ? { fetch: options.fetch } : {}),
-      // A Re-check (uncapped health check) always probes afresh; runs reuse the cached wire.
-      ...(state.wireHint && !options.uncapped ? { wireHint: state.wireHint } : {}),
-      onServerRequest: serverRequestHandler(state),
-      onNotification: notificationHandler(state),
-    });
-
-  const writeCatalog = (state: ServerState, connection: Pick<CloudMcpConnection, "tools"> & Partial<CloudMcpConnection>): void => {
-    const wire = connection.wire ?? (state.session ? sessionWireInfo(state.session) : undefined);
-    options.catalog?.write({
-      serverId: state.server.id,
-      serverName: state.server.name,
-      tools: connection.tools,
-      fetchedAt: now(),
-      ...(wire ? { wire } : {}),
-      ...(options.inventory && connection.prompts
-        ? {
-            prompts: connection.prompts,
-            resources: connection.resources ?? [],
-            resourceTemplates: connection.resourceTemplates ?? [],
-            capabilities: state.session?.capabilities ?? {},
-          }
-        : {}),
-    });
-  };
-
-  /** One handshake per server per run; auth rejections get one repair attempt. */
-  const connect = (state: ServerState): Promise<void> => {
-    if (state.connecting) {
-      return state.connecting;
-    }
-    state.pending = true;
-    state.connecting = (async () => {
-      const attempt = async (): Promise<CloudMcpConnection> => {
-        try {
-          return await connectRaw(state, state.server);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "connect failed";
-          if (!/auth rejected/i.test(message)) {
-            throw error;
-          }
-          // A scope challenge on the handshake itself: no refresh or re-resolve
-          // can widen a grant — park the server and say so.
-          const stepUp = await parkForStepUp(state, error);
-          if (stepUp) {
-            throw new Error(stepUp);
-          }
-          if (options.reconnect && !options.credentials) {
-            // Legacy project-agent path: the owner's shard refreshes and persists;
-            // the fresh material moves behind a new lease, never onto the state.
-            const fresh = await options.reconnect(state.server.id).catch(() => null);
-            if (fresh) {
-              state.lease = createCredentialLease(fresh, { repairGrant });
-              state.server = stripCloudMcpCredentials(fresh);
-              return connectRaw(state, state.server);
-            }
-            throw error;
-          }
-          // The recorded expiry may be missing or wrong (no expires_in, revoked
-          // early). Redeem the refresh token once (resolver-backed leases
-          // re-resolve with force) and retry — mirrors the browser's 401 replay,
-          // so a sleeping sign-in repairs instead of failing.
-          if (await state.lease.repair()) {
-            return connectRaw(state, state.server);
-          }
-          throw error;
-        }
-      };
-      try {
-        const connection = await attempt();
-        state.session = connection.session;
-        state.catalog = connection.tools;
-        state.failure = null;
-        state.stale = false;
-        if (options.inventory) {
-          state.promptCount = connection.prompts.length;
-          state.resourceCount = connection.resources.length;
-        }
-        const tableChars = jsonText(connection.tools).length;
-        if (tableChars > DEFERRED_SCHEMA_CHARS) {
-          state.failure = `publishes ${connection.tools.length} tools whose schemas exceed ${Math.round(DEFERRED_SCHEMA_CHARS / 1_000_000)} MB — too large to search`;
-          state.catalog = null;
-          return;
-        }
-        writeCatalog(state, connection);
-        const capabilities = connection.session.capabilities;
-        const listens =
-          capabilities?.tools?.listChanged === true ||
-          capabilities?.prompts?.listChanged === true ||
-          capabilities?.resources?.listChanged === true;
-        if (options.notificationStreams !== false && listens) {
-          // Standalone GET stream for list_changed while the run lives; servers
-          // answering 405 simply work without one.
-          state.stream = await openMcpNotificationStream(connection.session, { connectTimeoutMs: 5_000 });
-        }
-      } catch (error) {
-        const raw = error instanceof Error ? error.message : "connect failed";
-        state.failure = redactCloudMcpText(raw, cloudServerRedactions(state.server));
-      } finally {
-        state.pending = false;
-      }
-    })();
-    return state.connecting;
-  };
-
-  /** After list_changed: re-list on the live session (or reconnect when the run only had the cache). */
-  const refreshIfStale = async (state: ServerState): Promise<void> => {
-    if (!state.stale || state.failure) {
-      return;
-    }
-    if (!state.session) {
-      state.connecting = null;
-      await connect(state);
-      return;
-    }
-    try {
-      const tools = await listCloudMcpTools(state.session, state.server, {
-        maxTools: DEFERRED_TOOLS_PER_SERVER,
-        includeDisabled: true,
-      });
-      state.catalog = tools;
-      state.stale = false;
-      writeCatalog(state, { tools });
-      note({ kind: "catalog_refreshed", serverId: state.server.id, serverName: state.server.name, detail: `${tools.length} tools after list_changed` });
-    } catch (error) {
-      // Keep the previous table; the next search tries again.
-      note({
-        kind: "catalog_refreshed",
-        serverId: state.server.id,
-        serverName: state.server.name,
-        detail: `re-list failed: ${redactCloudMcpText(error instanceof Error ? error.message : "unknown error", cloudServerRedactions(state.server))}`,
-      });
-    }
-  };
-
-  /**
-   * Connects every server the predicate selects, in parallel, inside the
-   * run's connect budget. The clock starts at the first handshake of the run,
-   * so auto's two rounds (tables, then sessions) share one budget. Servers
-   * still pending when it lapses get an honest failure now; their handshake
-   * finishes in the background and `awaitLate` picks it up on first use.
-   */
-  let connectDeadline: number | null = null;
-  const connectMissing = async (predicate: (state: ServerState) => boolean): Promise<void> => {
-    const wanted = states.filter((state) => !state.failure && predicate(state));
-    if (wanted.length === 0) {
-      return;
-    }
-    connectDeadline ??= Date.now() + connectBudgetMs;
-    const all = Promise.all(wanted.map((state) => connect(state))).then(() => true);
-    const remaining = connectDeadline - Date.now();
-    const inTime = remaining > 0
-      ? await Promise.race([all, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), remaining))])
-      : await Promise.race([all, Promise.resolve(false)]);
-    if (inTime) {
-      return;
-    }
-    const seconds = Math.round(connectBudgetMs / 1_000);
-    for (const state of wanted) {
-      if (state.pending && !state.failure) {
-        state.failure = `did not connect within the run's ${seconds} s connection budget (the handshake continues in the background)`;
-      }
-    }
-  };
-
-  /** A call to a server the budget left pending waits for that handshake to settle (bounded by its own timeouts). */
-  const awaitLate = async (state: ServerState): Promise<void> => {
-    if (state.pending && state.connecting) {
-      await state.connecting;
-    }
-  };
-
-  /**
-   * The run's combined catalog budget: tables are admitted in server order
-   * until their JSON would exceed the budget; the rest stay out with an honest
-   * mcp_limit record that names them. Idempotent — auto calls it before it
-   * decides, every mode calls it before it arms.
-   */
-  const enforceCatalogBudget = (): void => {
-    let total = 0;
-    for (const state of states) {
-      if (state.failure || state.catalog === null) {
-        continue;
-      }
-      const chars = jsonText(state.catalog).length;
-      if (total + chars > catalogBudgetChars) {
-        state.leftOut = true;
-        state.failure = `left out of this run: its ${state.catalog.length} tools would push the run's combined tool catalogs past ${Math.round(catalogBudgetChars / 1_000_000)} MB (${(total / 1_000_000).toFixed(1)} MB already admitted). Disable it or trim other servers' tools to bring it back.`;
-        state.catalog = null;
-        state.session = null;
-        state.stream?.close();
-        state.stream = null;
-        continue;
-      }
-      total += chars;
-    }
-  };
-
-  // Auto needs the tables before it can choose; cold caches connect now.
+  // A cold auto run cannot price unseen schemas without violating lazy startup.
   let mode: McpToolsetMode;
   if (requested === "auto") {
-    await connectMissing((state) => state.catalog === null);
+    const cold = states.some((state) => state.catalog === null);
     enforceCatalogBudget();
     const tools = states.flatMap((state) => visibleTools(state, policy));
-    mode = decideMcpToolLoading(
-      "auto",
-      { toolCount: tools.length, schemaChars: jsonText(tools.map((tool) => tool.inputSchema)).length },
-      options.contextWindowTokens,
+    mode = cold ? "deferred" : decideMcpToolLoading(
+      "auto", { toolCount: tools.length, schemaChars: jsonText(tools.map((tool) => tool.inputSchema)).length }, options.contextWindowTokens,
     );
   } else {
     mode = requested;
   }
 
-  const revealed = new Set<string>();
+  const revealed = new Map<string, string>();
+  const schemaKey = (tool: CloudMcpTool): string => jsonText([tool.inputSchema, tool.annotations ?? {}, tool.uiOnly === true]);
   const revealKey = (serverId: string, toolName: string): string => `${serverId}\u0000${toolName}`;
 
   /** Honest record + info row for a server that contributes nothing this run. */
@@ -1380,7 +717,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     runtime.failures.push(
       state.leftOut
         ? { name: "mcp_limit", arguments: server.name, result: `MCP server "${server.name}" was ${reason}` }
-        : { name: "mcp_connect", arguments: server.name, result: `Could not connect MCP server "${server.name}": ${reason}` },
+        : { name: state.authFailure ? "mcp_auth" : "mcp_connect", arguments: server.name, result: `Could not connect MCP server "${server.name}": ${reason}` },
     );
     infos.push({ id: server.id, name: server.name, kind: "mcp", toolCount: 0, deferred, unavailable: reason });
   };
@@ -1445,18 +782,16 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       }
     }
   } else {
-    // Deferred: a searchable table is all the start needs — cold caches
-    // connect once; everything else waits for the first call.
-    await connectMissing((state) => state.catalog === null);
+    // Deferred startup is cache-only: no upstream requests, refreshes, or subscriptions.
     enforceCatalogBudget();
     for (const state of states) {
       const server = state.server;
-      if (state.failure || !state.catalog) {
+      if (state.failure) {
         recordUnavailable(state, true);
         continue;
       }
-      const count = visibleTools(state, policy).length;
-      runtime.summary.push(`${server.name} (${count} tools · deferred)`);
+      const count = state.catalog === null ? -1 : visibleTools(state, policy).length;
+      runtime.summary.push(`${server.name} (${count < 0 ? "catalog not loaded" : `${count} tools`} · deferred)`);
       const wireVersion = state.session?.protocolVersion ?? state.wireHint?.protocolVersion;
       infos.push({
         id: server.id,
@@ -1468,7 +803,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         ...(wireVersion ? { protocolVersion: wireVersion } : {}),
       });
     }
-    if (states.some((state) => state.catalog !== null)) {
+    if (states.some((state) => !state.failure)) {
       runtime.toolDefs.push(...mcpMetaToolDefinitions());
     }
   }
@@ -1477,8 +812,8 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const deferredNote =
     mode === "deferred" && deferredInfos.length > 0
       ? [
-          `MCP servers are connected in deferred mode — their tools are NOT listed as functions. Discover them with ${MCP_SEARCH_TOOL_NAME}({ query, serverId?, limit? }) (full-text over names, descriptions and input fields; returns descriptors with complete schemas), then run one with ${MCP_CALL_TOOL_NAME}({ serverId, toolName, arguments }). Only tools a search returned in this conversation can be called.`,
-          `Servers: ${deferredInfos.map((info) => `${info.id} "${info.name}" · ${info.toolCount} tools`).join("; ")}.`,
+          `MCP tools use deferred loading. An unaddressed ${MCP_SEARCH_TOOL_NAME} reads cached catalogs only. For an unloaded server, pass its serverId to search: only that server connects. A cold ${MCP_CALL_TOOL_NAME} returns a schema with executed:false, not a tool result; call again after reading the schema. Only complete schemas returned in this run can be called.`,
+          `Servers: ${deferredInfos.map((info) => `${info.id} "${info.name}" · ${info.toolCount < 0 ? "catalog not loaded" : `${info.toolCount} tools`}`).join("; ")}.`,
         ].join(" ")
       : "";
   // The model learns what a confirmation means for it only when something is armed.
@@ -1489,7 +824,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
 
   const searchable = (): McpSearchableServer[] =>
     states
-      .filter((state) => state.catalog !== null && !state.failure)
+      .filter((state) => state.catalog !== null && !state.failure && !state.stale && !state.pending)
       .map((state) => ({ serverId: state.server.id, serverName: state.server.name, tools: visibleTools(state, policy) }));
 
   const findState = (serverId: string): ServerState | undefined => {
@@ -1510,6 +845,21 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
   const serverList = (): string =>
     states.map((state) => `${state.server.id} ("${state.server.name}")`).join(", ") || "none";
 
+  const syncInfos = (): void => {
+    for (const state of states) {
+      const info = infos.find((item) => item.id === state.server.id);
+      if (info) {
+        info.toolCount = state.catalog === null || state.stale ? -1 : visibleTools(state, policy).length;
+        info.unavailable = state.failure ?? undefined;
+        info.protocolVersion = state.session?.protocolVersion ?? state.wireHint?.protocolVersion;
+        info.promptCount = state.promptCount;
+        info.resourceCount = state.resourceCount;
+      }
+      if (state.failure && !runtime.failures.some((item) => item.arguments === state.server.name)) {
+        runtime.failures.push({ name: state.leftOut ? "mcp_limit" : state.authFailure ? "mcp_auth" : "mcp_connect", arguments: state.server.name, result: `MCP server "${state.server.name}": ${state.failure}` });
+      }
+    }
+  };
   const runSearch = async (args: Record<string, unknown>): Promise<McpToolOutcome> => {
     const query = typeof args.query === "string" ? args.query : "";
     const serverId = typeof args.serverId === "string" && args.serverId.trim() ? args.serverId.trim() : undefined;
@@ -1521,21 +871,20 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         isError: true,
       };
     }
-    // Handshakes the connect budget left pending may have settled since —
-    // wait for them once so their tables take part; then a list_changed
-    // notification since the last look means the table may be outdated —
-    // re-list before ranking so the model never sees a ghost tool.
-    await Promise.all(states.map((state) => awaitLate(state)));
-    await Promise.all(states.filter((state) => state.stale).map((state) => refreshIfStale(state)));
-    const scopeId = serverId ? findState(serverId)?.server.id : undefined;
-    const hits = searchMcpTools(searchable(), query, { serverId: scopeId, limit });
-    for (const hit of hits) {
-      revealed.add(revealKey(hit.serverId, hit.tool.name));
+    const addressed = serverId ? findState(serverId) : undefined;
+    if (addressed) {
+      await awaitLate(addressed);
+      if (addressed.catalog === null && !addressed.failure) await connect(addressed);
+      await refreshIfStale(addressed);
     }
+    if (isClosed()) return { text: "This MCP run has closed.", isError: true };
+    syncInfos();
+    const hits = searchMcpTools(searchable(), query, { serverId: addressed?.server.id, limit });
     const servers = states.map((state) => ({
       serverId: state.server.id,
       name: state.server.name,
-      toolCount: state.catalog ? visibleTools(state, policy).length : 0,
+      toolCount: state.catalog && !state.stale && !state.pending ? visibleTools(state, policy).length : -1,
+      ...(!state.catalog || state.stale || state.pending ? { catalogStatus: state.pending ? "loading" : "unloaded" } : {}),
       ...(state.failure ? { unavailable: state.failure } : {}),
     }));
     const matches = hits.map((hit) => ({
@@ -1552,7 +901,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
           matches: shown,
           note:
             shown.length === 0
-              ? "No tools matched. Try other keywords, a broader query, or an empty query to list tools."
+              ? "No tools matched in loaded catalogs. For unloaded/stale catalogs, search with serverId to connect only that server; otherwise try other keywords."
               : `${shown.length} tool${shown.length === 1 ? "" : "s"} shown${omitted > 0 ? ` (${omitted} more matched but did not fit)` : ""}. Call ${MCP_CALL_TOOL_NAME} with the exact serverId and toolName.`,
         },
         null,
@@ -1565,8 +914,13 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       text = render(shown, matches.length - shown.length);
     }
     if (text.length > SEARCH_RESULT_CHARS && shown.length === 1) {
-      shown = [{ ...shown[0], inputSchema: { _note: "schema omitted: too large to render" } }];
-      text = render(shown, matches.length - 1);
+      shown = [];
+      text = render(shown, matches.length);
+    }
+    // Never reveal an omitted descriptor or a truncated schema.
+    for (const match of shown) {
+      const hit = hits.find((item) => item.serverId === match.serverId && item.tool.name === match.toolName);
+      if (hit) revealed.set(revealKey(hit.serverId, hit.tool.name), schemaKey(hit.tool));
     }
     return { text };
   };
@@ -1582,8 +936,15 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
       return { text: `No MCP server "${serverId}" is connected in this run. Known servers: ${serverList()}.`, isError: true };
     }
     const server = state.server;
+    if (state.catalog === null && !state.failure) {
+      const found = await runSearch({ query: toolName, serverId: server.id, limit: 1 });
+      if (found.isError) return found;
+      if (state.failure) return { text: `MCP server "${server.name}" is unavailable this run: ${state.failure}.`, isError: true };
+      return { ...found, executed: false, text: JSON.stringify({ executed: false, note: "Tool not executed. Read the returned schema, then call again.", discovery: JSON.parse(found.text) as unknown }) };
+    }
     await awaitLate(state);
     await refreshIfStale(state);
+    syncInfos();
     if (state.failure || !state.catalog) {
       return { text: `MCP server "${server.name}" is unavailable this run: ${state.failure ?? "connect failed"}.`, isError: true };
     }
@@ -1607,7 +968,7 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
         isError: true,
       };
     }
-    if (!revealed.has(revealKey(server.id, toolName))) {
+    if (revealed.get(revealKey(server.id, toolName)) !== schemaKey(catalogTool)) {
       return {
         text: `Tool "${toolName}" on "${server.name}" was not returned by ${MCP_SEARCH_TOOL_NAME} in this conversation. Search for it first so its input schema is known, then call it with the exact serverId and toolName.`,
         isError: true,
@@ -1631,10 +992,17 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     }
     if (!state.session) {
       await connect(state);
+      syncInfos();
       if (state.failure || !state.session) {
         return { text: `MCP tool failed (${server.name}): ${state.failure ?? "connect failed"}`, isError: true };
       }
+      const current = visibleTools(state, policy).find((tool) => tool.name === toolName);
+      if (!current || schemaKey(current) !== schemaKey(catalogTool)) {
+        revealed.delete(revealKey(server.id, toolName));
+        return { text: "The tool or its schema changed while connecting. Search it again before execution.", isError: true, executed: false };
+      }
     }
+    if (isClosed()) return { text: "This MCP run has closed.", isError: true };
     try {
       return richOutcome(await callCloudMcpToolRich(state.session, toolName, callArgs));
     } catch (error) {
@@ -1655,16 +1023,12 @@ export async function resolveMcpToolset(options: ResolveMcpToolsetOptions): Prom
     promptNote,
     servers: infos,
     journal,
-    close() {
-      for (const state of states) {
-        state.stream?.close();
-        state.stream = null;
-      }
-    },
+    close,
     owns(name) {
       return runtime.routes.has(name) || (mode === "deferred" && isMcpMetaToolName(name));
     },
     async execute(name, args) {
+      if (isClosed()) return { text: "This MCP run has closed.", isError: true };
       const route = runtime.routes.get(name);
       if (route) {
         const state = route.type === "mcp" ? states.find((item) => item.server.id === route.serverId) : undefined;

@@ -129,10 +129,12 @@ export async function relayRepoPreviews(relay: RepoPreviewRelayContext, request:
   if (body !== undefined) {
     headers.set("Content-Type", "application/json");
   }
-  let github = request.headers.get("X-Gera-Upstream-Authorization") ?? "";
-  if (github.startsWith("gera-account:")) {
-    const serverId = github.slice("gera-account:".length) || "github";
-    github = (await relay.accountAuthorizationLease(request.url, account, serverId, false)) ?? "";
+  const reference = request.headers.get("X-Gera-Upstream-Authorization") ?? "";
+  let github = "";
+  if (reference) {
+    const match = /^gera-account:([A-Za-z0-9_-]{1,80})$/.exec(reference);
+    if (!match) return relay.corsJson({ error: "server_owned_github_required" }, 400);
+    github = (await relay.accountAuthorizationLease(request.url, account, match[1], false)) ?? "";
   }
   if (github) {
     headers.set("X-Gera-GitHub-Authorization", github);

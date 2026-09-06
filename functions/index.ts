@@ -56,7 +56,8 @@ import { AccessRegistry } from "./access-registry";
 import { verifyCronSignature } from "./cron-auth";
 import { TRACKER_JS } from "./desk-pageviews";
 import { handleKnowledgeRoute, probeRorkStorage } from "./knowledge-storage";
-import { githubRequestHeaders } from "./native-github";
+import { relayGitHubAccount as relayGitHubFromAccount, type GitHubAccountRelayContext } from "./github-account-relay";
+import { MCP_PROTOCOL_HEADERS } from "./mcp-headers";
 import {
   relayAccountMcp,
   relayBrowserOAuthRefresh,
@@ -138,9 +139,9 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Authorization, Content-Type, X-Intercom-Region, X-Gera-Upstream-Authorization, X-Gera-Upstream-Url, X-Gera-GitHub-Accept",
+    `Authorization, Content-Type, X-Intercom-Region, X-Gera-Upstream-Authorization, X-Gera-Upstream-Url, X-Gera-GitHub-Accept, ${MCP_PROTOCOL_HEADERS.join(", ")}`,
   "Access-Control-Expose-Headers":
-    "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate, X-Gera-Relay-Auth, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After, Link, Content-Disposition",
+    `${MCP_PROTOCOL_HEADERS.join(", ")}, WWW-Authenticate, X-Gera-Relay-Auth, X-GitHub-SSO, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After, Link, Content-Disposition`,
   "Access-Control-Max-Age": "86400",
 };
 
@@ -1356,79 +1357,14 @@ async function accountAuthorizationLease(
   return response.ok && typeof data.authorization === "string" ? data.authorization : null;
 }
 
-/** Account-owned GitHub relay. Provider tokens stay between Worker and account shard. */
+/** Account-owned GitHub relay; route logic stays outside the Worker entrypoint. */
 async function relayGitHubAccount(request: Request, url: URL, env: Env): Promise<Response> {
-  if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(request.method)) {
-    return corsJson({ error: "method_not_allowed" }, 405);
-  }
-  const account = await requireInvitedAccount(request, env);
-  if (account instanceof Response) {
-    return account;
-  }
-  const serverId = url.searchParams.get("serverId") ?? "github";
-  const rawPath = url.searchParams.get("path") ?? "";
-  if (!serverId || serverId.length > 80 || !rawPath.startsWith("/") || rawPath.length > 4_000) {
-    return corsJson({ error: "invalid_github_request" }, 400);
-  }
-  let target: URL;
-  try {
-    target = new URL(rawPath, "https://api.github.com");
-  } catch {
-    return corsJson({ error: "invalid_github_request" }, 400);
-  }
-  if (
-    target.origin !== "https://api.github.com" ||
-    target.pathname.split("/").some((segment) => segment === "." || segment === "..")
-  ) {
-    return corsJson({ error: "invalid_github_request" }, 400);
-  }
-  const body = request.method === "GET" ? undefined : await readBoundedText(request, 2_000_000);
-  if (body === null) {
-    return corsJson({ error: "body_too_large" }, 413);
-  }
-  const execute = async (force: boolean): Promise<Response | null> => {
-    const authorization = await accountAuthorizationLease(env, request.url, account, serverId, force);
-    if (!authorization) {
-      return null;
-    }
-    return fetchPublicHttps(target.toString(), {
-      method: request.method,
-      // Shared builder: includes the User-Agent GitHub requires from servers.
-      // Without it every relayed call came back 403 and the account card
-      // could never resolve who the grant belongs to.
-      headers: githubRequestHeaders(
-        authorization,
-        body !== undefined,
-        request.headers.get("X-Gera-GitHub-Accept") ?? "application/vnd.github+json",
-      ),
-      body,
-      signal: AbortSignal.timeout(30_000),
-    }, { allowCrossOriginGet: request.method === "GET" });
+  const context: GitHubAccountRelayContext<AccountPrincipal> = {
+    corsHeaders: CORS_HEADERS, corsJson, readBoundedText,
+    requireAccount: (req) => requireInvitedAccount(req, env),
+    shardCall: (requestUrl, account, path, init) => shardCall(env, requestUrl, account, path, init),
   };
-  let upstream = await execute(false);
-  if (!upstream) {
-    return corsJson({ error: "github_sign_in_required" }, 401);
-  }
-  if (upstream.status === 401) {
-    upstream = (await execute(true)) ?? upstream;
-  }
-  const headers = new Headers({ ...CORS_HEADERS });
-  for (const name of [
-    "Content-Type",
-    "Content-Disposition",
-    "X-OAuth-Scopes",
-    "X-Accepted-OAuth-Scopes",
-    "X-RateLimit-Remaining",
-    "X-RateLimit-Reset",
-    "Retry-After",
-    "Link",
-  ]) {
-    const value = upstream.headers.get(name);
-    if (value) {
-      headers.set(name, value);
-    }
-  }
-  return new Response(upstream.body, { status: upstream.status, headers });
+  return relayGitHubFromAccount(context, request, url);
 }
 
 /** Error-journal bodies stay small (≤20 rows × ≈4.4 KB); anything bigger is a bug or abuse. */

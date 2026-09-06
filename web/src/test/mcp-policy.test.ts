@@ -211,7 +211,7 @@ describe("toolset · allowlist filters functions, search and calls", () => {
       notificationStreams: false,
       policy: { allow: { things: ["read_thing"] }, writes: "auto" },
     });
-    const search = JSON.parse((await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing" })).text) as {
+    const search = JSON.parse((await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing", serverId: "things" })).text) as {
       matches: Array<{ toolName: string }>;
       servers: Array<{ toolCount: number }>;
     };
@@ -245,7 +245,7 @@ describe("toolset · write policy on an unattended surface", () => {
       policy: { allow: null, writes: "ask" },
     });
     expect(toolset.promptNote).toMatch(/unattended run cannot ask/);
-    await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing" });
+    await toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "thing", serverId: "things" });
     expect(await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "things", toolName: "read_thing", arguments: {} })).toEqual({ text: "ok read_thing" });
     const write = await toolset.execute(MCP_CALL_TOOL_NAME, {
       serverId: "things",

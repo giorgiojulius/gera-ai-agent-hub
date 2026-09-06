@@ -498,6 +498,15 @@ export async function setProjectMemberRole(
   await parseOrThrow(response, "Could not change the role");
 }
 
+/** Validates a draft project PAT server-side without changing the personal connector. */
+export async function validateProjectGitHubToken(projectId: string, token: string): Promise<{ login: string; name: string | null; scopes: string[] | null }> {
+  const response = await authedFetch(`/projects/${projectId}/agents/github-validate`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }),
+  });
+  const data = await parseOrThrow<{ viewer: { login: string; name: string | null; scopes: string[] | null } }>(response, "Could not verify the project PAT");
+  return data.viewer;
+}
+
 export async function upsertProjectAgent(
   projectId: string,
   payload: AgentUpsertPayload,

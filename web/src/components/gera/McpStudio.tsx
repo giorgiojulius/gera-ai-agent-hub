@@ -35,6 +35,7 @@ import { VAULT_RESIGNIN_NOTICE } from "@/lib/mcp-credential-migration";
 import { mcpCatalogConnectTid, mcpServerCardTid, mcpServerConnectTid, mcpServerEnabledTid, TID } from "@/lib/testids";
 import type { McpAuthMode, McpServerConfig, McpToolInfo } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { MCP_MODERN_PROTOCOL_VERSIONS } from "../../../../functions/mcp-protocol-shared";
 
 const CATEGORIES = Object.keys(MCP_CATEGORY_LABEL) as McpCategory[];
 
@@ -758,13 +759,13 @@ function ConnectedCard({
           ) : null}
           {server.status === "connected" ? (
             <p className="text-[11px] leading-relaxed text-emerald-700">
-              Verified {verifiedTime(server.verifiedAt)} — handshake and tool listing succeeded
+              Verified {verifiedTime(server.verifiedAt)} — protocol negotiation and tool listing succeeded
               {server.identity ? ` · ${server.identity}` : ""}.
               {server.protocolVersion ? (
                 <span
                   data-testid={TID.mcpProtocolBadge}
                   title={
-                    server.protocolVersion >= "2026-07-28"
+                    MCP_MODERN_PROTOCOL_VERSIONS.includes(server.protocolVersion)
                       ? "Stateless MCP revision: no initialize, no session id; every request carries its own protocol metadata."
                       : "Legacy MCP revision negotiated through the initialize handshake."
                   }

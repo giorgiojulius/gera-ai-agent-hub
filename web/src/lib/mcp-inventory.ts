@@ -4,7 +4,9 @@
 // resource URI, and the arguments the user typed. Inventories are cached
 // per server for the session so reopening a menu costs nothing.
 
-import { authedFetch } from "@/lib/backend";
+import { authedFetchForSession } from "@/lib/backend";
+import { authSessionSnapshot } from "@/lib/auth-tokens";
+import { connectorCacheKey, assertConnectorScope, invalidateConnectorCaches, subscribeConnectorCaches } from "@/lib/connector-cache-scope";
 import { newId } from "@/lib/env";
 import type { Attachment, McpServerConfig } from "@/lib/types";
 
@@ -63,14 +65,11 @@ export type McpResourceContent = {
 const INVENTORY_TTL_MS = 5 * 60_000;
 const inventoryCache = new Map<string, { at: number; value: McpInventory }>();
 const inventoryInFlight = new Map<string, Promise<McpInventory>>();
+subscribeConnectorCaches(() => { inventoryCache.clear(); inventoryInFlight.clear(); });
 
 /** Drops cached inventories (sign-out, Re-check). */
 export function clearMcpInventoryCache(serverId?: string): void {
-  if (serverId) {
-    inventoryCache.delete(serverId);
-    return;
-  }
-  inventoryCache.clear();
+  invalidateConnectorCaches(serverId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -78,12 +77,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function postJson<T>(path: string, body: unknown, fallback: string): Promise<T> {
-  const response = await authedFetch(path, {
+  const serverId = isRecord(body) && typeof body.serverId === "string" ? body.serverId : "";
+  const scope = connectorCacheKey(serverId);
+  const response = await authedFetchForSession(path, authSessionSnapshot(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   const data = (await response.json().catch(() => null)) as unknown;
+  assertConnectorScope(serverId, scope);
   if (!response.ok) {
     const error = isRecord(data) && typeof data.error === "string" ? data.error : "";
     throw new Error(
@@ -116,11 +118,13 @@ export function menuEligibleServers(servers: McpServerConfig[], kind: "prompts" 
 
 /** Lists prompts/resources/templates of one server (account cache first, then one handshake). */
 export function fetchMcpInventory(serverId: string, options: { refresh?: boolean } = {}): Promise<McpInventory> {
-  const cached = inventoryCache.get(serverId);
+  if (options.refresh) clearMcpInventoryCache(serverId);
+  const key = connectorCacheKey(serverId);
+  const cached = inventoryCache.get(key);
   if (!options.refresh && cached && Date.now() - cached.at < INVENTORY_TTL_MS) {
     return Promise.resolve(cached.value);
   }
-  const pending = inventoryInFlight.get(serverId);
+  const pending = inventoryInFlight.get(key);
   if (pending) {
     return pending;
   }
@@ -133,13 +137,14 @@ export function fetchMcpInventory(serverId: string, options: { refresh?: boolean
         toolCount: typeof data.toolCount === "number" ? data.toolCount : 0,
         cached: data.cached === true,
       };
-      inventoryCache.set(serverId, { at: Date.now(), value });
+      assertConnectorScope(serverId, key);
+      inventoryCache.set(key, { at: Date.now(), value });
       return value;
     })
     .finally(() => {
-      inventoryInFlight.delete(serverId);
+      if (inventoryInFlight.get(key) === task) inventoryInFlight.delete(key);
     });
-  inventoryInFlight.set(serverId, task);
+  inventoryInFlight.set(key, task);
   return task;
 }
 

@@ -331,7 +331,6 @@ async function runDebate(ctx: DebateContext): Promise<void> {
           },
         ],
         tools: ctx.verifierTools,
-        mcpServers: [],
         handlers: {
           signal: ctx.signal,
           onReasoning: (full) => {
@@ -595,8 +594,7 @@ export async function runJuliusTurn(params: JuliusRunParams): Promise<JuliusRunR
           modelId: candidate.modelId,
           history: params.history,
           tools: webTools,
-          mcpServers: [],
-          // The competition is between SPECIFIC models — a silent gateway
+            // The competition is between SPECIFIC models — a silent gateway
           // fallback would mislabel the card and let an imposter compete.
           // An honest per-candidate failure is data; the panel survives it.
           fallbacks: false,

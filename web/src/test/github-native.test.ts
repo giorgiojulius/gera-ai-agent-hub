@@ -15,6 +15,7 @@ import {
   type GitHubRepoMeta,
 } from "@/lib/github-native";
 import type { McpServerConfig } from "@/lib/types";
+import { githubTestTarget } from "./fixtures/github-proxy";
 
 describe("injectGitHubRunAuth", () => {
   const base: McpServerConfig = {
@@ -29,31 +30,32 @@ describe("injectGitHubRunAuth", () => {
   };
   const other: McpServerConfig = { ...base, id: "notion", name: "Notion" };
 
-  it("hands the browser credential to the GitHub entry only", () => {
-    const out = injectGitHubRunAuth([other, base], "Bearer gho_x");
-    expect(out[1].token).toBe("Bearer gho_x");
+  it("keeps the GitHub entry eligible without copying provider credentials", () => {
+    const out = injectGitHubRunAuth([other, base], "gera-account:github");
+    expect(out[1]).toMatchObject({ token: "", credentialStored: true });
     expect(out[0].token).toBeUndefined();
   });
 
   it("matches by catalogId when the entry has a custom id", () => {
     const custom: McpServerConfig = { ...base, id: "srv_1", catalogId: "github" };
-    const out = injectGitHubRunAuth([custom], "Bearer gho_x");
-    expect(out[0].token).toBe("Bearer gho_x");
+    const out = injectGitHubRunAuth([custom], "gera-account:github");
+    expect(out[0]).toMatchObject({ token: "", credentialStored: true });
   });
 
-  it("never overwrites a pasted PAT — that credential already rides the run", () => {
+  it("removes legacy browser PAT material from the run copy without mutating settings", () => {
     const pat: McpServerConfig = { ...base, token: "ghp_pasted" };
     const input = [pat];
-    const out = injectGitHubRunAuth(input, "Bearer gho_x");
-    expect(out[0].token).toBe("ghp_pasted");
-    expect(out).toBe(input); // nothing changed — same array back
+    const out = injectGitHubRunAuth(input, "gera-account:github");
+    expect(out[0].token).toBe("");
+    expect(out).not.toBe(input);
+    expect(input[0].token).toBe("ghp_pasted");
   });
 
   it("drops GitHub without a browser credential and never mutates sources", () => {
     const input = [base];
     expect(injectGitHubRunAuth(input, undefined)).toEqual([]);
     expect(input).toEqual([base]);
-    const out = injectGitHubRunAuth(input, "Bearer gho_x");
+    const out = injectGitHubRunAuth(input, "gera-account:github");
     expect(out).not.toBe(input);
     expect(base.token).toBeUndefined(); // settings state stays pristine
   });
@@ -273,7 +275,7 @@ describe("write rails", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const target = String(input);
+        const target = githubTestTarget(input).toString();
         if (target.endsWith("/repos/o/r")) {
           return new Response(
             JSON.stringify({ full_name: "o/r", default_branch: "main", html_url: "https://github.com/o/r" }),
@@ -285,7 +287,7 @@ describe("write rails", () => {
     );
     try {
       await expect(
-        callGitHubNativeTool("Bearer x", "put_file", {
+        callGitHubNativeTool("gera-account:github", "put_file", {
           owner: "o",
           repo: "r",
           branch: "main",
@@ -303,7 +305,7 @@ describe("write rails", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const target = String(input);
+        const target = githubTestTarget(input).toString();
         if (target.endsWith("/repos/o/r")) {
           return new Response(JSON.stringify({ full_name: "o/r", default_branch: "develop" }), { status: 200 });
         }
@@ -312,7 +314,7 @@ describe("write rails", () => {
     );
     try {
       await expect(
-        callGitHubNativeTool("Bearer x", "delete_file", {
+        callGitHubNativeTool("gera-account:github", "delete_file", {
           owner: "o",
           repo: "r",
           branch: "develop",
@@ -327,7 +329,7 @@ describe("write rails", () => {
 
   it("create_pull refuses head === base without touching the network", async () => {
     await expect(
-      callGitHubNativeTool("Bearer x", "create_pull", {
+      callGitHubNativeTool("gera-account:github", "create_pull", {
         owner: "o",
         repo: "r",
         title: "t",
@@ -339,16 +341,16 @@ describe("write rails", () => {
 
   it("update_pull validates state and requires an actual change", async () => {
     await expect(
-      callGitHubNativeTool("Bearer x", "update_pull", { owner: "o", repo: "r", number: 1, state: "merged" }),
+      callGitHubNativeTool("gera-account:github", "update_pull", { owner: "o", repo: "r", number: 1, state: "merged" }),
     ).rejects.toThrow(/"open" or "closed"/);
     await expect(
-      callGitHubNativeTool("Bearer x", "update_pull", { owner: "o", repo: "r", number: 1 }),
+      callGitHubNativeTool("gera-account:github", "update_pull", { owner: "o", repo: "r", number: 1 }),
     ).rejects.toThrow(/Nothing to update/);
   });
 
   it("put_file rejects oversized content before any network call", async () => {
     await expect(
-      callGitHubNativeTool("Bearer x", "put_file", {
+      callGitHubNativeTool("gera-account:github", "put_file", {
         owner: "o",
         repo: "r",
         branch: "fix/x",
@@ -383,17 +385,22 @@ describe("formatRepoLine", () => {
 });
 
 describe("resolveGitHubAuth", () => {
-  it("prefers a pasted PAT and normalizes it to a Bearer header", async () => {
-    await expect(resolveGitHubAuth({ id: "github", token: "ghp_abc" })).resolves.toBe("Bearer ghp_abc");
+  it("requires an explicit server save/check for a pasted PAT", async () => {
+    await expect(resolveGitHubAuth({ id: "github", token: "ghp_abc" })).rejects.toThrow(/Sign in with GitHub/);
   });
 
-  it("keeps an explicit Bearer prefix untouched", async () => {
-    await expect(resolveGitHubAuth({ id: "github", token: "Bearer gho_xyz" })).resolves.toBe("Bearer gho_xyz");
+  it("never uses the old browser PAT after a vault 401", async () => {
+    const calls = vi.fn(async () => new Response("{}", { status: 401 }));
+    vi.stubGlobal("fetch", calls);
+    try {
+      await expect(resolveGitHubAuth({ id: "github", credentialStored: true, token: "Bearer gho_xyz" })).rejects.toThrow(/Sign in with GitHub/);
+      expect(calls.mock.calls).toHaveLength(1);
+    } finally { vi.unstubAllGlobals(); }
   });
 });
 
 describe("callGitHubNativeTool", () => {
   it("rejects unknown tools without touching the network", async () => {
-    await expect(callGitHubNativeTool("Bearer x", "nope", {})).rejects.toThrow('Unknown GitHub tool "nope"');
+    await expect(callGitHubNativeTool("gera-account:github", "nope", {})).rejects.toThrow('Unknown GitHub tool "nope"');
   });
 });

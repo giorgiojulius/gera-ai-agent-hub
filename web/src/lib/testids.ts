@@ -202,6 +202,8 @@ export const TID = {
   mcpResigninNotice: "mcp-resignin-notice",
   /** Badge with the MCP protocol revision the last check actually spoke. */
   mcpProtocolBadge: "mcp-protocol-badge",
+  projectAgentEdit: "project-agent-edit",
+  agentMcpLinkCount: "agent-mcp-link-count",
   /** Local Blender connector: setup guide and protected remote bridge form. */
   mcpCatalogSearch: "mcp-catalog-search",
   blenderSetup: "blender-setup",

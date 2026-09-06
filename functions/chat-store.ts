@@ -119,6 +119,7 @@ import {
   handleMcpOAuthStart,
   handleMcpPromptGet,
   handleMcpResolve,
+  handleMcpCatalogWrite,
   handleMcpResourceRead,
   type McpRouteContext,
 } from "./mcp-routes";
@@ -1648,6 +1649,8 @@ export class ChatStore extends DurableObject {
       // agents resolve their linked MCP servers through this account.
       case "/mcp/resolve":
         return method === "POST" ? handleMcpResolve(this.oauthStore, request, email) : null;
+      case "/mcp/catalog-write":
+        return method === "POST" ? handleMcpCatalogWrite(this.oauthStore, request, email) : null;
       case "/mcp/auth-lease":
         return method === "POST" ? handleMcpAuthLease(this.oauthStore, request, email) : null;
       default:

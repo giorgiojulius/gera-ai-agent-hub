@@ -149,6 +149,12 @@ function installFixtureFetch(servers: FixtureServer[]): void {
   );
 }
 
+function warmCatalog(servers: FixtureServer[]) {
+  const catalog = createMemoryMcpCatalogStore();
+  for (const server of servers) catalog.write({ serverId: server.id, serverName: server.id, tools: server.tools, fetchedAt: Date.now() });
+  return catalog;
+}
+
 function mcpFunctionDefs(toolset: McpToolset): string[] {
   return toolset.toolDefs.map((def) => def.function.name).filter((name) => name.startsWith("mcp_"));
 }
@@ -179,21 +185,22 @@ describe("resolveMcpToolset · deferred loading", () => {
     expect(mcpFunctionDefs(toolset)).toEqual([MCP_SEARCH_TOOL_NAME, MCP_CALL_TOOL_NAME]);
     expect(toolset.routes.size).toBe(0);
     expect(toolset.failures).toEqual([]);
-    expect(toolset.summary).toEqual(["Alpha (40 tools · deferred)", "Beta (40 tools · deferred)", "Gamma (40 tools · deferred)"]);
+    expect(toolset.summary).toEqual(["Alpha (catalog not loaded · deferred)", "Beta (catalog not loaded · deferred)", "Gamma (catalog not loaded · deferred)"]);
     // One line per server, no schemas in the prompt.
-    expect(toolset.promptNote).toContain('alpha "Alpha" · 40 tools');
-    expect(toolset.promptNote).toContain('gamma "Gamma" · 40 tools');
+    expect(toolset.promptNote).toContain('alpha "Alpha" · catalog not loaded');
+    expect(toolset.promptNote).toContain('gamma "Gamma" · catalog not loaded');
     expect(toolset.promptNote).not.toContain("inputSchema");
     expect(toolset.promptNote.length).toBeLessThan(1_200);
-    // A cold cache needed one handshake per server to learn the tables — no tool ran.
-    expect(servers.map((server) => server.initializes)).toEqual([1, 1, 1]);
+    // Cold auto exposes unloaded catalogs without a single upstream request.
+    expect(fetch).not.toHaveBeenCalled();
+    expect(servers.map((server) => server.initializes)).toEqual([0, 0, 0]);
     expect(servers.flatMap((server) => server.calls)).toEqual([]);
   });
 
   it("(b) search ranks a description word and a schema field name to the right tool", async () => {
     const servers = [fixture("alpha", 40), fixture("beta", 12)];
     installFixtureFetch(servers);
-    const toolset = await resolveMcpToolset({ servers: servers.map((server) => cloudServer(server)), mode: "deferred" });
+    const toolset = await resolveMcpToolset({ servers: servers.map((server) => cloudServer(server)), mode: "deferred", catalog: warmCatalog(servers) });
 
     const byDescription = await searchResult(toolset, { query: "calendar invite" });
     expect(byDescription.matches[0]).toMatchObject({ serverId: "alpha", toolName: "alpha_schedule_meeting" });
@@ -280,6 +287,7 @@ describe("resolveMcpToolset · deferred loading", () => {
     const toolset = await resolveMcpToolset({
       servers: [cloudServer(servers[0], ["alpha_schedule_meeting", "alpha_tool_01"])],
       mode: "deferred",
+      catalog: warmCatalog(servers),
     });
     expect(toolset.summary).toEqual(["Alpha (38 tools · deferred)"]);
 
@@ -324,7 +332,14 @@ describe("resolveMcpToolset · deferred loading", () => {
     // Forty tools with small schemas stay native under the default 128k window.
     const forty = [fixture("delta", 40)];
     installFixtureFetch(forty);
-    const auto = await resolveMcpToolset({ servers: [cloudServer(forty[0])], mode: "auto" });
+    const catalog = createMemoryMcpCatalogStore();
+    const cold = await resolveMcpToolset({ servers: [cloudServer(forty[0])], mode: "auto", catalog });
+    expect(cold.mode).toBe("deferred");
+    expect(fetch).not.toHaveBeenCalled();
+    await searchResult(cold, { query: "", serverId: "delta" });
+    expect(cold.mode).toBe("deferred");
+    cold.close();
+    const auto = await resolveMcpToolset({ servers: [cloudServer(forty[0])], mode: "auto", catalog });
     expect(auto.mode).toBe("native");
     expect(mcpFunctionDefs(auto)).toHaveLength(40);
     expect(auto.promptNote).toBe("");
@@ -380,7 +395,7 @@ describe("resolveMcpToolset · deferred loading", () => {
     expect(servers.map((server) => server.id)).toEqual(raw.map((server) => server.id));
   });
 
-  it("a slow server does not hold the run past the connect budget, and a later call picks it up", async () => {
+  it("native and addressed deferred connections are bounded; cold startup never waits for a slow server", async () => {
     const servers = [fixture("alpha", 10), { ...fixture("slow", 10), delayMs: 400 }];
     installFixtureFetch(servers);
 
@@ -399,8 +414,8 @@ describe("resolveMcpToolset · deferred loading", () => {
     expect(native.servers.find((info) => info.id === "slow")?.unavailable).toContain("connection budget");
     expect(native.servers.find((info) => info.id === "alpha")?.toolCount).toBe(10);
 
-    // Deferred: the budget lapses the same way, but the first search waits for
-    // the handshake that kept going in the background and lists the table.
+    native.close();
+    // Deferred starts untouched. An addressed slow server cannot block another search.
     const again = [fixture("alpha", 10), { ...fixture("slow", 10), delayMs: 400 }];
     installFixtureFetch(again);
     const deferred = await resolveMcpToolset({
@@ -408,15 +423,17 @@ describe("resolveMcpToolset · deferred loading", () => {
       mode: "deferred",
       connectBudgetMs: 150,
     });
-    expect(deferred.servers.find((info) => info.id === "slow")?.unavailable).toContain("connection budget");
-    const found = await searchResult(deferred, { query: "slow_tool_02" });
-    const slow = found.servers.find((server) => server.serverId === "slow");
-    expect(slow?.unavailable).toBeUndefined();
-    expect(slow?.toolCount).toBe(10);
-    expect(found.matches[0]?.toolName).toBe("slow_tool_02");
-    const ran = await deferred.execute(MCP_CALL_TOOL_NAME, { serverId: "slow", toolName: "slow_tool_02", arguments: { input: "z" } });
-    expect(ran.isError).toBeUndefined();
-    expect(again[1].calls).toEqual([{ name: "slow_tool_02", arguments: { input: "z" } }]);
+    expect(deferred.servers.find((info) => info.id === "slow")?.unavailable).toBeUndefined();
+    expect(again.map((server) => server.initializes)).toEqual([0, 0]);
+    const pending = searchResult(deferred, { query: "slow_tool_02", serverId: "slow" });
+    const fast = await searchResult(deferred, { query: "alpha_tool_02", serverId: "alpha" });
+    expect(fast.matches[0]?.toolName).toBe("alpha_tool_02");
+    const found = await pending;
+    expect(found.servers.find((server) => server.serverId === "slow")?.unavailable).toContain("connection budget");
+    expect(found.matches).toEqual([]);
+    deferred.close();
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(again[1].calls).toEqual([]);
   });
 
   it("the combined catalog budget leaves later servers out with an honest record that names them", async () => {
@@ -429,6 +446,8 @@ describe("resolveMcpToolset · deferred loading", () => {
       // Room for two tables, not three.
       catalogBudgetChars: perServer * 2 + 100,
     });
+    expect(toolset.failures).toEqual([]);
+    for (const server of servers) await searchResult(toolset, { query: "", serverId: server.id });
     expect(toolset.servers.map((info) => [info.id, info.unavailable === undefined])).toEqual([
       ["alpha", true],
       ["beta", true],
@@ -485,19 +504,85 @@ describe("resolveMcpToolset · deferred loading", () => {
     expect(toolset.owns(MCP_CALL_TOOL_NAME)).toBe(true);
     expect(toolset.owns("web_search")).toBe(false);
 
+    expect(toolset.failures).toEqual([]);
+    await searchResult(toolset, { query: "", serverId: "broken" });
     const failure = toolset.failures.find((record) => record.name === "mcp_connect");
     expect(failure?.arguments).toBe("Broken");
     expect(failure?.result).toContain("auth rejected");
     expect(failure?.result).not.toContain("ghp_fixture");
     const broken = toolset.servers.find((server) => server.id === "broken");
     expect(broken?.unavailable).toContain("auth rejected");
-    expect(toolset.promptNote).not.toContain("broken");
+    expect(toolset.promptNote).toContain("catalog not loaded");
 
     const search = await searchResult(toolset, { query: "fixture" });
     expect(search.servers.find((server) => server.serverId === "broken")?.unavailable).toContain("auth rejected");
     const call = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "broken", toolName: "broken_tool_01" });
     expect(call.isError).toBe(true);
     expect(call.text).toContain("unavailable this run");
+  });
+});
+
+describe("addressed cold MCP operations", () => {
+  it("five cold servers make zero startup requests; the first cold call reveals a schema, the next executes", async () => {
+    const servers = ["a", "b", "c", "d", "e"].map((id) => fixture(id, 10));
+    installFixtureFetch(servers);
+    const toolset = await resolveMcpToolset({ servers: servers.map((server) => cloudServer(server)), mode: "deferred" });
+    expect(fetch).not.toHaveBeenCalled();
+    const overview = await searchResult(toolset, { query: "" });
+    expect(overview.matches).toEqual([]);
+    expect(overview.servers.map((server) => server.toolCount)).toEqual([-1, -1, -1, -1, -1]);
+    expect(fetch).not.toHaveBeenCalled();
+    const first = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "c", toolName: "c_tool_02", arguments: { input: "not yet" } });
+    expect(first.executed).toBe(false);
+    expect(JSON.parse(first.text).discovery.matches[0].toolName).toBe("c_tool_02");
+    expect(servers.map((server) => server.initializes)).toEqual([0, 0, 1, 0, 0]);
+    expect(servers.flatMap((server) => server.calls)).toEqual([]);
+    const second = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "c", toolName: "c_tool_02", arguments: { input: "now" } });
+    expect(second.text).toBe('c_tool_02 → {"input":"now"}');
+    expect(servers[2].calls).toHaveLength(1);
+    toolset.close();
+  });
+
+  it("concurrent addressed searches share one connect and do not warm other servers", async () => {
+    const servers = [fixture("a", 10), fixture("b", 10)];
+    installFixtureFetch(servers);
+    const toolset = await resolveMcpToolset({ servers: servers.map((server) => cloudServer(server)), mode: "deferred" });
+    await Promise.all([searchResult(toolset, { query: "a_tool_02", serverId: "a" }), searchResult(toolset, { query: "a_tool_03", serverId: "a" })]);
+    expect(servers.map((server) => server.initializes)).toEqual([1, 0]);
+    toolset.close();
+  });
+
+  it.each(["timeout", "close"])("%s during credential acquisition makes no late upstream request or catalog write", async (reason) => {
+    const remote = fixture("a", 10);
+    installFixtureFetch([remote]);
+    let release: (server: CloudMcpServer) => void = () => undefined;
+    const credential = new Promise<CloudMcpServer>((resolve) => { release = resolve; });
+    const catalog = createMemoryMcpCatalogStore();
+    const persist = vi.fn(async () => undefined);
+    const toolset = await resolveMcpToolset({ servers: [cloudServer(remote)], mode: "deferred", catalog, connectBudgetMs: 15, credentials: async () => credential, persistCatalog: persist });
+    const pending = toolset.execute(MCP_SEARCH_TOOL_NAME, { query: "", serverId: "a" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    if (reason === "close") toolset.close();
+    await pending;
+    release(cloudServer(remote));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(fetch).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    expect(catalog.read("a")).toBeNull();
+    toolset.close();
+  });
+
+  it("an omitted oversized schema never becomes callable", async () => {
+    const remote = fixture("a", 1);
+    remote.tools[0].inputSchema.description = "x".repeat(70_000);
+    installFixtureFetch([remote]);
+    const toolset = await resolveMcpToolset({ servers: [cloudServer(remote)], mode: "deferred", catalog: warmCatalog([remote]) });
+    const found = await searchResult(toolset, { query: "a_tool_01" });
+    expect(found.matches).toEqual([]);
+    const call = await toolset.execute(MCP_CALL_TOOL_NAME, { serverId: "a", toolName: "a_tool_01" });
+    expect(call.isError).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+    toolset.close();
   });
 });
 

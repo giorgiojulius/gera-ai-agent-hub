@@ -17,7 +17,11 @@ export const MCP_CREDENTIAL_MIGRATION_KEY = "gera.mcp.oauth.migration.v1";
 export const VAULT_RESIGNIN_NOTICE =
   "Gera moved sign-ins to the server vault — sign in again to reconnect this server.";
 
+export const VAULT_RECHECK_NOTICE = "Gera retired an old browser credential — retry the server check before entering a new key.";
+
 export type McpCredentialMigrationReport = {
+  /** Old PAT/header copies purged; a server check will establish whether re-entry is needed. */
+  checking?: number;
   /** When the purge ran. */
   at: number;
   /** Grants the vault already held (`credentialStored`) — nothing to do for the user. */
@@ -69,7 +73,8 @@ export function migrateBrowserGrantsToVault(
   now: number = Date.now(),
 ): { settings: AgentSettings; report: McpCredentialMigrationReport | null } {
   const purge = purgeLegacyOAuthStorage();
-  if (!purge.found) {
+  const hasLegacyKeys = settings.mcpServers.some((server) => Boolean(server.token?.trim() || server.headersJson.trim()));
+  if (!purge.found && !hasLegacyKeys) {
     return { settings, report: null };
   }
   const purgedIds = new Set(purge.serverIds);
@@ -77,7 +82,22 @@ export function migrateBrowserGrantsToVault(
   let awaiting = 0;
   const serverIds: string[] = [];
   let changed = false;
+  let checking = 0;
   const mcpServers = settings.mcpServers.map((server): McpServerConfig => {
+    if (server.token?.trim() || server.headersJson.trim()) {
+      changed = true;
+      serverIds.push(server.id);
+      const clean: McpServerConfig = { ...server, token: "", headersJson: "" };
+      if (server.credentialStored === true) { moved += 1; return clean; }
+      checking += 1;
+      // Unknown vault presence must never become the explicit false/empty delete signal.
+      delete clean.credentialStored;
+      delete clean.identity;
+      delete clean.verifiedAt;
+      clean.status = "error";
+      clean.error = VAULT_RECHECK_NOTICE;
+      return clean;
+    }
     if (!affectedBy(server, purgedIds) || !reliesOnBrowserGrant(server)) {
       return server;
     }
@@ -95,13 +115,13 @@ export function migrateBrowserGrantsToVault(
       ...server,
       status: "error",
       error: VAULT_RESIGNIN_NOTICE,
-      credentialStored: false,
+      credentialStored: undefined,
     };
     delete next.identity;
     delete next.verifiedAt;
     return next;
   });
-  const report: McpCredentialMigrationReport = { at: now, moved, awaiting, serverIds };
+  const report: McpCredentialMigrationReport = { at: now, moved, awaiting, serverIds, ...(checking ? { checking } : {}) };
   saveMcpCredentialMigrationReport(report);
   return { settings: changed ? { ...settings, mcpServers } : settings, report };
 }
@@ -134,6 +154,7 @@ export function loadMcpCredentialMigrationReport(): McpCredentialMigrationReport
       at: parsed.at,
       moved: parsed.moved,
       awaiting: parsed.awaiting,
+      ...(typeof parsed.checking === "number" ? { checking: parsed.checking } : {}),
       serverIds: Array.isArray(parsed.serverIds)
         ? parsed.serverIds.filter((id): id is string => typeof id === "string")
         : [],
@@ -145,7 +166,7 @@ export function loadMcpCredentialMigrationReport(): McpCredentialMigrationReport
 
 /** Human line for Diagnostics; null when there is nothing to report. */
 export function describeMcpCredentialMigration(report: McpCredentialMigrationReport | null): string | null {
-  if (!report || (report.moved === 0 && report.awaiting === 0)) {
+  if (!report || (report.moved === 0 && report.awaiting === 0 && !report.checking)) {
     return null;
   }
   const moved = `${report.moved} sign-in${report.moved === 1 ? "" : "s"} moved to the vault`;
@@ -153,5 +174,5 @@ export function describeMcpCredentialMigration(report: McpCredentialMigrationRep
     report.awaiting > 0
       ? `${report.awaiting} await${report.awaiting === 1 ? "s" : ""} a fresh sign-in`
       : "none awaiting sign-in";
-  return `Browser grants retired · ${moved} · ${awaiting}`;
+  return `Browser grants retired · ${moved} · ${awaiting}${report.checking ? ` · ${report.checking} saved connections need a server check` : ""}`;
 }

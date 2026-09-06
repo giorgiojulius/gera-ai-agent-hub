@@ -40,6 +40,7 @@ const PROJECT_SUB_ROUTES: Record<string, "GET" | "POST"> = {
   "/members/remove": "POST",
   "/members/role": "POST",
   "/agents/upsert": "POST",
+  "/agents/github-validate": "POST",
   "/agents/delete": "POST",
   "/agents/slack-create-app": "POST",
   "/agents/slack-install-url": "POST",

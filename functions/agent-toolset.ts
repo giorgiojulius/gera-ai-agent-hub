@@ -43,6 +43,8 @@ export type AgentToolsetContext<A extends { name: string } = { name: string }> =
   secretFlags(secrets: AgentSecrets): AgentSecretFlags;
   /** True when `email` is a current member who may manage the project — linked servers and accounts resolve only through such members. */
   canManage(email: string): boolean;
+  /** Reloads the current agent before each delegated credential request. */
+  currentAgent?(agent: A): A | null;
 };
 
 export type AgentToolsetResult = {
@@ -127,8 +129,8 @@ export async function buildAgentToolset<A extends { name: string }>(
   let toolset: McpToolset | null = null;
   if (selection && selectionRefs.length > 0) {
     const noteLines: string[] = [];
-    const resolved = await resolveOwnerMcp(ctx, selection);
-    if (!resolved.ok) {
+    const resolved = await resolveOwnerMcp(ctx, selection, undefined, true);
+    if (resolved.ok === false) {
       for (const ref of selectionRefs) {
         noteLines.push(
           `- "${ref.name}": unavailable (${capText(resolved.error, 160)}) — its tools are missing this run; say so if they are needed.`,
@@ -158,11 +160,34 @@ export async function buildAgentToolset<A extends { name: string }>(
         for (const entry of resolved.catalog) {
           catalog.write(entry);
         }
+        const generations = { ...resolved.generations };
+        const stillLinked = async (serverId: string): Promise<boolean> => {
+          if (!ctx.canManage(selection.owner)) return false;
+          const current = ctx.currentAgent ? ctx.currentAgent(agent) : agent;
+          if (!current || !accessForAgentSurface(ctx.agentAccess(current), surface).mcp) return false;
+          const live = (await ctx.revealAgentSecrets(current)).mcpSelection;
+          const original = selection.servers.find((ref) => ref.id === serverId);
+          const currentRef = live?.servers.find((ref) => ref.id === serverId);
+          return Boolean(original && currentRef && live?.owner === selection.owner && live.writes === selection.writes && JSON.stringify(original) === JSON.stringify(currentRef));
+        };
         toolset = await resolveMcpToolset({
           servers,
           mode: resolved.toolLoading,
           surface: "background",
           catalog,
+          persistCatalog: async (entry, signal) => {
+            if (!await stillLinked(entry.serverId)) throw new Error("MCP delegation changed; re-link this server");
+            signal.throwIfAborted();
+            if (!ctx.durable || !generations[entry.serverId]) return;
+            const response = await ctx.durable.fetch(new Request("https://gera.internal/mcp/catalog-write", {
+              method: "POST", signal,
+              headers: { "Content-Type": "application/json", "X-Rork-DO-Class": "ChatStore", "X-Rork-DO-Id": chatShardId(selection.owner), "X-Gera-Email": encodeURIComponent(selection.owner) },
+              body: JSON.stringify({ entry, generation: generations[entry.serverId] }),
+            }));
+            signal.throwIfAborted();
+            // A concurrent Re-check/sync supersedes caching, not the tool's authorization.
+            if (!response.ok && response.status !== 409 && response.status !== 413) throw new Error("Owner MCP catalog could not be saved");
+          },
           // Per-agent policy: tool allowlists per linked server and the
           // write policy ("ask" declines write tools — agents run unattended).
           policy: agentMcpPolicy(selection),
@@ -181,7 +206,11 @@ export async function buildAgentToolset<A extends { name: string }>(
           // or key is opened there for each MCP request (refresh inside, forced
           // after an auth rejection) and never retained in this project shard.
           credentials: async (serverId, { force }) => {
-            const fresh = await resolveOwnerMcp(ctx, selection, force ? [serverId] : undefined);
+            if (!await stillLinked(serverId)) return null;
+            const addressed = { ...selection, servers: selection.servers.filter((ref) => ref.id === serverId) };
+            const fresh = await resolveOwnerMcp(ctx, addressed, force ? [serverId] : undefined);
+            if (!await stillLinked(serverId)) return null;
+            if (fresh.ok) Object.assign(generations, fresh.generations);
             const server = fresh.ok ? fresh.servers.find((candidate) => candidate.id === serverId) : undefined;
             return server ? { ...server, name: refName.get(serverId) ?? server.name } : null;
           },
@@ -199,7 +228,7 @@ export async function buildAgentToolset<A extends { name: string }>(
             );
           } else if (info.deferred) {
             noteLines.push(
-              `- "${info.name}": connected — ${info.toolCount} tools, loaded on demand (find them with mcp_search_tools, run them with mcp_call_tool).`,
+              `- "${info.name}": ${info.toolCount < 0 ? "catalog not loaded" : `${info.toolCount} tools cached`} — use addressed mcp_search_tools, then mcp_call_tool.`,
             );
           } else {
             noteLines.push(`- "${info.name}": connected — ${info.toolCount} tools available (mcp_* functions).`);
@@ -255,7 +284,7 @@ export async function resolveOwnerAuth(
 }
 
 export type OwnerMcpResolution =
-  | { ok: true; servers: CloudMcpServer[]; toolLoading: McpToolLoadingMode; catalog: McpCatalogEntry[] }
+  | { ok: true; servers: CloudMcpServer[]; toolLoading: McpToolLoadingMode; catalog: McpCatalogEntry[]; generations: Record<string, string> }
   | { ok: false; error: string };
 
 /**
@@ -268,6 +297,7 @@ export async function resolveOwnerMcp(
   ctx: Pick<AgentToolsetContext, "durable">,
   selection: AgentMcpSelection,
   force?: string[],
+  bootstrap: boolean = false,
 ): Promise<OwnerMcpResolution> {
   const doBinding = ctx.durable;
   if (!doBinding) {
@@ -285,6 +315,7 @@ export async function resolveOwnerMcp(
         headers,
         body: JSON.stringify({
           ids: selection.servers.map((server) => server.id),
+          bootstrap,
           ...(force && force.length > 0 ? { force } : {}),
         }),
       }),
@@ -299,6 +330,7 @@ export async function resolveOwnerMcp(
       servers?: unknown;
       toolLoading?: unknown;
       catalog?: unknown;
+      generations?: Record<string, string>;
     } | null;
     const rawList = data && Array.isArray(data.servers) ? data.servers : [];
     const servers: CloudMcpServer[] = [];
@@ -313,6 +345,7 @@ export async function resolveOwnerMcp(
       servers,
       toolLoading: normalizeMcpToolLoading(data?.toolLoading),
       catalog: normalizeMcpCatalogEntries(data?.catalog),
+      generations: data?.generations ?? {},
     };
   } catch (error) {
     console.error("agent mcp resolve failed:", error instanceof Error ? error.message : "unknown");

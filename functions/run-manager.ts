@@ -45,6 +45,7 @@ import {
 import { modelAcceptsImages } from "./model-catalog";
 import {
   markOAuthRefreshStarted,
+  mcpConfigsWithSecrets,
   oauthTokensWithRotations,
   persistRefreshedGrant,
   recordOAuthFailure,
@@ -862,7 +863,7 @@ export class RunManager {
     const config = run.body.config;
     // The tab chooses connector ids only. Runtime config and every credential
     // are re-read from this account's durable profile on the server.
-    const durableMcpConfigs = this.profileMcpConfigsForRun(run.owner, config.mcpServers);
+    const durableMcpConfigs = await this.profileMcpConfigsForRun(run.owner, config.mcpServers);
     const isAutomation = Boolean(run.body.automationId);
     const contractPrompt = isAutomation
       ? executionOutcomeSystemPrompt(run.kind === "research" ? "marker" : "tool", "automation")
@@ -919,6 +920,7 @@ export class RunManager {
               persist: (rotated) => persistRefreshedGrant(this.oauthStore, run.owner, rotated, appliedChains),
               reportFailure: (id, outcome) => recordOAuthFailure(this.oauthStore, run.owner, id, outcome),
               beginRefresh: (id) => markOAuthRefreshStarted(this.oauthStore, run.owner, id),
+              credentials: (id, { force }) => this.leaseServerCredential(run.owner, config.mcpServers, id, force, appliedChains),
             })
           : idleToolset();
         run.closeToolset = () => researchToolset.close();
@@ -2209,7 +2211,7 @@ export class RunManager {
     }
   }
 
-  private profileMcpConfigsForRun(owner: string, requested: Array<Record<string, unknown>>): unknown[] {
+  private async profileMcpConfigsForRun(owner: string, requested: Array<Record<string, unknown>>): Promise<unknown[]> {
     const ids = new Set<string>();
     for (const item of requested) {
       if (typeof item.id === "string" && item.id) ids.add(item.id);
@@ -2219,28 +2221,15 @@ export class RunManager {
     try {
       const servers = this.profileSettings(owner)?.mcpServers;
       if (!Array.isArray(servers)) return [];
-      const secretRows = this.ctx.storage.sql
-        .exec<{ server_id: string; payload: string }>(
-          "SELECT server_id, payload FROM mcp_server_secrets WHERE owner_email = ?",
-          owner,
-        )
-        .toArray();
-      const secrets = new Map<string, Record<string, unknown>>();
-      for (const secret of secretRows) {
-        try {
-          secrets.set(secret.server_id, JSON.parse(secret.payload) as Record<string, unknown>);
-        } catch {
-          // malformed secret rows authenticate nothing
-        }
-      }
-      return servers.flatMap((item): unknown[] => {
+      const selected = servers.flatMap((item): unknown[] => {
         if (!item || typeof item !== "object" || Array.isArray(item)) return [];
         const server = item as Record<string, unknown>;
         const id = typeof server.id === "string" ? server.id : "";
         const catalogId = typeof server.catalogId === "string" ? server.catalogId : "";
         if (!ids.has(id) && !ids.has(catalogId)) return [];
-        return [{ ...server, ...(secrets.get(id) ?? {}) }];
+        return [server];
       });
+      return await mcpConfigsWithSecrets(this.oauthStore, owner, selected);
     } catch {
       return [];
     }
@@ -2259,7 +2248,7 @@ export class RunManager {
     force: boolean,
     appliedChains: Map<string, string[]>,
   ): Promise<CloudMcpServer | null> {
-    const configs = this.profileMcpConfigsForRun(owner, requested);
+    const configs = await this.profileMcpConfigsForRun(owner, requested);
     const { tokens } = await oauthTokensWithRotations(this.oauthStore, owner);
     const server = cloudMcpServersForAutomation(configs, [serverId], tokens).find((item) => item.id === serverId) ?? null;
     if (!server || server.kind !== "mcp") {

@@ -4,7 +4,9 @@ Last synced: 2026-09-06 · code commit `aa57eef` (landed on top of `880767c`); p
 
 Current MCP contract: cold auto/deferred starts make no provider requests; an addressed search warms only one server, and a first cold call returns `executed:false` with its schema. GitHub operations use server-owned references only. Inventory persists negotiated wire, project warmups write back to the owner, and both protocol families retain their policy/credential boundaries.
 
-Verification: 1029 unit tests / 93 files; 52 browser tests / 9 files; separate e2e 31 tests = 29 neutral scenarios + drag-and-drop + legacy-settings-PAT migration. All final runs have 0 failures/skips. Reports: `web/e2e-results/mcp-{unit|browser|e2e}-final-2026-09-06.json`; scenario report `web.latest.json` started `2026-09-06T18:50:00.158Z` (29/0). The e2e count is a subset of browser, not an additional 31 tests.
+Reply length contract (2026-09-07): Gera never rations a reply. Every completion carries the picked model's own output ceiling (`max_tokens` from the gateway catalog — the tab sends `maxOutputTokens` in the run config, the server falls back to its 10-minute catalog cache) instead of the provider default (Anthropic: 4096 tokens, the cause of Fable 5.1 cuts); a 400 that rejects the cap is retried once without it. A round the provider ends with `finish_reason: "length"` is continued in place — the chunk is replayed as an assistant turn plus `CUT_CONTINUE_NOTE`, the model repeats a few words and `joinCutText` splices the seam (the shown text only grows) — until the model stops on its own. This holds for Standard chat (`runEngineTurn`), the research report writer, Julius candidates/verifier/council/chairman/synthesis (`streamGatewayText`) and project agents. A cut inside a tool call drops the incomplete call and asks for smaller calls; a blank cut round gets one direct retry; a verbatim-repeated chunk stops the chain. The only remaining ceilings are infrastructure: the run's wall clock (chat 15 min, research/Julius 40 min) and the per-message storage cap (600 000 chars ≈ 150k tokens) — at which the reply wraps up honestly (`stopReason: "size"`, “say continue”) instead of being truncated on save. The system prompt rule “Be concise” was replaced by “Length follows the task, not a quota … deliver all of it in one reply” in both engine copies.
+
+Verification: 1029 unit tests / 93 files; 52 browser tests / 9 files; separate e2e 31 tests = 29 neutral scenarios + drag-and-drop + legacy-settings-PAT migration. All final runs have 0 failures/skips. Reports: `web/e2e-results/mcp-{unit|browser|e2e}-final-2026-09-06.json`; scenario report `web.latest.json` started `2026-09-06T18:50:00.158Z` (29/0). The e2e count is a subset of browser, not an additional 31 tests. Reply-length change (2026-09-07): unit **94 files, 1051/1051 pass, 0 skip** — `web/e2e-results/output-length-unit-2026-09-07.json` (new file `agent-output-length.test.ts`, 22 tests); the e2e scenario “Deferred MCP loading rides into the run” was run alone in the browser (1 pass, 30 filtered out) to confirm `config.maxOutputTokens = 64_000` from the stubbed catalog — that is not a full browser/e2e run.
 
 Live gaps: authenticated DeepWiki `/mcp/check`, OAuth re-login/check and a >8-server user run still require the user's account. The unauthenticated direct DeepWiki transport at `2026-09-06T18:51:03.026Z` returned legacy 2025-11-25 / 3 tools; it does not close those gaps. Published `/ping` and CORS OPTIONS passed; internal resolve/catalog-write remain public 404; GitHub/project credential routes require sign-in.
 
@@ -249,6 +251,13 @@ textarea auto-grows line by line with an animated height (hook
 internally past the cap) — the same hook powers the edit-and-resend box in
 user bubbles. A thread renders `chat-thread`
 with `message-user` / `message-assistant` rows (markdown, artifacts, media).
+
+Reply length (2026-09-07): a Standard reply is never cut short by the
+provider. The run config carries the model's `maxOutputTokens` from the
+gateway catalog (`cachedMaxOutputTokens`), the server sends it as
+`max_tokens`, and a round that still ends with `finish_reason: "length"` is
+continued in place in the same bubble — the text only grows, no restart, no
+“continue?” prompt. Regression: `agent-output-length.test.ts`.
 
 Code-change workbench (2026-08-31): the first repository branch/write call
 streams a `code` run event and opens `code-change-flow` inside that assistant
@@ -629,6 +638,12 @@ settings (deeper = longer + more credits). Produces a cited report; with
 Julius on, every candidate researches independently and the council
 distills one final report.
 
+The report writer (2026-09-07) streams through `streamGatewayText`: it sends
+the report model's own output ceiling and continues a report the provider
+cut (`finish_reason: "length"`) in place until it is complete — long Fable
+5.1 reports no longer stop mid-section. Cancel stops the chain with what
+streamed. Regression: `agent-output-length.test.ts` (streamGatewayText).
+
 Research runs on the question text alone (2026-08-30): an attachments-only
 send in research mode is blocked with an honest toast, and both engines
 (`functions/research-runner.ts` + browser twin `deep-research.ts`) reject a
@@ -682,6 +697,11 @@ in the thread (`JuliusPanel`). The Verifier receives the run's scoped native
 GitHub route in plain Julius and Research × Julius, is explicitly told to
 inspect connected sources, and can execute read tools only (no issues, branches,
 files, comments, or PR writes). Regression: `github-run-flow.test.ts`.
+Every phase runs its own model, so each completion carries that model's
+output ceiling (`maxOutputTokensFor` → server catalog) and council/chairman/
+synthesis prose is continued in place when the provider cuts it
+(`streamGatewayText`); candidates and the verifier inherit the same
+continuation from `runEngineTurn` (2026-09-07).
 
 ## Media modes
 

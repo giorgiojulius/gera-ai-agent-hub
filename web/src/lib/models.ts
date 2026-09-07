@@ -428,6 +428,19 @@ export function cachedContextWindow(selectionId: string): number | undefined {
 }
 
 /**
+ * Output ceiling (tokens) of a picked model from the last loaded gateway
+ * catalog (`max_tokens`); undefined until the catalog loaded or when the
+ * gateway omits it. Server runs send it with every completion so the
+ * provider's default cap never shortens a reply.
+ */
+export function cachedMaxOutputTokens(selectionId: string): number | undefined {
+  const model = resolveSelectionModel(lastGatewayModels, selectionId);
+  return typeof model?.max_tokens === "number" && Number.isFinite(model.max_tokens) && model.max_tokens >= 1
+    ? Math.floor(model.max_tokens)
+    : undefined;
+}
+
+/**
  * Whether the picked model accepts image input per the last loaded gateway
  * catalog (`modalities.input` lists "image"); undefined until the catalog
  * loaded or when the gateway omits modalities. Server runs use it to decide

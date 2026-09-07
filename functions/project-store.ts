@@ -21,6 +21,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { capText, DEFAULT_CHAT_MODEL, type EngineMessage, runEngineTurn } from "./agent-engine";
+import { modelMaxOutputTokens } from "./model-catalog";
 import {
   type AgentToolsetContext,
   type AgentToolsetResult,
@@ -2312,6 +2313,9 @@ export class ProjectStore extends DurableObject {
       modelId: agent.model || DEFAULT_CHAT_MODEL,
       apiMessages,
       tools: [...tools, executionOutcomeToolDefinition()],
+      // The agent model's own output ceiling rides on every completion; a cut
+      // deliverable is continued in place by the engine either way.
+      maxOutputTokens: await modelMaxOutputTokens(agent.model || DEFAULT_CHAT_MODEL),
       executeTool: (name, argsJson) => {
         if (name === EXECUTION_OUTCOME_TOOL_NAME) {
           executionClaim = parseExecutionOutcomeClaim(argsJson);
@@ -2529,6 +2533,9 @@ export class ProjectStore extends DurableObject {
       modelId: agent.model || DEFAULT_CHAT_MODEL,
       apiMessages,
       tools: [...tools, executionOutcomeToolDefinition()],
+      // The agent model's own output ceiling rides on every completion; a cut
+      // deliverable is continued in place by the engine either way.
+      maxOutputTokens: await modelMaxOutputTokens(agent.model || DEFAULT_CHAT_MODEL),
       executeTool: (name, argsJson) => {
         if (name === EXECUTION_OUTCOME_TOOL_NAME) {
           executionClaim = parseExecutionOutcomeClaim(argsJson);
@@ -2800,6 +2807,9 @@ export class ProjectStore extends DurableObject {
       modelId: agent.model || DEFAULT_CHAT_MODEL,
       apiMessages,
       tools: [...tools, executionOutcomeToolDefinition()],
+      // The agent model's own output ceiling rides on every completion; a cut
+      // deliverable is continued in place by the engine either way.
+      maxOutputTokens: await modelMaxOutputTokens(agent.model || DEFAULT_CHAT_MODEL),
       executeTool: (name, argsJson) => {
         if (name === EXECUTION_OUTCOME_TOOL_NAME) {
           executionClaim = parseExecutionOutcomeClaim(argsJson);

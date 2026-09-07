@@ -11,6 +11,12 @@
 // continues in place — no restart, no rewrite. Post-answer guidance appends
 // a continuation below the finished text.
 //
+// Reply length is not capped by the engine: every request carries the picked
+// model's own output ceiling (`max_tokens` from the gateway catalog, when
+// known) instead of the provider default, and a round the provider ends with
+// `finish_reason: "length"` is continued in place — the model picks up where
+// it was cut and the seam is spliced (`joinCutText`) until the reply is done.
+//
 // Server-side toolkit calls MUST send `Authorization: Bearer <key>` — only
 // browser builds get delegated auth injected by the Rork runtime.
 
@@ -45,7 +51,7 @@ Artifacts — the chat renders these fenced blocks as rich interactive cards, so
 Write a short lead-in sentence, then the fence. Markdown tables render nicely too.
 
 Rules:
-- Be concise, structured, and specific.
+- Be structured and specific. Length follows the task, not a quota: when the request needs a long reply — a full document, a whole file or program, an exhaustive list, a complete step-by-step guide — deliver all of it in one reply. Never cut a deliverable short, compress it into a summary, or leave parts "for a follow-up" to save space. Cut filler, never substance.
 - Cost/time/team estimates MUST reflect today's AI-tooling reality, not the pre-AI baselines that dominate training data and older articles. Since 2023, AI coding agents and generation tools cut software/content build effort 10-100x: an MVP, internal tool, chat app, or landing page is now hours-to-days for one person with AI tools (roughly the cost of subscriptions), not "4-9 months and $80K-$300K" of agency work. Lead with the AI-era estimate; quote legacy agency figures only as an explicitly labeled comparison, and treat pre-2024 cost articles as historical sources. Stay honest about what has NOT collapsed: salaries, compliance and audits, marketing, hardware, physical operations, infra at scale, deep enterprise integrations, and the last stretch of production polish.
 - Citations: every web_search / fetch_url result carries a system-assigned citation number like [2]. When a claim comes from a source, put the marker right after the claim: "revenue grew 40% [2]". Several sources: [1][3]. The UI turns markers into clickable chips and shows a sources bar automatically — do not dump plain URL lists at the end, and never use a number that was not shown to you.
 - Never fabricate. If you cannot reach something — a tool errors, a connector or key is missing or expired, a page or repo will not load — say plainly that you can't reach it and why, then continue with what you actually have. Never fill the gap with invented facts, numbers, quotes, links, file contents, or pretended tool results: an honest admission beats confident filler every time.
@@ -147,7 +153,7 @@ export type EngineTurnResult = {
   toolCalls: EngineToolRecord[];
   /** Set when the gateway fell back and a different model wrote the reply. */
   servedBy?: string;
-  stopReason: "completed" | "stopped" | "loop" | "budget" | "time";
+  stopReason: "completed" | "stopped" | "loop" | "budget" | "time" | "size";
 };
 
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
@@ -489,6 +495,14 @@ export type StreamCompletionParams = {
   tools: EngineToolDef[];
   /** Pass false to fail honestly instead of letting the gateway switch to a backup model. */
   fallbacks?: boolean;
+  /**
+   * The picked model's own output ceiling (tokens) from the gateway catalog.
+   * Sent as `max_tokens` so the provider's default cap (Anthropic: 4096) never
+   * shortens a reply; absent → the gateway default applies and the engine
+   * continues a cut reply instead. A 400 that rejects the value is retried
+   * once without it.
+   */
+  maxOutputTokens?: number;
   /** Soft stop: stops READING gracefully and resolves with whatever accumulated. */
   softStop?: AbortSignal;
   handlers: EngineHandlers;
@@ -496,9 +510,30 @@ export type StreamCompletionParams = {
   onUsage?: (modelId: string, usage: unknown) => void;
 };
 
-export async function streamGatewayCompletion(
-  params: StreamCompletionParams,
-): Promise<{ content: string; toolCalls: EngineToolCall[]; images: string[]; servedModelId?: string }> {
+export type StreamCompletionResult = {
+  content: string;
+  toolCalls: EngineToolCall[];
+  images: string[];
+  servedModelId?: string;
+  /**
+   * The provider's `finish_reason` for the round ("stop", "tool_calls",
+   * "length", …); undefined when the stream ended without one (soft stop,
+   * providers that omit it).
+   */
+  finishReason?: string;
+};
+
+/** Positive whole token count, or undefined for anything the gateway would reject. */
+export function normalizeOutputTokens(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined;
+}
+
+/** A 400 that blames the output cap (too large for the model, or input + max_tokens over the context). */
+function rejectsOutputCap(status: number, body: string): boolean {
+  return status === 400 && /max_tokens|max_completion_tokens|maxOutputTokens|output tokens/i.test(body);
+}
+
+export async function streamGatewayCompletion(params: StreamCompletionParams): Promise<StreamCompletionResult> {
   const selection = parseSelection(params.modelId || DEFAULT_CHAT_MODEL);
   const effort = params.reasoningEffort ?? selection.effort;
   const gatewayUrl = params.gatewayUrl ?? `${TOOLKIT_URL}/v2/vercel/v1/chat/completions`;
@@ -517,28 +552,42 @@ export async function streamGatewayCompletion(
   ) {
     throw new Error("gateway URL must be an allowlisted public HTTPS endpoint");
   }
-  const response = await fetch(gateway.toString(), {
-    ...(isStagingOverride ? { redirect: "error" as const } : {}),
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${params.authKey}`,
-      "idempotency-key": crypto.randomUUID(),
-    },
-    body: JSON.stringify({
-      model: selection.catalogId,
-      messages: params.messages,
-      stream: true,
-      stream_options: { include_usage: true },
-      ...(params.tools.length > 0 ? { tools: params.tools, tool_choice: "auto" } : {}),
-      ...(effort ? { reasoning: { enabled: true, effort } } : {}),
-      ...(params.fallbacks === false ? {} : { providerOptions: { gateway: { models: [...CHAT_FALLBACKS] } } }),
-    }),
-  });
+  const outputCap = normalizeOutputTokens(params.maxOutputTokens);
+  const request = (withCap: number | undefined): Promise<Response> =>
+    fetch(gateway.toString(), {
+      ...(isStagingOverride ? { redirect: "error" as const } : {}),
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.authKey}`,
+        "idempotency-key": crypto.randomUUID(),
+      },
+      body: JSON.stringify({
+        model: selection.catalogId,
+        messages: params.messages,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(withCap !== undefined ? { max_tokens: withCap } : {}),
+        ...(params.tools.length > 0 ? { tools: params.tools, tool_choice: "auto" } : {}),
+        ...(effort ? { reasoning: { enabled: true, effort } } : {}),
+        ...(params.fallbacks === false ? {} : { providerOptions: { gateway: { models: [...CHAT_FALLBACKS] } } }),
+      }),
+    });
+  let response = await request(outputCap);
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw new Error(`gateway ${response.status}: ${text.slice(0, 260)}`);
+    if (outputCap === undefined || !rejectsOutputCap(response.status, text)) {
+      throw new Error(`gateway ${response.status}: ${text.slice(0, 260)}`);
+    }
+    // The catalog ceiling did not fit this call (a fallback model with a
+    // smaller cap, or a long thread where input + max_tokens exceeds the
+    // context). Let the provider default apply — a cut reply is continued.
+    response = await request(undefined);
+    if (!response.ok) {
+      const retryText = await response.text().catch(() => "");
+      throw new Error(`gateway ${response.status}: ${retryText.slice(0, 260)}`);
+    }
   }
 
   let content = "";
@@ -546,6 +595,7 @@ export async function streamGatewayCompletion(
   let finalUsage: unknown = null;
   /** Model the gateway ACTUALLY routed to — differs from the pick on fallback. */
   let servedModel = "";
+  let finishReason: string | undefined;
   const toolAcc = new Map<number, { id: string; name: string; arguments: string }>();
   const images: string[] = [];
 
@@ -580,6 +630,10 @@ export async function streamGatewayCompletion(
     }
     if (typeof event.model === "string" && event.model.length > 0) {
       servedModel = event.model;
+    }
+    const reason = choices?.[0]?.finish_reason;
+    if (typeof reason === "string" && reason.length > 0) {
+      finishReason = reason;
     }
 
     const piece =
@@ -654,7 +708,140 @@ export async function streamGatewayCompletion(
       function: { name: call.name, arguments: call.arguments || "{}" },
     }));
 
-  return { content, toolCalls, images, servedModelId: servedModel || undefined };
+  return { content, toolCalls, images, servedModelId: servedModel || undefined, finishReason };
+}
+
+/** Overlaps shorter than this are too coincidence-prone to dedupe. */
+const CUT_MIN_OVERLAP = 3;
+/** The model is told to repeat at most one short line — cap the overlap scan. */
+const CUT_MAX_OVERLAP = 320;
+/** Room kept under a surface's per-message ceiling for the honest wrap-up sentence. */
+const CUT_WRAPUP_RESERVE = 4_000;
+
+/**
+ * Splices a reply the provider cut at its output-token limit with the model's
+ * continuation. CUT_CONTINUE_NOTE asks the model to repeat the last few words
+ * verbatim, so the longest head-suffix / tail-prefix overlap is deduped (blank
+ * lines before the repeat are tolerated). Without an overlap the text is
+ * joined byte-for-byte: a token cut is a hard boundary that may split a word
+ * or a code line, so no whitespace is invented. Called on every stream chunk:
+ * while the tail so far still sits inside the head's end, the head is shown
+ * unchanged, so the text never jumps backwards once the overlap resolves.
+ */
+export function joinCutText(head: string, tail: string): string {
+  if (head.length === 0) {
+    return tail;
+  }
+  if (tail.length === 0) {
+    return head;
+  }
+  const candidates = [tail];
+  const unpadded = tail.replace(/^\n+/u, "");
+  if (unpadded.length > 0 && unpadded !== tail) {
+    candidates.push(unpadded);
+  }
+  const seam = head.slice(-CUT_MAX_OVERLAP);
+  for (const next of candidates) {
+    const cap = Math.min(head.length, next.length, CUT_MAX_OVERLAP);
+    for (let k = cap; k >= CUT_MIN_OVERLAP; k -= 1) {
+      if (head.endsWith(next.slice(0, k))) {
+        return head + next.slice(k);
+      }
+    }
+    // Streaming warm-up: a verbatim repeat is probably still arriving.
+    if (next.length < CUT_MAX_OVERLAP && seam.includes(next)) {
+      return head;
+    }
+  }
+  return head + tail;
+}
+
+/**
+ * Rides along when the provider ended a round at its output-token limit. The
+ * kept text stays on screen; the model repeats a few words so the seam can be
+ * spliced (joinCutText), then keeps writing — the reply is never restarted.
+ */
+export const CUT_CONTINUE_NOTE =
+  "[continuation] Your reply above stopped because the output-length limit of a single response was reached — not because it was finished. The user sees it exactly as written, and what you write now is appended directly after it as one continuous reply. First repeat, verbatim, the last few words before the cut (a handful of words, at most one short line — the app splices the overlap automatically), then keep writing from exactly that point. Do not restart, summarize, apologize, or mention the cut. If the cut fell inside a code block, the fence is still open: keep writing the code without opening a new fence and close it when the code ends. Keep going until the reply is genuinely complete — if the limit is reached again, you will simply be asked to continue again.";
+
+/**
+ * Rides along when the cut landed inside a tool call: its arguments are
+ * incomplete, so it never ran, and the model must split the work up.
+ */
+export const CUT_TOOLCALL_NOTE =
+  "[continuation] Your previous round hit the output-length limit while emitting a tool call, so its arguments were incomplete and the call did NOT run. Redo that work with smaller calls: split large payloads into several calls (write files in parts, fewer items per call) and keep any prose short until the calls are done. Text you already wrote is kept on screen exactly as shown — continue it, do not restart.";
+
+/** Rides along when the cut landed before any visible text (the budget went to hidden reasoning). */
+export const CUT_EMPTY_NOTE =
+  "[continuation] The output-length limit was reached before any visible reply text was produced. Write the answer itself now, directly and without lengthy deliberation; if the task is large, start delivering it — you will be asked to continue.";
+
+export type StreamTextParams = Omit<StreamCompletionParams, "tools" | "softStop" | "handlers"> & {
+  handlers: Pick<EngineHandlers, "onText" | "onReasoning">;
+  /** Stops chaining continuations (the in-flight stream still finishes). */
+  isCancelled?: () => boolean;
+};
+
+/**
+ * One tool-less completion whose text is never left cut by the provider's
+ * output limit: a round that ends with `finish_reason: "length"` is continued
+ * in place — the chunk is replayed as an assistant turn followed by
+ * CUT_CONTINUE_NOTE and the seam is spliced (joinCutText) — until the model
+ * stops on its own. Only a stuck model (blank or verbatim-repeated chunk) or
+ * a cancel ends the chain early. Used by the research report writer and the
+ * Julius council, which stream prose without tools.
+ */
+export async function streamGatewayText(params: StreamTextParams): Promise<StreamCompletionResult> {
+  const { handlers, isCancelled, messages: initial, ...rest } = params;
+  const messages: EngineMessage[] = [...initial];
+  const images: string[] = [];
+  let base = "";
+  let lastChunk = "";
+  let emptyRounds = 0;
+  let servedModelId: string | undefined;
+  const stitch = (text: string): string => (base.length === 0 ? text : joinCutText(base, text));
+  const settle = (content: string, finishReason?: string): StreamCompletionResult => ({
+    content,
+    toolCalls: [],
+    images,
+    servedModelId,
+    finishReason,
+  });
+  for (let round = 0; round < MAX_AGENT_STEPS; round += 1) {
+    const completion = await streamGatewayCompletion({
+      ...rest,
+      messages,
+      tools: [],
+      handlers: {
+        onText: (full) => handlers.onText(stitch(full)),
+        ...(handlers.onReasoning ? { onReasoning: handlers.onReasoning } : {}),
+      },
+    });
+    images.push(...completion.images);
+    servedModelId = completion.servedModelId ?? servedModelId;
+    const shown = stitch(completion.content);
+    if (completion.finishReason !== "length" || isCancelled?.()) {
+      return settle(shown, completion.finishReason);
+    }
+    const chunk = completion.content;
+    if (chunk.trim().length === 0) {
+      // The budget went to hidden reasoning: one direct retry, then stop honestly.
+      emptyRounds += 1;
+      if (emptyRounds > 1) {
+        return settle(base, completion.finishReason);
+      }
+      messages.push({ role: "system", content: CUT_EMPTY_NOTE });
+      continue;
+    }
+    emptyRounds = 0;
+    if (chunk === lastChunk) {
+      // Verbatim repeat: the model is looping, not writing — keep what came before it.
+      return settle(base, completion.finishReason);
+    }
+    lastChunk = chunk;
+    base = shown;
+    messages.push({ role: "assistant", content: chunk }, { role: "system", content: CUT_CONTINUE_NOTE });
+  }
+  return settle(base, "length");
 }
 
 /**
@@ -694,6 +881,14 @@ export type EngineTurnParams = {
   isStopped?: () => boolean;
   /** Honest wall-clock budget — past it the run wraps up with what it has. */
   deadlineAt?: number;
+  /** The picked model's output ceiling (tokens) from the gateway catalog; see StreamCompletionParams. */
+  maxOutputTokens?: number;
+  /**
+   * The surface's per-message storage ceiling (chars). A cut reply keeps
+   * being continued until the next chunk could no longer fit; then it wraps
+   * up honestly instead of being truncated on save. Absent → no ceiling.
+   */
+  maxContentChars?: number;
   handlers: EngineHandlers;
   onUsage?: (modelId: string, usage: unknown) => void;
   /** Called after steering items were injected into the live context. */
@@ -711,7 +906,7 @@ export type EngineTurnParams = {
   persistMedia?: (items: EngineMediaItem[]) => string[];
 };
 
-type FinalizeReason = "loop" | "budget" | "time";
+type FinalizeReason = "loop" | "budget" | "time" | "size";
 
 /** Label for the vision message: the tool, or the MCP server · tool behind the meta function. */
 function describeToolForVision(name: string, argumentsJson: string): string {
@@ -781,12 +976,25 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
   let lastContent = "";
 
   /**
-   * Steering can cut a round mid-stream; the kept text lives here and every
-   * later emission — and the final result — is stitched after it, so the
-   * reply grows in place instead of restarting.
+   * Steering or an output-token cut can end a round mid-reply; the kept text
+   * lives here and every later emission — and the final result — is stitched
+   * after it, so the reply grows in place instead of restarting.
    */
   let contentBase = "";
-  const stitch = (text: string): string => (contentBase.length > 0 ? contentBase + text : text);
+  /**
+   * True after a token-limit cut: the next chunk is spliced overlap-aware
+   * (joinCutText) because the model repeats a few words at the seam. Steering
+   * cuts append raw — the model continues from the exact character.
+   */
+  let spliceCut = false;
+  const stitch = (text: string): string =>
+    contentBase.length === 0 ? text : spliceCut ? joinCutText(contentBase, text) : contentBase + text;
+  /** Consecutive cut rounds that produced no visible text (the budget went to reasoning). */
+  let emptyCutRounds = 0;
+  /** Consecutive cut rounds that ended inside a tool call. */
+  let cutToolRounds = 0;
+  /** The previous cut chunk — an identical repeat means the model is stuck, not writing. */
+  let lastCutChunk = "";
   const handlers: EngineHandlers = {
     ...params.handlers,
     onText: (full) => params.handlers.onText(stitch(full)),
@@ -831,7 +1039,9 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         ? "Loop guard: you are repeating the same tool calls without gaining new information. Stop using tools now. Write your complete final answer using everything gathered above. If something could not be determined, say so plainly instead of retrying."
         : reason === "time"
           ? "You hit this run's server time limit. Stop using tools now. Write your complete final answer using everything gathered above. If work remains, list exactly what is left and offer to continue in a follow-up message."
-          : "You have used an unusually large number of tool steps this turn. Stop using tools now. Write your complete final answer using everything gathered above. If work remains, list exactly what is left and offer to continue in a follow-up message.";
+          : reason === "size"
+            ? "Your reply above has reached the maximum length one message can hold; it stays on screen exactly as written. Do not continue the content. In one or two sentences, say precisely where it stopped and offer to continue in a follow-up message. Do not repeat or summarize what is already written."
+            : "You have used an unusually large number of tool steps this turn. Stop using tools now. Write your complete final answer using everything gathered above. If work remains, list exactly what is left and offer to continue in a follow-up message.";
     apiMessages.push({ role: "system", content: instruction });
     handlers.onText("");
     const fallbackText =
@@ -839,7 +1049,9 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         ? `I stopped this run because tool calls started repeating in a loop with no new information. The ${allToolCalls.length} calls above hold everything gathered — say “continue” and I’ll pick up from there.`
         : reason === "time"
           ? `I paused this run at its server time limit after ${allToolCalls.length} tool calls. Everything gathered is shown above — say “continue” and I’ll pick up from there.`
-          : `I paused this run after ${allToolCalls.length} tool calls. Everything gathered is shown above — say “continue” and I’ll pick up from there.`;
+          : reason === "size"
+            ? `${lastContent}\n\nThis reply reached the maximum length one message can hold. Say “continue” and I’ll pick up exactly where it stopped.`
+            : `I paused this run after ${allToolCalls.length} tool calls. Everything gathered is shown above — say “continue” and I’ll pick up from there.`;
     try {
       const completion = await streamGatewayCompletion({
         authKey: params.authKey,
@@ -848,13 +1060,18 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         messages: apiMessages,
         tools: [],
         fallbacks: params.fallbacks,
+        maxOutputTokens: params.maxOutputTokens,
         handlers,
         onUsage: params.onUsage,
       });
       noteServed(completion.servedModelId);
       images.push(...completion.images);
       const content =
-        completion.content.trim().length > 0 ? stitch(completion.content) : lastContent || fallbackText;
+        completion.content.trim().length > 0
+          ? reason === "size"
+            ? `${lastContent}\n\n${completion.content.trim()}`
+            : stitch(completion.content)
+          : lastContent || fallbackText;
       return {
         content,
         images,
@@ -867,7 +1084,7 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
     } catch {
       // The wrap-up call itself failed — surface the gathered work honestly.
       return {
-        content: lastContent || fallbackText,
+        content: reason === "size" ? fallbackText : lastContent || fallbackText,
         images,
         videos,
         audioUrl: audios[0],
@@ -911,6 +1128,7 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         messages: apiMessages,
         tools: params.tools,
         fallbacks: params.fallbacks,
+        maxOutputTokens: params.maxOutputTokens,
         softStop: soft?.signal,
         handlers,
         onUsage: params.onUsage,
@@ -931,7 +1149,8 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
       const draft = completion.content;
       if (draft.trim().length > 0) {
         apiMessages.push({ role: "assistant", content: draft });
-        contentBase += draft;
+        contentBase = stitch(draft);
+        spliceCut = false;
       }
       if (params.isStopped?.()) {
         if (completion.toolCalls.length > 0) {
@@ -956,6 +1175,77 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
       continue;
     }
 
+    if (completion.finishReason === "length") {
+      // The provider ended the round at its output-token limit — the reply is
+      // not finished. Keep the chunk exactly as shown and continue the SAME
+      // reply in place; only a stuck model or the surface's storage ceiling
+      // ends the chain, and then honestly.
+      const draft = completion.content;
+      if (draft.trim().length === 0 && completion.toolCalls.length === 0) {
+        emptyCutRounds += 1;
+        if (emptyCutRounds > 1) {
+          return {
+            content: lastContent,
+            images,
+            videos,
+            audioUrl: audios[0],
+            toolCalls: allToolCalls,
+            servedBy: served.current,
+            stopReason: "completed",
+          };
+        }
+        apiMessages.push({ role: "system", content: CUT_EMPTY_NOTE });
+        staleRounds = 0;
+        continue;
+      }
+      emptyCutRounds = 0;
+      if (draft.length > 0 && draft === lastCutChunk) {
+        // Verbatim repeat of the previous chunk: the model is looping, not
+        // writing. Keep what was shown before the repeat.
+        return {
+          content: contentBase || lastContent,
+          images,
+          videos,
+          audioUrl: audios[0],
+          toolCalls: allToolCalls,
+          servedBy: served.current,
+          stopReason: "completed",
+        };
+      }
+      lastCutChunk = draft;
+      if (draft.trim().length > 0) {
+        const shown = stitch(draft);
+        apiMessages.push({ role: "assistant", content: draft });
+        contentBase = shown;
+        spliceCut = true;
+        if (
+          params.maxContentChars !== undefined &&
+          shown.length + draft.length + CUT_WRAPUP_RESERVE > params.maxContentChars
+        ) {
+          // One more chunk would overflow the surface's per-message ceiling and
+          // be truncated on save — wrap up honestly instead.
+          return finalize("size");
+        }
+      }
+      if (completion.toolCalls.length > 0) {
+        // The cut landed inside a tool call: its arguments are incomplete, so
+        // it never runs and its ghost chip disappears.
+        cutToolRounds += 1;
+        params.handlers.onToolCalls?.(allToolCalls.map((call) => ({ ...call })));
+        if (cutToolRounds > 1) {
+          return finalize("budget");
+        }
+        apiMessages.push({ role: "system", content: CUT_TOOLCALL_NOTE });
+      } else {
+        cutToolRounds = 0;
+        apiMessages.push({ role: "system", content: CUT_CONTINUE_NOTE });
+      }
+      staleRounds = 0;
+      continue;
+    }
+    emptyCutRounds = 0;
+    cutToolRounds = 0;
+
     if (completion.toolCalls.length === 0) {
       // Guidance can slip past the live cut in the instant between the stream
       // finishing and the loop settling. Check the inbox once more: if
@@ -967,6 +1257,7 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
         if (injectSteering(params.steeringWrapNote)) {
           if (pendingBase.trim().length > 0) {
             contentBase = stitch(pendingBase) + "\n\n";
+            spliceCut = false;
           }
           staleRounds = 0;
           continue;

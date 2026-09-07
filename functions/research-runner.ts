@@ -13,7 +13,7 @@ import {
   FAST_MODEL,
   fallbackServedBy,
   runEngineTurn,
-  streamGatewayCompletion,
+  streamGatewayText,
   withRetries,
   TOOLKIT_URL,
   type EngineMessage,
@@ -587,6 +587,12 @@ export type ResearchRunParams = {
   githubRepo?: string;
   citations?: "numeric" | "links";
   fallbacks?: boolean;
+  /**
+   * The report model's output ceiling (tokens) from the gateway catalog. Sent
+   * with the report write so the provider default never shortens the report;
+   * a report the provider still cuts is continued in place either way.
+   */
+  maxOutputTokens?: number;
   /**
    * The run's deferred MCP toolset: research never lists tool schemas — a
    * bounded scout step searches the connected servers and reads the few
@@ -1210,14 +1216,17 @@ export async function runServerDeepResearch(
     ];
     // The dossier is already collected — a network blip while writing the
     // report must not throw away the whole research run, so retry the write.
+    // The write carries the model's own output ceiling and continues in place
+    // when the provider cuts it, so a long report is never truncated.
     const completion = await withRetries(
       () =>
-        streamGatewayCompletion({
+        streamGatewayText({
           authKey: params.authKey,
           modelId: params.modelId,
           messages,
-          tools: [],
           fallbacks: params.fallbacks,
+          maxOutputTokens: params.maxOutputTokens,
+          isCancelled: params.isCancelled,
           handlers: { onText: params.onText },
           onUsage: params.onUsage,
         }),

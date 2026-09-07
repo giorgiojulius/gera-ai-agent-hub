@@ -101,7 +101,7 @@ const GATEWAY_MODEL_STUBS: GatewayModelStub[] = [
   { id: "alibaba/qwen3.8-max", name: "Qwen3.8 Max", owned_by: "alibaba" },
   { id: "alibaba/qwen3.7-flash", name: "Qwen3.7 Flash", owned_by: "alibaba" },
   { id: "bytedance/seed-1.8", name: "Seed 1.8", owned_by: "bytedance" },
-].map((entry) => ({ ...entry, type: "language" as const, context_window: 200_000 }));
+].map((entry) => ({ ...entry, type: "language" as const, context_window: 200_000, max_tokens: 64_000 }));
 
 function base64UrlEncode(value: object): string {
   return btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -165,6 +165,7 @@ type StubRunBody = {
     mcpToolLoading?: string;
     confirmWriteTools?: boolean;
     contextWindow?: number;
+    maxOutputTokens?: number;
   };
 };
 let lastStubRun: StubRun | null = null;
@@ -1162,9 +1163,11 @@ for (const scenario of E2E_SCENARIOS) {
     }
     if (scenario.id === "connect-open-mcp-deferred") {
       // The Settings switch rides into the run config as a snapshot, and the
-      // model's context window from the stubbed gateway catalog comes along.
+      // model's catalog facts (context window, output ceiling) come along so
+      // the server never lets a provider default shorten the reply.
       expect(lastStubRunBody?.config?.mcpToolLoading).toBe("deferred");
       expect(lastStubRunBody?.config?.contextWindow).toBe(200_000);
+      expect(lastStubRunBody?.config?.maxOutputTokens).toBe(64_000);
     }
     if (scenario.id === "github-pin-and-send") {
       expect(lastStubRunBody?.config?.githubRepo).toBe("acme/private-app");

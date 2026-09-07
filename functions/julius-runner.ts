@@ -11,7 +11,7 @@ import {
   buildApiMessages,
   fallbackServedBy,
   runEngineTurn,
-  streamGatewayCompletion,
+  streamGatewayText,
   withRetries,
   type EngineToolDef,
 } from "./agent-engine";
@@ -326,6 +326,13 @@ export type ServerJuliusParams = {
   mcpRoutes?: Map<string, McpRoute>;
   research?: ServerJuliusResearchRunner;
   systemPrompt?: string;
+  /**
+   * Output ceiling (tokens) of a model per the gateway catalog. Every phase
+   * runs its own model (candidates, council, chairman), so each completion
+   * carries that model's ceiling instead of the provider default; unknown →
+   * no cap is sent and a cut text is continued in place.
+   */
+  maxOutputTokensFor?: (modelId: string) => Promise<number | undefined>;
   isCancelled?: () => boolean;
   onUpdate: (julius: JuliusState) => void;
   onContent?: (full: string) => void;
@@ -442,6 +449,7 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
       tools: input.tools,
       executeTool: (name, argsJson) => executeServerTool(name, argsJson, ctx),
       fallbacks: input.fallbacks,
+      maxOutputTokens: await params.maxOutputTokensFor?.(input.modelId),
       isStopped: params.isCancelled,
       handlers: {
         onText: input.onText,
@@ -590,14 +598,15 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
 
   const runPlainReview = async (review: JuliusReviewState, system: string): Promise<void> => {
     try {
-      const completion = await streamGatewayCompletion({
+      const completion = await streamGatewayText({
         authKey: params.authKey,
         modelId: review.modelId,
         messages: [
           { role: "system", content: system },
           { role: "user", content: transcript },
         ],
-        tools: [],
+        maxOutputTokens: await params.maxOutputTokensFor?.(review.modelId),
+        isCancelled: params.isCancelled,
         handlers: {
           onText: (full) => {
             if (full) {
@@ -686,7 +695,7 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
   // Phase 3 — the chairman weighs the debate and rules.
   const runChairman = async (): Promise<string> => {
     try {
-      const ruling = await streamGatewayCompletion({
+      const ruling = await streamGatewayText({
         authKey: params.authKey,
         modelId: params.settings.chairmanModelId,
         messages: [
@@ -696,7 +705,8 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
           },
           { role: "user", content: [transcript, reviewsBlock(state)].join("\n\n") },
         ],
-        tools: [],
+        maxOutputTokens: await params.maxOutputTokensFor?.(params.settings.chairmanModelId),
+        isCancelled: params.isCancelled,
         handlers: {
           onText: (full) => {
             if (full) {
@@ -768,7 +778,7 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
   };
   const runSynthesis = async (): Promise<{ content: string; servedBy?: string }> => {
     const researchMode = state.candidates.some((item) => Boolean(item.label));
-    const completion = await streamGatewayCompletion({
+    const completion = await streamGatewayText({
       authKey: params.authKey,
       modelId: params.settings.chairmanModelId,
       messages: [
@@ -787,7 +797,8 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
           ].join("\n\n"),
         },
       ],
-      tools: [],
+      maxOutputTokens: await params.maxOutputTokensFor?.(params.settings.chairmanModelId),
+      isCancelled: params.isCancelled,
       handlers: {
         onText: (full) => {
           if (full) {

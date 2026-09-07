@@ -1,18 +1,21 @@
-// Gateway model facts the server needs at run time — today: whether a model
-// accepts image input, so images an MCP tool returns can be shown to it.
+// Gateway model facts the server needs at run time: whether a model accepts
+// image input (so images an MCP tool returns can be shown to it) and the
+// model's own output ceiling (`max_tokens`, sent with every completion so the
+// provider default never shortens a reply).
 //
-// The web client passes the same fact from its loaded catalog (`vision` in the
-// run config); background runs (automations, project agents) and older clients
-// fall back to this per-isolate cache of the gateway's public model list.
-// Unknown model or unreachable gateway → false: the model then only sees the
-// text stub for an image, never an input part it might reject.
+// The web client passes the same facts from its loaded catalog (`vision` and
+// `maxOutputTokens` in the run config); background runs (automations, project
+// agents) and older clients fall back to this per-isolate cache of the
+// gateway's public model list. Unknown model or unreachable gateway → false /
+// undefined: the model then only sees the text stub for an image, and the
+// engine continues a reply the provider default cut instead of capping it.
 
-import { parseSelection, TOOLKIT_URL } from "./agent-engine";
+import { normalizeOutputTokens, parseSelection, TOOLKIT_URL } from "./agent-engine";
 
 /** How long one fetched catalog is trusted. */
 export const MODEL_CATALOG_TTL_MS = 10 * 60_000;
 
-type CatalogEntry = { id: string; inputs: string[] };
+type CatalogEntry = { id: string; inputs: string[]; maxOutputTokens?: number };
 type CatalogCache = { fetchedAt: number; byId: Map<string, CatalogEntry> };
 
 const caches = new Map<string, Promise<CatalogCache> | CatalogCache>();
@@ -21,7 +24,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Parses the gateway `/v1/models` body into id → input modalities; tolerant of missing fields. */
+/** Parses the gateway `/v1/models` body into id → input modalities + output ceiling; tolerant of missing fields. */
 export function parseModelCatalog(payload: unknown): Map<string, CatalogEntry> {
   const byId = new Map<string, CatalogEntry>();
   const data = isRecord(payload) && Array.isArray(payload.data) ? payload.data : [];
@@ -33,7 +36,8 @@ export function parseModelCatalog(payload: unknown): Map<string, CatalogEntry> {
     const inputs = Array.isArray(modalities.input)
       ? modalities.input.filter((item): item is string => typeof item === "string").map((item) => item.toLowerCase())
       : [];
-    byId.set(raw.id, { id: raw.id, inputs });
+    const maxOutputTokens = normalizeOutputTokens(raw.max_tokens);
+    byId.set(raw.id, { id: raw.id, inputs, ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}) });
   }
   return byId;
 }
@@ -83,6 +87,20 @@ export async function modelAcceptsImages(selectionId: string, options: ModelCata
   const catalog = await catalogFor(options.url ?? `${TOOLKIT_URL}/v2/vercel/v1/models`, options.fetch ?? fetch);
   const entry = catalog?.byId.get(catalogId);
   return entry ? entry.inputs.includes("image") : false;
+}
+
+/**
+ * The picked model's output ceiling (tokens) per the gateway catalog
+ * (`max_tokens`). Unknown model, missing field or unreachable gateway →
+ * undefined: the request then carries no cap and a cut reply is continued.
+ */
+export async function modelMaxOutputTokens(
+  selectionId: string,
+  options: ModelCatalogOptions = {},
+): Promise<number | undefined> {
+  const { catalogId } = parseSelection(selectionId);
+  const catalog = await catalogFor(options.url ?? `${TOOLKIT_URL}/v2/vercel/v1/models`, options.fetch ?? fetch);
+  return catalog?.byId.get(catalogId)?.maxOutputTokens;
 }
 
 /** Test seam: forgets every cached catalog. */

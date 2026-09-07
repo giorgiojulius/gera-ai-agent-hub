@@ -54,6 +54,7 @@ import { beginMcpHealthCheck, invalidateMcpHealth, mcpHealthFingerprint, mcpHeal
 import {
   cachedAcceptsImages,
   cachedContextWindow,
+  cachedMaxOutputTokens,
   IMAGE_EDIT_MODEL,
   modelIdForMode,
   modelShortName,
@@ -570,18 +571,24 @@ function createSteerBridge(
 }
 
 /**
- * MCP facts every server run carries: the account's tool-loading setting and
- * its "Confirm write tools" switch (so a change flipped moments ago applies
- * before the profile syncs), the tools already allowed for this chat, and the
- * picked model's context window from the gateway catalog, which the server's
- * auto mode uses to judge when tool schemas would crowd the prompt.
+ * MCP and model facts every server run carries: the account's tool-loading
+ * setting and its "Confirm write tools" switch (so a change flipped moments
+ * ago applies before the profile syncs), the tools already allowed for this
+ * chat, and the picked model's gateway-catalog facts — its context window
+ * (the server's auto mode judges when tool schemas would crowd the prompt),
+ * its output ceiling (sent as `max_tokens` so the provider default never
+ * shortens a reply) and whether it accepts images.
  */
 function mcpRunConfig(
   settings: AgentSettings,
   selectionId: string,
   conversation?: Pick<Conversation, "mcpApproved">,
-): Pick<ServerRunConfig, "mcpToolLoading" | "confirmWriteTools" | "mcpApproved" | "contextWindow" | "vision"> {
+): Pick<
+  ServerRunConfig,
+  "mcpToolLoading" | "confirmWriteTools" | "mcpApproved" | "contextWindow" | "maxOutputTokens" | "vision"
+> {
   const contextWindow = cachedContextWindow(selectionId);
+  const maxOutputTokens = cachedMaxOutputTokens(selectionId);
   const vision = cachedAcceptsImages(selectionId);
   const approved = conversation?.mcpApproved ?? [];
   return {
@@ -589,6 +596,7 @@ function mcpRunConfig(
     confirmWriteTools: settings.confirmWriteTools,
     ...(approved.length > 0 ? { mcpApproved: approved } : {}),
     ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
     ...(vision !== undefined ? { vision } : {}),
   };
 }

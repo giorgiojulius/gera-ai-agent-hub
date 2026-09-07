@@ -16,6 +16,7 @@
 
 import {
   buildApiMessages,
+  normalizeOutputTokens,
   runEngineTurn,
   type EngineSteerItem,
   type EngineToolRecord,
@@ -42,7 +43,7 @@ import {
   type CloudMcpServer,
   type RefreshedOAuth,
 } from "./mcp-cloud";
-import { modelAcceptsImages } from "./model-catalog";
+import { modelAcceptsImages, modelMaxOutputTokens } from "./model-catalog";
 import {
   markOAuthRefreshStarted,
   mcpConfigsWithSecrets,
@@ -107,8 +108,13 @@ const TIME_BUDGET_MS: Record<RunKind, number> = {
 };
 const MAX_LIVE_RUNS_PER_OWNER = 3;
 
-/** Caps for the final assistant message written into chat history. */
-const FINAL_CONTENT_CHARS = 300_000;
+/**
+ * Caps for the final assistant message written into chat history. The content
+ * ceiling is a storage bound, not a reply limit: the engine keeps continuing a
+ * reply the provider cut until one more chunk could no longer fit under it,
+ * then wraps up honestly (see EngineTurnParams.maxContentChars).
+ */
+const FINAL_CONTENT_CHARS = 600_000;
 const FINAL_TOOLCALLS = 40;
 const FINAL_TOOL_RESULT_CHARS = 4_000;
 const FINAL_TOOL_ARGS_CHARS = 500;
@@ -116,7 +122,7 @@ const FINAL_SOURCES = 100;
 const STEER_TEXT_CHARS = 8_000;
 
 /** Snapshot caps — the row must stay well under the 2 MB SQLite value limit. */
-const SNAP_CONTENT_CHARS = 400_000;
+const SNAP_CONTENT_CHARS = 600_000;
 const SNAP_TOOL_RESULT_CHARS = 1_200;
 const SNAP_TOOLCALLS = 48;
 const SNAP_REASONING_CHARS = 2_000;
@@ -874,6 +880,18 @@ export class RunManager {
       run.usageEvents.push({ modelId, usage, ...(service ? { service: true } : {}) });
     };
     const isCancelled = (): boolean => run.stopRequested || Date.now() >= deadlineAt;
+    // Gateway model facts (vision, output ceiling): the tab's catalog snapshot
+    // wins; otherwise the server's own catalog cache (10 minutes) answers.
+    const catalogOptions = this.env.STAGING_GATEWAY_URL
+      ? { url: `${this.env.STAGING_GATEWAY_URL.replace(/\/chat\/completions$/, "")}/models` }
+      : {};
+    // Output ceiling: the model's own maximum rides on every completion so the
+    // provider default never shortens a reply or a report; unknown → no cap is
+    // sent and the engine continues a cut text in place.
+    const outputCeilingFor = (modelId: string): Promise<number | undefined> =>
+      modelMaxOutputTokens(modelId, catalogOptions);
+    const maxOutputTokens =
+      normalizeOutputTokens(config.maxOutputTokens) ?? (await outputCeilingFor(run.body.modelId));
     // The account's loading mode: the tab's snapshot wins (it reflects the
     // switch the user just flipped); otherwise the synced profile decides.
     const toolLoading = normalizeMcpToolLoading(
@@ -938,6 +956,7 @@ export class RunManager {
           githubDisabledTools: unlockGithubChatWrites("github", config.research?.githubDisabledTools ?? []),
           githubRepo: config.githubRepo,
           citations: config.research?.citations ?? "numeric",
+          maxOutputTokens,
           mcpToolset: researchToolset.servers.some((server) => server.deferred && !server.unavailable)
             ? researchToolset
             : undefined,
@@ -1021,6 +1040,7 @@ export class RunManager {
           mcpToolDefs: juliusMcp.toolDefs,
           mcpRoutes: juliusMcp.routes,
           systemPrompt,
+          maxOutputTokensFor: outputCeilingFor,
           isCancelled,
           research: juliusConfig.research
             ? async ({ modelId, onText, onResearch }) => {
@@ -1037,6 +1057,7 @@ export class RunManager {
                   // Candidates compete as SPECIFIC models — the report write
                   // fails honestly instead of being ghost-written by a backup.
                   fallbacks: false,
+                  maxOutputTokens: await outputCeilingFor(modelId),
                   isCancelled,
                   onUpdate: onResearch,
                   onText,
@@ -1234,11 +1255,9 @@ export class RunManager {
       ...(isAutomation ? [executionOutcomeToolDefinition()] : []),
     ];
 
-    // Vision: the tab's catalog fact wins; otherwise the gateway catalog (10-minute cache); unknown → text stubs only.
+    // Vision: unknown → text stubs only.
     const acceptsImages =
-      typeof config.vision === "boolean"
-        ? config.vision
-        : await modelAcceptsImages(run.body.modelId, this.env.STAGING_GATEWAY_URL ? { url: `${this.env.STAGING_GATEWAY_URL.replace(/\/chat\/completions$/, "")}/models` } : {});
+      typeof config.vision === "boolean" ? config.vision : await modelAcceptsImages(run.body.modelId, catalogOptions);
     const apiMessages = buildApiMessages(config.history, systemPrompt);
     if (mcp.promptNote) {
       apiMessages.push({ role: "system", content: mcp.promptNote });
@@ -1271,6 +1290,8 @@ export class RunManager {
         apiMessages,
         tools,
         acceptsImages,
+        maxOutputTokens,
+        maxContentChars: FINAL_CONTENT_CHARS,
         persistMedia: (items) => this.storeMedia(run, items),
         executeTool: async (name, argsJson) => {
           if (isAutomation && name === executionOutcomeToolDefinition().function.name) {

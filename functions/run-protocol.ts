@@ -937,6 +937,12 @@ export type StartRunConfig = {
   mcpApproved?: Array<{ serverId: string; toolName: string }>;
   /** Context window (tokens) of the picked model from the gateway catalog; unknown → 128k assumed. */
   contextWindow?: number;
+  /**
+   * The picked model's output ceiling (tokens) from the gateway catalog
+   * (`max_tokens`); absent → the server consults the catalog. Sent with every
+   * completion so the provider default never shortens a reply.
+   */
+  maxOutputTokens?: number;
   /** The picked model accepts image input (gateway catalog `modalities.input`); absent → the server consults the catalog. */
   vision?: boolean;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */

@@ -71,6 +71,12 @@ export type ServerRunConfig = {
   mcpApproved?: McpToolApproval[];
   /** Context window (tokens) of the picked model from the gateway catalog, when known. */
   contextWindow?: number;
+  /**
+   * Output ceiling (tokens) of the picked model from the gateway catalog
+   * (`max_tokens`); absent → the server consults the catalog. Sent with every
+   * completion so the provider default never shortens a reply.
+   */
+  maxOutputTokens?: number;
   /** The picked model accepts image input (gateway catalog `modalities.input`); absent → the server consults the catalog. */
   vision?: boolean;
   /** Thread-pinned owner/repo; server modes treat it as the structured default. */

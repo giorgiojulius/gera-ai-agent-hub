@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-06 · commit `880767c`.
+Last synced: 2026-09-06 · code commit `aa57eef` (landed on top of `880767c`); published backend re-verified 2026-09-07 08:53Z (`/ping` 200, internal MCP routes 404, CORS preflight 204) without a redeploy.
 
 Current MCP contract: cold auto/deferred starts make no provider requests; an addressed search warms only one server, and a first cold call returns `executed:false` with its schema. GitHub operations use server-owned references only. Inventory persists negotiated wire, project warmups write back to the owner, and both protocol families retain their policy/credential boundaries.
 

@@ -346,14 +346,14 @@ export type ChatMessage = {
   /** Julius panel state when this reply was produced by parallel candidates. */
   julius?: JuliusState;
   /**
-   * True while a run is writing into this message. Persisted on purpose: a
-   * reload (app update, crash) that kills the run leaves the flag behind,
-   * and the next load turns it into an honest `interrupted` marker.
+   * True while this tab observes a run writing into this message. A persisted
+   * flag is an unresolved local snapshot, not evidence that the server stopped.
+   * Boot reconciliation adopts the live run or applies its stored result.
    */
   pending?: boolean;
   /** Open questions (MCP elicitation) the live run is paused on — rendered as cards. Never persisted past the run. */
   pauses?: RunPauseRequest[];
-  /** Set on load when a reload cut this reply mid-run — offers Continue/Retry. */
+  /** Completion unconfirmed locally or interrupted server-side; does not identify the cause. */
   interrupted?: boolean;
   createdAt: number;
 };

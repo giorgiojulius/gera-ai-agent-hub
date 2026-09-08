@@ -242,7 +242,7 @@ function MessageBubble({
           <MediaAudioCard className="mt-3" src={message.audioUrl} downloadName="gera-audio" />
         ) : null}
         {!streaming && message.execution ? <ExecutionOutcomeCard outcome={message.execution} /> : null}
-        {message.interrupted && !readOnly ? (
+        {message.interrupted && !streaming && !message.pending && !readOnly ? (
           <InterruptedNotice message={message} busy={busy} />
         ) : null}
         {!streaming && citationSources.length > 0 ? <SourcesStrip sources={citationSources} /> : null}
@@ -399,13 +399,14 @@ function ToolCallRow({ call, divided }: { call: ToolCallRecord; divided: boolean
 }
 
 /**
- * Honest marker for a turn that a page reload (an app update mid-run) cut.
+ * An unresolved saved reply is not proof that a reload stopped the server.
+ * Wait for boot reconciliation before offering an explicit continuation.
  * Text partials offer Continue — the reply picks up in the same bubble;
  * empty turns offer Retry. Julius panels with usable candidates recover
  * through their own pick UI, so they get the marker without a button.
  */
 function InterruptedNotice({ message, busy }: { message: ChatMessage; busy: boolean }) {
-  const { resumeInterrupted, retryInterrupted } = useAgent();
+  const { resumeInterrupted, retryInterrupted, isRecoveringRuns, runRecoveryRetrySeconds, recheckServerRuns } = useAgent();
   const hasText = message.content.trim().length > 0;
   const julius = message.julius;
   const juliusRecovers = Boolean(julius && (julius.status === "choice" || julius.status === "done"));
@@ -417,15 +418,36 @@ function InterruptedNotice({ message, busy }: { message: ChatMessage; busy: bool
         ? "continue"
         : "retry";
   return (
-    <div className="mt-2.5 flex flex-wrap items-center gap-2 rounded-xl border border-ember/30 bg-ember/5 px-3 py-2 text-xs">
-      <AlertCircle className="h-3.5 w-3.5 shrink-0 text-ember" />
+    <div
+      data-testid={TID.messageRecoveryNotice}
+      role="status"
+      className={cn("mt-2.5 flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2 text-xs", isRecoveringRuns ? "border-border bg-muted/30" : "border-ember/30 bg-ember/5")}
+    >
+      {isRecoveringRuns
+        ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+        : <AlertCircle className="h-3.5 w-3.5 shrink-0 text-ember" />}
       <span className="min-w-0 flex-1 text-muted-foreground">
-        {hasText
-          ? "Cut off by a page reload — this reply is incomplete."
-          : "A page reload interrupted this turn before anything arrived."}
+        {isRecoveringRuns
+          ? runRecoveryRetrySeconds != null
+            ? `Connection unavailable. Retrying status in ${runRecoveryRetrySeconds}s — your draft is preserved.`
+            : "Checking saved run status… Your draft is preserved."
+          : hasText
+            ? "Completion wasn't confirmed. This saved reply may be incomplete."
+            : "Completion wasn't confirmed. No reply is available in this saved turn."}
       </span>
-      {action && !busy ? (
+      {!busy && (!isRecoveringRuns || runRecoveryRetrySeconds != null) ? (
         <button
+          data-testid={TID.messageRecoveryCheck}
+          type="button"
+          onClick={recheckServerRuns}
+          className="shrink-0 rounded-full border border-border px-3 py-1 font-medium transition-colors hover:bg-muted"
+        >
+          Check now
+        </button>
+      ) : null}
+      {action && !busy && !isRecoveringRuns ? (
+        <button
+          data-testid={TID.messageRecoveryAction}
           type="button"
           onClick={() =>
             action === "continue" ? resumeInterrupted(message.id) : retryInterrupted(message.id)

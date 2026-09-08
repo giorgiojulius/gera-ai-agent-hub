@@ -68,9 +68,15 @@ export type AgentContextValue = {
   send: () => void;
   /** Edits a sent user message: truncates the thread there and resends. */
   editMessage: (messageId: string, newText: string) => void;
-  /** Continues a reply that a reload cut mid-stream (partial text kept). */
+  /** True until saved runs and history have been reconciled. */
+  isRecoveringRuns: boolean;
+  /** Delay before the next automatic status retry, null while not backing off. */
+  runRecoveryRetrySeconds: number | null;
+  /** Rechecks existing server jobs only; never starts or stops a prompt. */
+  recheckServerRuns: () => void;
+  /** Explicitly continues an unresolved reply (partial text kept). */
   resumeInterrupted: (messageId: string) => void;
-  /** Re-runs a turn that a reload killed before anything arrived. */
+  /** Explicitly re-runs an unresolved turn. */
   retryInterrupted: (messageId: string) => void;
   stop: () => void;
   /** Queues the composer as a follow-up; steer injects it into the live run without interrupting. */

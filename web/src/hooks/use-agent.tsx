@@ -17,7 +17,7 @@ import {
   type AgentState,
 } from "@/lib/agent-store";
 import { fileToAttachment } from "@/lib/attachments";
-import { getAccessToken } from "@/lib/auth-tokens";
+import { authSessionSnapshot, getAccessToken, isAuthSessionCurrent } from "@/lib/auth-tokens";
 import { errorFromUnknown } from "@/lib/errors";
 import { shouldSignalExecution } from "@/lib/execution-outcome";
 import { hasActiveCloudRun, stopServerRun } from "@/lib/server-run";
@@ -1236,12 +1236,50 @@ export function AgentProvider({ children }: { children: ReactNode }) {
    * silently spending tokens.
    */
   const bootRecoveryRef = useRef<boolean>(false);
+  const [isRecoveringRuns, setIsRecoveringRuns] = useState<boolean>(true);
   const [bootRecoveryTick, setBootRecoveryTick] = useState<number>(0);
+  const [runRecoveryRetrySeconds, setRunRecoveryRetrySeconds] = useState<number | null>(null);
+  const recoveryTimerRef = useRef<number | null>(null);
+  const recoveryFailuresRef = useRef<number>(0);
+  const recoveryRequestRef = useRef<boolean>(false);
+  const recoveryReadOnlyRef = useRef<boolean>(false);
+  const recoveryMountedRef = useRef<boolean>(true);
+  useEffect(() => {
+    recoveryMountedRef.current = true;
+    return () => {
+      recoveryMountedRef.current = false;
+      if (recoveryTimerRef.current !== null) window.clearTimeout(recoveryTimerRef.current);
+    };
+  }, []);
+  const recheckServerRuns = useCallback(() => {
+    if (recoveryRequestRef.current) return;
+    if (recoveryTimerRef.current !== null) window.clearTimeout(recoveryTimerRef.current);
+    recoveryTimerRef.current = null;
+    recoveryReadOnlyRef.current = true;
+    bootRecoveryRef.current = false;
+    setIsRecoveringRuns(true);
+    setRunRecoveryRetrySeconds(null);
+    setBootRecoveryTick((value) => value + 1);
+  }, []);
   useEffect(() => {
     if (bootRecoveryRef.current || isAuthLoading) {
       return;
     }
     bootRecoveryRef.current = true;
+    recoveryRequestRef.current = true;
+    const session = authSessionSnapshot();
+    const isCurrent = () => recoveryMountedRef.current && isAuthSessionCurrent(session);
+    const scheduleRetry = (delay: number) => {
+      if (!isCurrent()) return;
+      if (recoveryTimerRef.current !== null) window.clearTimeout(recoveryTimerRef.current);
+      recoveryTimerRef.current = window.setTimeout(() => {
+        recoveryTimerRef.current = null;
+        if (!isCurrent()) return;
+        bootRecoveryRef.current = false;
+        setRunRecoveryRetrySeconds(null);
+        setBootRecoveryTick((value) => value + 1);
+      }, delay);
+    };
     void (async () => {
       // Runs may be executing (or already finished) on the server — adopt
       // them BEFORE local recovery so a reply is never continued twice.
@@ -1251,32 +1289,40 @@ export function AgentProvider({ children }: { children: ReactNode }) {
           const result = await adoptActiveServerRuns({
             runningOnly: !isHydrated,
             getState: () => stateRef.current,
-            setState,
+            setState: (update) => { if (isCurrent()) setState(update); },
             onDone: (conversationId, stopped, execution) => {
-              if (stopped !== true) {
+              if (isCurrent() && stopped !== true) {
                 notifyRef.current(conversationId, execution);
                 window.setTimeout(() => drainRef.current(conversationId), 60);
               }
             },
           });
+          if (!isCurrent()) return;
+          recoveryFailuresRef.current = 0;
           for (const id of [...result.running, ...result.applied]) {
             adopted.add(id);
           }
         } catch {
           // A deploy/network gap does not prove the durable run is absent.
           // Retry adoption before local recovery; never start a duplicate.
-          bootRecoveryRef.current = false;
-          window.setTimeout(() => setBootRecoveryTick((value) => value + 1), 2_000);
+          if (!isCurrent()) return;
+          const delays = [2, 4, 8, 15, 30];
+          const seconds = delays[Math.min(recoveryFailuresRef.current++, delays.length - 1)];
+          setRunRecoveryRetrySeconds(seconds);
+          scheduleRetry(seconds * 1_000);
           return;
         }
       }
       // Attach live jobs immediately; only local replay needs the full history
       // baseline. A slow history/media pull is not evidence of interruption.
       if (user !== null && !isHydrated) {
-        bootRecoveryRef.current = false;
-        window.setTimeout(() => setBootRecoveryTick((value) => value + 1), 2_000);
+        scheduleRetry(2_000);
         return;
       }
+      if (!isCurrent()) return;
+      setIsRecoveringRuns(false);
+      setRunRecoveryRetrySeconds(null);
+      if (recoveryReadOnlyRef.current) return;
       const snapshot = stateRef.current;
       const now = Date.now();
       const recovering = new Set<string>();
@@ -1309,7 +1355,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         }
         window.setTimeout(() => drainRef.current(conversationId), 400);
       }
-    })();
+    })().finally(() => { recoveryRequestRef.current = false; });
   }, [bootRecoveryTick, isAuthLoading, isHydrated, resumeInterrupted, retryInterrupted, user]);
 
   /**
@@ -1510,6 +1556,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       editMessage,
       resumeInterrupted,
       retryInterrupted,
+      isRecoveringRuns,
+      runRecoveryRetrySeconds,
+      recheckServerRuns,
       stop,
       queueMessage,
       removeQueued,
@@ -1565,6 +1614,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
     editMessage,
     resumeInterrupted,
     retryInterrupted,
+    isRecoveringRuns,
+    runRecoveryRetrySeconds,
+    recheckServerRuns,
     stop,
     queueMessage,
     removeQueued,

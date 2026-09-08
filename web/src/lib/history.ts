@@ -225,10 +225,9 @@ export function reviveMessage(message: ChatMessage): ChatMessage {
         }
       : message;
   if (message.pending) {
-    // A run was writing into this message when the tab died (reload after a
-    // publish, crash). Media that already landed means the turn essentially
-    // delivered; otherwise the flag flips to an honest "interrupted" marker
-    // the UI offers to continue.
+    // This is only an unresolved local snapshot. The server may still be
+    // working or already done; boot adoption/sync must reconcile it before
+    // the UI offers continuation. `interrupted` does not prove a reload cut it.
     const delivered =
       (message.images?.length ?? 0) > 0 ||
       (message.videos?.length ?? 0) > 0 ||

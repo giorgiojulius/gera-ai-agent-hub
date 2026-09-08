@@ -31,6 +31,12 @@ export const TID = {
   messageUser: "message-user",
   /** One assistant message row (repeats per turn). */
   messageAssistant: "message-assistant",
+  /** Saved reply whose completion is being checked or remains unconfirmed. */
+  messageRecoveryNotice: "message-recovery-notice",
+  /** Explicit Continue/Retry, only after boot reconciliation. */
+  messageRecoveryAction: "message-recovery-action",
+  /** Read-only retry of saved cloud run status. */
+  messageRecoveryCheck: "message-recovery-check",
   /** Evidence-backed outcome receipt under an autonomous agent reply. */
   executionOutcome: "execution-outcome",
   /** Live repository edit workbench inside an assistant turn. */

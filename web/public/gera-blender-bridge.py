@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-BRIDGE_VERSION = "1.0.0"
+BRIDGE_VERSION = "1.0.1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_COMMAND = "uvx blender-mcp"
@@ -58,10 +58,26 @@ STARTUP_TIMEOUT_S = 300.0  # the first `uvx blender-mcp` run downloads and insta
 MAX_BODY_BYTES = 16 * 1024 * 1024
 MCP_PATH = "/mcp"
 # The bridge relays tools/list and tools/call, whose wire shape is identical across these revisions.
+# 2025-11-25 is the newest revision of the initialize-handshake line and the ceiling of the mcp 1.x SDK that
+# `blender-mcp` pins (`mcp<2`). The 2026-07-28 revision (server/discover, no handshake or sessions) is the
+# client's business: Gera probes it first and falls back to initialize when this bridge answers -32601.
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 WWW_AUTHENTICATE = 'Bearer realm="gera-blender-bridge"'
 TOKEN_FILE = Path.home() / ".gera" / "blender-bridge.token"
 TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def negotiate_version(requested: Any, upstream: Any) -> str:
+    """Pick the revision to advertise to Gera: never newer than what blender-mcp itself agreed to.
+
+    Revisions are ISO dates, so plain string comparison orders them. A client asking for an older
+    supported revision gets it (the relayed methods are identical); anything else gets the upstream one.
+    """
+    ceiling = upstream if isinstance(upstream, str) and upstream in SUPPORTED_PROTOCOL_VERSIONS else SUPPORTED_PROTOCOL_VERSIONS[0]
+    if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS and requested <= ceiling:
+        return requested
+    return ceiling
+
 
 JSON_RPC_PARSE_ERROR = -32700
 JSON_RPC_INVALID_REQUEST = -32600
@@ -487,7 +503,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         requested = params.get("protocolVersion")
         upstream = self.state.child.init_result
-        version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else upstream.get("protocolVersion", SUPPORTED_PROTOCOL_VERSIONS[0])
+        version = negotiate_version(requested, upstream.get("protocolVersion"))
         result: dict[str, Any] = {
             "protocolVersion": version,
             "capabilities": upstream.get("capabilities") or {"tools": {}},

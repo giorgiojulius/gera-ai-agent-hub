@@ -1165,7 +1165,17 @@ changes on every cloudflared restart, the token does not. Any other HTTPS
 tunnel works without `--tunnel`. Wire: `server/discover` → JSON-RPC -32601
 (so Gera's client falls back to the initialize handshake), `initialize`
 answered from the cached upstream handshake with a fresh `Mcp-Session-Id`
-(one shared upstream session; stale ids are tolerated rather than 404ed),
+(one shared upstream session; stale ids are tolerated rather than 404ed).
+Protocol revision: the bridge speaks the initialize line only
+(`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`) because
+`blender-mcp` (1.9.1, 2026-09-02) pins `mcp<2` and the Python SDK 1.x
+ceiling is `2025-11-25`; the spec's current revision `2026-07-28`
+(`server/discover`, no handshake/sessions, SDK 2.x) is Gera's client-side
+probe, not something a stdio wrapper can add. `negotiate_version` (bridge
+1.0.1) never advertises a revision newer than the one upstream actually
+negotiated: requested 2025-11-25 over an upstream on 2025-06-18 →
+2025-06-18; an older supported request is honoured; unknown/modern requests
+→ the upstream revision.
 notifications → 202, other requests forwarded with id remapping, GET → 405,
 DELETE → 204, upstream crash → error then restart on the next request,
 per-request timeout → -32001. No CORS headers are ever emitted. It does NOT

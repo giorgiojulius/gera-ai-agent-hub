@@ -111,6 +111,12 @@ describe("Blender MCP setup", () => {
     expect(script).toContain("if not self._authorized():");
     expect(script).toContain('if method == "server/discover":');
     expect(script).toContain("JSON_RPC_METHOD_NOT_FOUND = -32601");
+    // Handshake line only: blender-mcp pins `mcp<2`, whose ceiling is 2025-11-25. The 2026-07-28 revision is the
+    // client's probe (discover → -32601 → fallback); the bridge never advertises a newer revision than upstream agreed to.
+    expect(script).toContain('SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")');
+    expect(script).not.toContain('"2026-07-28"');
+    expect(script).toContain("requested <= ceiling");
+    expect(script).toContain('negotiate_version(requested, upstream.get("protocolVersion"))');
     expect(script).toContain('"tunnel", "--url"');
     expect(script).toContain("trycloudflare");
     expect(script).toContain('Path.home() / ".gera" / "blender-bridge.token"');

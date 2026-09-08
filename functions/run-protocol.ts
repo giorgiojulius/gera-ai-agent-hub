@@ -49,6 +49,12 @@ export type RunToolRecord = {
   images?: string[];
   /** Audio / blob parts the tool returned (cloud media refs) — Save affordance. */
   files?: RunToolFile[];
+  /**
+   * Length of the reply text already written when the model issued this call
+   * — the UI splits the content there so the row sits between the commentary
+   * that led to it and the text that followed. Absent on legacy records.
+   */
+  textOffset?: number;
 };
 
 /** One file mutation captured from a repository tool call for the chat workbench. */
@@ -460,6 +466,25 @@ export function extractExecutionOutcomeMarker(content: string): {
 /** Outcome-tool calls are control metadata, never user-facing evidence chips. */
 export function visibleExecutionToolCalls<T extends { name: string }>(calls: T[]): T[] {
   return calls.filter((call) => call.name !== EXECUTION_OUTCOME_TOOL_NAME);
+}
+
+/**
+ * Pins a tool record's text offset to the length of the text shown when the
+ * call first appeared. The engine stamps offsets in its own coordinates; a
+ * resumed run prefixes the pre-reload partial, so the first sighting (when
+ * `shownLength` is exactly the visible text before the call) is remembered
+ * and replayed for every later emission of the same record.
+ */
+export function rebaseToolOffset(call: RunToolRecord, shownLength: number, memo: Map<string, number>): RunToolRecord {
+  if (typeof call.textOffset !== "number") {
+    return call;
+  }
+  const known = memo.get(call.id);
+  if (known !== undefined) {
+    return { ...call, textOffset: known };
+  }
+  memo.set(call.id, shownLength);
+  return { ...call, textOffset: shownLength };
 }
 
 /**

@@ -88,6 +88,12 @@ export type ToolCallRecord = {
   images?: string[];
   /** Audio / blob parts the tool returned — saveable into the media vault. */
   files?: ToolCallFile[];
+  /**
+   * Length of the reply text already written when the model issued this call.
+   * The bubble splits `content` there so the row sits between the commentary
+   * that led to it and the text that followed. Absent on legacy records.
+   */
+  textOffset?: number;
 };
 
 /** One repository file mutation rendered inside a chat turn's code workbench. */

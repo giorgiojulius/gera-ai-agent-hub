@@ -167,6 +167,12 @@ export const TID = {
   settingsMcpLoading: "settings-mcp-loading",
   /** One tool-call row under an assistant reply (repeats; MCP meta calls render as "MCP · server · tool"). */
   messageToolCall: "message-tool-call",
+  /** One batch of tool calls issued at the same point of the reply text (repeats; sits between prose segments). */
+  messageToolGroup: "message-tool-group",
+  /** Summary row of a collapsed batch (4+ calls) — tap to expand the rows. */
+  messageToolGroupToggle: "message-tool-group-toggle",
+  /** One prose segment of an assistant reply (repeats when tool batches split the text). */
+  messageText: "message-text",
   /** Thumbnail strip of images an MCP tool returned (under its row). */
   messageToolImages: "message-tool-images",
   /** One saveable audio/blob chip an MCP tool returned (repeats). */

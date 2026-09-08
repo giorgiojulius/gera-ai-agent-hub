@@ -781,13 +781,20 @@ export async function runAgentTurn(params: {
       };
     }
 
+    // The commentary written before these calls stays part of the reply: later
+    // rounds append below it, and each record remembers where it was issued.
+    const shownBefore = stitch(completion.content);
     const records: ToolCallRecord[] = completion.toolCalls.map((call) => ({
       id: call.id,
       name: call.function.name,
       arguments: call.function.arguments,
       status: "running",
+      textOffset: shownBefore.length,
     }));
     allToolCalls.push(...records);
+    if (completion.content.trim().length > 0) {
+      contentBase = `${shownBefore}\n\n`;
+    }
     params.handlers.onToolCalls?.(allToolCalls.map((call) => ({ ...call })));
 
     apiMessages.push({

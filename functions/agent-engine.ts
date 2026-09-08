@@ -114,6 +114,12 @@ export type EngineToolRecord = {
   images?: string[];
   /** Audio / blob parts the tool returned, as persisted media refs (Save affordance). */
   files?: EngineToolFileRef[];
+  /**
+   * Length of the reply text that was already written when the model issued
+   * this call — the UI splits the content there so tool rows sit between the
+   * commentary that led to them and the text that followed.
+   */
+  textOffset?: number;
 };
 
 export type EngineToolOutcome = {
@@ -1277,13 +1283,22 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
       };
     }
 
+    // The commentary written before these calls is part of the reply: it stays
+    // on screen through the tool phase, later rounds append below it, and each
+    // record remembers where in the text it was issued.
+    const shownBefore = stitch(completion.content);
     const records: EngineToolRecord[] = completion.toolCalls.map((call) => ({
       id: call.id,
       name: call.function.name,
       arguments: call.function.arguments,
       status: "running",
+      textOffset: shownBefore.length,
     }));
     allToolCalls.push(...records);
+    if (completion.content.trim().length > 0) {
+      contentBase = `${shownBefore}\n\n`;
+      spliceCut = false;
+    }
     params.handlers.onToolCalls?.(allToolCalls.map((call) => ({ ...call })));
 
     apiMessages.push({

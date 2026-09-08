@@ -19,7 +19,7 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { CodeChangeFlow } from "@/components/gera/CodeChangeFlow";
 import { RepoPreviewFlow } from "@/components/gera/RepoPreviewFlow";
@@ -36,6 +36,7 @@ import { useAutoGrow } from "@/hooks/use-autogrow";
 import { estimateAnswerCost, estimateMediaCost } from "@/lib/arena";
 import { isCodeMutationToolName } from "@/lib/code-changes";
 import { downloadOrOpenMedia } from "@/lib/media-actions";
+import { buildMessageTimeline, summarizeToolLabels, TOOL_GROUP_COLLAPSE_AT } from "@/lib/message-timeline";
 import { findModel, formatUsd, modelShortName } from "@/lib/models";
 import { TID } from "@/lib/testids";
 import type { ChatMessage, ResearchSource, ResearchState, ResearchStep, ResearchStepKind, ToolCallRecord, TurnUsage } from "@/lib/types";
@@ -215,53 +216,13 @@ function MessageBubble({
               <RunPauseCard key={request.id} request={request} conversationId={conversationId} />
             ))
           : null}
-        {ordinaryToolCalls.length > 0 ? (
-          <div className="mb-3 flex flex-col gap-1.5">
-            {ordinaryToolCalls.map((call) => {
-              const view = describeToolCall(call);
-              const hasMedia = (call.images?.length ?? 0) > 0 || (call.files?.length ?? 0) > 0;
-              return (
-                <div
-                  key={call.id}
-                  data-testid={TID.messageToolCall}
-                  className={cn(
-                    "flex gap-2 rounded-xl border border-border/70 bg-card px-3 py-2 text-xs shadow-sm",
-                    hasMedia ? "flex-col" : "items-center",
-                  )}
-                >
-                  <div className="flex min-w-0 items-center gap-2">
-                  {call.status === "running" ? (
-                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-ember" />
-                  ) : call.status === "error" ? (
-                    <Wrench className="h-3.5 w-3.5 shrink-0 text-destructive" />
-                  ) : (
-                    <Check className="h-3.5 w-3.5 shrink-0 text-gold" />
-                  )}
-                  {view.surf ? <Compass className="h-3.5 w-3.5 shrink-0 text-ember" /> : null}
-                  <span className="shrink-0 font-medium">{view.name}</span>
-                  {view.detail ? (
-                    <span className="min-w-0 truncate text-muted-foreground">{view.detail}</span>
-                  ) : null}
-                  <span
-                    className={cn(
-                      "ml-auto shrink-0 text-muted-foreground",
-                      call.status === "running" && "animate-pulse",
-                    )}
-                  >
-                    {call.status === "running" ? "running" : call.status === "error" ? "failed" : "done"}
-                  </span>
-                  </div>
-                  {hasMedia ? <ToolCallMedia images={call.images} files={call.files} /> : null}
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
-        {message.content ? (
-          <MarkdownBody text={message.content} streaming={streaming} sources={citationSources} />
-        ) : streaming && message.research?.status !== "running" && !message.julius && !message.repoPreview ? (
-          <TypingDots />
-        ) : null}
+        <ReplyTimeline
+          content={message.content}
+          calls={ordinaryToolCalls}
+          streaming={streaming}
+          sources={citationSources}
+          thinking={streaming && message.research?.status !== "running" && !message.julius && !message.repoPreview}
+        />
         {message.images && message.images.length > 0 ? (
           <MediaImageGrid images={message.images} className="mt-3" />
         ) : null}
@@ -292,6 +253,147 @@ function MessageBubble({
           </div>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The reply in reading order: the prose the model wrote, then the batch of
+ * tool calls it led to, then the prose that followed. The commentary written
+ * before a call is part of the answer and stays exactly where it was said —
+ * never a wall of rows above a lone final paragraph.
+ */
+function ReplyTimeline({
+  content,
+  calls,
+  streaming,
+  sources,
+  thinking,
+}: {
+  content: string;
+  calls: ToolCallRecord[];
+  streaming: boolean;
+  sources: ResearchSource[];
+  /** Streaming with no other live indicator (research trail, Julius, preview) on screen. */
+  thinking: boolean;
+}) {
+  const timeline = useMemo(() => buildMessageTimeline(content, calls), [content, calls]);
+  const last = timeline[timeline.length - 1];
+  // Dots only while nothing visible is in motion: no text streaming in and no tool spinning.
+  const showDots =
+    thinking && (!last || (last.kind === "tools" && !last.calls.some((call) => call.status === "running")));
+  return (
+    <>
+      {timeline.map((segment, index) =>
+        segment.kind === "text" ? (
+          <div key={segment.id} data-testid={TID.messageText}>
+            <MarkdownBody text={segment.text} streaming={streaming && index === timeline.length - 1} sources={sources} />
+          </div>
+        ) : (
+          <ToolCallGroup key={segment.id} calls={segment.calls} />
+        ),
+      )}
+      {showDots ? <TypingDots /> : null}
+    </>
+  );
+}
+
+/** "MCP · deepwiki · ask_question" / "mcp_github_get_job_logs" — the label a row shows, for headers and summaries. */
+function toolLabel(call: ToolCallRecord): string {
+  const view = describeToolCall(call);
+  return view.detail ? `${view.name} · ${view.detail}` : view.name;
+}
+
+function hasToolMedia(call: ToolCallRecord): boolean {
+  return (call.images?.length ?? 0) > 0 || (call.files?.length ?? 0) > 0;
+}
+
+function ToolStatusIcon({ status, className }: { status: ToolCallRecord["status"]; className?: string }) {
+  if (status === "running") {
+    return <Loader2 className={cn("h-3.5 w-3.5 shrink-0 animate-spin text-ember", className)} />;
+  }
+  if (status === "error") {
+    return <Wrench className={cn("h-3.5 w-3.5 shrink-0 text-destructive", className)} />;
+  }
+  return <Check className={cn("h-3.5 w-3.5 shrink-0 text-gold", className)} />;
+}
+
+/**
+ * One batch of calls issued at the same point of the reply. Up to three calls
+ * list as rows; a longer batch (eight log fetches in a row) collapses into a
+ * single summary row — count, distinct tools with repeat counts, the call in
+ * flight — so the commentary around it stays the thing the eye lands on.
+ * Media a call returned stays visible even while the rows are folded.
+ */
+function ToolCallGroup({ calls }: { calls: ToolCallRecord[] }) {
+  const collapsible = calls.length >= TOOL_GROUP_COLLAPSE_AT;
+  const [open, setOpen] = useState<boolean>(false);
+  const expanded = !collapsible || open;
+  const running = calls.filter((call) => call.status === "running");
+  const failed = calls.filter((call) => call.status === "error").length;
+  const status: ToolCallRecord["status"] = running.length > 0 ? "running" : failed > 0 ? "error" : "done";
+  const mediaCalls = calls.filter(hasToolMedia);
+  return (
+    <div
+      data-testid={TID.messageToolGroup}
+      className="my-3 overflow-hidden rounded-xl border border-border/70 bg-card text-xs shadow-sm first:mt-0"
+    >
+      {collapsible ? (
+        <button
+          type="button"
+          data-testid={TID.messageToolGroupToggle}
+          aria-expanded={expanded}
+          onClick={() => setOpen((value) => !value)}
+          className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-foreground/[0.03]"
+        >
+          <ToolStatusIcon status={status} />
+          <span className="shrink-0 font-medium">{calls.length} tool calls</span>
+          <span className="min-w-0 truncate text-muted-foreground">
+            {running.length > 0 ? `now · ${toolLabel(running[0])}` : summarizeToolLabels(calls.map(toolLabel))}
+          </span>
+          <span className={cn("ml-auto shrink-0 text-muted-foreground", status === "running" && "animate-pulse")}>
+            {status === "running" ? "running" : failed > 0 ? `${failed} failed` : "done"}
+          </span>
+          <ChevronDown
+            className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")}
+          />
+        </button>
+      ) : null}
+      {expanded ? (
+        <div className={cn("flex flex-col", collapsible && "border-t border-border/60")}>
+          {calls.map((call, index) => (
+            <ToolCallRow key={call.id} call={call} divided={index > 0} />
+          ))}
+        </div>
+      ) : mediaCalls.length > 0 ? (
+        <div className="flex flex-col gap-2 border-t border-border/60 px-3 py-2">
+          {mediaCalls.map((call) => (
+            <ToolCallMedia key={call.id} images={call.images} files={call.files} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ToolCallRow({ call, divided }: { call: ToolCallRecord; divided: boolean }) {
+  const view = describeToolCall(call);
+  const media = hasToolMedia(call);
+  return (
+    <div
+      data-testid={TID.messageToolCall}
+      className={cn("flex gap-2 px-3 py-2", media ? "flex-col" : "items-center", divided && "border-t border-border/60")}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <ToolStatusIcon status={call.status} />
+        {view.surf ? <Compass className="h-3.5 w-3.5 shrink-0 text-ember" /> : null}
+        <span className="shrink-0 font-medium">{view.name}</span>
+        {view.detail ? <span className="min-w-0 truncate text-muted-foreground">{view.detail}</span> : null}
+        <span className={cn("ml-auto shrink-0 text-muted-foreground", call.status === "running" && "animate-pulse")}>
+          {call.status === "running" ? "running" : call.status === "error" ? "failed" : "done"}
+        </span>
+      </div>
+      {media ? <ToolCallMedia images={call.images} files={call.files} /> : null}
     </div>
   );
 }

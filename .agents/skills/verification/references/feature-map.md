@@ -1,6 +1,6 @@
 # Gera Feature Map (user POV)
 
-Last synced: 2026-09-06 · code commit `aa57eef` (landed on top of `880767c`); published backend re-verified 2026-09-07 08:53Z (`/ping` 200, internal MCP routes 404, CORS preflight 204) without a redeploy.
+Last synced: 2026-09-08 · reply timeline (tool batches interleaved with the prose, commentary kept) on top of code commit `aa57eef`; published backend re-verified 2026-09-07 08:53Z (`/ping` 200, internal MCP routes 404, CORS preflight 204), redeployed 2026-09-08 for the tool-offset contract.
 
 Current MCP contract: cold auto/deferred starts make no provider requests; an addressed search warms only one server, and a first cold call returns `executed:false` with its schema. GitHub operations use server-owned references only. Inventory persists negotiated wire, project warmups write back to the owner, and both protocol families retain their policy/credential boundaries.
 
@@ -251,6 +251,33 @@ textarea auto-grows line by line with an animated height (hook
 internally past the cap) — the same hook powers the edit-and-resend box in
 user bubbles. A thread renders `chat-thread`
 with `message-user` / `message-assistant` rows (markdown, artifacts, media).
+
+Reply timeline (2026-09-08): an assistant bubble renders in reading order —
+prose segment (`message-text`), the batch of tool calls issued at that point
+(`message-tool-group`), the prose that followed, and so on — instead of a wall
+of tool rows above a lone final paragraph. The commentary a model writes
+before calling tools (“Checking the failed job logs first.”) is part of the
+reply: the server engine (`runEngineTurn`) keeps it on screen through the tool
+phase, appends the next round below it (`\n\n`), persists the whole text as
+`content`, and stamps every tool record with `textOffset` — the length of the
+text already written when the call was issued (`agent-engine.ts`,
+`run-protocol.ts`, `cappedToolCalls` in `run-manager.ts` passes it, plus
+`images`/`files`, through snapshots and the final message; resumed runs
+re-base offsets onto the shown text via `rebaseToolOffset`). The bubble splits
+`content` at those offsets (`web/src/lib/message-timeline.ts`,
+`buildMessageTimeline`); records without an offset (older replies, MCP
+failure notes) keep the old rows-then-text layout. Up to three calls in a
+batch list as rows (`message-tool-call`); four or more fold into one summary
+row (`message-tool-group-toggle`: “8 tool calls · mcp_github_get_job_logs ×8”,
+“now · <call in flight>” while running, “N failed”) that expands on tap; media a
+call returned stays visible while folded. “Gera is thinking” dots show only
+when nothing else is live (no text streaming in, no call spinning). The
+browser Julius loop (`chat.ts` `runAgentTurn`) applies the same accumulation.
+Tests: `agent-commentary.test.ts` (three-round prose+tools turn, silent tool
+round, loop-guard wrap-up under kept commentary), `message-timeline.test.ts`
+(segmentation, legacy order, stable sort, clamping, summary, rebase),
+browser `message-timeline.browser.test.tsx` (order, fold/expand, running /
+failed headers, legacy layout).
 
 Reply length (2026-09-07): a Standard reply is never cut short by the
 provider. The run config carries the model's `maxOutputTokens` from the
@@ -1261,8 +1288,10 @@ written by every `/mcp/check` (Connect / Re-check now runs uncapped and no
 longer truncates big servers at 90) and by every handshake a run performs;
 `/mcp/resolve` ships `toolLoading` + the cached `catalog` to project shards so
 agents defer without a handshake. Chat rows for the meta calls read
-"MCP · <server> · <tool>" (`describeToolCall`, testid `message-tool-call`)
-with the same running/done/failed chip as native tools. Binary parts of a
+"MCP · <server> · <tool>" (`describeToolCall`, testid `message-tool-call`,
+inside a `message-tool-group` batch placed where the model issued them — see
+Reply timeline under Chat) with the same running/done/failed chip as native
+tools. Binary parts of a
 result (2026-09-04, `extractMcpResultMedia` in `mcp-protocol.ts`): `type:
 "image"` parts (up to 5 / 4 MB per call) become thumbnails under the row
 (`message-tool-images`, `ToolCallMedia`) and message images; audio parts and
@@ -1907,6 +1936,18 @@ downgrades, interruption, marker parsing, sync normalization, Slack footer,
 and the real cloud-automation outcome-tool loop. Browser regression
 `execution-outcome.browser.test.tsx` expands the compact receipt and checks
 artifact, evidence, and next owner.
+
+Reply-timeline coverage (2026-09-08): browser regression
+`message-timeline.browser.test.tsx` renders the real `MessageList` with an
+interleaved reply (prose → 8-call batch → prose → 1-call batch → prose),
+checks DOM order of `message-text` / `message-tool-group`, the folded summary
+(“8 tool calls”, “mcp_github_get_job_logs ×8”) expanding to nine
+`message-tool-call` rows, the “now · <call>” / “1 failed” headers, no thinking
+dots under a spinning batch, and the legacy rows-then-text layout for records
+without offsets. The neutral scenario `connect-open-mcp-deferred` keeps
+asserting the MCP meta-call rows (two calls → rows, no fold). Reports:
+`web/e2e-results/tool-timeline-unit-2026-09-08.json` (96 files / 1063 tests)
+and `tool-timeline-browser-2026-09-08.json` (10 files / 56 tests).
 
 Browser-only auth coverage: `auth-resume.browser.test.ts` recreates two MCP
 relay requests returning delayed 401s after a sleeping-tab token expiry and

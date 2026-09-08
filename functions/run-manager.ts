@@ -71,6 +71,7 @@ import {
   executionOutcomeToolDefinition,
   extractExecutionOutcomeMarker,
   parseExecutionOutcomeClaim,
+  rebaseToolOffset,
   visibleExecutionToolCalls,
   type ExecutionOutcomeClaim,
   type JuliusState,
@@ -1271,6 +1272,12 @@ export class RunManager {
 
     const resumeBase = config.resume?.partial ?? "";
     const joined = (tail: string): string => (resumeBase ? joinResumedText(resumeBase, tail) : tail);
+    // A resumed run shows `joined(engine text)`, so the engine's text offsets
+    // land in the wrong coordinates; each new call is re-based once onto the
+    // text actually shown when it was issued.
+    const shownOffsets = new Map<string, number>();
+    const rebaseOffsets = (calls: RunToolRecord[]): RunToolRecord[] =>
+      resumeBase ? calls.map((call) => rebaseToolOffset(call, run.content.length, shownOffsets)) : calls;
 
     let sourceCount = run.sources.length;
     const syncSources = (): void => {
@@ -1324,7 +1331,7 @@ export class RunManager {
             this.emit(run, { t: "reasoning", seq: 0, tail: run.reasoningTail });
           },
           onToolCalls: (calls) => {
-            const visibleCalls = visibleExecutionToolCalls(calls);
+            const visibleCalls = rebaseOffsets(visibleExecutionToolCalls(calls));
             run.toolCalls = [...failureRecords, ...visibleCalls];
             this.emitTools(run);
             this.captureCodeChanges(run, visibleCalls);
@@ -1423,6 +1430,11 @@ export class RunManager {
       arguments: capStr(call.arguments, FINAL_TOOL_ARGS_CHARS),
       status: call.status,
       ...(call.result !== undefined ? { result: capStr(call.result, resultCap) } : {}),
+      // Media refs and the text offset are short and must reach the surface:
+      // thumbnails / Save chips and the interleaved rows depend on them.
+      ...(call.images && call.images.length > 0 ? { images: call.images } : {}),
+      ...(call.files && call.files.length > 0 ? { files: call.files } : {}),
+      ...(typeof call.textOffset === "number" ? { textOffset: call.textOffset } : {}),
     }));
   }
 

@@ -317,7 +317,7 @@ export const E2E_SCENARIOS: E2eScenario[] = [
   },
   {
     id: "blender-mcp-setup",
-    title: "Blender setup explains the local bridge, rejects localhost and never creates a phantom connection",
+    title: "Blender setup explains Gera's self-protecting bridge, rejects localhost and never creates a phantom connection",
     steps: [
       { do: "goto", path: "/mcp" },
       { do: "see", target: TID.mcpCatalogSearch, timeoutMs: 20_000 },
@@ -325,7 +325,9 @@ export const E2E_SCENARIOS: E2eScenario[] = [
       { do: "tap", target: mcpCatalogConnectTid("blender") },
       { do: "see", target: TID.blenderSetup },
       { do: "seeText", target: TID.blenderGuide, text: "9876" },
-      { do: "seeText", target: TID.blenderGuide, text: "Service Auth" },
+      { do: "seeText", target: TID.blenderGuide, text: "uv run gera-blender-bridge.py --tunnel" },
+      { do: "seeText", target: TID.blenderGuide, text: "401" },
+      { do: "see", target: TID.blenderDownload },
       { do: "notSee", target: mcpServerCardTid("blender") },
       { do: "fill", target: TID.blenderEndpoint, text: "http://localhost:9876" },
       { do: "tap", target: TID.blenderConnect },
@@ -338,15 +340,14 @@ export const E2E_SCENARIOS: E2eScenario[] = [
   },
   {
     id: "blender-mcp-connect",
-    title: "A protected Blender bridge is verified through the existing MCP path (stubbed)",
+    title: "A token-protected Blender bridge is verified through the existing MCP path (stubbed)",
     steps: [
       { do: "goto", path: "/mcp" },
       { do: "see", target: TID.mcpCatalogSearch, timeoutMs: 20_000 },
       { do: "fill", target: TID.mcpCatalogSearch, text: "Blender" },
       { do: "tap", target: mcpCatalogConnectTid("blender") },
       { do: "fill", target: TID.blenderEndpoint, text: "https://blender.example.com/mcp" },
-      { do: "fill", target: TID.blenderClientId, text: "test-client.access" },
-      { do: "fill", target: TID.blenderClientSecret, text: "test-service-credential" },
+      { do: "fill", target: TID.blenderToken, text: "test-bridge-token" },
       { do: "tap", target: TID.blenderAcknowledge },
       { do: "tap", target: TID.blenderConnect },
       { do: "notSee", target: TID.blenderSetup },

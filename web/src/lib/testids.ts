@@ -208,6 +208,7 @@ export const TID = {
   mcpCatalogSearch: "mcp-catalog-search",
   blenderSetup: "blender-setup",
   blenderGuide: "blender-guide",
+  blenderDownload: "blender-download",
   blenderEndpoint: "blender-endpoint",
   blenderAuth: "blender-auth",
   blenderToken: "blender-token",

@@ -561,12 +561,11 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
         expect(body.server.credentialStored).not.toBe(false);
         expect(body.server.url).toBe("https://blender.example.com/mcp");
         expect(body.server.catalogId).toBe("blender");
-        expect(body.server.authMode).toBe("headers");
-        if (body.server.headersJson) {
-          expect(JSON.parse(body.server.headersJson)).toEqual({
-            "CF-Access-Client-Id": "test-client.access",
-            "CF-Access-Client-Secret": "test-service-credential",
-          });
+        // Gera's bridge enforces its own Bearer token; the token travels only to the account's vault route.
+        expect(body.server.authMode).toBe("bearer");
+        expect(body.server.headersJson ?? "").toBe("");
+        if (body.server.credentialStored !== true) {
+          expect(body.server.token).toBe("test-bridge-token");
         }
         return jsonResponse({
           tools: [
@@ -1149,8 +1148,7 @@ for (const scenario of E2E_SCENARIOS) {
       expect(blenderCheckCount).toBeGreaterThan(0);
       await expect.poll(() => localStorage.getItem("gera.settings.v1") ?? "").toContain("blender.example.com");
       const persisted = localStorage.getItem("gera.settings.v1") ?? "";
-      expect(persisted).not.toContain("test-service-credential");
-      expect(persisted).not.toContain("test-client.access");
+      expect(persisted).not.toContain("test-bridge-token");
     }
     if (scenario.id === "elicitation-accept") {
       // The card's Accept sent exactly the validated form values through /runs/answer.

@@ -1,8 +1,20 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import { cloudMcpServersForAutomation } from "../../../functions/mcp-cloud";
 import { addCatalogMcp, addMissingCatalogMcps } from "@/lib/agent-store";
-import { BLENDER_BRIDGE_COMMAND, blenderConnectionInput, blenderEndpointError, blenderSetupSchema, type BlenderSetupValues } from "@/lib/blender-mcp";
+import {
+  BLENDER_BRIDGE_COMMAND,
+  BLENDER_BRIDGE_SCRIPT_PATH,
+  BLENDER_BRIDGE_TOKEN_FILE,
+  BLENDER_MCP_PROXY_COMMAND,
+  BLENDER_TUNNEL_COMMAND,
+  blenderConnectionInput,
+  blenderEndpointError,
+  blenderSetupSchema,
+  type BlenderSetupValues,
+} from "@/lib/blender-mcp";
 import { normalizeStoredSettings } from "@/lib/history";
 import { catalogEntryToServer, findCatalogEntry, missingCatalogEntries } from "@/lib/mcp-catalog";
 import type { McpServerConfig } from "@/lib/types";
@@ -71,9 +83,39 @@ describe("Blender MCP setup", () => {
     expect(cloudMcpServersForAutomation([server({ url: "http://localhost:9876" })], ["blender"], {})).toEqual([]);
   });
 
-  it("keeps the documented bridge on loopback, using stdio and telemetry opt-out", () => {
-    expect(BLENDER_BRIDGE_COMMAND).toContain("--host 127.0.0.1 --port 8000");
-    expect(BLENDER_BRIDGE_COMMAND).toContain("-e DISABLE_TELEMETRY true -- uvx blender-mcp");
-    expect(BLENDER_BRIDGE_COMMAND).not.toContain("--allow-origin");
+  it("documents Gera's self-protecting bridge and pins the third-party alternative", () => {
+    expect(BLENDER_BRIDGE_COMMAND).toBe("uv run gera-blender-bridge.py --tunnel");
+    expect(BLENDER_BRIDGE_SCRIPT_PATH).toBe("/gera-blender-bridge.py");
+    expect(BLENDER_TUNNEL_COMMAND).toBe("cloudflared tunnel --url http://127.0.0.1:8000");
+    // mcp-proxy 0.12 has no upper bound on `mcp`; 2.0.0 removed request_ctx and it crashes on import.
+    expect(BLENDER_MCP_PROXY_COMMAND).toContain('uvx --with "mcp<2" mcp-proxy');
+    expect(BLENDER_MCP_PROXY_COMMAND).toContain("--host 127.0.0.1 --port 8000");
+    expect(BLENDER_MCP_PROXY_COMMAND).toContain("-e DISABLE_TELEMETRY true -- uvx blender-mcp");
+    expect(BLENDER_MCP_PROXY_COMMAND).not.toContain("--allow-origin");
+  });
+
+  it("ships the bridge script: stdlib only, loopback default, mandatory Bearer gate, legacy handshake, telemetry opt-out", () => {
+    // A static contract check of the file Gera serves — the live behaviour was exercised separately against a stdio fixture.
+    const script = readFileSync(new URL(`../../public${BLENDER_BRIDGE_SCRIPT_PATH}`, import.meta.url), "utf8");
+    expect(script.startsWith("#!/usr/bin/env python3\n# /// script\n# requires-python = \">=3.10\"\n# dependencies = []\n# ///\n")).toBe(true);
+    const stdlib = new Set(["__future__", "argparse", "hmac", "json", "os", "re", "secrets", "shlex", "shutil", "signal", "subprocess", "sys", "threading", "time", "uuid", "http", "pathlib", "typing"]);
+    const imports = [...script.matchAll(/^(?:import|from)\s+([A-Za-z_][\w.]*)/gm)].map((match) => match[1].split(".")[0]);
+    expect(imports.length).toBeGreaterThan(10);
+    expect(imports.filter((name) => !stdlib.has(name))).toEqual([]);
+    expect(script).toContain('DEFAULT_HOST = "127.0.0.1"');
+    expect(script).toContain("DEFAULT_PORT = 8000");
+    expect(script).toContain('DEFAULT_COMMAND = "uvx blender-mcp"');
+    expect(script).toContain('env.setdefault("DISABLE_TELEMETRY", "true")');
+    expect(script).toContain("hmac.compare_digest");
+    expect(script).toContain('Bearer realm="gera-blender-bridge"');
+    expect(script).toContain("if not self._authorized():");
+    expect(script).toContain('if method == "server/discover":');
+    expect(script).toContain("JSON_RPC_METHOD_NOT_FOUND = -32601");
+    expect(script).toContain('"tunnel", "--url"');
+    expect(script).toContain("trycloudflare");
+    expect(script).toContain('Path.home() / ".gera" / "blender-bridge.token"');
+    expect(BLENDER_BRIDGE_TOKEN_FILE).toBe("~/.gera/blender-bridge.token");
+    // Only the token gates access: no CORS headers are ever emitted for browsers.
+    expect(script).not.toContain("Access-Control-Allow");
   });
 });

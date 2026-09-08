@@ -2,9 +2,28 @@ import { z } from "zod";
 
 import { safePublicHttpsUrl } from "../../../functions/network-safety";
 
-/** Upstream stdio server exposed on loopback only. Authentication belongs at the HTTPS edge. */
-export const BLENDER_BRIDGE_COMMAND =
-  "uvx mcp-proxy --host 127.0.0.1 --port 8000 -e DISABLE_TELEMETRY true -- uvx blender-mcp";
+/** Served from Gera's own origin. Standard library only, so an unrelated `mcp` package release cannot break it. */
+export const BLENDER_BRIDGE_SCRIPT_PATH = "/gera-blender-bridge.py";
+
+/** Where the bridge keeps the token it generates on first start (printed at every start). */
+export const BLENDER_BRIDGE_TOKEN_FILE = "~/.gera/blender-bridge.token";
+
+/**
+ * Starts upstream `uvx blender-mcp` on stdio, serves it on loopback behind the bridge's own
+ * Bearer token and, with `--tunnel`, prints a Cloudflare quick-tunnel address to paste into Gera.
+ */
+export const BLENDER_BRIDGE_COMMAND = "uv run gera-blender-bridge.py --tunnel";
+
+/** Any HTTPS tunnel works because the bridge itself answers 401 without the token. */
+export const BLENDER_TUNNEL_COMMAND = "cloudflared tunnel --url http://127.0.0.1:8000";
+
+/**
+ * The third-party bridge, pinned. `mcp-proxy` 0.12 declares `mcp>=1.17.0` with no upper bound, so a
+ * plain `uvx mcp-proxy` resolves `mcp==2.0.0` (2026-07-28), which removed `request_ctx` and fails on
+ * import. It has no authentication of its own, so it must stay behind Cloudflare Access.
+ */
+export const BLENDER_MCP_PROXY_COMMAND =
+  'uvx --with "mcp<2" mcp-proxy --host 127.0.0.1 --port 8000 -e DISABLE_TELEMETRY true -- uvx blender-mcp';
 
 /** Gera cannot reach the add-on socket or launch a local stdio process. */
 export function blenderEndpointError(value: string): string | undefined {

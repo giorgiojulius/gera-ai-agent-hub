@@ -2,80 +2,190 @@
   "schema": 1,
   "platform": "web",
   "app": "gera-web",
-  "startedAt": "2026-09-07T09:27:00.098Z",
-  "durationMs": 494,
-  "passed": 1,
+  "startedAt": "2026-09-08T08:00:48.105Z",
+  "durationMs": 1124,
+  "passed": 2,
   "failed": 0,
   "results": [
     {
-      "scenarioId": "connect-open-mcp-deferred",
-      "title": "Deferred MCP loading rides into the run and its meta calls read like native tools",
+      "scenarioId": "blender-mcp-setup",
+      "title": "Blender setup explains Gera's self-protecting bridge, rejects localhost and never creates a phantom connection",
       "ok": true,
-      "ms": 475,
+      "ms": 639,
       "steps": [
         {
           "index": 0,
-          "label": "goto /settings",
+          "label": "goto /mcp",
           "ok": true,
-          "ms": 37
+          "ms": 42
         },
         {
           "index": 1,
-          "label": "see page-settings",
+          "label": "see mcp-catalog-search",
           "ok": true,
-          "ms": 58
+          "ms": 122
         },
         {
           "index": 2,
-          "label": "see settings-mcp-loading",
+          "label": "fill mcp-catalog-search",
           "ok": true,
-          "ms": 0
+          "ms": 78
         },
         {
           "index": 3,
-          "label": "tap mcp-loading-option-deferred",
+          "label": "tap mcp-catalog-connect-blender",
           "ok": true,
-          "ms": 115
+          "ms": 213
         },
         {
           "index": 4,
-          "label": "goto /",
+          "label": "see blender-setup",
           "ok": true,
           "ms": 1
         },
         {
           "index": 5,
-          "label": "see composer-input",
+          "label": "see \"9876\" in blender-guide",
           "ok": true,
-          "ms": 57
+          "ms": 1
         },
         {
           "index": 6,
-          "label": "fill composer-input",
+          "label": "see \"uv run gera-blender-bridge.py --tunnel\" in blender-guide",
           "ok": true,
-          "ms": 32
+          "ms": 0
         },
         {
           "index": 7,
-          "label": "tap composer-send",
+          "label": "see \"401\" in blender-guide",
           "ok": true,
-          "ms": 174
+          "ms": 0
         },
         {
           "index": 8,
-          "label": "see \"deepwiki · ask_question\" in message-tool-call",
+          "label": "see blender-download",
           "ok": true,
           "ms": 1
         },
         {
           "index": 9,
-          "label": "see \"done\" in message-tool-call",
+          "label": "not see mcp-server-blender",
           "ok": true,
           "ms": 0
         },
         {
           "index": 10,
-          "label": "see \"Gera e2e reply\" in message-assistant",
+          "label": "fill blender-endpoint",
+          "ok": true,
+          "ms": 45
+        },
+        {
+          "index": 11,
+          "label": "tap blender-connect",
+          "ok": true,
+          "ms": 74
+        },
+        {
+          "index": 12,
+          "label": "see \"Gera cannot reach localhost\" in blender-setup",
+          "ok": true,
+          "ms": 0
+        },
+        {
+          "index": 13,
+          "label": "not see mcp-server-blender",
+          "ok": true,
+          "ms": 0
+        },
+        {
+          "index": 14,
+          "label": "tap blender-cancel",
+          "ok": true,
+          "ms": 61
+        },
+        {
+          "index": 15,
+          "label": "not see blender-setup",
+          "ok": true,
+          "ms": 0
+        },
+        {
+          "index": 16,
+          "label": "not see mcp-server-blender",
+          "ok": true,
+          "ms": 1
+        }
+      ]
+    },
+    {
+      "scenarioId": "blender-mcp-connect",
+      "title": "A token-protected Blender bridge is verified through the existing MCP path (stubbed)",
+      "ok": true,
+      "ms": 460,
+      "steps": [
+        {
+          "index": 0,
+          "label": "goto /mcp",
+          "ok": true,
+          "ms": 8
+        },
+        {
+          "index": 1,
+          "label": "see mcp-catalog-search",
+          "ok": true,
+          "ms": 91
+        },
+        {
+          "index": 2,
+          "label": "fill mcp-catalog-search",
+          "ok": true,
+          "ms": 60
+        },
+        {
+          "index": 3,
+          "label": "tap mcp-catalog-connect-blender",
+          "ok": true,
+          "ms": 82
+        },
+        {
+          "index": 4,
+          "label": "fill blender-endpoint",
+          "ok": true,
+          "ms": 21
+        },
+        {
+          "index": 5,
+          "label": "fill blender-token",
+          "ok": true,
+          "ms": 33
+        },
+        {
+          "index": 6,
+          "label": "tap blender-acknowledge",
+          "ok": true,
+          "ms": 68
+        },
+        {
+          "index": 7,
+          "label": "tap blender-connect",
+          "ok": true,
+          "ms": 96
+        },
+        {
+          "index": 8,
+          "label": "not see blender-setup",
+          "ok": true,
+          "ms": 1
+        },
+        {
+          "index": 9,
+          "label": "see \"get_scene_info\" in mcp-server-blender",
+          "ok": true,
+          "ms": 0
+        },
+        {
+          "index": 10,
+          "label": "see \"2 tools\" in mcp-server-blender",
           "ok": true,
           "ms": 0
         }

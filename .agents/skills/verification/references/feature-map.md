@@ -1149,17 +1149,40 @@ Blender MCP (2026-09-05): catalog → Popular or Design / search “Blender”
 ahujasid/blender-mcp integration, NOT an official hosted Blender endpoint.
 The catalog entry explicitly has `setup: blender` and no shared URL; it
 cannot be auto-added by the fixed-endpoint or bulk catalog factories.
-Guide: install the add-on in local Blender, start its TCP socket (9876),
-run `uvx mcp-proxy --host 127.0.0.1 --port 8000 -e DISABLE_TELEMETRY true -- uvx blender-mcp`
-on the same machine, protect a named HTTPS tunnel with Cloudflare Access
-Service Auth (service-token Client ID/Secret) or an authenticated Bearer
-reverse proxy. Never tunnel the raw 9876 socket or expose an unauthenticated
-bridge. The web app does not install software or run Blender locally.
+Guide (2026-09-08, self-protecting bridge): install the add-on in local
+Blender, start its TCP socket (9876), download `gera-blender-bridge.py`
+(`blender-download`, served verbatim from `web/public/`) and run
+`uv run gera-blender-bridge.py --tunnel` on the same machine. The script is
+Python standard library only: it spawns upstream `uvx blender-mcp` on stdio
+(`DISABLE_TELEMETRY=true`), serves Streamable HTTP at
+`http://127.0.0.1:8000/mcp`, and answers **401** + `WWW-Authenticate: Bearer`
+to every request without its own token (generated once into
+`~/.gera/blender-bridge.token`, printed at start; `--rotate-token`,
+`--show-token`, `--token`, `GERA_BRIDGE_TOKEN`). `--tunnel` starts a
+Cloudflare quick tunnel via `cloudflared` and prints the
+`https://….trycloudflare.com/mcp` address plus token to paste; the address
+changes on every cloudflared restart, the token does not. Any other HTTPS
+tunnel works without `--tunnel`. Wire: `server/discover` → JSON-RPC -32601
+(so Gera's client falls back to the initialize handshake), `initialize`
+answered from the cached upstream handshake with a fresh `Mcp-Session-Id`
+(one shared upstream session; stale ids are tolerated rather than 404ed),
+notifications → 202, other requests forwarded with id remapping, GET → 405,
+DELETE → 204, upstream crash → error then restart on the next request,
+per-request timeout → -32001. No CORS headers are ever emitted. It does NOT
+replace the add-on or its 9876 socket — it wraps the upstream stdio server.
+The previous third-party bridge is kept only as a pinned alternative:
+`uvx --with "mcp<2" mcp-proxy …` (`mcp-proxy` 0.12 has no upper bound on
+`mcp`, and `mcp==2.0.0` of 2026-07-28 removed `request_ctx`, so a plain
+`uvx mcp-proxy` fails with `ImportError: cannot import name 'request_ctx'`);
+it has no auth of its own and must stay behind Cloudflare Access Service
+Auth. Never tunnel the raw 9876 socket or expose an unauthenticated bridge.
+The web app does not install software or run Blender locally.
 Form uses `blenderSetupSchema`: public HTTPS only, no localhost/private
 hosts, website/stdio URLs, port 9876, URL credentials/query/fragment;
-selected auth fields + explicit risk acknowledgement required. Cloudflare
-credentials become `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers,
-not an OAuth popup. Connect keeps `catalogId: blender` through the existing
+selected auth fields + explicit risk acknowledgement required. Default auth
+is the bridge's Bearer token (`authMode: bearer`, token to the vault);
+Cloudflare credentials become `CF-Access-Client-Id` /
+`CF-Access-Client-Secret` headers, not an OAuth popup. Connect keeps `catalogId: blender` through the existing
 `/mcp/check` → vault → generic MCP path; no backend transport or network
 exceptions. Cancel/invalid input sends nothing and adds no phantom row.
 The connected card offers setup/credential replacement; existing disabled
@@ -1172,10 +1195,19 @@ open or a scene operation succeeded: the guide asks the user to run
 the user's running Blender and reachable secured bridge; real-device scene
 operations are not covered by the hermetic tests.
 Unit `blender-mcp.test.ts`: endpoint rejection, auth mapping, cloud tool
-eligibility, catalog guards and profile preservation. Browser scenarios
-`blender-mcp-setup` (guide, bad URL, cancel, zero checks) and
-`blender-mcp-connect` (explicit fixture bridge, verified tools, no persisted
-service credentials). Testids: `blender-guide`, `blender-endpoint`,
+eligibility, catalog guards, profile preservation, the documented commands
+and a static contract check of the shipped script (stdlib-only imports,
+loopback default, `compare_digest` Bearer gate, discover → -32601, tunnel,
+token file, no CORS). The bridge's live behaviour was exercised on
+2026-09-08 against a stdio fixture (`tmp/fake_blender_mcp.py`, not shipped):
+401 without/with wrong token, discover probe, initialize + session id,
+202 for notifications, id remapping, tools/call, 405/204/404/400, two
+parallel 2 s calls in 2.0 s, -32001 timeout, crash → restart, batch. That
+is a local fixture run, not a Blender or tunnel check. Browser scenarios
+`blender-mcp-setup` (guide with the `uv run … --tunnel` command, 401 note
+and download link, bad URL, cancel, zero checks) and `blender-mcp-connect`
+(fixture bridge with a Bearer token, verified tools, token absent from
+browser persistence). Testids: `blender-guide`, `blender-endpoint`,
 `blender-auth`, `blender-client-id`, `blender-client-secret`, `blender-token`,
 `blender-acknowledge`, `blender-connect`, `blender-cancel`, `blender-errors`.
 Verification 2026-09-05: unit 87 files / 994 checks; browser 8 files / 47
@@ -1829,8 +1861,8 @@ The network harness rejects any browser `/mcp-proxy`, `/mcp/resolve` or direct a
 | connect-open-mcp | MCP catalog → Connect → initialize/session/tools-list → verified tool count |
 | mcp-deploy-recovery | Reload saved identity/401 errors → server-owned checks (Intercom retries 503) → three verified cards, credentials preserved, no duplicate checks |
 | mcp-cancel-check | Connect (held request) → disable/enable → Connect remains usable → newer verification beats old failing response |
-| blender-mcp-setup | Search Blender → Set up → local/secured-bridge guide → localhost rejected → Cancel → no request or phantom connector |
-| blender-mcp-connect | Secured bridge form → explicit stubbed `/mcp/check` → Blender identity + tools → service credentials absent from browser persistence (not a real Blender operation) |
+| blender-mcp-setup | Search Blender → Set up → self-protecting bridge guide (`uv run gera-blender-bridge.py --tunnel`, 401 note, download link) → localhost rejected → Cancel → no request or phantom connector |
+| blender-mcp-connect | Bearer-token bridge form → explicit stubbed `/mcp/check` (`authMode: bearer`, no headers) → Blender identity + tools → token absent from browser persistence (not a real Blender operation) |
 | connect-open-mcp-deferred | Settings → Toolkit “Always deferred” → send → `/runs/start` carries `mcpToolLoading` + `contextWindow` → `mcp_search_tools` / `mcp_call_tool` rows read “MCP · deepwiki · ask_question · done” → reply |
 | prompt-slash | Connected DeepWiki → type `/expl` → prompts menu → pick `explain_repo` → required-argument dialog → submit → `/mcp/prompt-get` text lands in the composer input, dialog gone |
 | resource-mention | Type `@READ` → resources menu → pick the README → `/mcp/resource-read` becomes an attachment chip, `@deepwiki/wiki://…` mention stays in the input |

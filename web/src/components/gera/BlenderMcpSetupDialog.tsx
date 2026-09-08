@@ -12,8 +12,11 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   BLENDER_BRIDGE_COMMAND,
+  BLENDER_BRIDGE_DOWNLOADS_DIR,
   BLENDER_BRIDGE_SCRIPT_PATH,
   BLENDER_BRIDGE_TOKEN_FILE,
+  BLENDER_BRIDGE_TOOLS,
+  BLENDER_BRIDGE_VERSION,
   BLENDER_MCP_PROXY_COMMAND,
   BLENDER_TUNNEL_COMMAND,
   blenderConnectionInput,
@@ -98,6 +101,13 @@ export function BlenderMcpSetupDialog({
               </div>
               <span className="mt-1 block text-muted-foreground">
                 Python standard library only — nothing to install besides uv, and no <code>mcp</code> package release can break it.
+              </span>
+              <span className="mt-1 block text-muted-foreground">
+                Bridge {BLENDER_BRIDGE_VERSION} adds <code>{BLENDER_BRIDGE_TOOLS[0]}</code> and <code>{BLENDER_BRIDGE_TOOLS[1]}</code>: Gera fetches
+                GLB/FBX/OBJ/USD files and textures from public URLs on your computer with browser-grade headers, retries and resume, verifies
+                them, saves them under <code>{BLENDER_BRIDGE_DOWNLOADS_DIR}</code> and imports them into the open scene — no more 403s from CDNs
+                or downloads stuck inside Blender. Running an older bridge? Download the script again, restart it, then press Re-check on the
+                Blender card so the new tools appear.
               </span>
             </li>
             <li>

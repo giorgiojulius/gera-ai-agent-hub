@@ -5,8 +5,21 @@ import { safePublicHttpsUrl } from "../../../functions/network-safety";
 /** Served from Gera's own origin. Standard library only, so an unrelated `mcp` package release cannot break it. */
 export const BLENDER_BRIDGE_SCRIPT_PATH = "/gera-blender-bridge.py";
 
+/** Mirrors `BRIDGE_VERSION` in the script; older bridges lack the download tools below. */
+export const BLENDER_BRIDGE_VERSION = "1.1.0";
+
 /** Where the bridge keeps the token it generates on first start (printed at every start). */
 export const BLENDER_BRIDGE_TOKEN_FILE = "~/.gera/blender-bridge.token";
+
+/** Where `download_file` / `import_model_from_url` save files on the Blender computer (`--downloads-dir` changes it). */
+export const BLENDER_BRIDGE_DOWNLOADS_DIR = "~/.gera/blender-downloads";
+
+/**
+ * Tools the bridge answers itself, next to blender-mcp's own. Files from the internet are fetched by the
+ * bridge (browser-grade headers, retries, resume, verification) instead of inside Blender's Python, where
+ * CDNs such as *.r2.dev answer the default User-Agent with 403 and the add-on's safe mode forbids network code.
+ */
+export const BLENDER_BRIDGE_TOOLS = ["download_file", "import_model_from_url"] as const;
 
 /**
  * Starts upstream `uvx blender-mcp` on stdio, serves it on loopback behind the bridge's own

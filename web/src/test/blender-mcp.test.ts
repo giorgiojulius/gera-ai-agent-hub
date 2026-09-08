@@ -6,8 +6,11 @@ import { cloudMcpServersForAutomation } from "../../../functions/mcp-cloud";
 import { addCatalogMcp, addMissingCatalogMcps } from "@/lib/agent-store";
 import {
   BLENDER_BRIDGE_COMMAND,
+  BLENDER_BRIDGE_DOWNLOADS_DIR,
   BLENDER_BRIDGE_SCRIPT_PATH,
   BLENDER_BRIDGE_TOKEN_FILE,
+  BLENDER_BRIDGE_TOOLS,
+  BLENDER_BRIDGE_VERSION,
   BLENDER_MCP_PROXY_COMMAND,
   BLENDER_TUNNEL_COMMAND,
   blenderConnectionInput,
@@ -98,7 +101,7 @@ describe("Blender MCP setup", () => {
     // A static contract check of the file Gera serves — the live behaviour was exercised separately against a stdio fixture.
     const script = readFileSync(new URL(`../../public${BLENDER_BRIDGE_SCRIPT_PATH}`, import.meta.url), "utf8");
     expect(script.startsWith("#!/usr/bin/env python3\n# /// script\n# requires-python = \">=3.10\"\n# dependencies = []\n# ///\n")).toBe(true);
-    const stdlib = new Set(["__future__", "argparse", "hmac", "json", "os", "re", "secrets", "shlex", "shutil", "signal", "subprocess", "sys", "threading", "time", "uuid", "http", "pathlib", "typing"]);
+    const stdlib = new Set(["__future__", "argparse", "hashlib", "hmac", "json", "mimetypes", "os", "re", "secrets", "shlex", "shutil", "signal", "ssl", "subprocess", "sys", "threading", "time", "urllib", "uuid", "http", "pathlib", "typing"]);
     const imports = [...script.matchAll(/^(?:import|from)\s+([A-Za-z_][\w.]*)/gm)].map((match) => match[1].split(".")[0]);
     expect(imports.length).toBeGreaterThan(10);
     expect(imports.filter((name) => !stdlib.has(name))).toEqual([]);
@@ -123,5 +126,42 @@ describe("Blender MCP setup", () => {
     expect(BLENDER_BRIDGE_TOKEN_FILE).toBe("~/.gera/blender-bridge.token");
     // Only the token gates access: no CORS headers are ever emitted for browsers.
     expect(script).not.toContain("Access-Control-Allow");
+  });
+
+  it("bridge 1.1 downloads files itself: browser-grade User-Agent, resume, verification, one-step import, safe-mode-clean script", () => {
+    // Live behaviour was exercised against a stdio fixture and a fixture file server (403 for the bridge UA → browser UA,
+    // dropped connection → Range resume, HTML instead of a model → refusal, slow file → background continuation) and
+    // against the real r2.dev asset host, which answers `Python-urllib/*` with 403 and every other User-Agent with 206/200.
+    const script = readFileSync(new URL(`../../public${BLENDER_BRIDGE_SCRIPT_PATH}`, import.meta.url), "utf8");
+    expect(script).toContain(`BRIDGE_VERSION = "${BLENDER_BRIDGE_VERSION}"`);
+    expect(BLENDER_BRIDGE_TOOLS).toEqual(["download_file", "import_model_from_url"]);
+    for (const tool of BLENDER_BRIDGE_TOOLS) expect(script).toContain(`"name": "${tool}"`);
+    expect(script).toContain('DOWNLOADS_DIR = Path.home() / ".gera" / "blender-downloads"');
+    expect(BLENDER_BRIDGE_DOWNLOADS_DIR).toBe("~/.gera/blender-downloads");
+    // Never Python's default User-Agent; a 403 for the bridge's own UA is retried as a browser before giving up.
+    expect(script).toContain('BRIDGE_USER_AGENT = f"Mozilla/5.0 (compatible; gera-blender-bridge/{BRIDGE_VERSION})"');
+    expect(script).toContain("if exc.code == 403 and user_agent == BRIDGE_USER_AGENT:");
+    expect(script).toContain('headers["Range"] = f"bytes={offset}-"');
+    expect(script).toContain('headers["If-Range"] = job.validator');
+    // A call returns before Gera's 40 s tools/call budget; the transfer itself keeps running for the next call.
+    expect(script).toContain("DOWNLOAD_WAIT_S = 25.0");
+    expect(script).toContain('payload["cached"] = True');
+    // Verification refuses an HTML page saved as a model instead of handing Blender a broken file.
+    expect(script).toContain('if suffix in (".glb", ".gltf") and not verification.get("ok"):');
+    expect(script).toContain('header[:4] != b"glTF"');
+    // The import script stays inside blender-mcp's safe mode: literal operators, no os/open, library load only for .blend.
+    expect(script).toContain('".fbx": ("bpy.ops.wm.fbx_import", "bpy.ops.import_scene.fbx")');
+    expect(script).toContain("bpy.ops.import_scene.gltf");
+    expect(script).toContain('if suffix == ".blend":');
+    expect(script).toContain("print('GERA_IMPORT_JSON ' + json.dumps(summary))");
+    expect(script).not.toMatch(/"import os"|'import os'/);
+    // Only http(s) targets, saved under a sanitized basename; the model steers away from downloading inside Blender.
+    expect(script).toContain('if parts.scheme not in ("http", "https") or not parts.hostname:');
+    expect(script).toContain('SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")');
+    expect(script).toContain("EXECUTE_CODE_NOTE");
+    expect(script).toContain('if method == "tools/list":');
+    expect(script).toContain("if method == \"tools/call\" and params.get(\"name\") in BRIDGE_TOOL_NAMES:");
+    // Logs name host and file, never the full URL (signed links) or the token.
+    expect(script).toContain('log(f"download {job.target.name} ← {job.host}');
   });
 });

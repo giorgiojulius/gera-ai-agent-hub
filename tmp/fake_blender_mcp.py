@@ -49,6 +49,20 @@ def handle(msg):
         if name == "get_scene_info":
             send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": json.dumps({"name": "Scene", "object_count": 3})}]}})
             return
+        if name == "execute_blender_code":
+            # Mimics blender-mcp: stdout of the script comes back as text. The bridge's import script prints one
+            # GERA_IMPORT_JSON line; echo a plausible summary so the parsing path is exercised end to end.
+            code = str(args.get("code", ""))
+            if "GERA_IMPORT_JSON" in code:
+                path = next((line.split("=", 1)[1].strip() for line in code.splitlines() if line.startswith("path =")), "?")
+                summary = {"scene": "Scene", "fps": 24.0, "frame_range": [1, 250], "collection": None, "object_count": 2,
+                           "objects": [{"name": "Goalkeeper", "type": "ARMATURE", "bones": 52}, {"name": "Body", "type": "MESH", "vertices": 4200}],
+                           "actions": [{"name": "Idle", "frames": [1.0, 48.0], "seconds": 1.958}], "imported_path": path}
+                text = "Code executed successfully: GERA_IMPORT_JSON " + json.dumps(summary) + "\n"
+            else:
+                text = "Code executed successfully: "
+            send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+            return
         if name == "slow":
             time.sleep(float(args.get("seconds", 1)))
             send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": f"slept {args.get('seconds')}"}]}})

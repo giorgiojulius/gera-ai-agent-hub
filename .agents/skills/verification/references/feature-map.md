@@ -1207,6 +1207,61 @@ notifications → 202, other requests forwarded with id remapping, GET → 405,
 DELETE → 204, upstream crash → error then restart on the next request,
 per-request timeout → -32001. No CORS headers are ever emitted. It does NOT
 replace the add-on or its 9876 socket — it wraps the upstream stdio server.
+
+Bridge 1.1.0 (2026-09-08, files from the internet): two bridge-owned tools
+are appended to blender-mcp's `tools/list` (`annotate_tools`; the
+`execute_blender_code` description gets a note pointing at them, `initialize`
+`instructions` too) and answered by the bridge itself, never forwarded.
+Reason: the asset host `pub-…r2.dev` answers Python's default
+`Python-urllib/3.x` User-Agent with 403 (curl / requests / browser UAs get
+206/200, verified 2026-09-08), a transfer inside `execute_blender_code`
+blocks the add-on with no retry or resume, and blender-mcp's safe mode
+rejects network code outright — so a Gera run could only fetch 256-byte Range
+probes and never import. `download_file({url, filename?, overwrite?,
+wait_seconds?})` fetches a public http(s) URL on the Blender computer with a
+browser-grade UA (`Mozilla/5.0 (compatible; gera-blender-bridge/…)`, a 403
+is retried once with a Chrome UA), retries with backoff on network errors /
+408/425/429/5xx (Retry-After honoured, 5 attempts), resumes dropped
+transfers with `Range` + `If-Range: <ETag|Last-Modified>` (200 instead of
+206 → restart), falls back to `curl` when the Python has no CA bundle, caps
+the size (`--max-download-mb`, default 2048), infers a missing extension
+from the `glTF` magic / Content-Type, verifies the result (GLB header +
+JSON chunk, glTF JSON, .blend magic; an HTML page saved as `.glb` is refused
+with the Content-Type named) and returns `{status, path, bytes, sha256,
+content_type, verification: {ok, detail, generator, nodes, meshes,
+materials, skins, animations: [{name, seconds, channels}],
+external_resources}, hint}`. Files land in `~/.gera/blender-downloads`
+(`--downloads-dir`) next to a `manifest.json`; the same URL again returns
+the saved file instantly (`cached: true`), `overwrite: true` refetches,
+unrelated files with the same name get a `-<sha1(url)[:6]>` suffix. A call
+waits at most `wait_seconds` (default 25, max 30 — under Gera's 40 s
+`tools/call` budget) and then reports `status: "downloading"` with
+received/total/percent; the transfer keeps running in a thread and the next
+call with the same URL picks it up (a client that disconnected early does
+not kill it). `import_model_from_url({url, filename?, collection?,
+overwrite?, wait_seconds?})` does the same download, then sends the bridge's
+import script through upstream `execute_blender_code`: literal operator
+candidates per extension (`.glb/.gltf` → `import_scene.gltf`; `.fbx` →
+`wm.fbx_import` then legacy `import_scene.fbx`; `.obj/.stl/.ply` → `wm.*_import`
+then legacy; USD/ABC/DAE via `wm.*`; `.blend` appends all objects through
+`bpy.data.libraries`), no `os`/`open`/computed `getattr` so it passes
+blender-mcp's safe mode (verified against the upstream validator; the
+`.blend` branch is the one thing safe mode rejects, honestly). Existing
+objects stay untouched; the reply lists new objects (type, dimensions,
+location, parent, vertices, materials, bones, action), new actions (name,
+frame range, seconds), scene fps/frame range, optional target collection
+(created, objects moved), plus the file facts. A missing `GERA_IMPORT_JSON`
+line returns the Blender text as `status: "failed"` (file stays saved).
+Both tools carry annotations `readOnlyHint: false, destructiveHint: false`
+(→ Gera risk "write", so "Confirm write tools" asks, like
+`execute_blender_code`); failures come back as `isError` tool results with
+`status: "failed"`, never JSON-RPC errors. Only `http`/`https` URLs, basename
+sanitised to `[A-Za-z0-9._-]`, logs name host + file (never the full URL or
+the token). Gera caches a server's catalog for 10 min: after replacing an
+older bridge, press Re-check on the Blender card so the two tools appear.
+UI: `blender-mcp.ts` exports `BLENDER_BRIDGE_VERSION`,
+`BLENDER_BRIDGE_TOOLS`, `BLENDER_BRIDGE_DOWNLOADS_DIR`; the setup dialog
+step 2 explains the tools and the re-download + Re-check step.
 The previous third-party bridge is kept only as a pinned alternative:
 `uvx --with "mcp<2" mcp-proxy …` (`mcp-proxy` 0.12 has no upper bound on
 `mcp`, and `mcp==2.0.0` of 2026-07-28 removed `request_ctx`, so a plain
@@ -1235,12 +1290,30 @@ Unit `blender-mcp.test.ts`: endpoint rejection, auth mapping, cloud tool
 eligibility, catalog guards, profile preservation, the documented commands
 and a static contract check of the shipped script (stdlib-only imports,
 loopback default, `compare_digest` Bearer gate, discover → -32601, tunnel,
-token file, no CORS). The bridge's live behaviour was exercised on
+token file, no CORS) plus a 1.1 contract check (version, both tool names,
+browser-grade UA + 403 fallback, Range/If-Range resume, 25 s wait, cached
+flag, GLB refusal, importer chains, safe-mode-clean script, http(s)-only,
+sanitised names, tools/list + tools/call interception, host-only logging).
+The bridge's live behaviour was exercised on
 2026-09-08 against a stdio fixture (`tmp/fake_blender_mcp.py`, not shipped):
 401 without/with wrong token, discover probe, initialize + session id,
 202 for notifications, id remapping, tools/call, 405/204/404/400, two
 parallel 2 s calls in 2.0 s, -32001 timeout, crash → restart, batch. That
-is a local fixture run, not a Blender or tunnel check. Browser scenarios
+is a local fixture run, not a Blender or tunnel check. Bridge 1.1.0 was
+exercised the same day against the fixture upstream (it echoes a
+`GERA_IMPORT_JSON` summary for `execute_blender_code`) and a fixture file
+server (`tmp/bridge-fixture/files.py`, not shipped): plain GLB → done +
+animations; 403 for the bridge UA → browser UA → done (`attempts: 2`,
+note); connection dropped mid-body → `Range` resume → done (note); HTML
+as `.glb` → `isError` refusal naming `text/html`; slow file with
+`wait_seconds: 1` → `downloading` → second call `done`; extension-less URL
+→ `.glb` from the magic; repeat → `cached: true`; `file:`/`ftp:`/missing
+url → refused; 404 → failed; `import_model_from_url` → `imported` with
+the Blender summary; non-model → refused with the saved path. Against the
+real asset host the user's two GLBs (11.4 MB and 7.3 MB from
+`pub-…r2.dev`) downloaded in 0.6 s / 0.5 s as valid glTF 2.0 with their
+Mixamo clips listed (`Goalie_Throw` 3.87 s, `Dribble` 1.77 s, …). Not a
+Blender check: the import step reached a fixture, not a running Blender. Browser scenarios
 `blender-mcp-setup` (guide with the `uv run … --tunnel` command, 401 note
 and download link, bad URL, cancel, zero checks) and `blender-mcp-connect`
 (fixture bridge with a Bearer token, verified tools, token absent from

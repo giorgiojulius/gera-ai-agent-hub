@@ -1,5 +1,7 @@
 import { toast } from "sonner";
 
+import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
+import { AuthSessionChangedError } from "@/lib/backend";
 import { serializeConversation } from "@/lib/chat-sync";
 import { mergeCodeChangeStates } from "@/lib/code-changes";
 import { githubRepoRefs, injectGitHubRunAuth, pinnedRepoPromptBlock, resolveGitHubAuth } from "@/lib/github-native";
@@ -1679,6 +1681,8 @@ function makePatcher(
 }
 
 type AdoptParams = {
+  /** Before history hydration, attach live jobs but do not ack finished history. */
+  runningOnly?: boolean;
   getState: () => AgentState;
   setState: SetAgentState;
   /** Fires when an adopted run settles; `stoppedManually` holds the queue. */
@@ -1846,19 +1850,32 @@ async function applyFinishedServerRun(run: ActiveServerRun, params: AdoptParams)
 export async function adoptActiveServerRuns(
   params: AdoptParams,
 ): Promise<{ running: string[]; applied: string[] }> {
+  const session = authSessionSnapshot();
   const runs = await listActiveServerRuns();
+  if (!isAuthSessionCurrent(session)) throw new AuthSessionChangedError();
+  const originalParams = params;
+  params = {
+    ...originalParams,
+    setState: (update) => originalParams.setState((prev) => isAuthSessionCurrent(session) ? update(prev) : prev),
+    onDone: (...args) => { if (isAuthSessionCurrent(session)) originalParams.onDone?.(...args); },
+  };
   const running: string[] = [];
   const applied: string[] = [];
   for (const run of runs) {
+    if (!isAuthSessionCurrent(session)) throw new AuthSessionChangedError();
     if (run.status === "running") {
+      running.push(run.conversationId);
       if (params.getState().runningIds.includes(run.conversationId)) {
         continue; // this tab already streams it
       }
-      running.push(run.conversationId);
       adoptRunningServerRun(run, params);
       continue;
     }
-    if (run.result) {
+    if (run.result && params.getState().runningIds.includes(run.conversationId)) {
+      running.push(run.conversationId);
+      continue; // Its observer owns settlement/usage; do not ack ahead of it.
+    }
+    if (run.result && !params.runningOnly) {
       try {
         const ok = await applyFinishedServerRun(run, params);
         if (ok) {

@@ -75,8 +75,6 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   const interruptPendingRef = useRef<Set<string>>(new Set());
   /** Completion signals (chime + desktop notification); a ref so every settle path can call it. */
   const notifyRef = useRef<(conversationId: string, execution?: ExecutionOutcome) => void>(() => {});
-  /** Server runs are adopted once per session (boot or first sign-in). */
-  const adoptedRef = useRef<boolean>(false);
   const stateRef = useRef(state);
   const firstSettingsSaveRef = useRef<boolean>(true);
   stateRef.current = state;
@@ -1240,7 +1238,7 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   const bootRecoveryRef = useRef<boolean>(false);
   const [bootRecoveryTick, setBootRecoveryTick] = useState<number>(0);
   useEffect(() => {
-    if (bootRecoveryRef.current || isAuthLoading || (user !== null && !isHydrated)) {
+    if (bootRecoveryRef.current || isAuthLoading) {
       return;
     }
     bootRecoveryRef.current = true;
@@ -1249,9 +1247,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       // them BEFORE local recovery so a reply is never continued twice.
       const adopted = new Set<string>();
       if (getAccessToken()) {
-        adoptedRef.current = true;
         try {
           const result = await adoptActiveServerRuns({
+            runningOnly: !isHydrated,
             getState: () => stateRef.current,
             setState,
             onDone: (conversationId, stopped, execution) => {
@@ -1271,6 +1269,13 @@ export function AgentProvider({ children }: { children: ReactNode }) {
           window.setTimeout(() => setBootRecoveryTick((value) => value + 1), 2_000);
           return;
         }
+      }
+      // Attach live jobs immediately; only local replay needs the full history
+      // baseline. A slow history/media pull is not evidence of interruption.
+      if (user !== null && !isHydrated) {
+        bootRecoveryRef.current = false;
+        window.setTimeout(() => setBootRecoveryTick((value) => value + 1), 2_000);
+        return;
       }
       const snapshot = stateRef.current;
       const now = Date.now();

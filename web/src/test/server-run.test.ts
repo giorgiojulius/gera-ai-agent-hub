@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/backend", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/backend")>();
@@ -34,7 +34,88 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
 describe("attachServerRun", () => {
+  it("settles from durable state even while a stuck SSE keeps pinging", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", globalThis);
+    let pingTimer: ReturnType<typeof setInterval>;
+    authedFetchMock.mockImplementation(async (path: string) => {
+      if (path.startsWith("/runs/stream")) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            pingTimer = setInterval(() => controller.enqueue(new TextEncoder().encode(
+              'data: {"t":"ping","seq":1}\n\n',
+            )), 1_000);
+          },
+          cancel() { clearInterval(pingTimer); },
+        }));
+      }
+      return jsonResponse({ runs: [{
+        runId: "r1", conversationId: "c1", status: "stopped", snapshot: null,
+        result: { message: { id: "a1", content: "Stored final" }, usageEvents: [], steered: [], chatUpdatedAt: 42 },
+      }] });
+    });
+    let settled = false;
+    const result = attachServerRun({ conversationId: "c1", onEvent: () => {} }).then((done) => {
+      settled = true;
+      return done;
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(settled).toBe(true);
+    expect((await result).status).toBe("stopped");
+    expect(authedFetchMock.mock.calls.every(([path]) => !path.includes("/stop") && !path.includes("/start"))).toBe(true);
+  });
+
+  it("does not wait for a hung stream cancellation after receiving done", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", globalThis);
+    authedFetchMock.mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+          t: "done", status: "done", message: { id: "a1", content: "Final" },
+        })}\n\n`));
+      },
+      cancel: () => new Promise<void>(() => {}),
+    })));
+    let settled = false;
+    void attachServerRun({ conversationId: "c1", onEvent: () => {} }).then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(settled).toBe(true);
+  });
+
+  it("treats an upstream AbortError as a reconnect, not a user Stop", async () => {
+    authedFetchMock.mockRejectedValueOnce(new DOMException("Network aborted", "AbortError"));
+    authedFetchMock.mockResolvedValueOnce(jsonResponse({ runs: [{
+      runId: "r1", conversationId: "c1", status: "done", snapshot: null,
+      result: { message: { id: "a1", content: "Finished" }, usageEvents: [], steered: [], chatUpdatedAt: 9 },
+    }] }));
+    const result = await attachServerRun({ conversationId: "c1", onEvent: () => {} });
+    expect(result.message.content).toBe("Finished");
+    expect(result.status).toBe("done");
+  });
+  it("bounds a stalled headers request and detaches a tab without stopping its job", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", globalThis);
+    const tab = new AbortController();
+    authedFetchMock.mockImplementation(async (path: string) => {
+      if (path.startsWith("/runs/stream")) return new Promise<Response>(() => {});
+      return jsonResponse({ runs: [{ conversationId: "c1", status: "running", result: null, snapshot: null }] });
+    });
+    const result = attachServerRun({ conversationId: "c1", signal: tab.signal, onEvent: () => {} });
+    const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(15_001);
+    expect(authedFetchMock.mock.calls.some(([path]) => path === "/runs/active")).toBe(true);
+    tab.abort();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await rejected;
+    expect(authedFetchMock.mock.calls.some(([path]) => path === "/runs/stop")).toBe(false);
+  });
+
   it("replays live events in order and resolves with the terminal payload", async () => {
     authedFetchMock.mockResolvedValueOnce(
       sseResponse([

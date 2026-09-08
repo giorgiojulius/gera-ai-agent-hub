@@ -8,8 +8,8 @@
 // run snapshots and keeps reconnecting — the run itself never depends on
 // this tab being alive.
 
-import { authSessionSnapshot } from "@/lib/auth-tokens";
-import { authedFetch, authedFetchForSession, parseOrThrow } from "@/lib/backend";
+import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
+import { AuthSessionChangedError, authedFetch, authedFetchForSession, parseOrThrow } from "@/lib/backend";
 import { logDiagnostic } from "@/lib/diagnostics";
 import type {
   Attachment,
@@ -399,10 +399,16 @@ export async function ackServerRun(runId: string): Promise<void> {
   }
 }
 
-export async function listActiveServerRuns(): Promise<ActiveServerRun[]> {
-  const response = await authedFetch("/runs/active");
-  const data = await parseOrThrow<{ runs?: ActiveServerRun[] }>(response, "Could not list runs");
-  return Array.isArray(data.runs) ? data.runs : [];
+export async function listActiveServerRuns(signal?: AbortSignal): Promise<ActiveServerRun[]> {
+  return observeWithin(async (requestSignal) => {
+    const response = await authedFetch("/runs/active", { signal: requestSignal, cache: "no-store" });
+    const data = await parseOrThrow<{ runs?: ActiveServerRun[] }>(response, "Could not list runs");
+    // The durable row owns status; older backends omit it inside result.
+    return (Array.isArray(data.runs) ? data.runs : []).map((run) => ({
+      ...run,
+      result: run.result && run.status !== "running" ? { ...run.result, status: run.status } : run.result,
+    }));
+  }, 12_000, signal);
 }
 
 export async function fetchRunMedia(runId: string, index: number): Promise<{ kind: string; dataUrl: string }> {
@@ -521,8 +527,42 @@ export async function resolveCloudMediaInConversation(conversation: Conversation
 // ---------------------------------------------------------------------------
 // Attach: SSE stream with stall detection + polling fallback + reconnect.
 
-/** No bytes (pings run every 15s) for this long means the stream is dead. */
-const STREAM_STALL_MS = 32_000;
+/** Reconcile durable state even if pings keep a stale subscription alive. */
+const STREAM_RECONCILE_MS = 15_000;
+
+/** Bounds an observer, never the server job; includes response-body waits. */
+async function observeWithin<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let detach: () => void = () => {};
+  const interrupted = new Promise<never>((_, reject) => {
+    detach = () => {
+      reject(abortError());
+      controller.abort();
+    };
+    if (signal?.aborted) {
+      detach();
+      return;
+    }
+    signal?.addEventListener("abort", detach, { once: true });
+    timer = setTimeout(() => {
+      reject(new Error("Run observation timed out; reconnecting."));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    if (controller.signal.aborted) return await interrupted;
+    return await Promise.race([operation(controller.signal), interrupted]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", detach);
+    controller.abort();
+  }
+}
 const POLL_INTERVAL_MS = 1_800;
 const POLL_CYCLES_PER_ROUND = 4;
 
@@ -538,8 +578,8 @@ function doneFromActive(run: ActiveServerRun): ServerRunDone | null {
   return run.result;
 }
 
-async function pollRunState(conversationId: string): Promise<PollState> {
-  const runs = await listActiveServerRuns();
+async function pollRunState(conversationId: string, signal?: AbortSignal): Promise<PollState> {
+  const runs = await listActiveServerRuns(signal);
   const run = runs.find((item) => item.conversationId === conversationId);
   if (!run) {
     return { kind: "missing" };
@@ -555,17 +595,21 @@ async function pollRunState(conversationId: string): Promise<PollState> {
  * Reads one SSE stream until a terminal event. Returns the done payload,
  * or null when the stream ended/stalled without one (caller retries).
  */
-async function streamRunOnce(params: {
+async function readRunStream(params: {
   conversationId: string;
   onEvent: (event: ServerRunEvent) => void;
   signal?: AbortSignal;
 }): Promise<ServerRunDone | null> {
   const response = await authedFetch(
     `/runs/stream?conversationId=${encodeURIComponent(params.conversationId)}`,
-    { signal: params.signal },
+    { signal: params.signal, cache: "no-store" },
   );
+  if (params.signal?.aborted) {
+    void response.body?.cancel().catch(() => undefined);
+    throw abortError();
+  }
   if (response.status === 404) {
-    const state = await pollRunState(params.conversationId);
+    const state = await pollRunState(params.conversationId, params.signal);
     if (state.kind === "missing") {
       throw new Error("The run is no longer on the server.");
     }
@@ -578,6 +622,8 @@ async function streamRunOnce(params: {
     throw new Error(`Run stream failed (${response.status}).`);
   }
   const reader = response.body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => undefined); };
+  params.signal?.addEventListener("abort", cancel, { once: true });
   const decoder = new TextDecoder();
   let buffer = "";
   try {
@@ -585,14 +631,8 @@ async function streamRunOnce(params: {
       if (params.signal?.aborted) {
         throw abortError();
       }
-      const step = await Promise.race([
-        reader.read().then((result) => ({ kind: "read" as const, result })),
-        sleep(STREAM_STALL_MS).then(() => ({ kind: "stall" as const })),
-      ]);
-      if (step.kind === "stall") {
-        return null; // dead stream — the caller falls back to polling
-      }
-      const { done, value } = step.result;
+      const { done, value } = await reader.read();
+      if (params.signal?.aborted) throw abortError();
       if (done) {
         return null; // ended without a terminal event — reconnect
       }
@@ -632,7 +672,9 @@ async function streamRunOnce(params: {
       }
     }
   } finally {
-    await reader.cancel().catch(() => undefined);
+    params.signal?.removeEventListener("abort", cancel);
+    // A stalled cancel handshake must not hold an already received result.
+    cancel();
   }
 }
 
@@ -649,6 +691,10 @@ export async function attachServerRun(params: {
   signal?: AbortSignal;
 }): Promise<ServerRunDone> {
   const id = params.conversationId;
+  const session = authSessionSnapshot();
+  const ensureSession = () => {
+    if (!isAuthSessionCurrent(session)) throw new AuthSessionChangedError();
+  };
   try {
     while (true) {
       if (params.signal?.aborted) {
@@ -656,14 +702,19 @@ export async function attachServerRun(params: {
       }
       try {
         setPhase(id, "live");
-        const done = await streamRunOnce(params);
+        ensureSession();
+        const done = await observeWithin((signal) => readRunStream({
+          ...params,
+          signal,
+          onEvent: (event) => { ensureSession(); params.onEvent(event); },
+        }), STREAM_RECONCILE_MS, params.signal);
+        ensureSession();
         if (done) {
           return done;
         }
       } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-          throw error;
-        }
+        if (params.signal?.aborted) throw abortError();
+        if (error instanceof AuthSessionChangedError) throw error;
         if (error instanceof Error && error.message === "The run is no longer on the server.") {
           throw error;
         }
@@ -677,9 +728,13 @@ export async function attachServerRun(params: {
         }
         let state: PollState | null = null;
         try {
-          state = await pollRunState(id);
+          ensureSession();
+          state = await pollRunState(id, params.signal);
+          ensureSession();
           networkDown = false;
-        } catch {
+        } catch (error) {
+          if (params.signal?.aborted) throw abortError();
+          if (error instanceof AuthSessionChangedError) throw error;
           networkDown = true;
         }
         if (state) {

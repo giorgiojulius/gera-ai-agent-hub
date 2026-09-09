@@ -247,9 +247,18 @@ export function hasActiveCloudRun(conversationId: string | null): boolean {
 // ---------------------------------------------------------------------------
 // REST calls.
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(abortError()); return; }
+    const cancel = () => {
+      window.clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", cancel);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", cancel, { once: true });
   });
 }
 
@@ -268,6 +277,7 @@ export type StartServerRunResponse = {
 
 export async function startServerRun(
   body: StartServerRunRequest,
+  signal?: AbortSignal,
 ): Promise<StartServerRunResponse> {
   // The backend resolves connector configuration and credentials from the
   // account shard. The browser sends only ids needed for per-run scoping.
@@ -287,26 +297,50 @@ export async function startServerRun(
   // Every retry is pinned to the account that created this payload. Switching
   // accounts while a response is lost must never replay history into the new one.
   const sessionNonce = authSessionSnapshot();
-  // A just-stopped previous run may still be finalizing — retry run_active briefly.
+  // Freeze the wire payload: durable receipts compare the ID AND input hash.
+  // This retries acceptance of one request, never creates a replacement run.
+  const payload = JSON.stringify(serverOwnedBody);
+  const delays = [2_000, 4_000, 8_000, 15_000];
+  const ensureSession = () => {
+    if (!isAuthSessionCurrent(sessionNonce)) throw new AuthSessionChangedError();
+  };
+  const unconfirmed = (reason: string) => new Error(
+    `Server connection failed (${reason}). Run acceptance could not be confirmed. Check the saved run status before sending again.`,
+  );
   for (let attempt = 0; ; attempt += 1) {
+    ensureSession();
+    if (signal?.aborted) throw abortError();
     let response: Response;
     try {
       response = await authedFetchForSession("/runs/start", sessionNonce, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(serverOwnedBody),
+        body: payload,
       });
     } catch (error) {
-      if (attempt < 4) {
-        await sleep(900 * (attempt + 1));
+      ensureSession();
+      if (error instanceof AuthSessionChangedError) throw error;
+      if (attempt < delays.length) {
+        await sleep(delays[attempt], signal);
         continue;
       }
-      throw error;
+      throw unconfirmed("network unavailable");
+    }
+    ensureSession();
+    if (response.status === 502 || response.status === 504) {
+      // The relay may have lost the acknowledgment AFTER durable acceptance.
+      // The same ID retrieves that receipt, including a terminal interruption.
+      void response.body?.cancel().catch(() => undefined);
+      if (attempt < delays.length) {
+        await sleep(delays[attempt], signal);
+        continue;
+      }
+      throw unconfirmed(`HTTP ${response.status}`);
     }
     if (response.status === 409) {
       const conflict = (await response.clone().json().catch(() => ({}))) as { error?: unknown };
       if (conflict.error === "run_active" && attempt < 4) {
-        await sleep(900);
+        await sleep(900, signal);
         continue;
       }
       if (conflict.error === "run_active") {
@@ -316,7 +350,9 @@ export async function startServerRun(
         throw new Error("This run id was already accepted with different input; nothing was executed twice.");
       }
     }
-    return parseOrThrow<StartServerRunResponse>(response, "Could not start the run on the server");
+    const result = await parseOrThrow<StartServerRunResponse>(response, "Could not start the run on the server");
+    ensureSession();
+    return result;
   }
 }
 

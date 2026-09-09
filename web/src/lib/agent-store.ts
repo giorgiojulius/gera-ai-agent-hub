@@ -668,7 +668,7 @@ async function runServerTurn(params: ServerTurnParams): Promise<ServerRunDone> {
       automationId: seeded.automationId,
       chatSeed,
       config: params.config,
-    });
+    }, params.signal);
     ackStart();
     if (started.status && started.status !== "running" && started.result) {
       return { ...started.result, status: started.status } as ServerRunDone;

@@ -170,6 +170,8 @@ type StubRunBody = {
 };
 let lastStubRun: StubRun | null = null;
 let lastStubRunBody: StubRunBody | null = null;
+let loseStartAcknowledgment = false;
+const startPayloads: string[] = [];
 /** Set by /runs/start when the prompt carries STUB_HANG_PROMPT — the stream then never terminates. */
 let hangStubRun = false;
 let codeStubRun = false;
@@ -720,6 +722,11 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
       } catch {
         body = {};
       }
+      startPayloads.push(raw);
+      if (loseStartAcknowledgment && startPayloads.length > 1) {
+        expect(raw).toBe(startPayloads[0]);
+        return jsonResponse({ ok: true, runId: lastStubRun?.runId, historyOnServer: true, replayed: true, status: "running" });
+      }
       lastStubRunBody = body;
       lastStubRun = {
         runId: body.runId ?? "e2e-run",
@@ -731,6 +738,7 @@ function handleStubbed(url: string, init?: RequestInit): Response | Promise<Resp
       mcpStubRun = body.config?.prompt === STUB_MCP_PROMPT;
       elicitStubRun = body.config?.prompt === STUB_ELICIT_PROMPT;
       confirmStubRun = body.config?.prompt === STUB_CONFIRM_PROMPT;
+      if (loseStartAcknowledgment) return new Response('{"error":"upstream_unreachable"}', { status: 502 });
       return jsonResponse({ ok: true, runId: lastStubRun.runId, historyOnServer: true });
     }
     if (url.includes("/runs/stream")) {
@@ -891,6 +899,8 @@ beforeEach(() => {
   sessionStorage.clear();
   lastStubRun = null;
   lastStubRunBody = null;
+  loseStartAcknowledgment = false;
+  startPayloads.length = 0;
   blenderCheckCount = 0;
   deployRecovery = false;
   resolveCancelledCheck?.();
@@ -963,6 +973,21 @@ test("e2e · A legacy settings PAT is removed and the saved server credential is
     return settings.mcpServers?.find((server: { id: string }) => server.id === "github");
   }, { timeout: 15_000 }).toMatchObject({ status: "connected", credentialStored: true });
   expect(JSON.stringify(Object.entries(localStorage))).not.toContain("legacy-browser-pat");
+});
+
+test("e2e · A lost HTTP 502 start acknowledgment recovers the same reply after one Send", { timeout: 20_000 }, async () => {
+  loseStartAcknowledgment = true;
+  const driver = webDriver();
+  await driver.goto("/");
+  await driver.see(TID.composerInput, 10_000);
+  await driver.fill(TID.composerInput, "Recover this reply after a gateway error");
+  await driver.tap(TID.composerSend);
+  await driver.seeText(TID.messageAssistant, STUB_REPLY_SNIPPET, 10_000);
+  await driver.notSee(TID.composerStop, 5_000);
+  expect(startPayloads).toHaveLength(2);
+  expect(startPayloads[0]).toBe(startPayloads[1]);
+  expect(page.getByTestId(TID.messageUser).elements()).toHaveLength(1);
+  expect(page.getByTestId(TID.messageAssistant).elements()).toHaveLength(1);
 });
 
 for (const scenario of E2E_SCENARIOS) {

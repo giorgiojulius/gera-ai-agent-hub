@@ -20,6 +20,7 @@ const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
 let run: ActiveServerRun;
 let activeGate: Promise<void> | undefined;
 let activeFailures = 0;
+let activeFailureStatus = 503;
 let hideRun = false;
 const activeTimes: number[] = [];
 
@@ -57,6 +58,7 @@ beforeEach(() => {
   requests.length = 0;
   activeGate = undefined;
   activeFailures = 0;
+  activeFailureStatus = 503;
   hideRun = false;
   activeTimes.length = 0;
   streams.clear();
@@ -83,7 +85,7 @@ beforeEach(() => {
       await activeGate;
       if (activeFailures > 0) {
         activeFailures -= 1;
-        return new Response("Temporarily unavailable", { status: 503 });
+        return new Response("Temporarily unavailable", { status: activeFailureStatus });
       }
       return json({ runs: hideRun ? [] : [run] });
     }
@@ -176,9 +178,10 @@ test("a finished job waiting for history hydration is not labelled incomplete or
   }
 });
 
-test("status retries back off after repeated failures and recover the same finished job", async () => {
+test.each([502, 503])("status retries back off after repeated HTTP %i failures and recover the same finished job", async (status) => {
   baseline.hydrated = true;
   activeFailures = 2;
+  activeFailureStatus = status;
   finish(false);
   const view = await render(tree());
   try {

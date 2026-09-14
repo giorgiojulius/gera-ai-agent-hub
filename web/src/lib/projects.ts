@@ -793,6 +793,15 @@ export type DeskTeammate = {
 
 export type DeskStatsRange = { from: number; to: number };
 
+/** One harvested reply without any text — enough to bucket trends client-side. */
+export type DeskTimelinePoint = {
+  at: number;
+  adminId: string;
+  conversationId: string;
+  responseMs: number;
+  grade: string;
+};
+
 export type DeskStats = {
   isAdmin: boolean;
   teammates: DeskTeammate[];
@@ -804,6 +813,8 @@ export type DeskStats = {
   withinOneHour: number;
   p90ResponseMs: number;
   ungraded: number;
+  /** Absent on older backends — the trend section then stays hidden. */
+  timeline?: DeskTimelinePoint[];
   range: DeskStatsRange;
   coverage: {
     scannedConversations: number;

@@ -1084,9 +1084,21 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   filter every metric by reply timestamp. Per-teammate cards use REAL transcripts
   and show conversations/replies, median speed, slow-tail p90, share answered
   within one hour, good/bad grades, ungraded work, exact first/last dates,
-  coaching and up to 10 explained examples. The compact "What to act on" block
+  coaching and up to 10 explained examples. **Trend over the period**
+  (`screen-desk-performance-trend`, 2026-09-14): the stats payload now carries a
+  text-free `timeline` (at/adminId/conversationId/responseMs/grade per visible
+  reply, already visibility-filtered server-side); the client buckets it in the
+  viewer's local time (`web/src/lib/desk-trends.ts`: days ≤31d, weeks ≤190d,
+  months beyond, manual override, empty buckets kept, weeks start Monday) into a
+  recharts bar chart with three metric tabs — Volume (stacked good/bad/ungraded),
+  Reply time (median per bucket, red >1h), Quality (good share, colour-coded) —
+  and a "Compared with the previous <equal-length period>" strip (replies,
+  conversations, median reply, rated good) with signed deltas; a previous window
+  with zero collected replies says so instead of faking a delta. Open-ended
+  ranges derive the span from the data. Section hidden without timeline. Unit:
+  `desk-trends.test.ts` (5). The compact "What to act on" block
   reports only operational signals: ungraded backlog, bad replies, >1h slow tail,
-  and incomplete scan coverage — no decorative charts. Data flows only on demand:
+  and incomplete scan coverage. Data flows only on demand:
   admin "Analyze conversations" (`screen-desk-performance-analyze`, POST
   `/intercom/stats/refresh`) uses Intercom Search date filters and cursor pages to
   scan/read up to 300 matching conversations via `harvestIntercomReplyPairs` /

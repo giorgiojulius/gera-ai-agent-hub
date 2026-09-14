@@ -43,6 +43,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type React
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
+import { DeskTrendSection } from "@/components/gera/DeskTrendSection";
 import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { MarkdownBody } from "@/components/gera/Markdown";
 import { Button } from "@/components/ui/button";
@@ -1966,6 +1967,10 @@ function PerformancePanel({
                 </p>
               ) : null}
             </div>
+          ) : null}
+
+          {stats && stats.totalReplies > 0 && stats.timeline && stats.timeline.length > 0 ? (
+            <DeskTrendSection timeline={stats.timeline} range={stats.range} now={stats.now} />
           ) : null}
 
           {stats && stats.totalReplies > 0 ? (

@@ -1192,6 +1192,15 @@ function deskStatsPayload(
         ? responseTimes[Math.min(responseTimes.length - 1, Math.ceil(responseTimes.length * 0.9) - 1)]
         : 0,
     ungraded: summaryReplies.filter((row) => row.grade === "").length,
+    // Compact per-reply points (no text) so the client can draw period trends
+    // in the viewer's own timezone; visibility filtering already applied above.
+    timeline: summaryReplies.map((row) => ({
+      at: row.at,
+      adminId: row.admin_id,
+      conversationId: row.conversation_id,
+      responseMs: row.response_ms,
+      grade: row.grade,
+    })),
     range,
     coverage: meta
       ? {

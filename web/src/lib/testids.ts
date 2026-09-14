@@ -145,6 +145,8 @@ export const TID = {
   screenDeskPerformancePanel: "screen-desk-performance-panel",
   /** Date-range controls for filtering and collecting team performance. */
   screenDeskPerformanceDates: "screen-desk-performance-dates",
+  /** Period trend chart + previous-period comparison inside team performance. */
+  screenDeskPerformanceTrend: "screen-desk-performance-trend",
   /** Starts a deep Intercom collection and grading pass. */
   screenDeskPerformanceAnalyze: "screen-desk-performance-analyze",
   /** Clears harvested team-performance results while preserving links. */

@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   autoDeskGranularity,
   bucketDeskTimeline,
+  bucketMetricValue,
   compareDeskPeriods,
+  describeTrend,
   effectiveDeskSpan,
   percentDelta,
+  rankTeammateShifts,
 } from "@/lib/desk-trends";
 import type { DeskTimelinePoint } from "@/lib/projects";
 
@@ -77,5 +80,96 @@ describe("desk period trends", () => {
     expect(comparison?.current.medianResponseMs).toBe(40 * 60 * 1000);
     expect(percentDelta(comparison?.current.replies ?? 0, comparison?.previous.replies ?? 0)).toBe(50);
     expect(percentDelta(3, 0)).toBeNull();
+  });
+});
+
+describe("per-teammate trends", () => {
+  const from = localDay(2026, 9, 1, 0);
+  const to = localDay(2026, 9, 5, 23);
+
+  it("turns a bucket into one comparable number per metric, null without evidence", () => {
+    const [first, second] = bucketDeskTimeline(
+      [
+        point(localDay(2026, 9, 1), { grade: "good", responseMs: 30 * 60 * 1000 }),
+        point(localDay(2026, 9, 1, 13), { grade: "bad", responseMs: 3 * HOUR }),
+        point(localDay(2026, 9, 2), { responseMs: 0 }),
+      ],
+      { from, to: localDay(2026, 9, 2, 23) },
+      "day",
+      to,
+    );
+    expect(bucketMetricValue(first, "quality")).toBe(50);
+    expect(bucketMetricValue(first, "response")).toBe(180);
+    expect(bucketMetricValue(first, "withinHour")).toBe(50);
+    expect(bucketMetricValue(first, "replies")).toBe(2);
+    expect(bucketMetricValue(second, "quality")).toBeNull();
+    expect(bucketMetricValue(second, "response")).toBeNull();
+    expect(bucketMetricValue(second, "replies")).toBe(1);
+  });
+
+  it("reads a streak, a last-bucket dip and a stable series without a model", () => {
+    const rising = [
+      point(localDay(2026, 9, 1), { grade: "bad" }),
+      point(localDay(2026, 9, 2), { grade: "good" }),
+      point(localDay(2026, 9, 2, 13), { grade: "bad" }),
+      point(localDay(2026, 9, 3), { grade: "good" }),
+      point(localDay(2026, 9, 3, 13), { grade: "good" }),
+      point(localDay(2026, 9, 3, 14), { grade: "bad" }),
+      point(localDay(2026, 9, 4), { grade: "good" }),
+    ];
+    const streak = describeTrend(bucketDeskTimeline(rising, { from, to }, "day", to), "quality", "day");
+    expect(streak).toEqual({ tone: "up", text: "Quality rising 3 days in a row." });
+
+    const slower = [
+      point(localDay(2026, 9, 1), { responseMs: 10 * 60 * 1000 }),
+      point(localDay(2026, 9, 2), { responseMs: 12 * 60 * 1000 }),
+      point(localDay(2026, 9, 3), { responseMs: 9 * 60 * 1000 }),
+      point(localDay(2026, 9, 5), { responseMs: 2 * HOUR }),
+    ];
+    const dip = describeTrend(bucketDeskTimeline(slower, { from, to }, "day", to), "response", "day");
+    expect(dip.tone).toBe("down");
+    expect(dip.text).toContain("slower than before");
+    expect(dip.text).toContain("2h vs 10m before");
+
+    const flat = [
+      point(localDay(2026, 9, 1), { grade: "good" }),
+      point(localDay(2026, 9, 3), { grade: "good" }),
+      point(localDay(2026, 9, 5), { grade: "good" }),
+    ];
+    expect(describeTrend(bucketDeskTimeline(flat, { from, to }, "day", to), "quality", "day")).toEqual({
+      tone: "flat",
+      text: "Quality stable across the period, around 100%.",
+    });
+
+    const sparse = [point(localDay(2026, 9, 1), { grade: "good" })];
+    expect(describeTrend(bucketDeskTimeline(sparse, { from, to }, "day", to), "quality", "day").tone).toBe("none");
+  });
+
+  it("ranks teammates by movement and skips those without both periods", () => {
+    const points = [
+      // Anna: quality 50% -> 100%, median 60m -> 20m
+      point(localDay(2026, 8, 28), { adminId: "anna", grade: "good", responseMs: 60 * 60 * 1000 }),
+      point(localDay(2026, 8, 29), { adminId: "anna", grade: "bad", responseMs: 60 * 60 * 1000 }),
+      point(localDay(2026, 9, 2), { adminId: "anna", grade: "good", responseMs: 20 * 60 * 1000 }),
+      point(localDay(2026, 9, 3), { adminId: "anna", grade: "good", responseMs: 20 * 60 * 1000 }),
+      // Boris: quality 100% -> 100%, median 10m -> 12m (inside noise)
+      point(localDay(2026, 8, 28), { adminId: "boris", grade: "good", responseMs: 10 * 60 * 1000 }),
+      point(localDay(2026, 9, 2), { adminId: "boris", grade: "good", responseMs: 12 * 60 * 1000 }),
+      // Vera: only in the current period
+      point(localDay(2026, 9, 2), { adminId: "vera", grade: "good" }),
+    ];
+    const shifts = rankTeammateShifts(
+      points,
+      [
+        { adminId: "boris", name: "Boris" },
+        { adminId: "anna", name: "Anna" },
+        { adminId: "vera", name: "Vera" },
+      ],
+      { from, to },
+      to,
+    );
+    expect(shifts.map((shift) => shift.name)).toEqual(["Anna", "Boris"]);
+    expect(shifts[0]).toMatchObject({ qualityDelta: 50, responseDelta: -67, repliesDelta: 0 });
+    expect(shifts[1]).toMatchObject({ qualityDelta: 0, responseDelta: 20 });
   });
 });

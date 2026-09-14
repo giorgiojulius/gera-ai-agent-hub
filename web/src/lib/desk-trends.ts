@@ -217,3 +217,173 @@ export function percentDelta(current: number, previous: number): number | null {
   if (previous <= 0) return null;
   return Math.round(((current - previous) / previous) * 100);
 }
+
+export type DeskTrendMetric = "quality" | "response" | "withinHour" | "replies";
+
+/**
+ * Single comparable number for a bucket under the chosen metric, or null when
+ * the bucket has no evidence for it (no grades / no timing / no replies).
+ * Quality and within-hour are whole percents, response is minutes, replies a count.
+ */
+export function bucketMetricValue(bucket: DeskTrendBucket, metric: DeskTrendMetric): number | null {
+  if (metric === "replies") return bucket.replies > 0 ? bucket.replies : null;
+  if (metric === "response") return bucket.responseSamples > 0 ? bucket.medianResponseMs / 60000 : null;
+  if (metric === "withinHour") {
+    return bucket.responseSamples > 0 ? Math.round((bucket.withinOneHour / bucket.responseSamples) * 100) : null;
+  }
+  const graded = bucket.good + bucket.bad;
+  return graded > 0 ? Math.round((bucket.good / graded) * 100) : null;
+}
+
+export type DeskTrendVerdict = {
+  tone: "up" | "down" | "flat" | "none";
+  text: string;
+};
+
+const METRIC_NOUN: Record<DeskTrendMetric, string> = {
+  quality: "Quality",
+  response: "Reply time",
+  withinHour: "Within-1h share",
+  replies: "Volume",
+};
+
+function unitWord(granularity: DeskTrendGranularity, count: number): string {
+  const base = granularity === "day" ? "day" : granularity === "week" ? "week" : "month";
+  return count === 1 ? base : `${base}s`;
+}
+
+/** Human number for a metric value produced by `bucketMetricValue`. */
+export function formatMetric(value: number, metric: DeskTrendMetric): string {
+  if (metric === "replies") return `${Math.round(value)}`;
+  if (metric === "response") {
+    const minutes = Math.round(value);
+    if (minutes < 1) return "<1m";
+    if (minutes < 90) return `${minutes}m`;
+    const hours = Math.round(minutes / 60);
+    return hours < 36 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+  }
+  return `${Math.round(value)}%`;
+}
+
+/**
+ * One-line, model-free reading of a metric series: consecutive streak at the
+ * tail, a last-bucket dip/jump versus the earlier mean, or "stable". Buckets
+ * without evidence are skipped, so gaps do not break a streak. Needs at least
+ * two informative buckets; otherwise says so instead of guessing.
+ */
+export function describeTrend(
+  buckets: DeskTrendBucket[],
+  metric: DeskTrendMetric,
+  granularity: DeskTrendGranularity,
+): DeskTrendVerdict {
+  const values: number[] = [];
+  for (const bucket of buckets) {
+    const value = bucketMetricValue(bucket, metric);
+    if (value !== null) values.push(value);
+  }
+  const noun = METRIC_NOUN[metric];
+  if (values.length < 2) {
+    return {
+      tone: "none",
+      text: `Not enough ${unitWord(granularity, 2)} with data to read a ${noun.toLowerCase()} trend yet.`,
+    };
+  }
+  const lowerIsBetter = metric === "response";
+  // Relative tolerance so a one-point wiggle is not called a trend.
+  const tolerance = metric === "replies" ? 0.15 : metric === "response" ? 0.2 : 0;
+  const flatBand = metric === "quality" || metric === "withinHour" ? 3 : 0;
+  const direction = (prev: number, next: number): 1 | -1 | 0 => {
+    const diff = next - prev;
+    if (Math.abs(diff) <= flatBand || Math.abs(diff) <= Math.abs(prev) * tolerance) return 0;
+    return diff > 0 ? 1 : -1;
+  };
+  let streak = 1;
+  const lastDirection = direction(values[values.length - 2], values[values.length - 1]);
+  if (lastDirection !== 0) {
+    for (let index = values.length - 2; index > 0; index -= 1) {
+      if (direction(values[index - 1], values[index]) === lastDirection) streak += 1;
+      else break;
+    }
+  }
+  const improving = lowerIsBetter ? lastDirection < 0 : lastDirection > 0;
+  if (lastDirection !== 0 && streak >= 2) {
+    const verb = lowerIsBetter ? (improving ? "getting faster" : "getting slower") : improving ? "rising" : "falling";
+    return {
+      tone: improving ? "up" : "down",
+      text: `${noun} ${verb} ${streak} ${unitWord(granularity, streak)} in a row.`,
+    };
+  }
+  const last = values[values.length - 1];
+  const earlier = values.slice(0, -1);
+  const mean = earlier.reduce((sum, value) => sum + value, 0) / earlier.length;
+  const jump = direction(mean, last);
+  if (jump !== 0) {
+    const better = lowerIsBetter ? jump < 0 : jump > 0;
+    const phrase = lowerIsBetter
+      ? better
+        ? "faster than before"
+        : "slower than before"
+      : better
+        ? "above the earlier level"
+        : "below the earlier level";
+    return {
+      tone: better ? "up" : "down",
+      text: `Latest ${unitWord(granularity, 1)}: ${noun.toLowerCase()} ${phrase} (${formatMetric(last, metric)} vs ${formatMetric(mean, metric)} before).`,
+    };
+  }
+  return { tone: "flat", text: `${noun} stable across the period, around ${formatMetric(mean, metric)}.` };
+}
+
+export type DeskTeammateShift = {
+  adminId: string;
+  name: string;
+  current: DeskPeriodSummary;
+  previous: DeskPeriodSummary;
+  /** Percentage points of good share; null without grades in either period. */
+  qualityDelta: number | null;
+  /** Percent change of the median reply time; negative = faster. */
+  responseDelta: number | null;
+  repliesDelta: number | null;
+  /** Sorting weight — largest movement first. */
+  magnitude: number;
+};
+
+/**
+ * Period-over-period movement per teammate, sorted by how much they changed.
+ * Teammates with no replies in either window are left out — there is nothing
+ * to compare, and inventing a delta would mislead.
+ */
+export function rankTeammateShifts(
+  points: DeskTimelinePoint[],
+  teammates: Array<{ adminId: string; name: string }>,
+  range: DeskStatsRange,
+  now: number = Date.now(),
+): DeskTeammateShift[] {
+  const span = effectiveDeskSpan(points, range, now);
+  if (!span || span.to <= span.from) return [];
+  const length = span.to - span.from;
+  const shifts: DeskTeammateShift[] = [];
+  for (const teammate of teammates) {
+    const own = points.filter((point) => point.adminId === teammate.adminId);
+    const current = summarize(own, span.from, span.to);
+    const previous = summarize(own, span.from - length, span.from - 1);
+    if (current.replies === 0 || previous.replies === 0) continue;
+    const qualityDelta =
+      current.goodShare !== null && previous.goodShare !== null ? current.goodShare - previous.goodShare : null;
+    const responseDelta =
+      current.medianResponseMs > 0 && previous.medianResponseMs > 0
+        ? percentDelta(current.medianResponseMs, previous.medianResponseMs)
+        : null;
+    shifts.push({
+      adminId: teammate.adminId,
+      name: teammate.name,
+      current,
+      previous,
+      qualityDelta,
+      responseDelta,
+      repliesDelta: percentDelta(current.replies, previous.replies),
+      magnitude: Math.max(Math.abs(qualityDelta ?? 0), Math.abs(responseDelta ?? 0) / 2),
+    });
+  }
+  return shifts.sort((a, b) => b.magnitude - a.magnitude);
+}

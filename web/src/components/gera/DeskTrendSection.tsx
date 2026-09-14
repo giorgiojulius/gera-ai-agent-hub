@@ -8,6 +8,7 @@ import {
   compareDeskPeriods,
   effectiveDeskSpan,
   percentDelta,
+  rankTeammateShifts,
   type DeskPeriodSummary,
   type DeskTrendBucket,
   type DeskTrendGranularity,
@@ -166,10 +167,13 @@ export const DeskTrendSection = memo(function DeskTrendSection({
   timeline,
   range,
   now,
+  teammates = [],
 }: {
   timeline: DeskTimelinePoint[];
   range: DeskStatsRange;
   now: number;
+  /** Admin-only: teammates to rank by period-over-period movement. */
+  teammates?: Array<{ adminId: string; name: string }>;
 }) {
   const [metric, setMetric] = useState<Metric>("replies");
   const [manualGranularity, setManualGranularity] = useState<DeskTrendGranularity | null>(null);
@@ -182,6 +186,10 @@ export const DeskTrendSection = memo(function DeskTrendSection({
     [timeline, range, granularity, now],
   );
   const comparison = useMemo(() => compareDeskPeriods(timeline, range, now), [timeline, range, now]);
+  const shifts = useMemo(
+    () => (teammates.length > 1 ? rankTeammateShifts(timeline, teammates, range, now) : []),
+    [timeline, teammates, range, now],
+  );
 
   if (!span || buckets.length === 0) {
     return null;
@@ -345,6 +353,51 @@ export const DeskTrendSection = memo(function DeskTrendSection({
                 suffix=" pts"
               />
             </ComparisonCard>
+          </div>
+        </div>
+      ) : null}
+
+      {shifts.length > 0 ? (
+        <div className="mt-3" data-testid={TID.screenDeskPerformanceShifts}>
+          <p className="px-1 text-[11px] font-semibold">Who moved most</p>
+          <p className="mt-0.5 px-1 text-[10px] text-muted-foreground">
+            Change between this period and the previous one; teammates without replies in both windows are not ranked.
+          </p>
+          <div className="mt-1.5 divide-y divide-border/60 rounded-xl border border-border/60 bg-background/60">
+            {shifts.map((shift) => (
+              <div key={shift.adminId} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
+                <p className="min-w-0 flex-1 truncate text-xs font-medium">{shift.name}</p>
+                <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+                  quality
+                  {shift.qualityDelta === null ? (
+                    <span>—</span>
+                  ) : (
+                    <Delta
+                      current={shift.current.goodShare}
+                      previous={shift.previous.goodShare}
+                      absolute
+                      suffix=" pts"
+                    />
+                  )}
+                </span>
+                <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+                  speed
+                  {shift.responseDelta === null ? (
+                    <span>—</span>
+                  ) : (
+                    <Delta
+                      current={shift.current.medianResponseMs}
+                      previous={shift.previous.medianResponseMs}
+                      lowerIsBetter
+                    />
+                  )}
+                </span>
+                <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+                  replies
+                  <Delta current={shift.current.replies} previous={shift.previous.replies} />
+                </span>
+              </div>
+            ))}
           </div>
         </div>
       ) : null}

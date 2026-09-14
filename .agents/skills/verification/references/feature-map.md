@@ -1095,8 +1095,23 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   and a "Compared with the previous <equal-length period>" strip (replies,
   conversations, median reply, rated good) with signed deltas; a previous window
   with zero collected replies says so instead of faking a delta. Open-ended
-  ranges derive the span from the data. Section hidden without timeline. Unit:
-  `desk-trends.test.ts` (5). The compact "What to act on" block
+  ranges derive the span from the data. Section hidden without timeline.
+  **Per-teammate dynamics** (2026-09-14, `screen-desk-teammate-trend`): each
+  teammate card gets a collapsed "Dynamics over time" toggle
+  (`screen-desk-teammate-trend-toggle`, shown only when the teammate has timeline
+  points) opening `TeammateTrend.tsx` — four metric tabs (Quality good-share,
+  Reply time median, Within 1h share, Volume stacked by grade) with bars for the
+  teammate coloured by thresholds and a dashed team line over the SAME buckets
+  (`bucketMetricValue`), a model-free one-line verdict
+  (`describeTrend`: streak ≥2 buckets, last-bucket vs earlier mean with noise
+  tolerance, stable, or "not enough data"), and a vs-previous-period strip
+  (replies, median, rated good, within 1h) from the teammate's own points.
+  Admin-only "Who moved most" ranking (`screen-desk-performance-shifts`,
+  `rankTeammateShifts`) inside the team trend section lists quality pts / speed %
+  / replies % deltas sorted by movement, skipping teammates without replies in
+  both windows; hidden when ≤1 teammate is passed (members). Unit:
+  `desk-trends.test.ts` (8); browser: `desk-teammate-trend.browser.test.tsx` (2).
+  The compact "What to act on" block
   reports only operational signals: ungraded backlog, bad replies, >1h slow tail,
   and incomplete scan coverage. Data flows only on demand:
   admin "Analyze conversations" (`screen-desk-performance-analyze`, POST

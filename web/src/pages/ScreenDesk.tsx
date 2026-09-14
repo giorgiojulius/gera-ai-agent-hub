@@ -36,6 +36,7 @@ import {
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  TrendingUp,
   UserRound,
   X,
 } from "lucide-react";
@@ -45,6 +46,7 @@ import { toast } from "sonner";
 
 import { DeskTrendSection } from "@/components/gera/DeskTrendSection";
 import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
+import { TeammateTrend } from "@/components/gera/TeammateTrend";
 import { MarkdownBody } from "@/components/gera/Markdown";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -77,6 +79,7 @@ import {
   type DeskStats,
   type DeskStatsRange,
   type DeskTeammate,
+  type DeskTimelinePoint,
   type IntercomAttr,
   type IntercomContactProfile,
   type IntercomInboxItem,
@@ -1970,7 +1973,12 @@ function PerformancePanel({
           ) : null}
 
           {stats && stats.totalReplies > 0 && stats.timeline && stats.timeline.length > 0 ? (
-            <DeskTrendSection timeline={stats.timeline} range={stats.range} now={stats.now} />
+            <DeskTrendSection
+              timeline={stats.timeline}
+              range={stats.range}
+              now={stats.now}
+              teammates={stats.isAdmin ? stats.teammates : []}
+            />
           ) : null}
 
           {stats && stats.totalReplies > 0 ? (
@@ -2033,6 +2041,9 @@ function PerformancePanel({
                   isAdmin={stats?.isAdmin === true}
                   members={members}
                   onLink={(email) => link(teammate, email)}
+                  timeline={stats?.timeline ?? []}
+                  range={stats?.range ?? { from: 0, to: 0 }}
+                  now={stats?.now ?? Date.now()}
                 />
               ))}
             </div>
@@ -2098,15 +2109,23 @@ function TeammateCard({
   isAdmin,
   members,
   onLink,
+  timeline,
+  range,
+  now,
 }: {
   teammate: DeskTeammate;
   isAdmin: boolean;
   members: Array<{ email: string; name: string }>;
   onLink: (email: string) => Promise<void>;
+  timeline: DeskTimelinePoint[];
+  range: DeskStatsRange;
+  now: number;
 }) {
   const [showExamples, setShowExamples] = useState<boolean>(false);
+  const [showTrend, setShowTrend] = useState<boolean>(false);
   const graded = teammate.good + teammate.bad;
   const goodShare = graded > 0 ? Math.round((teammate.good / graded) * 100) : null;
+  const hasTimeline = timeline.some((point) => point.adminId === teammate.adminId);
 
   return (
     <div className="rounded-2xl border border-border/60 bg-card p-3.5">
@@ -2201,6 +2220,24 @@ function TeammateCard({
             Coaching
           </p>
           <p className="mt-1 text-[11px] leading-relaxed text-violet-900/90">{teammate.coaching}</p>
+        </div>
+      ) : null}
+
+      {hasTimeline ? (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => setShowTrend(!showTrend)}
+            aria-expanded={showTrend}
+            data-testid={`${TID.screenDeskTeammateTrend}-toggle`}
+            className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
+          >
+            <TrendingUp className="h-3 w-3" />
+            {showTrend ? "Hide dynamics" : "Dynamics over time"}
+          </button>
+          {showTrend ? (
+            <TeammateTrend adminId={teammate.adminId} timeline={timeline} range={range} now={now} />
+          ) : null}
         </div>
       ) : null}
 

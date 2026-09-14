@@ -147,6 +147,10 @@ export const TID = {
   screenDeskPerformanceDates: "screen-desk-performance-dates",
   /** Period trend chart + previous-period comparison inside team performance. */
   screenDeskPerformanceTrend: "screen-desk-performance-trend",
+  /** Per-teammate dynamics block (metric tabs, team line, verdict, comparison). */
+  screenDeskTeammateTrend: "screen-desk-teammate-trend",
+  /** "Who moved most" ranking inside the team trend section (admins only). */
+  screenDeskPerformanceShifts: "screen-desk-performance-shifts",
   /** Starts a deep Intercom collection and grading pass. */
   screenDeskPerformanceAnalyze: "screen-desk-performance-analyze",
   /** Clears harvested team-performance results while preserving links. */

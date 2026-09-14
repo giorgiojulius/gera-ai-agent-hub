@@ -259,12 +259,11 @@ export const TeammateTrend = memo(function TeammateTrend({
               tickFormatter={(value: number) => formatMetric(value, metric)}
             />
             <Tooltip cursor={{ fill: "hsl(var(--ember) / 0.08)" }} content={<TeammateTooltip metric={metric} />} />
+            {/* No fragment here: recharts (react-is 18) cannot see Bars nested inside a React 19 fragment. */}
+            {metric === "replies" ? <Bar dataKey="good" stackId="v" fill={GOOD} isAnimationActive={false} /> : null}
+            {metric === "replies" ? <Bar dataKey="bad" stackId="v" fill={BAD} isAnimationActive={false} /> : null}
             {metric === "replies" ? (
-              <>
-                <Bar dataKey="good" stackId="v" fill={GOOD} isAnimationActive={false} />
-                <Bar dataKey="bad" stackId="v" fill={BAD} isAnimationActive={false} />
-                <Bar dataKey="ungraded" stackId="v" fill={MUTED} radius={[3, 3, 0, 0]} isAnimationActive={false} />
-              </>
+              <Bar dataKey="ungraded" stackId="v" fill={MUTED} radius={[3, 3, 0, 0]} isAnimationActive={false} />
             ) : (
               <Bar dataKey="own" radius={[3, 3, 0, 0]} isAnimationActive={false}>
                 {rows.map((row) => (

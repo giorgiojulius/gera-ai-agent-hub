@@ -2209,7 +2209,7 @@ function TeammateCard({
         </div>
       ) : (
         <p className="mt-2 text-[10px] text-muted-foreground">
-          Not graded yet — {isAdmin ? "press Collect & grade above." : "an admin grades on demand."}
+          Not graded yet — {isAdmin ? "press Analyze conversations above." : "an admin grades on demand."}
         </p>
       )}
 

@@ -1106,7 +1106,12 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   (`describeTrend`: streak ≥2 buckets, last-bucket vs earlier mean with noise
   tolerance, stable, or "not enough data"), and a vs-previous-period strip
   (replies, median, rated good, within 1h) from the teammate's own points.
-  Admin-only "Who moved most" ranking (`screen-desk-performance-shifts`,
+  Volume charts (team + teammate) render each stacked `Bar` as a direct child of
+  the chart — recharts 2 ships react-is 18, which cannot see children wrapped in
+  a React 19 fragment, so the Volume tab used to draw an empty grid (fixed
+  2026-09-14; the browser test counts `.recharts-bar-rectangle` and imports
+  `@/index.css` so chart boxes have real height). Admin-only "Who moved most"
+  ranking (`screen-desk-performance-shifts`,
   `rankTeammateShifts`) inside the team trend section lists quality pts / speed %
   / replies % deltas sorted by movement, skipping teammates without replies in
   both windows; hidden when ≤1 teammate is passed (members). Unit:

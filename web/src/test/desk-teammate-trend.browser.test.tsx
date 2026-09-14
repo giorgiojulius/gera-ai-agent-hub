@@ -1,6 +1,9 @@
 import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
 
+// Real stylesheet: the chart boxes get their height from Tailwind classes, and
+// recharts draws nothing into a zero-height container.
+import "@/index.css";
 import { DeskTrendSection } from "@/components/gera/DeskTrendSection";
 import { TeammateTrend } from "@/components/gera/TeammateTrend";
 import type { DeskTimelinePoint } from "@/lib/projects";
@@ -61,7 +64,16 @@ test("teammate dynamics: verdict, metric tabs and previous-period comparison fol
   await expect.element(page.getByTestId(`${TID.screenDeskTeammateTrend}-verdict`)).toHaveTextContent(
     "Latest day: volume below the earlier level (1 vs 2 before).",
   );
+  // Regression: the stacked Volume bars must actually render (recharts 2 + react-is 18
+  // silently dropped Bars wrapped in a React 19 fragment — the chart came out empty).
+  await expect.poll(() => drawnBars(TID.screenDeskTeammateTrend), { timeout: 5000 }).toBeGreaterThan(0);
 });
+
+/** Count of bar rectangles recharts drew inside the given test-id block. */
+function drawnBars(testId: string): number {
+  const root = document.querySelector(`[data-testid="${testId}"]`);
+  return root ? root.querySelectorAll(".recharts-bar-rectangle path").length : 0;
+}
 
 test("team trend ranks who moved most for admins and hides the ranking for a single visible teammate", async () => {
   const screen = await render(
@@ -75,6 +87,9 @@ test("team trend ranks who moved most for admins and hides the ranking for a sin
       ]}
     />,
   );
+
+  // Volume is the default team metric; its stacked bars must be drawn, not an empty grid.
+  await expect.poll(() => drawnBars(TID.screenDeskPerformanceTrend), { timeout: 5000 }).toBeGreaterThan(0);
 
   const shifts = page.getByTestId(TID.screenDeskPerformanceShifts);
   await expect.element(shifts).toBeVisible();

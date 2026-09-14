@@ -16,6 +16,7 @@ import {
   deriveReplyPairs,
   deriveThreadParts,
   extractSpendValue,
+  harvestSearchQuery,
   intercomNextCursor,
   moneyValue,
   rankInboxRows,
@@ -494,6 +495,26 @@ describe("intercomNextCursor", () => {
     expect(intercomNextCursor({ pages: { next: { starting_after: "cursor-2" } } })).toBe("cursor-2");
     expect(intercomNextCursor({ pages: { next: null } })).toBe("");
     expect(intercomNextCursor({ pages: "invalid" })).toBe("");
+  });
+});
+
+describe("harvestSearchQuery", () => {
+  it("bounds the upper side by created_at so later-touched conversations are still scanned", () => {
+    const from = Date.UTC(2026, 5, 1);
+    const to = Date.UTC(2026, 5, 30, 23, 59, 59);
+    expect(harvestSearchQuery(from, to)).toEqual({
+      operator: "AND",
+      value: [
+        { field: "updated_at", operator: ">", value: Math.floor(from / 1000) - 1 },
+        { field: "created_at", operator: "<", value: Math.ceil(to / 1000) + 1 },
+      ],
+    });
+  });
+
+  it("keeps single-sided and open ranges honest", () => {
+    expect(harvestSearchQuery(0, 0)).toEqual({ field: "updated_at", operator: ">", value: 0 });
+    expect(harvestSearchQuery(5_000, 0)).toEqual({ field: "updated_at", operator: ">", value: 4 });
+    expect(harvestSearchQuery(0, 5_000)).toEqual({ field: "created_at", operator: "<", value: 6 });
   });
 });
 

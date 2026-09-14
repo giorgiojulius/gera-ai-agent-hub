@@ -1173,9 +1173,30 @@ export function intercomNextCursor(data: Record<string, unknown>): string {
 }
 
 /**
+ * Search query that can never miss a conversation holding a reply inside
+ * [from, to]: the conversation must already exist before the range ends
+ * (created_at < to) and must have seen activity after it starts
+ * (updated_at > from). Bounding the upper side by updated_at would drop
+ * conversations that were touched again after the range closed.
+ */
+export function harvestSearchQuery(from: number, to: number): Record<string, unknown> {
+  const filters: Array<Record<string, unknown>> = [];
+  if (from > 0) {
+    filters.push({ field: "updated_at", operator: ">", value: Math.max(0, Math.floor(from / 1000) - 1) });
+  }
+  if (to > 0) {
+    filters.push({ field: "created_at", operator: "<", value: Math.ceil(to / 1000) + 1 });
+  }
+  if (filters.length === 0) {
+    return { field: "updated_at", operator: ">", value: 0 };
+  }
+  return filters.length === 1 ? filters[0] : { operator: "AND", value: filters };
+}
+
+/**
  * Teammate replies + full transcripts across a bounded, paginated Intercom
- * search. Search narrows by conversation activity; reply timestamps enforce
- * the exact range after each full transcript is fetched.
+ * search. Search narrows by conversation lifetime overlapping the range;
+ * reply timestamps enforce the exact range after each full transcript is fetched.
  */
 export async function harvestIntercomReplyPairs(
   token: string,
@@ -1191,21 +1212,8 @@ export async function harvestIntercomReplyPairs(
 
   while (conversations.length < maxConversations) {
     const remaining = maxConversations - conversations.length;
-    const filters: Array<Record<string, unknown>> = [];
-    if (from > 0) {
-      filters.push({ field: "updated_at", operator: ">", value: Math.max(0, Math.floor(from / 1000) - 1) });
-    }
-    if (to > 0) {
-      filters.push({ field: "updated_at", operator: "<", value: Math.ceil(to / 1000) + 1 });
-    }
-    const query =
-      filters.length === 0
-        ? { field: "updated_at", operator: ">", value: 0 }
-        : filters.length === 1
-          ? filters[0]
-          : { operator: "AND", value: filters };
     const data = await relay(token, region, "POST", "/conversations/search", {
-      query,
+      query: harvestSearchQuery(from, to),
       pagination: {
         per_page: Math.min(150, remaining),
         ...(startingAfter ? { starting_after: startingAfter } : {}),

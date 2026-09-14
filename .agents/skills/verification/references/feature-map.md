@@ -1115,7 +1115,9 @@ at `/projects/:id/screens/:sid` (`screen-desk`; the open case rides
   reports only operational signals: ungraded backlog, bad replies, >1h slow tail,
   and incomplete scan coverage. Data flows only on demand:
   admin "Analyze conversations" (`screen-desk-performance-analyze`, POST
-  `/intercom/stats/refresh`) uses Intercom Search date filters and cursor pages to
+  `/intercom/stats/refresh`) uses Intercom Search date filters (`harvestSearchQuery`:
+  `updated_at > from AND created_at < to`, so conversations touched again AFTER the
+  range still get scanned — fixed 2026-09-14) and cursor pages to
   scan/read up to 300 matching conversations via `harvestIntercomReplyPairs` /
   `deriveReplyPairs` (human admin comments paired with the customer message they
   answered; bots and notes skipped; exact reply-date filter; dedup by part id into

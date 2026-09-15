@@ -101,11 +101,15 @@ const ROW_TTL_MS = 48 * 3_600_000;
 /** Generated media chunks are GC'd after this (chat refs resolve until then). */
 const MEDIA_TTL_MS = 7 * 24 * 3_600_000;
 const MEDIA_CHUNK_CHARS = 900_000;
-/** Honest wall-clock budgets per run kind. */
+/**
+ * Honest wall-clock budgets per run kind. Flagship reasoning models at high
+ * effort spend minutes thinking before the first token, and a long agentic
+ * chat chains many such rounds — 15 minutes cut them off mid-work.
+ */
 const TIME_BUDGET_MS: Record<RunKind, number> = {
-  chat: 15 * 60_000,
-  research: 40 * 60_000,
-  julius: 40 * 60_000,
+  chat: 40 * 60_000,
+  research: 60 * 60_000,
+  julius: 60 * 60_000,
 };
 const MAX_LIVE_RUNS_PER_OWNER = 3;
 

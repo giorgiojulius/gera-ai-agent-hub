@@ -1169,7 +1169,7 @@ export async function sendPrompt(params: {
       });
       manualStop = done.status === "stopped";
       executionOutcome = normalizeExecutionOutcome(done.message.execution);
-      const patch = await settleDone(done, usageCapture);
+      const patch = { ...(await settleDone(done, usageCapture)), ...failedRunBubblePatch(done, done.message.content) };
       if (wantJulius && patch.julius) {
         if (patch.julius.status === "error") {
           patchAssistant({ julius: patch.julius });
@@ -1312,7 +1312,7 @@ export async function sendPrompt(params: {
     });
     manualStop = done.status === "stopped";
     executionOutcome = normalizeExecutionOutcome(done.message.execution);
-    patchAssistant(await settleDone(done, usageCapture));
+    patchAssistant({ ...(await settleDone(done, usageCapture)), ...failedRunBubblePatch(done, done.message.content) });
     reconcileServerClock(params.setState, seeded.id, done.chatUpdatedAt);
     if (done.status === "error") {
       turnFailed = true;
@@ -1723,6 +1723,19 @@ function logServerRunFailure(done: ServerRunDone): void {
   logDiagnostic("chat", done.error ?? "The run failed on the server");
 }
 
+/**
+ * A failed cloud run that produced NO text used to leave a blank bubble with
+ * only a toast — gone the moment it faded. The honest reason belongs in the
+ * bubble itself (a streamed draft is never overwritten; it stays exactly as
+ * shown with the continuable marker).
+ */
+function failedRunBubblePatch(done: ServerRunDone, shown: string): Partial<ChatMessage> {
+  if (done.status !== "error" || shown.trim().length > 0) {
+    return {};
+  }
+  return { content: done.error ?? "The run failed on the server before any reply arrived.", interrupted: undefined };
+}
+
 // ---------------------------------------------------------------------------
 // Server-run adoption: a (re)opened tab picks up runs that live on the backend.
 
@@ -1842,7 +1855,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
       });
       manualStop = done.status === "stopped";
       executionOutcome = normalizeExecutionOutcome(done.message.execution);
-      patchAssistant(await settleDone(done, usageCapture));
+      patchAssistant({ ...(await settleDone(done, usageCapture)), ...failedRunBubblePatch(done, done.message.content) });
       reconcileServerClock(params.setState, conversationId, done.chatUpdatedAt);
       void ackServerRun(run.runId);
       if (done.status === "error") {

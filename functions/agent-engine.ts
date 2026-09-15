@@ -17,6 +17,13 @@
 // `finish_reason: "length"` is continued in place — the model picks up where
 // it was cut and the seam is spliced (`joinCutText`) until the reply is done.
 //
+// Transport is not trusted to be perfect either: a stream that ends WITHOUT
+// the provider's terminal marker (proxy time limit, connection reset, an
+// error chunk under HTTP 200, a stalled socket) is a cut, never a finished
+// reply — the streamed text is kept and the SAME reply continues over a fresh
+// connection; a request that fails before any token (429/5xx, network) is
+// retried with backoff. Only repeated failures surface, and then honestly.
+//
 // Server-side toolkit calls MUST send `Authorization: Bearer <key>` — only
 // browser builds get delegated auth injected by the Rork runtime.
 
@@ -213,6 +220,8 @@ export type RetryOptions<T> = {
   baseDelayMs?: number;
   isCancelled?: () => boolean;
   shouldRetryResult?: (value: T) => boolean;
+  /** Errors this rejects are thrown at once instead of being retried (default: retry every error). */
+  shouldRetryError?: (error: unknown) => boolean;
 };
 
 /** Transient-failure retry; cancellation is never retried. */
@@ -241,10 +250,63 @@ export async function withRetries<T>(run: () => Promise<T>, options: RetryOption
       if (options.isCancelled?.()) {
         throw error;
       }
+      if (options.shouldRetryError && !options.shouldRetryError(error)) {
+        throw error;
+      }
       lastError = error;
     }
   }
   throw lastError;
+}
+
+/** The gateway answered a completion request with a non-2xx status before any token streamed. */
+export class GatewayRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, body: string) {
+    super(`gateway ${status}: ${body.slice(0, 260)}`);
+    this.name = "GatewayRequestError";
+    this.status = status;
+  }
+}
+
+/**
+ * The completion stream ended without the provider finishing the reply and
+ * the engine could not (or may no longer) continue it: nothing usable had
+ * arrived, or the connection kept dropping. A cut AFTER text arrived is
+ * reported on the result as `cut` instead, so the text is kept and continued.
+ */
+export class GatewayStreamCutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GatewayStreamCutError";
+  }
+}
+
+/**
+ * Pacing of automatic recovery (a pause before reconnecting a dropped reply,
+ * the first backoff of a failed request). Mutable only as a test seam so the
+ * suites do not wait out real seconds; production never changes it.
+ */
+export const engineDelays = { cutContinueMs: 1_000, retryBaseMs: 1_500 };
+
+/**
+ * Whether a failed gateway call is worth repeating unchanged: overload and
+ * rate limits (429, 5xx), request timeouts, network resets and streams that
+ * dropped before any token. Client-side mistakes (400, 401, 404) are not.
+ */
+export function isTransientGatewayError(error: unknown): boolean {
+  if (error instanceof GatewayStreamCutError) {
+    return true;
+  }
+  if (error instanceof GatewayRequestError) {
+    return error.status === 408 || error.status === 425 || error.status === 429 || error.status >= 500;
+  }
+  if (typeof DOMException !== "undefined" && error instanceof DOMException) {
+    return error.name === "AbortError" || error.name === "TimeoutError";
+  }
+  // fetch() rejects with a TypeError on connection failures and resets.
+  return error instanceof TypeError;
 }
 
 function sortKeysDeep(value: unknown): unknown {
@@ -428,11 +490,61 @@ export function buildApiMessages(history: WireMessage[], customSystemPrompt?: st
 
 type SseReadStep =
   | { kind: "read"; result: ReadableStreamReadResult<Uint8Array> }
+  | { kind: "failed"; error: unknown }
+  | { kind: "idle" }
   | { kind: "soft" };
 
+/** How a completion stream ended — only "done" and "soft" are clean endings. */
+export type SseEnding =
+  | { kind: "done" }
+  | { kind: "soft" }
+  | { kind: "eof"; detail: string }
+  | { kind: "failed"; detail: string };
+
+type SseOutcome = { ending: SseEnding };
+
+/**
+ * A stream silent this long is treated as dead. Some providers think without
+ * streaming anything for minutes, so the guard is generous — but a socket
+ * that has said nothing for a quarter of an hour will never speak again, and
+ * without this guard the round would hang forever with nothing to continue.
+ */
+export const STREAM_IDLE_MS = 15 * 60_000;
+
+/** Parses the `data:` lines of one SSE block; blank frames are keepalives, not endings. */
+function* sseBlockEvents(block: string, outcome: SseOutcome): Generator<Record<string, unknown>> {
+  for (const line of block.split("\n")) {
+    if (!line.startsWith("data:")) {
+      continue;
+    }
+    const data = line.slice(5).trim();
+    if (!data) {
+      continue;
+    }
+    if (data === "[DONE]") {
+      outcome.ending = { kind: "done" };
+      return;
+    }
+    try {
+      yield JSON.parse(data) as Record<string, unknown>;
+    } catch {
+      // ignore partial JSON
+    }
+  }
+}
+
+/**
+ * Reads one completion stream event by event and records HOW it ended in
+ * `outcome`: the provider's `[DONE]`, the caller's soft stop, a connection
+ * that closed early (`eof`), or a read that threw / went silent (`failed`).
+ * Read errors are reported, not thrown, so the caller keeps every event that
+ * arrived before the failure.
+ */
 async function* iterateSse(
   response: Response,
+  outcome: SseOutcome,
   softStop?: AbortSignal,
+  idleMs: number = STREAM_IDLE_MS,
 ): AsyncGenerator<Record<string, unknown>> {
   if (!response.body) {
     throw new Error("No response stream.");
@@ -452,43 +564,98 @@ async function* iterateSse(
         softStop.addEventListener("abort", settle, { once: true });
       })
     : null;
+  const nextStep = async (): Promise<SseReadStep> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const idle = new Promise<SseReadStep>((resolve) => {
+      timer = globalThis.setTimeout(() => resolve({ kind: "idle" }), idleMs);
+    });
+    const read = reader.read().then(
+      (result): SseReadStep => ({ kind: "read", result }),
+      (error: unknown): SseReadStep => ({ kind: "failed", error }),
+    );
+    try {
+      return await Promise.race(softStopped ? [read, idle, softStopped] : [read, idle]);
+    } finally {
+      if (timer !== undefined) {
+        globalThis.clearTimeout(timer);
+      }
+    }
+  };
+  const drop = (): Promise<void> => reader.cancel().catch(() => undefined);
 
   while (true) {
-    const step: SseReadStep = softStopped
-      ? await Promise.race([
-          reader.read().then((result) => ({ kind: "read" as const, result })),
-          softStopped,
-        ])
-      : { kind: "read", result: await reader.read() };
+    const step = await nextStep();
     if (step.kind === "soft") {
       // Graceful cut — the caller keeps everything streamed so far.
-      await reader.cancel().catch(() => undefined);
+      await drop();
+      outcome.ending = { kind: "soft" };
+      return;
+    }
+    if (step.kind === "idle") {
+      await drop();
+      outcome.ending = { kind: "failed", detail: `the model sent nothing for ${Math.max(1, Math.round(idleMs / 60_000))} minutes` };
+      return;
+    }
+    if (step.kind === "failed") {
+      const message = step.error instanceof Error ? step.error.message : "read failed";
+      outcome.ending = { kind: "failed", detail: `the connection failed mid-reply: ${message.slice(0, 160)}` };
       return;
     }
     const { done, value } = step.result;
     if (done) {
-      break;
+      // A final block without its trailing blank line still counts.
+      const tail = buffer + decoder.decode();
+      buffer = "";
+      outcome.ending = { kind: "eof", detail: "the connection closed before the reply finished" };
+      if (tail.trim().length > 0) {
+        yield* sseBlockEvents(tail, outcome);
+      }
+      return;
     }
     buffer += decoder.decode(value, { stream: true });
     const chunks = buffer.split("\n\n");
     buffer = chunks.pop() ?? "";
     for (const chunk of chunks) {
-      for (const line of chunk.split("\n")) {
-        if (!line.startsWith("data:")) {
-          continue;
-        }
-        const data = line.slice(5).trim();
-        if (!data || data === "[DONE]") {
-          return;
-        }
-        try {
-          yield JSON.parse(data) as Record<string, unknown>;
-        } catch {
-          // ignore partial JSON
-        }
+      yield* sseBlockEvents(chunk, outcome);
+      if (outcome.ending.kind === "done") {
+        await drop();
+        return;
       }
     }
   }
+}
+
+/** A stream that ended without the provider finishing the reply. */
+export type StreamCut = {
+  /** "dropped": the connection closed, failed or went silent; "error": the gateway streamed an error. */
+  kind: "dropped" | "error";
+  detail: string;
+};
+
+/** Human-readable text of an error object the gateway streamed under HTTP 200. */
+function describeStreamError(payload: unknown): string {
+  if (typeof payload === "string" && payload.trim()) {
+    return payload.slice(0, 200);
+  }
+  if (!payload || typeof payload !== "object") {
+    return "the gateway reported a stream error";
+  }
+  const record = payload as { message?: unknown; value?: unknown };
+  // Some gateway builds bury the upstream reason as a JSON string inside
+  // `value.error_message` behind a generic top-level message — dig it out.
+  const nested = record.value as { error_message?: unknown } | undefined;
+  if (nested && typeof nested === "object" && typeof nested.error_message === "string" && nested.error_message.trim()) {
+    try {
+      const parsed = JSON.parse(nested.error_message) as { error?: { message?: unknown } };
+      if (typeof parsed.error?.message === "string" && parsed.error.message) {
+        return parsed.error.message.slice(0, 200);
+      }
+    } catch {
+      // not JSON — use the raw text
+    }
+    return nested.error_message.slice(0, 200);
+  }
+  return typeof record.message === "string" && record.message ? record.message.slice(0, 200) : "the gateway reported a stream error";
 }
 
 export type StreamCompletionParams = {
@@ -511,6 +678,8 @@ export type StreamCompletionParams = {
   maxOutputTokens?: number;
   /** Soft stop: stops READING gracefully and resolves with whatever accumulated. */
   softStop?: AbortSignal;
+  /** Silence on the stream this long is a dead connection (default STREAM_IDLE_MS). */
+  streamIdleMs?: number;
   handlers: EngineHandlers;
   /** Bills the tokens to the model that actually answered. */
   onUsage?: (modelId: string, usage: unknown) => void;
@@ -527,6 +696,13 @@ export type StreamCompletionResult = {
    * providers that omit it).
    */
   finishReason?: string;
+  /**
+   * Set when the stream ended before the provider finished the reply — the
+   * connection dropped, went silent, or the gateway streamed an error — and
+   * text had already arrived. `content` is that text; the reply is NOT
+   * complete and must be continued, never shown as finished.
+   */
+  cut?: StreamCut;
 };
 
 /** Positive whole token count, or undefined for anything the gateway would reject. */
@@ -584,7 +760,7 @@ export async function streamGatewayCompletion(params: StreamCompletionParams): P
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     if (outputCap === undefined || !rejectsOutputCap(response.status, text)) {
-      throw new Error(`gateway ${response.status}: ${text.slice(0, 260)}`);
+      throw new GatewayRequestError(response.status, text);
     }
     // The catalog ceiling did not fit this call (a fallback model with a
     // smaller cap, or a long thread where input + max_tokens exceeds the
@@ -592,7 +768,7 @@ export async function streamGatewayCompletion(params: StreamCompletionParams): P
     response = await request(undefined);
     if (!response.ok) {
       const retryText = await response.text().catch(() => "");
-      throw new Error(`gateway ${response.status}: ${retryText.slice(0, 260)}`);
+      throw new GatewayRequestError(response.status, retryText);
     }
   }
 
@@ -602,8 +778,11 @@ export async function streamGatewayCompletion(params: StreamCompletionParams): P
   /** Model the gateway ACTUALLY routed to — differs from the pick on fallback. */
   let servedModel = "";
   let finishReason: string | undefined;
+  /** An error the gateway streamed as an event (HTTP 200) — the reply did not finish. */
+  let streamError = "";
   const toolAcc = new Map<number, { id: string; name: string; arguments: string }>();
   const images: string[] = [];
+  const outcome: SseOutcome = { ending: { kind: "eof", detail: "the connection closed before the reply finished" } };
 
   /** Providers disagree on the reasoning delta shape — accept every known one. */
   const reasoningPiece = (source: Record<string, unknown>): string => {
@@ -626,11 +805,14 @@ export async function streamGatewayCompletion(params: StreamCompletionParams): P
     return "";
   };
 
-  for await (const event of iterateSse(response, params.softStop)) {
+  for await (const event of iterateSse(response, outcome, params.softStop, params.streamIdleMs)) {
     const choices = event.choices as Array<Record<string, unknown>> | undefined;
     const delta = (choices?.[0]?.delta ?? {}) as Record<string, unknown>;
     const message = (choices?.[0]?.message ?? {}) as Record<string, unknown>;
 
+    if (event.error !== undefined && event.error !== null) {
+      streamError = describeStreamError(event.error);
+    }
     if (event.usage && typeof event.usage === "object") {
       finalUsage = event.usage;
     }
@@ -714,7 +896,41 @@ export async function streamGatewayCompletion(params: StreamCompletionParams): P
       function: { name: call.name, arguments: call.arguments || "{}" },
     }));
 
-  return { content, toolCalls, images, servedModelId: servedModel || undefined, finishReason };
+  // Only the provider finishes a reply. A soft stop is the caller's own cut.
+  // An error event (or finish_reason "error") means the reply broke off even
+  // under HTTP 200. Otherwise a stream that closed, failed or went silent
+  // without the terminal marker is finished only when the provider had
+  // already sent its finish_reason or the final usage chunk (both come after
+  // the last token) — without either, the model was still writing.
+  const ending = outcome.ending;
+  let cut: StreamCut | undefined;
+  if (ending.kind !== "soft") {
+    if (streamError) {
+      cut = { kind: "error", detail: streamError };
+    } else if (finishReason === "error") {
+      cut = { kind: "error", detail: "the provider ended the reply with an error" };
+    } else if (
+      (ending.kind === "eof" || ending.kind === "failed") &&
+      finishReason === undefined &&
+      finalUsage === null
+    ) {
+      cut = { kind: "dropped", detail: ending.detail };
+    }
+  }
+  if (cut && content.trim().length === 0) {
+    // Nothing usable arrived (at most a half-assembled tool call): the whole
+    // request failed and is simply repeated unchanged by the caller's retry.
+    throw new GatewayStreamCutError(`the model connection dropped before any reply arrived — ${cut.detail}`);
+  }
+
+  return {
+    content,
+    toolCalls,
+    images,
+    servedModelId: servedModel || undefined,
+    finishReason,
+    ...(cut ? { cut } : {}),
+  };
 }
 
 /** Overlaps shorter than this are too coincidence-prone to dedupe. */
@@ -781,6 +997,62 @@ export const CUT_TOOLCALL_NOTE =
 export const CUT_EMPTY_NOTE =
   "[continuation] The output-length limit was reached before any visible reply text was produced. Write the answer itself now, directly and without lengthy deliberation; if the task is large, start delivering it — you will be asked to continue.";
 
+/**
+ * Rides along when the CONNECTION carrying a round dropped mid-reply (proxy
+ * time limit, provider hiccup, an error streamed under HTTP 200). The kept
+ * text stays on screen; the model repeats a few words so the seam can be
+ * spliced (joinCutText), then keeps writing over a fresh connection.
+ */
+export const CUT_DROPPED_NOTE =
+  "[continuation] The connection carrying your reply above dropped mid-generation — the reply is NOT finished, and the user sees it exactly as written. What you write now is appended directly after it as one continuous reply. First repeat, verbatim, the last few words before the cut (a handful of words, at most one short line — the app splices the overlap automatically), then keep writing from exactly that point. Do not restart, summarize, apologize, or mention the interruption. If the cut fell inside a code block, the fence is still open: keep writing the code without opening a new fence and close it when the code ends. Any tool call you were emitting when the connection dropped did NOT run — issue it again in full if you still need it.";
+
+/** Consecutive rounds a single reply may lose to dropped connections before the run gives up honestly. */
+export const MAX_DROPPED_ROUNDS = 8;
+/** Attempts for one gateway request that fails before any token (429, 5xx, network, empty cut). */
+export const GATEWAY_ATTEMPTS = 3;
+
+/** Honest wording for a reply whose connection kept dropping. */
+function droppedTooOften(modelId: string, drops: number, detail: string): GatewayStreamCutError {
+  return new GatewayStreamCutError(
+    `the connection to ${modelTail(parseSelection(modelId || DEFAULT_CHAT_MODEL).catalogId)} dropped mid-reply ${drops} times in a row (${detail}) — the text received so far is kept; say “continue” to pick up from there`,
+  );
+}
+
+/**
+ * One completion request, repeated with backoff while it fails BEFORE any
+ * token (overload, rate limit, network reset, a stream that dropped empty).
+ * A stop ends the wait with the failure; a soft stop (steering) that lands
+ * while waiting ends it as an empty soft-cut round so the guidance is woven
+ * in without a wasted request.
+ */
+async function streamRoundWithRetries(
+  request: () => Promise<StreamCompletionResult>,
+  options: { isStopped?: () => boolean; soft?: AbortSignal; onRetry?: () => void } = {},
+): Promise<StreamCompletionResult> {
+  let lastError: unknown = new Error("Nothing was attempted.");
+  for (let attempt = 0; attempt < GATEWAY_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) {
+      options.onRetry?.();
+      await sleep(Math.min(engineDelays.retryBaseMs * 2 ** (attempt - 1), 6_000));
+      if (options.isStopped?.()) {
+        throw lastError;
+      }
+      if (options.soft?.aborted) {
+        return { content: "", toolCalls: [], images: [] };
+      }
+    }
+    try {
+      return await request();
+    } catch (error) {
+      if (options.isStopped?.() || !isTransientGatewayError(error)) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
 export type StreamTextParams = Omit<StreamCompletionParams, "tools" | "softStop" | "handlers"> & {
   handlers: Pick<EngineHandlers, "onText" | "onReasoning">;
   /** Stops chaining continuations (the in-flight stream still finishes). */
@@ -803,6 +1075,7 @@ export async function streamGatewayText(params: StreamTextParams): Promise<Strea
   let base = "";
   let lastChunk = "";
   let emptyRounds = 0;
+  let droppedRounds = 0;
   let servedModelId: string | undefined;
   const stitch = (text: string): string => (base.length === 0 ? text : joinCutText(base, text));
   const settle = (content: string, finishReason?: string): StreamCompletionResult => ({
@@ -813,18 +1086,35 @@ export async function streamGatewayText(params: StreamTextParams): Promise<Strea
     finishReason,
   });
   for (let round = 0; round < MAX_AGENT_STEPS; round += 1) {
-    const completion = await streamGatewayCompletion({
-      ...rest,
-      messages,
-      tools: [],
-      handlers: {
-        onText: (full) => handlers.onText(stitch(full)),
-        ...(handlers.onReasoning ? { onReasoning: handlers.onReasoning } : {}),
-      },
-    });
+    const completion = await streamRoundWithRetries(
+      () =>
+        streamGatewayCompletion({
+          ...rest,
+          messages,
+          tools: [],
+          handlers: {
+            onText: (full) => handlers.onText(stitch(full)),
+            ...(handlers.onReasoning ? { onReasoning: handlers.onReasoning } : {}),
+          },
+        }),
+      { isStopped: isCancelled },
+    );
     images.push(...completion.images);
     servedModelId = completion.servedModelId ?? servedModelId;
     const shown = stitch(completion.content);
+    if (completion.cut && !isCancelled?.()) {
+      // The connection dropped while the text was still coming — keep it and
+      // continue the SAME text over a fresh connection.
+      droppedRounds += 1;
+      if (droppedRounds > MAX_DROPPED_ROUNDS) {
+        throw droppedTooOften(params.modelId, droppedRounds, completion.cut.detail);
+      }
+      base = shown;
+      lastChunk = completion.content;
+      messages.push({ role: "assistant", content: completion.content }, { role: "system", content: CUT_DROPPED_NOTE });
+      await sleep(engineDelays.cutContinueMs);
+      continue;
+    }
     if (completion.finishReason !== "length" || isCancelled?.()) {
       return settle(shown, completion.finishReason);
     }
@@ -1001,6 +1291,8 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
   let cutToolRounds = 0;
   /** The previous cut chunk — an identical repeat means the model is stuck, not writing. */
   let lastCutChunk = "";
+  /** Consecutive rounds lost to a dropped connection; a round that finishes resets it. */
+  let droppedRounds = 0;
   const handlers: EngineHandlers = {
     ...params.handlers,
     onText: (full) => params.handlers.onText(stitch(full)),
@@ -1059,17 +1351,21 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
             ? `${lastContent}\n\nThis reply reached the maximum length one message can hold. Say “continue” and I’ll pick up exactly where it stopped.`
             : `I paused this run after ${allToolCalls.length} tool calls. Everything gathered is shown above — say “continue” and I’ll pick up from there.`;
     try {
-      const completion = await streamGatewayCompletion({
-        authKey: params.authKey,
-        modelId: params.modelId,
-        gatewayUrl: params.gatewayUrl,
-        messages: apiMessages,
-        tools: [],
-        fallbacks: params.fallbacks,
-        maxOutputTokens: params.maxOutputTokens,
-        handlers,
-        onUsage: params.onUsage,
-      });
+      const completion = await streamRoundWithRetries(
+        () =>
+          streamGatewayCompletion({
+            authKey: params.authKey,
+            modelId: params.modelId,
+            gatewayUrl: params.gatewayUrl,
+            messages: apiMessages,
+            tools: [],
+            fallbacks: params.fallbacks,
+            maxOutputTokens: params.maxOutputTokens,
+            handlers,
+            onUsage: params.onUsage,
+          }),
+        { isStopped: params.isStopped },
+      );
       noteServed(completion.servedModelId);
       images.push(...completion.images);
       const content =
@@ -1125,20 +1421,31 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
     // letting guidance wait for the round to finish.
     const soft = params.watchSteering ? new AbortController() : null;
     const unwatch = soft ? params.watchSteering?.(() => soft.abort()) : undefined;
-    let completion: Awaited<ReturnType<typeof streamGatewayCompletion>>;
+    let completion: StreamCompletionResult;
     try {
-      completion = await streamGatewayCompletion({
-        authKey: params.authKey,
-        modelId: params.modelId,
-        gatewayUrl: params.gatewayUrl,
-        messages: apiMessages,
-        tools: params.tools,
-        fallbacks: params.fallbacks,
-        maxOutputTokens: params.maxOutputTokens,
-        softStop: soft?.signal,
-        handlers,
-        onUsage: params.onUsage,
-      });
+      // A request that fails before any token (overload, rate limit, a reset
+      // connection) is repeated with backoff instead of failing the reply.
+      completion = await streamRoundWithRetries(
+        () =>
+          streamGatewayCompletion({
+            authKey: params.authKey,
+            modelId: params.modelId,
+            gatewayUrl: params.gatewayUrl,
+            messages: apiMessages,
+            tools: params.tools,
+            fallbacks: params.fallbacks,
+            maxOutputTokens: params.maxOutputTokens,
+            softStop: soft?.signal,
+            handlers,
+            onUsage: params.onUsage,
+          }),
+        {
+          isStopped: params.isStopped,
+          soft: soft?.signal,
+          // A failed attempt may have shown half-assembled tool chips — clear them.
+          onRetry: () => params.handlers.onToolCalls?.(allToolCalls.map((call) => ({ ...call }))),
+        },
+      );
     } finally {
       unwatch?.();
     }
@@ -1180,6 +1487,35 @@ export async function runEngineTurn(params: EngineTurnParams): Promise<EngineTur
       staleRounds = 0;
       continue;
     }
+
+    if (completion.cut) {
+      // The CONNECTION dropped while the model was still writing (proxy time
+      // limit, provider hiccup, an error streamed under HTTP 200). The reply
+      // is not finished and must never be shown as such: keep the text exactly
+      // as shown, drop the round's half-assembled tool calls (they never ran),
+      // and continue the SAME reply over a fresh connection. Only a connection
+      // that keeps dropping ends the run, and then honestly.
+      droppedRounds += 1;
+      if (droppedRounds > MAX_DROPPED_ROUNDS) {
+        if (completion.toolCalls.length > 0) {
+          params.handlers.onToolCalls?.(allToolCalls.map((call) => ({ ...call })));
+        }
+        throw droppedTooOften(params.modelId, droppedRounds, completion.cut.detail);
+      }
+      const draft = completion.content;
+      apiMessages.push({ role: "assistant", content: draft }, { role: "system", content: CUT_DROPPED_NOTE });
+      contentBase = stitch(draft);
+      spliceCut = true;
+      lastContent = contentBase;
+      if (completion.toolCalls.length > 0) {
+        // The cut round's ghost tool chips disappear from the UI.
+        params.handlers.onToolCalls?.(allToolCalls.map((call) => ({ ...call })));
+      }
+      staleRounds = 0;
+      await sleep(engineDelays.cutContinueMs);
+      continue;
+    }
+    droppedRounds = 0;
 
     if (completion.finishReason === "length") {
       // The provider ended the round at its output-token limit — the reply is

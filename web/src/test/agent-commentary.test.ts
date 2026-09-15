@@ -22,7 +22,9 @@ function sseFeed() {
     send(event: Record<string, unknown>) {
       controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
     },
+    /** Ends the round the way the gateway does: terminal marker, then the connection closes. */
     close() {
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
     },
   };

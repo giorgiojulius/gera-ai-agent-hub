@@ -174,6 +174,8 @@ export type ActiveServerRun = {
   startedAt: number;
   title: string;
   assistantMessageId: string;
+  /** Incognito run — the chat was never seeded on the server; an adopting tab keeps it off the record. */
+  ephemeral?: boolean;
   snapshot: ServerRunSnapshot | null;
   result: ServerRunDone | null;
 };
@@ -266,6 +268,32 @@ function abortError(): DOMException {
   return new DOMException("Stopped.", "AbortError");
 }
 
+/**
+ * The thread already has a live reply on the server — started from another
+ * tab or device (this tab would have known about its own). The caller attaches
+ * to that run instead of failing the message.
+ */
+export class RunActiveError extends Error {
+  constructor() {
+    super("Another reply is still running in this chat — stop it or wait for it to finish.");
+    this.name = "RunActiveError";
+  }
+}
+
+/** The account already runs its maximum number of replies at once (every tab and device counts). */
+export class RunCapReachedError extends Error {
+  readonly limit: number | undefined;
+  constructor(limit?: number) {
+    super(
+      limit !== undefined
+        ? `Your account already has ${limit} replies running at once (across every tab and device). Wait for one to finish or stop it, then send again.`
+        : "Your account already has the maximum number of replies running at once (across every tab and device). Wait for one to finish or stop it, then send again.",
+    );
+    this.name = "RunCapReachedError";
+    this.limit = limit;
+  }
+}
+
 export type StartServerRunResponse = {
   ok: boolean;
   runId: string;
@@ -344,10 +372,23 @@ export async function startServerRun(
         continue;
       }
       if (conflict.error === "run_active") {
-        throw new Error("Another reply is still running in this chat — stop it or wait for it to finish.");
+        throw new RunActiveError();
       }
       if (conflict.error === "idempotency_conflict") {
         throw new Error("This run id was already accepted with different input; nothing was executed twice.");
+      }
+    }
+    if (response.status === 429) {
+      // The account-wide live-run cap counts every tab and device. A run that
+      // settles a moment later frees a slot, so wait briefly before giving up
+      // with the honest limit instead of a generic "too many requests".
+      const busy = (await response.clone().json().catch(() => ({}))) as { error?: unknown; limit?: unknown };
+      if (busy.error === "too_many_runs") {
+        if (attempt < 3) {
+          await sleep(2_500, signal);
+          continue;
+        }
+        throw new RunCapReachedError(typeof busy.limit === "number" ? busy.limit : undefined);
       }
     }
     const result = await parseOrThrow<StartServerRunResponse>(response, "Could not start the run on the server");

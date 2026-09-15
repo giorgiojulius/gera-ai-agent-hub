@@ -10,14 +10,29 @@ import type { MediaTally, ModelTokens, TurnUsage } from "@/lib/types";
  * cost but never pose as real model adoption in the arena standings.
  * Media generation reports per-asset units into `media`.
  *
- * Attribution is top-of-stack: concurrent runs (e.g. two background
- * automations) may occasionally credit a call to the other run's tally.
- * Totals across runs stay correct; per-run split is best effort.
+ * Browser-side helper calls attribute top-of-stack: concurrent runs (e.g. two
+ * background automations) may occasionally credit a router call to the other
+ * run's tally. Server runs replay their usage with an explicit capture
+ * (`reportUsageTo`), so parallel threads never swap their token bills.
  */
 const active: TurnUsage[] = [];
 
 function emptyUsage(): TurnUsage {
   return { prompt: 0, completion: 0, calls: 0, byModel: {} };
+}
+
+/**
+ * A standalone tally that is NOT on the capture stack — for replaying usage
+ * that arrives after the fact (a finished server run applied at boot) without
+ * ever intercepting the live turns' top-of-stack reports.
+ */
+export function detachedUsageTally(): TurnUsage {
+  return emptyUsage();
+}
+
+/** The tally when at least one call was metered, else undefined. */
+export function settledUsage(tally: TurnUsage): TurnUsage | undefined {
+  return tally.calls > 0 ? tally : undefined;
 }
 
 export function beginUsageCapture(): TurnUsage {
@@ -99,8 +114,20 @@ function addTokens(map: Record<string, ModelTokens>, modelId: string, parsed: Pa
  */
 export function reportUsage(modelId: string, usage: unknown, kind?: "service"): void {
   const target = active[active.length - 1];
+  if (!target) {
+    return;
+  }
+  reportUsageTo(target, modelId, usage, kind);
+}
+
+/**
+ * Reports one LLM call into a specific capture — for usage that arrives after
+ * the fact (a server run's terminal event) while other turns may have opened
+ * their own captures meanwhile.
+ */
+export function reportUsageTo(target: TurnUsage, modelId: string, usage: unknown, kind?: "service"): void {
   const parsed = parseUsagePayload(usage);
-  if (!target || !parsed) {
+  if (!parsed) {
     return;
   }
   target.prompt += parsed.prompt;

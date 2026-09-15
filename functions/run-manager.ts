@@ -504,7 +504,9 @@ export class RunManager {
       }
     }
     if (liveCount >= MAX_LIVE_RUNS_PER_OWNER) {
-      return json({ error: "too_many_runs" }, 429);
+      // The cap is per account, across every tab and device — the client
+      // phrases it from `limit` so the message stays true if the cap moves.
+      return json({ error: "too_many_runs", limit: MAX_LIVE_RUNS_PER_OWNER, active: liveCount }, 429);
     }
     const authKey = this.env.STAGING_GATEWAY_URL
       ? this.env.STAGING_GATEWAY_SECRET ?? ""
@@ -747,6 +749,9 @@ export class RunManager {
         startedAt: row.started_at,
         title: row.title,
         assistantMessageId: row.assistant_message_id,
+        // Incognito runs never seeded the chat; a tab adopting one must keep
+        // its placeholder thread off the record too.
+        ephemeral: row.ephemeral === 1,
         snapshot,
         result: row.status !== "running" ? this.parseJson<Record<string, unknown>>(row.result) : null,
       };

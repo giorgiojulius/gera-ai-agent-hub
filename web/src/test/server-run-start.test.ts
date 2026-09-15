@@ -10,7 +10,7 @@ vi.mock("@/lib/auth-tokens", async (original) => ({
   authSessionSnapshot: () => transport.session,
   isAuthSessionCurrent: (session: string) => session === transport.session,
 }));
-import { startServerRun, type StartServerRunRequest } from "@/lib/server-run";
+import { RunActiveError, RunCapReachedError, startServerRun, type StartServerRunRequest } from "@/lib/server-run";
 
 function request(): StartServerRunRequest {
   return {
@@ -105,6 +105,43 @@ describe("start acknowledgment recovery", () => {
     await vi.advanceTimersByTimeAsync(2_001);
     expect(await result).toEqual(accepted);
     expect(transport.fetch.mock.calls[0][2].body).toBe(transport.fetch.mock.calls[1][2].body);
+  });
+
+  it("waits out the account-wide live-run cap, then names the limit honestly", async () => {
+    transport.fetch.mockImplementation(async () => json({ error: "too_many_runs", limit: 3, active: 3 }, 429));
+    const result = startServerRun(request()).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const error = await result;
+    expect(error).toBeInstanceOf(RunCapReachedError);
+    expect((error as RunCapReachedError).limit).toBe(3);
+    expect((error as Error).message).toContain("3 replies running at once");
+    expect((error as Error).message).toContain("every tab and device");
+    expect(transport.fetch).toHaveBeenCalledTimes(4);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("starts once a slot frees up during the cap wait", async () => {
+    transport.fetch.mockResolvedValueOnce(json({ error: "too_many_runs", limit: 3 }, 429))
+      .mockResolvedValueOnce(json(accepted));
+    const result = startServerRun(request());
+    await vi.advanceTimersByTimeAsync(2_600);
+    expect(await result).toEqual(accepted);
+    expect(transport.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("still treats a plain HTTP 429 as a definitive rejection", async () => {
+    transport.fetch.mockResolvedValue(json({ error: "rate_limited" }, 429));
+    await expect(startServerRun(request())).rejects.toThrow("rate_limited");
+    expect(transport.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a persistent run_active as a typed error the caller can hand off", async () => {
+    transport.fetch.mockImplementation(async () => json({ error: "run_active", runId: "other" }, 409));
+    const result = startServerRun(request()).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const error = await result;
+    expect(error).toBeInstanceOf(RunActiveError);
+    expect(transport.fetch).toHaveBeenCalledTimes(5);
   });
 
   it("never retries into a changed account", async () => {

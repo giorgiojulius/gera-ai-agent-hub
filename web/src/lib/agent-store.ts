@@ -11,6 +11,7 @@ import {
   listActiveServerRuns,
   resolveCloudMediaRefs,
   resolveToolCallMedia,
+  RunActiveError,
   startServerRun,
   steerServerRun,
   stopServerRun,
@@ -69,9 +70,10 @@ import {
 import { extractImageUrl } from "@/lib/image-url";
 import { resizeImageForUpload, shrinkMessagesForApi, type UploadImage } from "@/lib/resize-image";
 import { planTools, routerContextDigest } from "@/lib/router";
+import { announceRunStarted, requestLocalRunReconcile } from "@/lib/run-signals";
 import { reportModelUsage, turnUsageEvents } from "@/lib/telemetry";
 import { generateChatTitle } from "@/lib/title";
-import { beginUsageCapture, endUsageCapture, reportUsage } from "@/lib/usage";
+import { beginUsageCapture, detachedUsageTally, endUsageCapture, reportUsageTo, settledUsage } from "@/lib/usage";
 import { clampImageCount, MAX_IMAGE_COUNT, parseImageCount } from "@/lib/image-count";
 import { generateAudio, generateImageBatch, generateVideo, type VideoImageInput } from "@/lib/tools";
 import type {
@@ -89,6 +91,7 @@ import type {
   QueuedMessage,
   Skill,
   SkillSurface,
+  TurnUsage,
 } from "@/lib/types";
 
 export type AgentState = {
@@ -446,12 +449,18 @@ function applyRunEvent(
   }
 }
 
-/** Resolves cloud media refs, vaults them, and replays server usage locally. */
-async function settleDone(done: ServerRunDone): Promise<Partial<ChatMessage>> {
+/**
+ * Resolves cloud media refs, vaults them, and replays server usage locally.
+ * `capture` is THIS turn's tally — threads run in parallel, so the newest
+ * open capture may belong to another thread by the time this one settles.
+ */
+async function settleDone(done: ServerRunDone, capture?: TurnUsage): Promise<Partial<ChatMessage>> {
   // Token usage happened on the server — replay it into this turn's capture
   // so pricing and arena telemetry keep working.
-  for (const event of done.usageEvents) {
-    reportUsage(event.modelId, event.usage, event.service ? "service" : undefined);
+  if (capture) {
+    for (const event of done.usageEvents) {
+      reportUsageTo(capture, event.modelId, event.usage, event.service ? "service" : undefined);
+    }
   }
   const message = done.message;
   let images: string[] | undefined;
@@ -673,6 +682,12 @@ async function runServerTurn(params: ServerTurnParams): Promise<ServerRunDone> {
     if (started.status && started.status !== "running" && started.result) {
       return { ...started.result, status: started.status } as ServerRunDone;
     }
+    // Sibling tabs of this account attach to the live stream right away
+    // instead of learning about the reply only when sync delivers it.
+    // Incognito runs stay unannounced — they belong to this tab alone.
+    if (seeded.incognito !== true) {
+      announceRunStarted(seeded.id);
+    }
     if (params.signal.aborted) {
       // Stop landed while the start request was in flight — the run is live
       // on the server now; kill it there instead of just detaching the tab.
@@ -867,6 +882,8 @@ export async function sendPrompt(params: {
   let turnFailed = false;
   /** Set when the server confirms a manual stop — the follow-up queue holds. */
   let manualStop = false;
+  /** The thread was already answering elsewhere — this message moved to the queue. */
+  let handedOff = false;
   let executionOutcome: ExecutionOutcome | undefined;
   // Image/video runs may honestly reroute to a capable model — telemetry
   // reports the model that actually ran.
@@ -1152,7 +1169,7 @@ export async function sendPrompt(params: {
       });
       manualStop = done.status === "stopped";
       executionOutcome = normalizeExecutionOutcome(done.message.execution);
-      const patch = await settleDone(done);
+      const patch = await settleDone(done, usageCapture);
       if (wantJulius && patch.julius) {
         if (patch.julius.status === "error") {
           patchAssistant({ julius: patch.julius });
@@ -1295,7 +1312,7 @@ export async function sendPrompt(params: {
     });
     manualStop = done.status === "stopped";
     executionOutcome = normalizeExecutionOutcome(done.message.execution);
-    patchAssistant(await settleDone(done));
+    patchAssistant(await settleDone(done, usageCapture));
     reconcileServerClock(params.setState, seeded.id, done.chatUpdatedAt);
     if (done.status === "error") {
       turnFailed = true;
@@ -1318,10 +1335,54 @@ export async function sendPrompt(params: {
     logDiagnostic("chat", error);
     // A manual Stop is a user choice, not a model failure.
     const aborted = error instanceof DOMException && error.name === "AbortError";
-    if (!aborted) {
+    if (error instanceof RunActiveError && shownContent.trim().length === 0) {
+      // The server already runs a reply in this thread — started from another
+      // tab or device this tab had not caught up with. Nothing failed: the
+      // seeded turn rolls back, the message waits in the ordinary queue, and
+      // this tab attaches to the live run, which drains the queue on settle.
+      handedOff = true;
+      manualStop = true; // holds the queue for the adopted run
+      const queuedItem: QueuedMessage = {
+        id: newId(),
+        text: prompt,
+        attachments,
+        mode,
+        deepResearch: wantResearch,
+        julius: wantJulius,
+        createdAt: Date.now(),
+      };
+      params.setState((prev) => {
+        const current = prev.conversations.find((item) => item.id === seeded.id);
+        if (!current) {
+          return prev;
+        }
+        const messages = current.messages.filter(
+          (item) => item.id !== userMessage.id && item.id !== assistantId,
+        );
+        const conversations = upsertConversation(prev.conversations, { ...current, messages });
+        persist(conversations, prev.activeId);
+        // A dispatched follow-up goes back to the head of its line; a message
+        // the user just typed waits behind what was queued before it.
+        const rest = prev.queued[seeded.id] ?? [];
+        return {
+          ...prev,
+          conversations,
+          queued: { ...prev.queued, [seeded.id]: background ? [queuedItem, ...rest] : [...rest, queuedItem] },
+        };
+      });
+      requestLocalRunReconcile(seeded.id);
+      if (!background) {
+        toast.info("This chat is already answering", {
+          description:
+            "A reply started from another tab or device is in progress — your message is queued and sends right after it.",
+        });
+      }
+    } else if (!aborted) {
       turnFailed = true;
     }
-    if (shownContent.trim().length === 0) {
+    if (handedOff) {
+      // Rolled back above — no bubble to write into.
+    } else if (shownContent.trim().length === 0) {
       // Nothing streamed yet — the empty bubble carries the honest reason.
       patchAssistant({ content: errorFromUnknown(error) });
     } else if (!aborted) {
@@ -1354,11 +1415,14 @@ export async function sendPrompt(params: {
     }
     const usage = endUsageCapture(usageCapture);
     // The pending marker dies with the run — only a reload mid-run leaves it
-    // behind for the next load to detect.
-    patchAssistant({ pending: undefined, ...(usage ? { usage } : {}) });
+    // behind for the next load to detect. A handed-off turn has no bubble
+    // anymore and never ran a model — nothing to settle, nothing to report.
+    if (!handedOff) {
+      patchAssistant({ pending: undefined, ...(usage ? { usage } : {}) });
+    }
     // Automatic arena telemetry — model, mode, outcome, token counts. Never
     // message content; incognito turns leave no trace anywhere, including here.
-    if (seeded.incognito !== true) {
+    if (seeded.incognito !== true && !handedOff) {
       reportModelUsage(
         turnUsageEvents({ usage, mode, fallbackModelId: effectiveModelId, ok: !turnFailed }),
       );
@@ -1556,7 +1620,7 @@ export async function resumePrompt(params: {
     });
     manualStop = done.status === "stopped";
     executionOutcome = normalizeExecutionOutcome(done.message.execution);
-    const patch = await settleDone(done);
+    const patch = await settleDone(done, usageCapture);
     const images = [...(message.images ?? []), ...(patch.images ?? [])];
     const videos = [...(message.videos ?? []), ...(patch.videos ?? [])];
     // Old citation numbers stay valid — new sources only append.
@@ -1597,6 +1661,14 @@ export async function resumePrompt(params: {
     if (error instanceof DOMException && error.name === "AbortError") {
       // The tab detached — the run continues on the server; whatever already
       // streamed stays in the bubble and sync reconciles the final text.
+    } else if (error instanceof RunActiveError) {
+      // Another tab or device already continues this reply — attach to that
+      // run instead of marking the bubble interrupted again.
+      manualStop = true; // the adopted run owns the queue
+      requestLocalRunReconcile(conversationId);
+      toast.info("This reply is already being continued", {
+        description: "Another tab or device picked it up — attaching to that run.",
+      });
     } else {
       turnFailed = true;
       // Content stays as streamed; the interrupted marker returns so Continue
@@ -1705,6 +1777,8 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
     if (!conversation) {
       // The thread lives on the server (sync is locked mid-run) — show a live
       // placeholder now; the full history arrives via sync once the run ends.
+      // An incognito run never seeded the server, so its placeholder stays
+      // incognito too — otherwise this tab would sync the reply into history.
       conversation = {
         id: conversationId,
         title: run.title || "Chat",
@@ -1712,6 +1786,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
         messages: [],
         createdAt: run.startedAt,
         updatedAt: Date.now(),
+        ...(run.ephemeral ? { incognito: true } : {}),
       };
     }
     const hasBubble = conversation.messages.some((item) => item.id === assistantId);
@@ -1767,7 +1842,7 @@ function adoptRunningServerRun(run: ActiveServerRun, params: AdoptParams): void 
       });
       manualStop = done.status === "stopped";
       executionOutcome = normalizeExecutionOutcome(done.message.execution);
-      patchAssistant(await settleDone(done));
+      patchAssistant(await settleDone(done, usageCapture));
       reconcileServerClock(params.setState, conversationId, done.chatUpdatedAt);
       void ackServerRun(run.runId);
       if (done.status === "error") {
@@ -1833,8 +1908,16 @@ async function applyFinishedServerRun(run: ActiveServerRun, params: AdoptParams)
   if (message.pending !== true && message.interrupted !== true && message.content.trim().length > 0) {
     return true; // already settled locally
   }
-  const patch = await settleDone(done);
-  makePatcher(params.setState, run.conversationId, messageId)({ ...patch, pending: undefined });
+  // A run that finished while no tab was open still gets its token bill on
+  // the message — in a detached tally, never on whatever turn is live now.
+  const tally = detachedUsageTally();
+  const patch = await settleDone(done, tally);
+  const usage = settledUsage(tally);
+  makePatcher(params.setState, run.conversationId, messageId)({
+    ...patch,
+    ...(usage ? { usage } : {}),
+    pending: undefined,
+  });
   reconcileServerClock(params.setState, run.conversationId, done.chatUpdatedAt);
   if (done.status === "error") {
     logServerRunFailure(done);

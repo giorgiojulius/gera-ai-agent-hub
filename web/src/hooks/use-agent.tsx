@@ -25,6 +25,7 @@ import { computeNextRunAt, type AutomationDraftInput } from "@/lib/automations";
 import { newId } from "@/lib/env";
 import { saveComposerDraft, saveConversations, saveQueuedFollowUps, saveSettings } from "@/lib/history";
 import { RESUME_FRESH_MS } from "@/lib/resume";
+import { subscribeRunSignals } from "@/lib/run-signals";
 import { deleteKnowledgeText } from "@/lib/knowledge-store";
 import { migrateConversationsToVault, pruneMediaVault } from "@/lib/media-vault";
 import { appNavigate, chatPath } from "@/lib/nav";
@@ -1357,6 +1358,90 @@ export function AgentProvider({ children }: { children: ReactNode }) {
       }
     })().finally(() => { recoveryRequestRef.current = false; });
   }, [bootRecoveryTick, isAuthLoading, isHydrated, resumeInterrupted, retryInterrupted, user]);
+
+  /**
+   * Sibling-tab awareness. Every run executes on the server, so a reply
+   * started in another tab (or bounced off here as "run_active") is just as
+   * live for this tab — attach to it right away instead of waiting for the
+   * finished text to arrive via sync. Read-only: never starts, stops, or
+   * replays a prompt; only live runs are adopted, finished history stays with
+   * the boot pass. Coalesced and single-flight so a burst of signals costs
+   * one `/runs/active` call.
+   */
+  const signalReconcileBusyRef = useRef<boolean>(false);
+  const signalReconcileAgainRef = useRef<boolean>(false);
+  const signalTimerRef = useRef<number | null>(null);
+  const signalReconcileAtRef = useRef<number>(0);
+  useEffect(() => {
+    const session = authSessionSnapshot();
+    const isCurrent = () => recoveryMountedRef.current && isAuthSessionCurrent(session);
+    const reconcile = async (): Promise<void> => {
+      if (!getAccessToken() || !isCurrent()) return;
+      if (signalReconcileBusyRef.current) {
+        signalReconcileAgainRef.current = true;
+        return;
+      }
+      signalReconcileBusyRef.current = true;
+      signalReconcileAtRef.current = Date.now();
+      try {
+        await adoptActiveServerRuns({
+          runningOnly: true,
+          getState: () => stateRef.current,
+          setState: (update) => { if (isCurrent()) setState(update); },
+          onDone: (conversationId, stopped, execution) => {
+            if (isCurrent() && stopped !== true) {
+              notifyRef.current(conversationId, execution);
+              window.setTimeout(() => drainRef.current(conversationId), 60);
+            }
+          },
+        });
+      } catch {
+        // A signal is a hint, not a promise — the next focus or sync catches up.
+      } finally {
+        signalReconcileBusyRef.current = false;
+        if (signalReconcileAgainRef.current && isCurrent()) {
+          signalReconcileAgainRef.current = false;
+          window.setTimeout(() => void reconcile(), 400);
+        }
+      }
+    };
+    const schedule = (delay: number) => {
+      if (signalTimerRef.current !== null) window.clearTimeout(signalTimerRef.current);
+      signalTimerRef.current = window.setTimeout(() => {
+        signalTimerRef.current = null;
+        void reconcile();
+      }, delay);
+    };
+    const unsubscribe = subscribeRunSignals((notice) => {
+      if (
+        notice.source === "sibling" &&
+        notice.conversationId &&
+        stateRef.current.runningIds.includes(notice.conversationId)
+      ) {
+        return; // this tab already streams that thread
+      }
+      // A local nudge fires from inside a failing turn whose spinner is still
+      // up — the delay lets its cleanup land before the live run is adopted.
+      // Sibling starts are announced before the server has the row committed
+      // for observers; the delay avoids an empty first look.
+      schedule(notice.source === "sibling" ? 350 : 150);
+    });
+    // Coming back to a tab: pick up whatever the account started meanwhile
+    // (another device, a cloud automation) without waiting for sync. Rapid
+    // alt-tabbing costs one status call every few seconds at most.
+    const onVisible = () => {
+      if (document.hidden || Date.now() - signalReconcileAtRef.current < 3_000) return;
+      schedule(200);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      unsubscribe();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+      if (signalTimerRef.current !== null) window.clearTimeout(signalTimerRef.current);
+    };
+  }, [user]);
 
   /**
    * Fires one automation run into its own background thread.

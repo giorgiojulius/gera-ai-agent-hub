@@ -5,11 +5,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   beginUsageCapture,
+  detachedUsageTally,
   endUsageCapture,
   mergeUsage,
   parseUsagePayload,
   reportMediaUsage,
   reportUsage,
+  reportUsageTo,
+  settledUsage,
 } from "@/lib/usage";
 
 describe("parseUsagePayload", () => {
@@ -76,6 +79,32 @@ describe("reportUsage", () => {
 
   it("is a no-op without an open capture", () => {
     expect(() => reportUsage("m", { prompt_tokens: 10, completion_tokens: 1 })).not.toThrow();
+  });
+});
+
+describe("reportUsageTo", () => {
+  it("bills the named capture even when a newer turn is on top of the stack", () => {
+    // Two threads run in parallel: A started first, B opened its capture
+    // later. A's server run settles while B is still live — A's tokens must
+    // land on A, not on whatever capture happens to be newest.
+    const a = beginUsageCapture();
+    const b = beginUsageCapture();
+    reportUsageTo(a, "spacexai/grok-4.6", { prompt_tokens: 400, completion_tokens: 100 });
+    reportUsageTo(a, "alibaba/qwen3.7-flash", { prompt_tokens: 20, completion_tokens: 5 }, "service");
+    expect(endUsageCapture(b)).toBeUndefined();
+    const usage = endUsageCapture(a);
+    expect(usage?.byModel).toEqual({ "spacexai/grok-4.6": { prompt: 400, completion: 100, calls: 1 } });
+    expect(usage?.serviceByModel).toEqual({ "alibaba/qwen3.7-flash": { prompt: 20, completion: 5, calls: 1 } });
+    expect(usage?.calls).toBe(2);
+  });
+
+  it("fills a detached tally without touching the live capture stack", () => {
+    const live = beginUsageCapture();
+    const tally = detachedUsageTally();
+    reportUsageTo(tally, "spacexai/grok-4.6", { prompt_tokens: 10, completion_tokens: 2 });
+    expect(settledUsage(tally)?.prompt).toBe(10);
+    expect(settledUsage(detachedUsageTally())).toBeUndefined();
+    expect(endUsageCapture(live)).toBeUndefined();
   });
 });
 

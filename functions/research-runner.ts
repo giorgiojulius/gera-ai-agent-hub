@@ -33,6 +33,7 @@ import {
   type GitHubRepoMeta,
 } from "./native-github";
 import { performSurf, type SurfJar } from "./selfsurf";
+import type { ResearchCheckpoint } from "./run-recovery";
 import type { ResearchDepth, ResearchState, ResearchStep, ResearchStepKind, WireMessage } from "./run-protocol";
 
 export class RunStoppedError extends Error {
@@ -600,6 +601,14 @@ export type ResearchRunParams = {
    */
   mcpToolset?: McpToolset;
   isCancelled?: () => boolean;
+  /**
+   * Continue a run whose node died: the dossier, spent queries, notes and
+   * counters are restored and the loop picks up at the next wave — planning,
+   * connector scouting and the repository preload are not redone.
+   */
+  resumeFrom?: ResearchCheckpoint;
+  /** Fired after the preparatory steps and after every wave with everything a restart needs. */
+  onCheckpoint?: (checkpoint: ResearchCheckpoint) => void;
   onUpdate: (research: ResearchState) => void;
   onText: (full: string) => void;
   onUsage?: (modelId: string, usage: unknown, service?: boolean) => void;
@@ -635,14 +644,25 @@ export async function runServerDeepResearch(
   params: ResearchRunParams,
 ): Promise<{ content: string; research: ResearchState; servedBy?: string }> {
   const profile = RESEARCH_PROFILES[params.depth ?? "balanced"];
-  const state: ResearchState = { status: "running", steps: [], sources: [], startedAt: Date.now() };
+  const resume = params.resumeFrom ?? null;
+  const state: ResearchState = {
+    status: "running",
+    // A step the restart caught running never finished — say so in the trail.
+    steps: resume
+      ? resume.steps.map((step) =>
+          step.status === "running" ? { ...step, status: "error" as const, detail: "server restarted" } : step,
+        )
+      : [],
+    sources: [],
+    startedAt: resume?.startedAt ?? Date.now(),
+  };
   const registry = new Map<string, RegistrySource>();
   /** The same document under variant URLs resolves to one registry slot. */
   const registryByKey = new Map<string, RegistrySource>();
-  const usedQueries: string[] = [];
+  const usedQueries: string[] = resume ? [...resume.usedQueries] : [];
   /** The reflector's own "still missing" notes, wave by wave — handed forward. */
-  const reflectionNotes: string[] = [];
-  let readsTotal = 0;
+  const reflectionNotes: string[] = resume ? [...resume.notes] : [];
+  let readsTotal = resume?.readsTotal ?? 0;
 
   const snapshot = (): ResearchState => ({
     ...state,
@@ -701,7 +721,23 @@ export async function runServerDeepResearch(
   };
 
   const repos = new Map<string, GitHubRepoMeta>();
-  const readRepoPicks = new Set<string>();
+  const readRepoPicks = new Set<string>(resume?.readRepoPicks ?? []);
+  if (resume) {
+    for (const meta of resume.repos) {
+      repos.set(meta.fullName.toLowerCase(), meta);
+    }
+    // Dossier slots come back under their original numbers so citations the
+    // reflector already saw keep pointing at the same sources.
+    for (const source of [...resume.sources].sort((a, b) => a.index - b.index)) {
+      if (findSource(source.url)) {
+        continue;
+      }
+      const restored: RegistrySource = { ...source, highlights: [...source.highlights] };
+      registry.set(source.url, restored);
+      registryByKey.set(sourceDedupeKey(source.url), restored);
+      state.sources.push({ url: source.url, title: source.title });
+    }
+  }
   const githubAuth: string | null = params.githubAuth?.trim() ? params.githubAuth.trim() : null;
   const githubDisabled = new Set(params.githubDisabledTools ?? []);
   const canGitHub = (toolName: string): boolean => !githubDisabled.has(toolName);
@@ -718,8 +754,37 @@ export async function runServerDeepResearch(
 
   // SelfSurf: one live-browsing session (cookie jar) for the whole run.
   const jar: SurfJar = {};
-  const browsedUrls = new Set<string>();
-  let browsesTotal = 0;
+  const browsedUrls = new Set<string>(resume?.browsedUrls ?? []);
+  let browsesTotal = resume?.browsesTotal ?? 0;
+  /** Everything a restart needs to continue from here; `nextQueries` empty means the loop is over. */
+  const checkpoint = (wave: number, nextQueries: string[]): void => {
+    if (!params.onCheckpoint) {
+      return;
+    }
+    params.onCheckpoint({
+      version: 1,
+      wave,
+      queries: [...nextQueries],
+      usedQueries: [...usedQueries],
+      notes: [...reflectionNotes],
+      readsTotal,
+      browsesTotal,
+      browsedUrls: [...browsedUrls],
+      readRepoPicks: [...readRepoPicks],
+      repos: [...repos.values()],
+      sources: [...registry.values()].map((source) => ({
+        index: source.index,
+        url: source.url,
+        title: source.title,
+        ...(source.published ? { published: source.published } : {}),
+        highlights: [...source.highlights],
+        ...(source.text ? { text: source.text } : {}),
+        ...(source.liveAt ? { liveAt: source.liveAt } : {}),
+      })),
+      steps: state.steps.map((step) => ({ ...step })),
+      startedAt: state.startedAt,
+    });
+  };
 
   const scoutMcpConnectors = async (toolset: McpToolset): Promise<void> => {
     const metaTools = toolset.toolDefs.filter((def) => isMcpMetaToolName(def.function.name));
@@ -866,6 +931,15 @@ export async function runServerDeepResearch(
         "Deep research needs a question — this run started with an empty message, so there is nothing to research.",
       );
     }
+    let queries: string[] = [];
+    // A resumed run already planned, browsed the prompt's URLs, scouted the
+    // connectors and preloaded the repositories — those steps are in the
+    // restored trail; the loop picks up at the next wave with the saved queries.
+    const repoRefs = resume ? [] : githubRunRepoRefs(params.prompt, params.githubRepo);
+    if (resume) {
+      queries = [...resume.queries];
+      emit();
+    } else {
     const planStep = addStep("plan", "Planning research");
     const today = new Date().toISOString().slice(0, 10);
     const planJson = await withRetries(
@@ -880,7 +954,7 @@ export async function runServerDeepResearch(
       { attempts: 2, isCancelled: params.isCancelled, shouldRetryResult: (result) => result === null },
     );
     ensureAlive();
-    let queries = stringArray(planJson?.queries, profile.plannerMax);
+    queries = stringArray(planJson?.queries, profile.plannerMax);
     if (queries.length === 0) {
       queries = [params.prompt.slice(0, 200)];
     }
@@ -900,11 +974,11 @@ export async function runServerDeepResearch(
       await scoutMcpConnectors(params.mcpToolset);
       ensureAlive();
     }
+    }
 
     // An explicit repo in the question wins; otherwise read the thread pin.
     // The pin is structured run data — system-prompt prose alone never reached
     // this deterministic GitHub preload, which made pinned private repos vanish.
-    const repoRefs = githubRunRepoRefs(params.prompt, params.githubRepo);
     if (repoRefs.length > 0 && (!githubAuth || !canGitHub("get_repo"))) {
       finishStep(
         addStep("read", repoRefs.map((ref) => `${ref.owner}/${ref.repo}`).join(", "), "GitHub"),
@@ -984,8 +1058,11 @@ export async function runServerDeepResearch(
       }
       ensureAlive();
     }
+    if (!resume) {
+      checkpoint(0, queries);
+    }
 
-    for (let wave = 1; wave <= profile.maxWaves; wave += 1) {
+    for (let wave = (resume?.wave ?? 0) + 1; wave <= profile.maxWaves; wave += 1) {
       const remainingBudget = Math.max(0, profile.maxQueriesTotal - usedQueries.length);
       const lowered = new Set(usedQueries.map((query) => query.toLowerCase()));
       const waveQueries = queries.filter((query) => !lowered.has(query.toLowerCase())).slice(0, remainingBudget);
@@ -1194,8 +1271,10 @@ export async function runServerDeepResearch(
       }
 
       if (isDone || queries.length === 0) {
+        checkpoint(wave, []);
         break;
       }
+      checkpoint(wave, queries);
     }
 
     ensureAlive();

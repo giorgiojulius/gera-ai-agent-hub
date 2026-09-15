@@ -8,8 +8,15 @@
 // - stop: finishes NOW with the draft kept exactly as shown;
 // - persistence: throttled snapshots + heartbeat, so a reopened tab gets the
 //   current state instantly and a crashed node leaves an honest trail;
-// - recovery: stale running rows (dead heartbeat) finalize as "interrupted"
-//   with the collected draft written into the chat — nothing is redrawn;
+// - survival: a Durable Object is evicted after 70–140 s without incoming
+//   traffic (a pending waitUntil or plain fetch() does not count) and every
+//   deploy kills it — so while runs live here a platform alarm (env.DO.setAlarm)
+//   ticks every KEEPALIVE_MS, the start body (credentials stripped) and, for
+//   research, a checkpoint after every wave are persisted, and a running row
+//   whose node died is RESUMED from those on the next tick or request
+//   (run-recovery.ts). Only a run that cannot be resumed finalizes as
+//   "interrupted" with the collected draft written into the chat — nothing
+//   is redrawn either way;
 // - results: the final assistant message is appended to the chat history
 //   (LWW clock bump) so normal sync delivers it to every device; generated
 //   media is stored in chunked rows and referenced as gera-cloud: refs.
@@ -53,6 +60,16 @@ import {
   type OAuthStoreContext,
 } from "./mcp-oauth-store";
 import { runServerDeepResearch, RunStoppedError } from "./research-runner";
+import {
+  decideRecovery,
+  parseResearchCheckpoint,
+  parseStoredSeed,
+  recoveredToolCalls,
+  seedForStorage,
+  staleRunError,
+  trimResearchCheckpoint,
+  type ResearchCheckpoint,
+} from "./run-recovery";
 import { CredentialScope } from "./vault-scope";
 import { SecretVault } from "./secret-vault";
 import { runServerJulius } from "./julius-runner";
@@ -112,6 +129,12 @@ const TIME_BUDGET_MS: Record<RunKind, number> = {
   julius: 60 * 60_000,
 };
 const MAX_LIVE_RUNS_PER_OWNER = 3;
+/**
+ * Keepalive tick while runs live in this object. Well inside the 70–140 s
+ * inactivity window after which the platform evicts an idle object; the alarm
+ * also survives a deploy, so a run whose node died is picked up within one tick.
+ */
+const KEEPALIVE_MS = 30_000;
 
 /**
  * Caps for the final assistant message written into chat history. The content
@@ -198,6 +221,10 @@ type LiveRun = {
   closeToolset?: () => void;
   /** Media items persisted for this run so far (`agent_run_media.idx` allocator). */
   mediaCount: number;
+  /** Research state saved before the node died — the loop continues from it instead of re-searching. */
+  resumeCheckpoint?: ResearchCheckpoint;
+  /** How many times this run was brought back after its node died. */
+  restarts: number;
   // Throttles.
   textTimer: ReturnType<typeof setTimeout> | null;
   toolsTimer: ReturnType<typeof setTimeout> | null;
@@ -210,6 +237,11 @@ type ManagerEnv = {
   /** Test-only deterministic gateway; production leaves both unset. */
   STAGING_GATEWAY_URL?: string;
   STAGING_GATEWAY_SECRET?: string;
+  /** Platform DO binding — carries the alarm RPCs facets cannot call natively; plain dispatcher in staging. */
+  DO?: {
+    fetch(request: Request): Promise<Response>;
+    setAlarm?(className: string, id: string, scheduledTime: number | Date): Promise<void>;
+  };
 };
 
 function json(data: unknown, status = 200): Response {
@@ -346,6 +378,29 @@ export class RunManager {
         data TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         PRIMARY KEY (owner_email, run_id, idx, chunk)
+      )
+    `);
+    // Recovery material, in their own rows (a run row must stay under the
+    // 2 MB row limit): the start body a dead run is re-executed with, and the
+    // research loop's latest checkpoint. Both go with the run when it settles.
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS agent_run_seeds (
+        owner_email TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        seed TEXT NOT NULL,
+        restarts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, run_id)
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS agent_run_checkpoints (
+        owner_email TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        checkpoint TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_email, run_id)
       )
     `);
   }
@@ -512,9 +567,7 @@ export class RunManager {
       // phrases it from `limit` so the message stays true if the cap moves.
       return json({ error: "too_many_runs", limit: MAX_LIVE_RUNS_PER_OWNER, active: liveCount }, 429);
     }
-    const authKey = this.env.STAGING_GATEWAY_URL
-      ? this.env.STAGING_GATEWAY_SECRET ?? ""
-      : this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.env.RORK_TOOLKIT_SECRET_KEY ?? "";
+    const authKey = this.gatewayAuthKey();
     if (!authKey) {
       return json({ error: "toolkit_key_missing" }, 503);
     }
@@ -543,21 +596,31 @@ export class RunManager {
       done: false,
       pauses: createRunPauseBoard(),
       mediaCount: 0,
+      restarts: 0,
       textTimer: null,
       toolsTimer: null,
       flushTimer: null,
     };
-    // Every change of the open-question list reaches watching tabs at once and
-    // lands in the persisted snapshot, so a reopened tab sees the card too.
-    run.pauses.subscribe(() => {
-      this.emit(run, { t: "pause", seq: 0, pending: run.pauses.pending() });
-      this.scheduleFlush(run);
-    });
+    this.watchPauses(run);
+    // The body a node restart re-executes this run with — credentials and the
+    // chat seed stripped; null for incognito (nothing may outlive the tab).
+    const recoverySeed = seedForStorage(body);
     // Seed + idempotency receipt + execution ownership commit together. A
     // deploy can observe all three or none; it can never accept a run id while
     // leaving a second request free to execute its tools.
     this.ctx.storage.transactionSync(() => {
       run.chatWritable = !ephemeral && this.applyChatSeed(owner, body);
+      if (recoverySeed) {
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO agent_run_seeds (owner_email, run_id, conversation_id, seed, restarts, created_at)
+           VALUES (?, ?, ?, ?, 0, ?)`,
+          owner,
+          body.runId,
+          body.conversationId,
+          recoverySeed,
+          now,
+        );
+      }
       this.ctx.storage.sql.exec(
         `INSERT INTO agent_run_receipts
           (owner_email, run_id, conversation_id, request_hash, status, history_on_server, result, error, created_at, updated_at)
@@ -588,7 +651,30 @@ export class RunManager {
         JSON.stringify(this.snapshotOf(run)),
       );
     });
-    this.live.set(this.liveKey(owner, body.conversationId), run);
+    this.spawn(run, authKey);
+    return json({ ok: true, runId: body.runId, historyOnServer: run.chatWritable, status: "running" });
+  }
+
+  private gatewayAuthKey(): string {
+    return this.env.STAGING_GATEWAY_URL
+      ? this.env.STAGING_GATEWAY_SECRET ?? ""
+      : this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? this.env.RORK_TOOLKIT_SECRET_KEY ?? "";
+  }
+
+  /**
+   * Every change of the open-question list reaches watching tabs at once and
+   * lands in the persisted snapshot, so a reopened tab sees the card too.
+   */
+  private watchPauses(run: LiveRun): void {
+    run.pauses.subscribe(() => {
+      this.emit(run, { t: "pause", seq: 0, pending: run.pauses.pending() });
+      this.scheduleFlush(run);
+    });
+  }
+
+  /** Registers the run as live in this object, starts its engine and arms the keepalive. */
+  private spawn(run: LiveRun, authKey: string): void {
+    this.live.set(this.liveKey(run.owner, run.conversationId), run);
     this.ctx.waitUntil(
       this.executeRun(run, authKey).catch((error) => {
         console.error("run crashed:", error instanceof Error ? error.message : "unknown");
@@ -598,7 +684,60 @@ export class RunManager {
         });
       }),
     );
-    return json({ ok: true, runId: body.runId, historyOnServer: run.chatWritable, status: "running" });
+    void this.armKeepalive();
+  }
+
+  private hasLiveRuns(): boolean {
+    for (const run of this.live.values()) {
+      if (!run.done) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Arms the platform alarm that keeps this object resident while runs live
+   * here (see the header). A binding without alarms (staging, tests) means
+   * the run relies on incoming traffic alone — exactly the old behaviour.
+   */
+  private async armKeepalive(): Promise<void> {
+    const binding = this.env.DO;
+    const name = this.ctx.id?.name ?? "";
+    if (!binding || typeof binding.setAlarm !== "function" || !name) {
+      return;
+    }
+    try {
+      await binding.setAlarm("ChatStore", name, Date.now() + KEEPALIVE_MS);
+    } catch (error) {
+      console.error("run keepalive alarm failed:", error instanceof Error ? error.message : "unknown");
+    }
+  }
+
+  /**
+   * Keepalive tick (ChatStore.onAlarm). Runs still executing here need
+   * nothing but the next tick; a running row without a live run means the
+   * node died in between — it is resumed or finalized honestly right away.
+   * At-least-once delivery is fine: recovery is keyed on the live map.
+   */
+  async onAlarm(): Promise<void> {
+    try {
+      const rows = this.ctx.storage.sql
+        .exec<RunRow>("SELECT * FROM agent_runs WHERE status = 'running'")
+        .toArray();
+      for (const row of rows) {
+        const live = this.live.get(this.liveKey(row.owner_email, row.conversation_id));
+        if (live && live.runId === row.run_id && !live.done) {
+          continue;
+        }
+        this.recoverStaleRow(row);
+      }
+    } catch (error) {
+      console.error("run keepalive tick failed:", error instanceof Error ? error.message : "unknown");
+    }
+    if (this.hasLiveRuns()) {
+      await this.armKeepalive();
+    }
   }
 
   private async handleSteer(request: Request, owner: string): Promise<Response> {
@@ -674,8 +813,9 @@ export class RunManager {
     }
     const row = this.runRow(owner, conversationId);
     if (row && row.status === "running") {
-      // The node running it died — finalize honestly as interrupted now.
-      this.finalizeStaleRow(row);
+      // The node running it died and the user wants it gone — finalize
+      // honestly as interrupted now instead of bringing it back.
+      this.finalizeStaleRow(row, "it was stopped");
       return json({ ok: true, stale: true });
     }
     return json({ ok: false, reason: "not_running" });
@@ -971,6 +1111,8 @@ export class RunManager {
             ? researchToolset
             : undefined,
           isCancelled,
+          resumeFrom: run.resumeCheckpoint,
+          onCheckpoint: (checkpoint) => this.storeCheckpoint(run, checkpoint),
           onUpdate: (research) => {
             run.research = research;
             run.sources = research.sources;
@@ -1996,11 +2138,21 @@ export class RunManager {
         if (live && live.runId === row.run_id && !live.done) {
           continue; // alive in this isolate — heartbeat will catch up
         }
-        this.finalizeStaleRow(row);
+        this.recoverStaleRow(row);
       }
-      // GC: acked/old finished rows and expired media.
+      // GC: acked/old finished rows, their recovery material and expired media.
       this.ctx.storage.sql.exec(
         "DELETE FROM agent_runs WHERE owner_email = ? AND status != 'running' AND (finished_at < ? OR (acked = 1 AND ephemeral = 1))",
+        owner,
+        now - ROW_TTL_MS,
+      );
+      this.ctx.storage.sql.exec(
+        "DELETE FROM agent_run_seeds WHERE owner_email = ? AND created_at < ?",
+        owner,
+        now - ROW_TTL_MS,
+      );
+      this.ctx.storage.sql.exec(
+        "DELETE FROM agent_run_checkpoints WHERE owner_email = ? AND updated_at < ?",
         owner,
         now - ROW_TTL_MS,
       );
@@ -2019,7 +2171,133 @@ export class RunManager {
     }
   }
 
-  private finalizeStaleRow(row: RunRow): void {
+  /** Persists the research loop's latest checkpoint (page texts water-filled to fit the row). */
+  private storeCheckpoint(run: LiveRun, checkpoint: ResearchCheckpoint): void {
+    try {
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO agent_run_checkpoints (owner_email, run_id, checkpoint, updated_at) VALUES (?, ?, ?, ?)",
+        run.owner,
+        run.runId,
+        JSON.stringify(trimResearchCheckpoint(checkpoint)),
+        Date.now(),
+      );
+    } catch (error) {
+      console.error("run checkpoint write failed:", error instanceof Error ? error.message : "unknown");
+    }
+  }
+
+  /** Recovery material goes with the run once it has settled. */
+  private dropRecoveryRows(owner: string, runId: string): void {
+    this.ctx.storage.sql.exec("DELETE FROM agent_run_seeds WHERE owner_email = ? AND run_id = ?", owner, runId);
+    this.ctx.storage.sql.exec("DELETE FROM agent_run_checkpoints WHERE owner_email = ? AND run_id = ?", owner, runId);
+  }
+
+  /**
+   * A running row without a live run: the node died mid-run. Brings the run
+   * back from its stored seed (and research checkpoint) with the collected
+   * draft as the resume base; finalizes honestly — naming the reason — only
+   * when it cannot. The row keeps its run id, so attached tabs simply see the
+   * run continue over their next reconnect.
+   */
+  private recoverStaleRow(row: RunRow): void {
+    const seedRow = this.ctx.storage.sql
+      .exec<{ seed: string; restarts: number }>(
+        "SELECT seed, restarts FROM agent_run_seeds WHERE owner_email = ? AND run_id = ?",
+        row.owner_email,
+        row.run_id,
+      )
+      .toArray()[0];
+    const snapshot = this.parseJson<RunSnapshot>(row.snapshot);
+    const kind: RunKind = row.kind === "research" || row.kind === "julius" ? row.kind : "chat";
+    const decision = decideRecovery({
+      kind,
+      ephemeral: row.ephemeral === 1,
+      seed: seedRow ? parseStoredSeed(seedRow.seed) : null,
+      restarts: seedRow?.restarts ?? 0,
+      snapshot,
+      startedAt: row.started_at,
+      now: Date.now(),
+      budgetMs: TIME_BUDGET_MS[kind],
+      assistantMessageId: row.assistant_message_id,
+    });
+    if (decision.action === "finalize") {
+      this.finalizeStaleRow(row, decision.reason);
+      return;
+    }
+    const authKey = this.gatewayAuthKey();
+    if (!authKey) {
+      this.finalizeStaleRow(row, "the gateway key is unavailable");
+      return;
+    }
+    const body = decision.body;
+    const checkpointRow =
+      kind === "research"
+        ? this.ctx.storage.sql
+            .exec<{ checkpoint: string }>(
+              "SELECT checkpoint FROM agent_run_checkpoints WHERE owner_email = ? AND run_id = ?",
+              row.owner_email,
+              row.run_id,
+            )
+            .toArray()[0]
+        : undefined;
+    const checkpoint = checkpointRow ? parseResearchCheckpoint(checkpointRow.checkpoint) : null;
+    const restarts = (seedRow?.restarts ?? 0) + 1;
+    const run: LiveRun = {
+      owner: row.owner_email,
+      runId: row.run_id,
+      conversationId: row.conversation_id,
+      kind,
+      startedAt: row.started_at,
+      body,
+      chatWritable: row.ephemeral !== 1,
+      // The draft exactly as the last heartbeat left it: the resume base for
+      // chat, the trail for research until the loop emits its next state.
+      content: body.config.resume?.partial ?? snapshot?.content ?? "",
+      reasoningTail: "",
+      toolCalls: recoveredToolCalls(snapshot?.toolCalls),
+      ...(snapshot?.codeChanges ? { codeChanges: snapshot.codeChanges } : {}),
+      sources: snapshot?.sources ?? [],
+      ...(snapshot?.research ? { research: snapshot.research } : {}),
+      // Steering consumed before the restart is part of the resumed history.
+      steered: snapshot?.steered ?? [],
+      usageEvents: [],
+      seq: 0,
+      inbox: [],
+      watchers: new Set(),
+      stopRequested: false,
+      subscribers: new Set(),
+      done: false,
+      pauses: createRunPauseBoard(),
+      mediaCount: 0,
+      ...(checkpoint ? { resumeCheckpoint: checkpoint } : {}),
+      restarts,
+      textTimer: null,
+      toolsTimer: null,
+      flushTimer: null,
+    };
+    this.watchPauses(run);
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "UPDATE agent_run_seeds SET restarts = ? WHERE owner_email = ? AND run_id = ?",
+        restarts,
+        row.owner_email,
+        row.run_id,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE agent_runs SET heartbeat_at = ?, snapshot = ? WHERE owner_email = ? AND conversation_id = ? AND run_id = ?",
+        now,
+        JSON.stringify(this.snapshotOf(run)),
+        row.owner_email,
+        row.conversation_id,
+        row.run_id,
+      );
+    });
+    this.spawn(run, authKey);
+    console.log("stale run resumed:", kind, row.conversation_id, "restart", restarts, checkpoint ? `wave ${checkpoint.wave}` : "");
+  }
+
+  private finalizeStaleRow(row: RunRow, reason = "it could not be brought back"): void {
     const snapshot = this.parseJson<RunSnapshot>(row.snapshot);
     const content = snapshot?.content ?? "";
     const research = snapshot?.research
@@ -2119,6 +2397,7 @@ export class RunManager {
           row.run_id,
         );
       });
+      this.dropRecoveryRows(row.owner_email, row.run_id);
       console.log("orphaned run recovered from settled chat:", row.conversation_id);
       return;
     }
@@ -2137,7 +2416,7 @@ export class RunManager {
               toolCalls: snapshot?.toolCalls,
               technicalStatus: "interrupted",
               surface: "automation",
-              error: "The server node restarted before the autonomous run finished.",
+              error: staleRunError(reason),
             }),
           }
         : {}),
@@ -2175,13 +2454,15 @@ export class RunManager {
         done: false,
         pauses: createRunPauseBoard(),
         mediaCount: 0,
+        restarts: 0,
         textTimer: null,
         toolsTimer: null,
       flushTimer: null,
     };
     const now = Date.now();
-    const error = "The server node running this reply restarted — the collected draft is shown as-is.";
+    const error = staleRunError(reason);
     this.ctx.storage.transactionSync(() => {
+      this.dropRecoveryRows(row.owner_email, row.run_id);
       if (row.ephemeral !== 1) {
         chatUpdatedAt = this.writeResultIntoChat(fake, message);
       }

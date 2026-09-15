@@ -659,6 +659,15 @@ export class ChatStore extends DurableObject {
     return json({ vault: this.vault.enabled ? "enabled" : this.vault.disabledReason, swept, rows, ...this.scope.describe() });
   }
 
+  /**
+   * Platform alarm (env.DO.setAlarm) — the keepalive that keeps this shard
+   * resident while interactive runs execute here and brings a run back after
+   * an eviction or deploy killed its node. RunManager decides what to do.
+   */
+  async onAlarm(): Promise<void> {
+    await this.runs.onAlarm();
+  }
+
   override async fetch(request: Request): Promise<Response> {
     try {
       return await this.route(request);

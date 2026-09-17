@@ -247,6 +247,31 @@ export const E2E_SCENARIOS: E2eScenario[] = [
     ],
   },
   {
+    id: "julius-hides-model-picker",
+    title: "Engaging Julius swaps the model picker for the candidate roster pill",
+    steps: [
+      { do: "goto", path: "/" },
+      { do: "see", target: TID.composerInput, timeoutMs: 20_000 },
+      { do: "see", target: TID.modelPickerTrigger },
+      { do: "tap", target: TID.composerModeTrigger },
+      { do: "tap", target: runModeOptionTid("julius") },
+      { do: "seeText", target: TID.composerModeTrigger, text: "Julius" },
+      { do: "notSee", target: TID.modelPickerTrigger },
+      { do: "see", target: TID.composerJuliusRoster },
+      { do: "seeText", target: TID.composerJuliusRoster, text: "Grok 4.6" },
+      { do: "tap", target: TID.composerJuliusRoster },
+      { do: "see", target: TID.composerJuliusRosterPanel },
+      { do: "seeText", target: TID.composerJuliusRosterPanel, text: "Candidates" },
+      // The pill is a toggle — a second tap folds the config away.
+      { do: "tap", target: TID.composerJuliusRoster },
+      { do: "notSee", target: TID.composerJuliusRosterPanel },
+      { do: "tap", target: TID.composerModeTrigger },
+      { do: "tap", target: runModeOptionTid("standard") },
+      { do: "see", target: TID.modelPickerTrigger },
+      { do: "notSee", target: TID.composerJuliusRoster },
+    ],
+  },
+  {
     id: "skills-rail-panel",
     title: "The rail Skills button opens the per-mode packs panel",
     steps: [

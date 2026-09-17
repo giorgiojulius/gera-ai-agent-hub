@@ -102,9 +102,12 @@ import { SKILL_SURFACE_LABEL, groupSkillsByFolder, setFolderSurface, setSkillSur
 import { isSteerableRun } from "@/lib/steering";
 import {
   composerPlaceholder,
+  findModel,
   MODE_MODEL_IDS,
   modelIdForMode,
+  modelShortName,
   modelsForMode,
+  parseModelSelection,
   videoModelTakesLocalFiles,
   voicesForModel,
 } from "@/lib/models";
@@ -957,7 +960,7 @@ export function Composer({ variant = "docked" }: { variant?: "docked" | "hero" }
             ) : null}
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
-            <ModelPicker />
+            {isChat && state.julius ? <JuliusRosterPill /> : <ModelPicker />}
             {activeRunning ? (
               <>
                 {canSend ? (
@@ -1292,6 +1295,55 @@ function JuliusConfig() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Stands in for the model picker while Julius is engaged: the answer comes
+ * from the candidate roster (and the council), never from one picked model,
+ * so the rail names the roster and opens the panel config instead.
+ */
+function JuliusRosterPill() {
+  const { state, models } = useAgent();
+  const julius = state.settings.julius;
+  const names = julius.candidateModelIds.map(
+    (id) => findModel(models, id)?.name ?? modelShortName(parseModelSelection(id).catalogId),
+  );
+  const single = names.length === 1;
+  const decision =
+    julius.decision === "council_v2" ? "Jev rules" : julius.decision === "council" || single ? "council rules" : "you pick";
+  const roster = names.join(" · ");
+  const detail = [
+    ...julius.candidateModelIds.map((id, index) => `${juliusLetter(index)} · ${names[index]} (${id})`),
+    `Decision: ${decision}`,
+  ].join("\n");
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-testid={TID.composerJuliusRoster}
+          aria-label={`Julius panel: ${names.length} ${single ? "candidate" : "candidates"} — ${roster}; ${decision}. Open panel settings.`}
+          title={`Julius answers with its own roster — the model picker does not apply.\n${detail}`}
+          className="flex h-8 min-w-0 items-center gap-1.5 rounded-lg px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground data-[state=open]:bg-foreground/5 data-[state=open]:text-foreground"
+        >
+          <Landmark className="h-3.5 w-3.5 shrink-0 text-ember" />
+          <span className="max-w-[9rem] truncate sm:max-w-[16rem]">{roster}</span>
+          <span className="hidden shrink-0 text-muted-foreground/70 md:inline">· {decision}</span>
+          <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-50" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="end"
+        sideOffset={10}
+        collisionPadding={12}
+        data-testid={TID.composerJuliusRosterPanel}
+        className="max-h-[min(70vh,30rem)] w-[min(92vw,22rem)] overflow-y-auto rounded-2xl border-border/80 bg-popover p-4 shadow-[0_24px_60px_-24px_rgba(35,20,28,0.45)]"
+      >
+        <JuliusConfig />
+      </PopoverContent>
+    </Popover>
   );
 }
 

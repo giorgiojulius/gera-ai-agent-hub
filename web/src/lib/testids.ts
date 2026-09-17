@@ -67,6 +67,10 @@ export const TID = {
   juliusBoardToggle: "julius-board-toggle",
   /** Chairman / editor verdict box inside a Julius panel card. */
   juliusVerdict: "julius-verdict",
+  /** Roster pill replacing the model picker while Julius is engaged (names the candidates, opens the panel config). */
+  composerJuliusRoster: "composer-julius-roster",
+  /** Body of the roster pill's popover (the Julius panel config). */
+  composerJuliusRosterPanel: "composer-julius-roster-panel",
   /** The one Skills button in the rail — its badge counts packs riding the active run mode. */
   composerSkills: "composer-skills",
   /** Body of the Skills popover (per-surface toggles). */

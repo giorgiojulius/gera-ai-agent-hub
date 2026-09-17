@@ -5,6 +5,11 @@
 // chairman rules, and the final deliverable is synthesized. In research mode
 // every candidate runs its own multi-wave deep research first and their
 // private source numberings are folded into one shared citation space.
+//
+// Council v2 (`decision: "council_v2"`): the Verifier fact-checks alone, then
+// Jev — TypeSafe's decision model (jev-board.ts) — picks the backbone, grades
+// every candidate and rules keep / fix / drop on every block with calibrated
+// probabilities; the chairman only writes the final answer from that plan.
 
 import type { McpRoute } from "./automation-runner";
 import {
@@ -15,6 +20,7 @@ import {
   withRetries,
   type EngineToolDef,
 } from "./agent-engine";
+import { boardPlanText, JEV_MODEL_ID, markBlocks, runJevBoard, type BoardBlock, type JevBoardOutcome } from "./jev-board";
 import {
   builtinToolDefs,
   createServerSurfSession,
@@ -213,6 +219,33 @@ function buildTranscript(prompt: string, candidates: JuliusCandidateState[], sou
   return parts.join("\n\n");
 }
 
+/** Council v2 material for the editor: every candidate with its ⟦id⟧-marked blocks, the backbone flagged. */
+function buildEditorMaterial(
+  prompt: string,
+  candidates: JuliusCandidateState[],
+  blocks: BoardBlock[],
+  winner: number,
+  sources?: RunSource[],
+): string {
+  const parts = [`USER REQUEST:\n"""\n${cap(prompt, PROMPT_CHARS)}\n"""`];
+  candidates.forEach((candidate, index) => {
+    const own = blocks.filter((block) => block.candidate === index);
+    if (own.length === 0) {
+      return;
+    }
+    const flag = candidate.status === "error" ? " (incomplete — generation was interrupted)" : "";
+    const role = index === winner && candidates.length > 1 ? " — BACKBONE" : "";
+    parts.push(
+      `CANDIDATE ${juliusLetter(index)} — model ${candidate.modelId}${role}${flag}, blocks marked ⟦id⟧:\n"""\n${markBlocks(own)}\n"""`,
+    );
+  });
+  const index = sourceIndexBlock(sources);
+  if (index) {
+    parts.push(index);
+  }
+  return parts.join("\n\n");
+}
+
 function parseChairman(text: string, candidates: JuliusCandidateState[]): { winner: number; verdict: string } {
   const valid = (index: number): boolean =>
     index >= 0 && index < candidates.length && candidates[index].content.trim().length > 0;
@@ -231,11 +264,34 @@ function parseChairman(text: string, candidates: JuliusCandidateState[]): { winn
   return { winner: Math.max(0, winner), verdict: verdict || text.trim() };
 }
 
-function synthesisPrompt(single: boolean, researchMode: boolean, winnerLetter: string): string {
-  const citing = researchMode
+function citationRules(researchMode: boolean): string {
+  return researchMode
     ? ` The candidates are deep-research reports that all cite ONE shared numbered source list with bracketed markers like [7] — the SOURCE INDEX in the material maps every number to its link, and the app renders each marker as a clickable citation pill. Citation rules: keep Perplexity-grade density — nearly every factual sentence keeps the [n] markers of the material it came from, stacked like [3][12] when several sources corroborate; copy markers EXACTLY, never renumber, never cite a number missing from the index, never replace markers with bare URLs. Preserve the strongest data artifacts from the candidates: carry over \`\`\`chart, \`\`\`map, and \`\`\`mermaid fences and comparison tables built from real source data (deduplicate — keep the best version of each; never invent data points). End with a "Sources" section (titled in the report's language) listing only the numbers you actually cited, in ascending order, one per line as "- [n] [Title](url)" copied from the SOURCE INDEX.`
     : ` When citing web sources, write full markdown links [title](url) taken from the material — never bare numeric markers like [3]; the reader cannot resolve them.`;
-  const reality = ` Sanity-check cost/time/effort claims against today's AI-tooling reality (${new Date().toISOString().slice(0, 10)}): AI coding agents now deliver in days what pre-2023 agencies quoted months and six figures for — correct or explicitly label stale baselines instead of repeating them.`;
+}
+
+function realityNote(): string {
+  return ` Sanity-check cost/time/effort claims against today's AI-tooling reality (${new Date().toISOString().slice(0, 10)}): AI coding agents now deliver in days what pre-2023 agencies quoted months and six figures for — correct or explicitly label stale baselines instead of repeating them.`;
+}
+
+/**
+ * Council v2: the chairman writes as an EDITOR bound by Jev's plan — kept
+ * blocks stay, fixed blocks take the Verifier's correction, dropped blocks
+ * vanish. The model contributes prose and order, never judgment.
+ */
+function editorPrompt(single: boolean, researchMode: boolean, backboneLetter: string | null): string {
+  const setting = single
+    ? "One answer to the user's request was produced and fact-checked by a neutral Verifier"
+    : "Several candidates answered the same user request in parallel and were fact-checked by a neutral Verifier";
+  const backbone = backboneLetter
+    ? ` Jev chose candidate ${backboneLetter} as the BACKBONE — build the final answer on its structure and add only what the plan keeps from the others.`
+    : "";
+  return `You are the EDITOR writing the final deliverable of a decision board. ${setting}; then Jev, a calibrated decision model, ruled on EVERY block of the material: KEEP, FIX, DROP (wrong) or DROP (redundant). Blocks are marked ⟦id⟧ in the material and listed in the BOARD PLAN.${backbone} Follow the plan exactly. KEEP blocks go in with their substance intact — you may reorder them, merge overlapping sentences and smooth transitions, never dilute or shorten their facts. FIX blocks go in with the Verifier's correction applied: use the Verifier's current value and its date; if the Verifier confirmed a flaw but gave no replacement, state the claim with its uncertainty named instead of repeating it as fact. DROP blocks do not appear in any form — no paraphrase, no footnote, no "some say". Never invent facts that are not in the kept material; when kept blocks contradict each other, keep the Verifier's version. Completeness is the plan's job; fidelity to it is yours.${citationRules(researchMode)}${realityNote()} Write directly to the user in the language of their request. Never mention the board, Jev, candidates, letters, blocks, markers, the Verifier, or this process. Output only the final answer.`;
+}
+
+function synthesisPrompt(single: boolean, researchMode: boolean, winnerLetter: string): string {
+  const citing = citationRules(researchMode);
+  const reality = realityNote();
   if (single) {
     return `You are the CHAIRMAN of a decision board writing the board's final deliverable. One answer was produced and then audited by a Proponent (praises by design), a Critic (attacks by design), and a neutral Verifier. Rewrite the answer into its final form: keep everything that is correct, fix every issue the reviews actually confirmed (the Verifier's evidence weighs most), and fill the real gaps they exposed. Never invent facts that are not in the material. The final version must not lose correct substance — as a rule it should be at least as complete as the original.${citing}${reality} Write directly to the user in the language of their request. Never mention the panel, the reviews, or this process. Output only the final answer.`;
   }
@@ -264,6 +320,9 @@ function makeEmitter(state: JuliusState, onUpdate: (julius: JuliusState) => void
       ...item,
       toolCalls: item.toolCalls?.map((call) => ({ ...call })),
     })),
+    board: state.board
+      ? { ...state.board, quality: [...state.board.quality], blocks: [...state.board.blocks] }
+      : undefined,
     sources: state.sources ? [...state.sources] : undefined,
   });
   let lastEmit = 0;
@@ -336,7 +395,8 @@ export type ServerJuliusParams = {
   isCancelled?: () => boolean;
   onUpdate: (julius: JuliusState) => void;
   onContent?: (full: string) => void;
-  onUsage?: (modelId: string, usage: unknown) => void;
+  /** `service` marks helper calls (Jev's board) — billed to the run, excluded from model adoption stats. */
+  onUsage?: (modelId: string, usage: unknown, service?: boolean) => void;
 };
 
 export type ServerJuliusResult = {
@@ -405,7 +465,8 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
     startedAt: Date.now(),
   };
   const single = state.candidates.length === 1;
-  const councilMode = params.settings.decision === "council" || single;
+  const councilMode = params.settings.decision !== "manual" || single;
+  const jevMode = params.settings.decision === "council_v2";
   state.chairmanModelId = councilMode ? params.settings.chairmanModelId : undefined;
 
   const { emit, snapshot } = makeEmitter(state, params.onUpdate);
@@ -570,7 +631,8 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
     return { julius: snapshot(), content: "" };
   }
 
-  // Phase 2 — council debate.
+  // Phase 2 — the debate. Council v2 runs the Verifier alone: Jev replaces
+  // the Proponent / Critic argument with calibrated rulings on the evidence.
   state.status = "debate";
   const transcript = buildTranscript(params.prompt, state.candidates, state.sources);
   const proponent: JuliusReviewState = {
@@ -591,7 +653,7 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
     content: "",
     status: "running",
   };
-  state.reviews = [proponent, critic, verifier];
+  state.reviews = jevMode ? [verifier] : [proponent, critic, verifier];
   emit(true);
 
   const count = withText.length;
@@ -679,17 +741,165 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
     emit(true);
   };
 
-  await Promise.all([
-    runPlainReview(proponent, proponentPrompt(count)),
-    runPlainReview(critic, criticPrompt(count)),
-    runVerifier(),
-  ]);
+  if (jevMode) {
+    await runVerifier();
+  } else {
+    await Promise.all([
+      runPlainReview(proponent, proponentPrompt(count)),
+      runPlainReview(critic, criticPrompt(count)),
+      runVerifier(),
+    ]);
+  }
 
   if (params.isCancelled?.()) {
     state.status = "choice";
     state.finishedAt = Date.now();
     emit(true);
     return { julius: snapshot(), content: "" };
+  }
+
+  const researchMode = state.candidates.some((item) => Boolean(item.label));
+
+  /**
+   * Phase 4 — the final deliverable: the chairman writes under `system` from
+   * `material`; the winner's own text stands in when the write fails.
+   */
+  const finalizeWith = async (winnerIdx: number, system: string, material: string): Promise<ServerJuliusResult> => {
+    state.status = "synthesis";
+    emit(true);
+    let finalContent = state.candidates[winnerIdx]?.content ?? "";
+    let finalServedBy = state.candidates[winnerIdx]?.servedBy;
+    const synthesisNote = (reason: string): void => {
+      state.verdict = [
+        state.verdict,
+        `_Final synthesis unavailable after ${COUNCIL_ATTEMPTS} attempts (${reason}) — showing the ${
+          jevMode && !single ? "backbone" : "winning"
+        } answer unchanged._`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    };
+    const write = async (): Promise<{ content: string; servedBy?: string }> => {
+      const completion = await streamGatewayText({
+        authKey: params.authKey,
+        modelId: params.settings.chairmanModelId,
+        messages: [
+          { role: "system", content: [params.systemPrompt?.trim(), system].filter(Boolean).join("\n\n") },
+          { role: "user", content: material },
+        ],
+        maxOutputTokens: await params.maxOutputTokensFor?.(params.settings.chairmanModelId),
+        isCancelled: params.isCancelled,
+        handlers: {
+          onText: (full) => {
+            if (full) {
+              params.onContent?.(full);
+            }
+          },
+        },
+        onUsage: params.onUsage,
+      });
+      return {
+        content: completion.content.trim(),
+        servedBy: fallbackServedBy(params.settings.chairmanModelId, completion.servedModelId),
+      };
+    };
+    try {
+      const merged = await withRetries(() => write(), {
+        attempts: COUNCIL_ATTEMPTS,
+        isCancelled: params.isCancelled,
+        shouldRetryResult: (result) => !result.content,
+      });
+      if (merged.content) {
+        finalContent = merged.content;
+        finalServedBy = merged.servedBy;
+      } else if (!params.isCancelled?.()) {
+        synthesisNote("the model returned nothing");
+      }
+    } catch (error) {
+      if (!params.isCancelled?.()) {
+        synthesisNote(messageOf(error));
+      }
+    }
+    state.status = "done";
+    state.finishedAt = Date.now();
+    emit(true);
+    return { julius: snapshot(), content: finalContent, servedBy: finalServedBy };
+  };
+
+  // Phase 3 (Council v2) — Jev rules on the evidence: the backbone, every
+  // candidate's quality, and keep / fix / drop for every block. No model
+  // argues a side; the chairman only writes from the plan.
+  if (jevMode) {
+    state.board = { modelId: JEV_MODEL_ID, status: "running", quality: [], blocks: [] };
+    emit(true);
+    let outcome: JevBoardOutcome;
+    try {
+      outcome = await runJevBoard({
+        authKey: params.authKey,
+        prompt: params.prompt,
+        candidates: state.candidates.map((item, index) => ({
+          index,
+          modelId: item.modelId,
+          content: item.content,
+          status: item.status,
+        })),
+        verifierReport: verifier.status === "done" ? verifier.content : null,
+        candidateChars: CANDIDATE_CHARS,
+        isCancelled: params.isCancelled,
+        onProgress: (board) => {
+          state.board = board;
+          emit(true);
+        },
+        onUsage: params.onUsage,
+      });
+    } catch (error) {
+      state.finishedAt = Date.now();
+      const stopped = params.isCancelled?.() === true;
+      const reason = messageOf(error);
+      state.board = {
+        modelId: JEV_MODEL_ID,
+        status: "error",
+        quality: state.board?.quality ?? [],
+        blocks: [],
+        ...(stopped ? {} : { error: reason }),
+      };
+      if (single) {
+        state.status = "done";
+        state.winner = 0;
+        state.verdict = stopped ? undefined : `Jev could not rule (${reason}) — the answer below is unreviewed.`;
+        emit(true);
+        return { julius: snapshot(), content: state.candidates[0].content, servedBy: state.candidates[0].servedBy };
+      }
+      state.status = "choice";
+      state.verdict = stopped ? undefined : `Jev could not rule (${reason}) — pick the winner yourself.`;
+      emit(true);
+      return { julius: snapshot(), content: "" };
+    }
+    // The board IS the ruling (the panel renders it structurally); `verdict`
+    // stays free for honest notes about failures.
+    state.board = outcome.board;
+    state.winner = outcome.winner;
+    state.decidedBy = "jev";
+    emit(true);
+    if (params.isCancelled?.()) {
+      state.status = "choice";
+      state.finishedAt = Date.now();
+      emit(true);
+      return { julius: snapshot(), content: "" };
+    }
+    const modelIds = new Map<number, string>(state.candidates.map((item, index) => [index, item.modelId]));
+    return finalizeWith(
+      outcome.winner,
+      editorPrompt(single, researchMode, single ? null : juliusLetter(outcome.winner)),
+      [
+        buildEditorMaterial(params.prompt, state.candidates, outcome.blocks, outcome.winner, state.sources),
+        `VERIFIER REPORT (neutral fact-check):\n"""\n${cap(
+          verifier.status === "done" ? verifier.content.trim() : "(review unavailable)",
+          REVIEW_CHARS,
+        )}\n"""`,
+        boardPlanText(outcome.board, modelIds),
+      ].join("\n\n"),
+    );
   }
 
   // Phase 3 — the chairman weighs the debate and rules.
@@ -701,7 +911,7 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
         messages: [
           {
             role: "system",
-            content: chairmanPrompt(count, state.candidates.some((item) => Boolean(item.label))),
+            content: chairmanPrompt(count, researchMode),
           },
           { role: "user", content: [transcript, reviewsBlock(state)].join("\n\n") },
         ],
@@ -763,75 +973,11 @@ export async function runServerJulius(params: ServerJuliusParams): Promise<Serve
   }
 
   // Phase 4 — the final deliverable.
-  const winnerContent = state.candidates[winnerIndex]?.content ?? "";
-  state.status = "synthesis";
-  emit(true);
-  let finalContent = winnerContent;
-  let finalServedBy = state.candidates[winnerIndex]?.servedBy;
-  const synthesisNote = (reason: string): void => {
-    state.verdict = [
-      state.verdict,
-      `_Final synthesis unavailable after ${COUNCIL_ATTEMPTS} attempts (${reason}) — showing the winning answer unchanged._`,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-  };
-  const runSynthesis = async (): Promise<{ content: string; servedBy?: string }> => {
-    const researchMode = state.candidates.some((item) => Boolean(item.label));
-    const completion = await streamGatewayText({
-      authKey: params.authKey,
-      modelId: params.settings.chairmanModelId,
-      messages: [
-        {
-          role: "system",
-          content: [params.systemPrompt?.trim(), synthesisPrompt(single, researchMode, juliusLetter(winnerIndex))]
-            .filter(Boolean)
-            .join("\n\n"),
-        },
-        {
-          role: "user",
-          content: [
-            transcript,
-            reviewsBlock(state),
-            `CHAIRMAN RULING:\n"""\n${cap(ruling.trim() || "(none)", REVIEW_CHARS)}\n"""`,
-          ].join("\n\n"),
-        },
-      ],
-      maxOutputTokens: await params.maxOutputTokensFor?.(params.settings.chairmanModelId),
-      isCancelled: params.isCancelled,
-      handlers: {
-        onText: (full) => {
-          if (full) {
-            params.onContent?.(full);
-          }
-        },
-      },
-      onUsage: params.onUsage,
-    });
-    return {
-      content: completion.content.trim(),
-      servedBy: fallbackServedBy(params.settings.chairmanModelId, completion.servedModelId),
-    };
-  };
-  try {
-    const merged = await withRetries(() => runSynthesis(), {
-      attempts: COUNCIL_ATTEMPTS,
-      isCancelled: params.isCancelled,
-      shouldRetryResult: (result) => !result.content,
-    });
-    if (merged.content) {
-      finalContent = merged.content;
-      finalServedBy = merged.servedBy;
-    } else if (!params.isCancelled?.()) {
-      synthesisNote("the model returned nothing");
-    }
-  } catch (error) {
-    if (!params.isCancelled?.()) {
-      synthesisNote(messageOf(error));
-    }
-  }
-  state.status = "done";
-  state.finishedAt = Date.now();
-  emit(true);
-  return { julius: snapshot(), content: finalContent, servedBy: finalServedBy };
+  return finalizeWith(
+    winnerIndex,
+    synthesisPrompt(single, researchMode, juliusLetter(winnerIndex)),
+    [transcript, reviewsBlock(state), `CHAIRMAN RULING:\n"""\n${cap(ruling.trim() || "(none)", REVIEW_CHARS)}\n"""`].join(
+      "\n\n",
+    ),
+  );
 }

@@ -6,6 +6,7 @@ import {
   Gavel,
   Landmark,
   Loader2,
+  Scale,
   ShieldCheck,
   Swords,
   Telescope,
@@ -18,8 +19,11 @@ import { MarkdownBody } from "@/components/gera/Markdown";
 import { useAgent } from "@/hooks/use-agent";
 import { juliusLetter } from "@/lib/julius";
 import { findModel, modelShortName } from "@/lib/models";
+import { TID } from "@/lib/testids";
 import type {
   GatewayModel,
+  JuliusBoard,
+  JuliusBoardDecision,
   JuliusCandidateState,
   JuliusReviewState,
   JuliusRole,
@@ -88,6 +92,7 @@ export function JuliusPanel({
     julius.status === "candidates" || julius.status === "debate" || julius.status === "synthesis";
   const single = julius.candidates.length === 1;
   const researchMode = julius.candidates.some((item) => Boolean(item.label));
+  const jevMode = julius.decision === "council_v2" || Boolean(julius.board);
   const [manual, setManual] = useState<boolean | null>(null);
   // Quality checks stay open when finished — the verdict is the point.
   const open = manual ?? !(julius.status === "done" && !single);
@@ -113,17 +118,23 @@ export function JuliusPanel({
           ? `Drafting the answer… · ${seconds}s`
           : `Asking ${julius.candidates.length} models in parallel… · ${seconds}s`
       : julius.status === "debate"
-        ? single
-          ? `The council is checking the ${researchMode ? "report" : "answer"}… · ${seconds}s`
-          : researchMode
-            ? `The council is comparing ${julius.candidates.length} research reports… · ${seconds}s`
-            : `The council is debating… · ${seconds}s`
+        ? jevMode
+          ? julius.board?.status === "running"
+            ? `Jev is ruling on every block… · ${seconds}s`
+            : `The Verifier is checking the ${single ? (researchMode ? "report" : "answer") : `${julius.candidates.length} ${researchMode ? "reports" : "answers"}`}… · ${seconds}s`
+          : single
+            ? `The council is checking the ${researchMode ? "report" : "answer"}… · ${seconds}s`
+            : researchMode
+              ? `The council is comparing ${julius.candidates.length} research reports… · ${seconds}s`
+              : `The council is debating… · ${seconds}s`
         : julius.status === "synthesis"
-          ? researchMode
-            ? `Writing the final research from all reports… · ${seconds}s`
-            : single
-              ? `Writing the final answer after the review… · ${seconds}s`
-              : `Merging the best of all answers… · ${seconds}s`
+          ? jevMode
+            ? `The editor is writing from Jev's plan… · ${seconds}s`
+            : researchMode
+              ? `Writing the final research from all reports… · ${seconds}s`
+              : single
+                ? `Writing the final answer after the review… · ${seconds}s`
+                : `Merging the best of all answers… · ${seconds}s`
           : julius.status === "choice"
             ? researchMode
               ? "Pick the winning report"
@@ -135,8 +146,12 @@ export function JuliusPanel({
                 ? "Quality check · council verdict below"
                 : "Quality check finished"
               : winner
-                ? `Winner: ${juliusLetter(julius.winner ?? 0)} · ${modelLabel(models, winner.modelId)} · ${
-                    julius.decidedBy === "chairman" ? "council ruling" : "your pick"
+                ? `${julius.decidedBy === "jev" ? "Backbone" : "Winner"}: ${juliusLetter(julius.winner ?? 0)} · ${modelLabel(models, winner.modelId)} · ${
+                    julius.decidedBy === "chairman"
+                      ? "council ruling"
+                      : julius.decidedBy === "jev"
+                        ? "Jev's ruling"
+                        : "your pick"
                   }`
                 : `${seconds}s`;
 
@@ -144,11 +159,14 @@ export function JuliusPanel({
   // rendering the card again would duplicate the whole text.
   const hideCandidates = single && hasFinalContent && julius.status !== "choice";
 
-  const showVerdictBox =
-    Boolean(julius.verdict) ||
-    (julius.status === "debate" &&
-      julius.reviews.length > 0 &&
-      julius.reviews.every((review) => review.status !== "running"));
+  // Council v2 renders Jev's board structurally; `verdict` then only carries
+  // honest notes (Jev unreachable, editor write failed).
+  const showVerdictBox = jevMode
+    ? Boolean(julius.verdict)
+    : Boolean(julius.verdict) ||
+      (julius.status === "debate" &&
+        julius.reviews.length > 0 &&
+        julius.reviews.every((review) => review.status !== "running"));
 
   return (
     <div className="mb-3 overflow-hidden rounded-2xl border border-border/70 bg-card shadow-sm">
@@ -213,11 +231,14 @@ export function JuliusPanel({
               ))}
             </div>
           ) : null}
+          {jevMode && julius.board ? (
+            <BoardSection board={julius.board} julius={julius} models={models} />
+          ) : null}
           {showVerdictBox ? (
-            <div className="rounded-xl border border-ember/40 bg-ember/5 px-3 py-2.5">
+            <div data-testid={TID.juliusVerdict} className="rounded-xl border border-ember/40 bg-ember/5 px-3 py-2.5">
               <p className="flex items-center gap-1.5 text-xs font-medium">
                 <Gavel className="h-3.5 w-3.5 text-ember" />
-                Chairman
+                {jevMode ? "Editor" : "Chairman"}
                 {julius.chairmanModelId ? (
                   <span className="font-normal text-muted-foreground">
                     · {modelLabel(models, julius.chairmanModelId)}
@@ -255,6 +276,177 @@ export function JuliusPanel({
             </p>
           ) : null}
         </div>
+      ) : null}
+    </div>
+  );
+}
+
+const DECISION_META: Record<JuliusBoardDecision, { label: string; tone: string; dot: string }> = {
+  keep: { label: "keep", tone: "text-gold", dot: "bg-gold" },
+  fix: { label: "fix", tone: "text-ember", dot: "bg-ember" },
+  drop_wrong: { label: "drop · wrong", tone: "text-destructive/90", dot: "bg-destructive/80" },
+  drop_redundant: { label: "drop · redundant", tone: "text-muted-foreground", dot: "bg-muted-foreground/60" },
+};
+
+function percentLabel(value: number | undefined): string {
+  return value === undefined ? "" : `${Math.round(value * 100)}%`;
+}
+
+/**
+ * Council v2: Jev's board — the backbone pick with its probability per
+ * candidate, every candidate's quality grade, the keep / fix / drop tally as a
+ * proportional bar, and (expanded) the ruling on every block with the
+ * excerpt it applies to.
+ */
+function BoardSection({ board, julius, models }: { board: JuliusBoard; julius: JuliusState; models: GatewayModel[] }) {
+  const [showBlocks, setShowBlocks] = useState<boolean>(false);
+  const tally: Record<JuliusBoardDecision, number> = { keep: 0, fix: 0, drop_wrong: 0, drop_redundant: 0 };
+  for (const block of board.blocks) {
+    tally[block.decision] += 1;
+  }
+  const total = board.blocks.length;
+  const running = board.status === "running";
+  const name = (index: number): string => {
+    const candidate = julius.candidates[index];
+    return candidate ? modelLabel(models, candidate.modelId) : `Candidate ${juliusLetter(index)}`;
+  };
+  const byCandidate = [...new Set(board.blocks.map((block) => block.candidate))].sort((a, b) => a - b);
+
+  return (
+    <div data-testid={TID.juliusBoard} className="rounded-xl border border-ember/40 bg-ember/5 px-3 py-2.5">
+      <p className="flex items-center gap-1.5 text-xs font-medium">
+        <Scale className={cn("h-3.5 w-3.5 text-ember", running && "animate-pulse")} />
+        <span>Jev’s board</span>
+        <span className="font-normal text-muted-foreground">· {modelShortName(board.modelId)} · decision model</span>
+        {running ? <Loader2 className="ml-auto h-3 w-3 animate-spin text-ember" /> : null}
+        {board.status === "error" ? <AlertCircle className="ml-auto h-3 w-3 text-destructive/80" /> : null}
+        {board.status === "done" && board.inputTokens ? (
+          <span className="ml-auto tabular-nums text-[10px] font-normal text-muted-foreground">
+            {board.inputTokens.toLocaleString()} tokens in · 0 out{board.elapsedMs ? ` · ${(board.elapsedMs / 1000).toFixed(1)}s` : ""}
+          </span>
+        ) : null}
+      </p>
+      {board.status === "error" && board.error ? (
+        <p className="mt-1 text-xs text-destructive/90">{board.error}</p>
+      ) : null}
+      {board.backbone ? (
+        <div className="mt-2 space-y-1">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Backbone</p>
+          {board.backbone.probabilities.map((probability, index) =>
+            julius.candidates[index] ? (
+              <div key={`backbone-${index}`} className="flex items-center gap-2 text-[11px]">
+                <span
+                  className={cn(
+                    "flex h-4 w-4 shrink-0 items-center justify-center rounded-full font-mono text-[9px] font-semibold",
+                    index === board.backbone?.winner ? "bg-gold/20 text-gold" : "bg-foreground/5 text-muted-foreground",
+                  )}
+                >
+                  {juliusLetter(index)}
+                </span>
+                <span className="w-28 shrink-0 truncate">{name(index)}</span>
+                <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-foreground/5">
+                  <span
+                    className={cn("block h-full rounded-full", index === board.backbone?.winner ? "bg-gold" : "bg-muted-foreground/40")}
+                    style={{ width: `${Math.max(2, Math.round(probability * 100))}%` }}
+                  />
+                </span>
+                <span className="w-9 shrink-0 text-right tabular-nums text-muted-foreground">{percentLabel(probability)}</span>
+                {index === board.backbone?.winner ? <Crown className="h-3 w-3 shrink-0 text-gold" /> : null}
+              </div>
+            ) : null,
+          )}
+        </div>
+      ) : null}
+      {board.quality.length > 0 ? (
+        <div className="mt-2">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Quality</p>
+          <div className="mt-0.5 flex flex-wrap gap-1.5">
+            {board.quality.map((item) => (
+              <span
+                key={`quality-${item.candidate}`}
+                className="rounded-full border border-border/60 bg-background/60 px-2 py-0.5 text-[10px]"
+                title={`${name(item.candidate)} — confidence ${percentLabel(item.confidence)}`}
+              >
+                <span className="font-mono font-semibold">{juliusLetter(item.candidate)}</span> {item.level}
+                <span className="text-muted-foreground"> · {percentLabel(item.confidence)}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {total > 0 ? (
+        <div className="mt-2">
+          <button
+            type="button"
+            data-testid={TID.juliusBoardToggle}
+            onClick={() => setShowBlocks((value) => !value)}
+            aria-expanded={showBlocks}
+            className="flex w-full items-center gap-2 text-left"
+          >
+            <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+              {total} blocks
+            </span>
+            <span className="flex h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-foreground/5">
+              {(Object.keys(DECISION_META) as JuliusBoardDecision[]).map((decision) =>
+                tally[decision] > 0 ? (
+                  <span
+                    key={decision}
+                    className={cn("block h-full", DECISION_META[decision].dot)}
+                    style={{ width: `${(tally[decision] / total) * 100}%` }}
+                  />
+                ) : null,
+              )}
+            </span>
+            <ChevronDown
+              className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform", showBlocks && "rotate-180")}
+            />
+          </button>
+          <p className="mt-1 flex flex-wrap gap-x-2 text-[10px] text-muted-foreground">
+            {(Object.keys(DECISION_META) as JuliusBoardDecision[]).map((decision) => (
+              <span key={decision} className="inline-flex items-center gap-1">
+                <span className={cn("inline-block h-1.5 w-1.5 rounded-full", DECISION_META[decision].dot)} />
+                {tally[decision]} {DECISION_META[decision].label}
+              </span>
+            ))}
+          </p>
+          {showBlocks ? (
+            <div className="mt-1.5 max-h-64 space-y-2 overflow-y-auto pr-0.5">
+              {byCandidate.map((index) => (
+                <div key={`blocks-${index}`}>
+                  <p className="text-[10px] font-medium">
+                    <span className="font-mono">{juliusLetter(index)}</span> · {name(index)}
+                    {board.backbone?.winner === index ? <span className="text-gold"> · backbone</span> : null}
+                  </p>
+                  <ul className="mt-0.5 space-y-0.5">
+                    {board.blocks
+                      .filter((block) => block.candidate === index)
+                      .map((block) => (
+                        <li
+                          key={block.id}
+                          data-testid={TID.juliusBoardBlock}
+                          data-decision={block.decision}
+                          className="flex items-start gap-1.5 text-[11px] leading-snug"
+                        >
+                          <span className={cn("mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full", DECISION_META[block.decision].dot)} />
+                          <span className={cn("w-[5.5rem] shrink-0 font-medium", DECISION_META[block.decision].tone)}>
+                            {DECISION_META[block.decision].label}
+                            {block.probability === undefined ? "" : ` ${percentLabel(block.probability)}`}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-muted-foreground" title={block.excerpt}>
+                            {block.excerpt}
+                          </span>
+                        </li>
+                      ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : running ? (
+        <p className="mt-1 animate-pulse text-xs text-muted-foreground">
+          {board.quality.length > 0 ? "Ruling on every block…" : "Picking the backbone and grading the candidates…"}
+        </p>
       ) : null}
     </div>
   );

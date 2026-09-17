@@ -293,6 +293,11 @@ export function reviveMessage(message: ChatMessage): ChatMessage {
   const reviews = (julius.reviews ?? []).map((item) =>
     item.status === "running" ? { ...item, status: "error" as const } : item,
   );
+  // A board still "running" died with the tab — its partial rulings stay, the status is honest.
+  const board =
+    julius.board && julius.board.status === "running"
+      ? { ...julius.board, status: "error" as const, error: "Interrupted by reload." }
+      : julius.board;
   const interrupted = julius.status === "candidates" || julius.status === "debate";
   // Single candidate = quality check: nothing to pick, settle as done.
   // A reload mid-synthesis keeps the ruling — the winner is already decided.
@@ -311,6 +316,7 @@ export function reviveMessage(message: ChatMessage): ChatMessage {
       ...julius,
       candidates,
       reviews,
+      ...(board ? { board } : {}),
       status,
       finishedAt: status !== julius.status ? julius.finishedAt ?? Date.now() : julius.finishedAt,
     },
@@ -741,7 +747,10 @@ function normalizeJulius(stored: unknown): JuliusSettings {
     : [];
   return {
     candidateModelIds: candidates.length >= JULIUS_MIN_CANDIDATES ? candidates : defaults.candidateModelIds,
-    decision: raw.decision === "manual" || raw.decision === "council" ? raw.decision : defaults.decision,
+    decision:
+      raw.decision === "manual" || raw.decision === "council" || raw.decision === "council_v2"
+        ? raw.decision
+        : defaults.decision,
     proponentModelId: sanitize(raw.proponentModelId, defaults.proponentModelId),
     criticModelId: sanitize(raw.criticModelId, defaults.criticModelId),
     verifierModelId: sanitize(raw.verifierModelId, defaults.verifierModelId),

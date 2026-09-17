@@ -333,7 +333,8 @@ function asModelType(value: unknown): ModelType {
     value === "speech" ||
     value === "transcription" ||
     value === "realtime" ||
-    value === "reranking"
+    value === "reranking" ||
+    value === "evaluation"
   ) {
     return value;
   }
@@ -777,6 +778,7 @@ export function typeLabel(type: ModelType): string {
     embedding: "Embed",
     realtime: "Realtime",
     reranking: "Rerank",
+    evaluation: "Decide",
   };
   return labels[type];
 }

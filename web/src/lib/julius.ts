@@ -545,7 +545,9 @@ export async function runJuliusTurn(params: JuliusRunParams): Promise<JuliusRunR
   };
   const single = state.candidates.length === 1;
   // A single candidate has nothing to "pick" — the council always reviews it.
-  const councilMode = params.settings.decision === "council" || single;
+  // Council v2 (Jev's board) is server-only; this legacy browser loop runs
+  // the classic council for it.
+  const councilMode = params.settings.decision !== "manual" || single;
   state.chairmanModelId = councilMode ? params.settings.chairmanModelId : undefined;
 
   const { emit, snapshot } = makeEmitter(state, params.onUpdate);

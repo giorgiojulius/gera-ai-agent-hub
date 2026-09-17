@@ -1118,15 +1118,23 @@ function ResearchConfig() {
   );
 }
 
-const COUNCIL_ROLES: {
+type CouncilRole = {
   key: "proponentModelId" | "criticModelId" | "verifierModelId" | "chairmanModelId";
   label: string;
   hint: string;
-}[] = [
+};
+
+const COUNCIL_ROLES: CouncilRole[] = [
   { key: "proponentModelId", label: "Proponent", hint: "always argues for" },
   { key: "criticModelId", label: "Critic", hint: "always attacks" },
   { key: "verifierModelId", label: "Verifier", hint: "checks facts, can search" },
   { key: "chairmanModelId", label: "Chairman", hint: "weighs it all, rules" },
+];
+
+/** Council v2: no Proponent / Critic — Jev rules on the Verifier's evidence; the chairman only writes. */
+const COUNCIL_V2_ROLES: CouncilRole[] = [
+  { key: "verifierModelId", label: "Verifier", hint: "checks facts, can search" },
+  { key: "chairmanModelId", label: "Editor", hint: "writes from Jev's plan" },
 ];
 
 /** Julius panel configuration: candidate models, decision mode, council models. */
@@ -1141,6 +1149,10 @@ function JuliusConfig() {
       : MODE_MODEL_IDS.chat.map((id) => ({ id, name: id }));
   }, [models]);
   const patch = (next: Partial<JuliusSettings>) => patchSettings({ julius: { ...julius, ...next } });
+  // One candidate has nothing to pick between: "I pick" falls back to the classic council.
+  const jev = julius.decision === "council_v2";
+  const classic = julius.decision === "council" || (singleCandidate && julius.decision === "manual");
+  const roles = jev ? COUNCIL_V2_ROLES : COUNCIL_ROLES;
 
   return (
     <div className="space-y-4">
@@ -1227,22 +1239,38 @@ function JuliusConfig() {
             description={singleCandidate ? "Needs 2+ candidates" : "Answers side by side — you choose the winner"}
           />
           <DecisionOption
-            active={singleCandidate || julius.decision === "council"}
+            active={classic}
             onClick={() => patch({ decision: "council" })}
             title="Council decides"
             description="Proponent vs Critic, Verifier checks, Chairman rules"
           />
+          <DecisionOption
+            active={jev}
+            onClick={() => patch({ decision: "council_v2" })}
+            title="Council v2 · Jev"
+            description="Verifier checks; Jev rules keep / fix / drop on every block; the editor writes"
+            testId={TID.juliusDecisionV2}
+            badge="new"
+          />
         </div>
-        {singleCandidate ? (
+        {jev ? (
+          <p className="px-0.5 text-[10px] leading-snug text-muted-foreground">
+            Jev (TypeSafe AI) is a decision model: no prose, typed rulings with calibrated probabilities, ~100× cheaper
+            than an LLM chairman. It picks the backbone{singleCandidate ? "" : " among the candidates"} and rules on
+            every block; no model argues a side.
+          </p>
+        ) : singleCandidate ? (
           <p className="px-0.5 text-[10px] leading-snug text-muted-foreground">
             With one candidate the council always reviews the answer quality.
           </p>
         ) : null}
       </div>
-      {singleCandidate || julius.decision === "council" ? (
+      {classic || jev ? (
         <div className="space-y-1.5">
-          <p className="px-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Council models</p>
-          {COUNCIL_ROLES.map((role) => (
+          <p className="px-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+            {jev ? "Council v2 models" : "Council models"}
+          </p>
+          {roles.map((role) => (
             <label key={role.key} className="flex items-center gap-2">
               <span className="w-24 shrink-0 text-xs">
                 {role.label}
@@ -1273,12 +1301,16 @@ function DecisionOption({
   onClick,
   title,
   description,
+  testId,
+  badge,
 }: {
   active: boolean;
   disabled?: boolean;
   onClick: () => void;
   title: string;
   description: string;
+  testId?: string;
+  badge?: string;
 }) {
   return (
     <button
@@ -1286,13 +1318,21 @@ function DecisionOption({
       onClick={onClick}
       disabled={disabled}
       aria-pressed={active}
+      data-testid={testId}
       className={cn(
         "rounded-xl border px-2.5 py-2 text-left transition-colors",
         active ? "border-ember/60 bg-ember/10" : "border-border/70 hover:bg-muted/50",
         disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
       )}
     >
-      <span className={cn("block text-xs font-medium", active && "text-ember")}>{title}</span>
+      <span className={cn("flex items-center gap-1.5 text-xs font-medium", active && "text-ember")}>
+        {title}
+        {badge ? (
+          <span className="rounded-full bg-gold/15 px-1.5 py-px text-[9px] font-semibold uppercase tracking-wide text-gold">
+            {badge}
+          </span>
+        ) : null}
+      </span>
       <span className="mt-0.5 block text-[10px] leading-tight text-muted-foreground">{description}</span>
     </button>
   );

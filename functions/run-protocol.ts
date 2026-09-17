@@ -867,7 +867,53 @@ export type ResearchState = {
 
 export type ResearchDepth = "eco" | "balanced" | "max";
 
-export type JuliusDecision = "manual" | "council";
+/**
+ * How a Julius panel picks the final answer: the user ("manual"), the LLM
+ * council with a chairman ruling ("council"), or Council v2 ("council_v2") —
+ * the Verifier fact-checks, Jev (TypeSafe's decision model) picks the backbone
+ * and rules keep / fix / drop on every block, and the chairman only writes.
+ */
+export type JuliusDecision = "manual" | "council" | "council_v2";
+
+/** What Jev ruled for one block of a candidate answer in Council v2. */
+export type JuliusBoardDecision = "keep" | "fix" | "drop_wrong" | "drop_redundant";
+
+export type JuliusBoardBlock = {
+  /** Block id as the plan cites it, e.g. "B3". */
+  id: string;
+  /** Index of the candidate the block belongs to. */
+  candidate: number;
+  /** Whitespace-collapsed opening of the block for the panel (≤ 160 chars). */
+  excerpt: string;
+  chars: number;
+  decision: JuliusBoardDecision;
+  /** Jev's probability of the chosen decision (0–1); absent when the provider sent no distribution. */
+  probability?: number;
+  probabilities?: Record<JuliusBoardDecision, number>;
+};
+
+export type JuliusBoardQuality = {
+  candidate: number;
+  /** Probability-weighted level, 0 … levels − 1. */
+  score: number;
+  /** Label of the most probable level. */
+  level: string;
+  confidence: number;
+};
+
+/** Council v2: Jev's editorial board over the candidates, stored with the panel. */
+export type JuliusBoard = {
+  modelId: string;
+  status: "running" | "done" | "error";
+  error?: string;
+  /** Multi-candidate panels: the backbone pick with a probability per candidate index. */
+  backbone?: { winner: number; probabilities: number[]; confidence: number };
+  quality: JuliusBoardQuality[];
+  blocks: JuliusBoardBlock[];
+  /** Jev input tokens the board cost (Jev bills no output). */
+  inputTokens?: number;
+  elapsedMs?: number;
+};
 
 export type JuliusRunStatus =
   | "waiting"
@@ -911,7 +957,9 @@ export type JuliusState = {
   chairmanServedBy?: string;
   chairmanThinking?: string;
   winner?: number;
-  decidedBy?: "user" | "chairman";
+  decidedBy?: "user" | "chairman" | "jev";
+  /** Council v2: Jev's rulings (backbone, quality, per-block keep / fix / drop). */
+  board?: JuliusBoard;
   hubOpsApplied?: number[];
   sources?: RunSource[];
   startedAt: number;

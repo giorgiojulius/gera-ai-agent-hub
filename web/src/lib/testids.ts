@@ -57,6 +57,16 @@ export const TID = {
   composerModeConfig: "composer-mode-config",
   /** Body of the run-mode settings popover (research depth / Julius panel). */
   composerModeConfigPanel: "composer-mode-config-panel",
+  /** "Council v2 · Jev" decision option inside the Julius config. */
+  juliusDecisionV2: "julius-decision-v2",
+  /** Council v2 board section inside a Julius panel card (Jev's rulings). */
+  juliusBoard: "julius-board",
+  /** One block ruling row inside the board (repeats). */
+  juliusBoardBlock: "julius-board-block",
+  /** Toggle that expands the per-block rulings of the board. */
+  juliusBoardToggle: "julius-board-toggle",
+  /** Chairman / editor verdict box inside a Julius panel card. */
+  juliusVerdict: "julius-verdict",
   /** The one Skills button in the rail — its badge counts packs riding the active run mode. */
   composerSkills: "composer-skills",
   /** Body of the Skills popover (per-surface toggles). */

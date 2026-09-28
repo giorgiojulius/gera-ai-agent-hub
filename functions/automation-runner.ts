@@ -26,6 +26,7 @@ import {
   type RefreshedOAuth,
 } from "./mcp-cloud";
 import type { McpRunPolicy } from "./mcp-policy";
+import { latestModelSelection } from "./model-catalog";
 import {
   idleToolset,
   resolveMcpToolset,
@@ -139,7 +140,7 @@ function createSourceLedger(): SourceLedger {
 
 const TOOLKIT_URL = "https://toolkit.rork.com";
 /** Mirrors the web client's gateway fallback chain. */
-const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.7-flash"];
+const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.8-flash"];
 const MAX_STEPS = 10;
 const LIVE_RESULT_CHARS = 12_000;
 const LLM_TIMEOUT_MS = 100_000;
@@ -304,6 +305,9 @@ export async function runAutomationJob(
         ...(credentials ? { credentials } : {}),
       })
     : idleToolset();
+  // A stored pick follows its model line: once the gateway lists a newer
+  // release (grok-4.6 → grok-4.7) the automation runs on it.
+  const modelId = await latestModelSelection(job.modelId);
   const tools: ToolDef[] = [...TOOLS, ...mcp.toolDefs, executionOutcomeToolDefinition()];
   const messages: GatewayMessage[] = [{ role: "system", content: buildSystemPrompt(job, mcp) }];
   for (const item of job.prior) {
@@ -356,7 +360,7 @@ export async function runAutomationJob(
     if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
       break; // Out of wall-clock budget — wrap up with what we have.
     }
-    const completion = await chatCompletion(job.modelId, messages, tools, authKey);
+    const completion = await chatCompletion(modelId, messages, tools, authKey);
     if (completion.content.trim().length > 0) {
       lastContent = completion.content;
     }
@@ -399,7 +403,7 @@ export async function runAutomationJob(
     content:
       "Stop using tools now. Write your complete final answer using everything gathered above; note plainly anything that could not be determined.",
   });
-  const wrapUp = await chatCompletion(job.modelId, messages, null, authKey);
+  const wrapUp = await chatCompletion(modelId, messages, null, authKey);
   return finish(wrapUp.content || lastContent || "(no output)");
 }
 

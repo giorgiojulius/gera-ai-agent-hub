@@ -1,4 +1,5 @@
 import { getToolkitUrl } from "@/lib/env";
+import { isPrereleaseModel, latestInFamily, latestSelection, modelFamily } from "../../../functions/model-lineage";
 import type {
   AgentSettings,
   CostTier,
@@ -17,7 +18,7 @@ export const PRIMARY_CHAT_MODEL_IDS = [
   "anthropic/claude-fable-5.1",
   "openai/gpt-5.6-luna",
 ] as const;
-export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.7-flash"] as const;
+export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.8-flash"] as const;
 /**
  * Cheapest catalog model for internal helper calls (tool router, research
  * planner). Gateway list rates as of 2026-08: qwen3.7-flash
@@ -28,7 +29,7 @@ export const FAST_MODEL = "alibaba/qwen3.7-flash";
  * Thread auto-titles run on Luna instead of the fast model — qwen titles
  * read clunky; at ≤64 output tokens per thread the upgrade costs pennies.
  */
-export const TITLE_MODEL = "openai/gpt-5.6-luna";
+export const TITLE_MODEL = "openai/gpt-6-luna";
 export const DEFAULT_IMAGE_MODEL = "openai/gpt-image-2";
 export const IMAGE_FALLBACKS = ["bytedance/seedream-5.0-lite", "spacexai/grok-imagine-image-2.0"] as const;
 export const DEFAULT_VIDEO_MODEL = "bytedance/seedance-2.5";
@@ -264,6 +265,92 @@ export function modeForModelType(type: ModelType): CreateMode {
 
 /** Chat catalog membership by base id — reasoning-effort suffixes ride along freely. */
 const CHAT_CATALOG_IDS = new Set(MODE_MODEL_IDS.chat.map((id) => parseModelSelection(id).catalogId));
+/**
+ * Model lines the chat catalog follows (`spacexai/grok-#`, `openai/gpt-#-sol`, …).
+ * A newer version of a curated line is a valid pick before any code change.
+ */
+const CHAT_FAMILIES = new Set([...CHAT_CATALOG_IDS].map(modelFamily));
+
+/** Whether a chat catalog id belongs to a curated line (any version, no pre-releases). */
+export function isCuratedChatLine(catalogId: string): boolean {
+  return CHAT_CATALOG_IDS.has(catalogId) || (CHAT_FAMILIES.has(modelFamily(catalogId)) && !isPrereleaseModel(catalogId));
+}
+
+/**
+ * Curated chat ids moved onto the newest version of each line the live
+ * catalog lists (grok-4.6 → grok-4.7 the day the gateway ships it). Media
+ * tabs stay hand-curated: their image-input and duration rules were probed
+ * per exact model. Empty catalog → the seeds as written.
+ */
+export function resolvedModeIds(models: GatewayModel[], mode: CreateMode): string[] {
+  if (mode !== "chat" || models.length === 0) {
+    return MODE_MODEL_IDS[mode];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of MODE_MODEL_IDS.chat) {
+    const next = latestSelection(models, id);
+    if (!seen.has(next)) {
+      seen.add(next);
+      out.push(next);
+    }
+  }
+  return out;
+}
+
+/**
+ * A saved chat pick on the newest version of its line per the live catalog;
+ * unknown line or empty catalog → unchanged. Effort suffix is preserved.
+ */
+export function upgradeChatSelection(models: GatewayModel[], selectionId: string): string {
+  if (!selectionId || models.length === 0) {
+    return selectionId;
+  }
+  const { catalogId } = parseModelSelection(selectionId);
+  if (!isCuratedChatLine(catalogId)) {
+    return selectionId;
+  }
+  return latestSelection(models, selectionId);
+}
+
+/**
+ * Every saved chat pick in settings (composer model, Julius roster and
+ * council, agent profiles) moved onto the newest release of its line.
+ * Returns the same object and an empty `changed` list when nothing moved.
+ */
+export function upgradeSettingsModels(
+  settings: AgentSettings,
+  models: GatewayModel[],
+): { settings: AgentSettings; changed: string[] } {
+  const changed: string[] = [];
+  const up = (id: string): string => {
+    const next = upgradeChatSelection(models, id);
+    if (next !== id) {
+      changed.push(`${id} → ${next}`);
+    }
+    return next;
+  };
+  const modelId = up(settings.modelId);
+  const julius = settings.julius;
+  const nextJulius = julius
+    ? {
+        ...julius,
+        candidateModelIds: julius.candidateModelIds.map(up),
+        proponentModelId: up(julius.proponentModelId),
+        criticModelId: up(julius.criticModelId),
+        verifierModelId: up(julius.verifierModelId),
+        chairmanModelId: up(julius.chairmanModelId),
+      }
+    : julius;
+  const agents = settings.agents.map((agent) => {
+    const next = up(agent.modelId);
+    return next === agent.modelId ? agent : { ...agent, modelId: next };
+  });
+  if (changed.length === 0) {
+    return { settings, changed };
+  }
+  return { settings: { ...settings, modelId, julius: nextJulius, agents }, changed };
+}
 
 /**
  * Retired picks that have a direct successor in the catalog. Without this a
@@ -292,6 +379,11 @@ export function sanitizeChatModel(id: string | undefined, fallback: string = DEF
   const successor = MODEL_SUCCESSORS[parsed.catalogId];
   if (successor && CHAT_CATALOG_IDS.has(successor)) {
     return withEffort(successor, parsed.reasoningEffort);
+  }
+  // Another version of a curated line (a newer release the catalog shipped,
+  // or an older one the next catalog load lifts to the line's head).
+  if (isCuratedChatLine(parsed.catalogId)) {
+    return id;
   }
   return fallback;
 }
@@ -412,6 +504,7 @@ function normalizeModel(raw: Record<string, unknown>): GatewayModel {
     tags: Array.isArray(raw.tags) ? raw.tags.filter((tag): tag is string => typeof tag === "string") : [],
     pricing: normalizePricing(raw.pricing),
     modalities,
+    released: typeof raw.released === "number" && Number.isFinite(raw.released) ? raw.released : undefined,
   };
 }
 
@@ -526,7 +619,7 @@ function modelsFromIds(models: GatewayModel[], ids: string[]): GatewayModel[] {
 
 /** Curated model list for one creation tab — old catalog generations excluded. */
 export function modelsForMode(models: GatewayModel[], mode: CreateMode): GatewayModel[] {
-  const resolved = modelsFromIds(models, MODE_MODEL_IDS[mode]);
+  const resolved = modelsFromIds(models, resolvedModeIds(models, mode));
   if (resolved.length > 0) {
     return resolved;
   }
@@ -541,7 +634,7 @@ export function modelsForMode(models: GatewayModel[], mode: CreateMode): Gateway
 export function chatBaseModels(models: GatewayModel[]): GatewayModel[] {
   const seen = new Set<string>();
   const result: GatewayModel[] = [];
-  for (const id of MODE_MODEL_IDS.chat) {
+  for (const id of resolvedModeIds(models, "chat")) {
     const catalogId = parseModelSelection(id).catalogId;
     if (seen.has(catalogId)) {
       continue;
@@ -564,10 +657,14 @@ export function groupChatModels(models: GatewayModel[]): {
   more: GatewayModel[];
 } {
   const modelsById = new Map<string, GatewayModel>(models.map((model) => [model.id, model]));
-  const primary = PRIMARY_CHAT_MODEL_IDS.map((id) => modelsById.get(id)).filter(
-    (model): model is GatewayModel => Boolean(model),
+  // Primary picks follow their line too: the head of each line leads the menu.
+  const primaryIdList = PRIMARY_CHAT_MODEL_IDS.map((id) =>
+    modelsById.has(id) ? latestInFamily(models, id) : [...modelsById.keys()].find((key) => modelFamily(key) === modelFamily(id)) ?? id,
   );
-  const primaryIds = new Set<string>(PRIMARY_CHAT_MODEL_IDS);
+  const primary = primaryIdList
+    .map((id) => modelsById.get(id))
+    .filter((model): model is GatewayModel => Boolean(model));
+  const primaryIds = new Set<string>(primaryIdList);
   const more = models.filter((model) => !primaryIds.has(model.id));
   return { primary, more };
 }
@@ -575,7 +672,7 @@ export function groupChatModels(models: GatewayModel[]): {
 /** Every curated model across all creation tabs, in tab order. */
 export function curatedModels(models: GatewayModel[]): GatewayModel[] {
   const modes: CreateMode[] = ["chat", "image", "video", "audio"];
-  return modes.flatMap((mode) => modelsFromIds(models, MODE_MODEL_IDS[mode]));
+  return modes.flatMap((mode) => modelsFromIds(models, resolvedModeIds(models, mode)));
 }
 
 export function findModel(models: GatewayModel[], id: string): GatewayModel | undefined {

@@ -32,7 +32,7 @@ import {
   Wand2,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { authSessionSnapshot, isAuthSessionCurrent } from "@/lib/auth-tokens";
 import { githubAccountReference } from "@/lib/github-transport";
 import { Link } from "react-router-dom";
@@ -61,13 +61,14 @@ import {
 } from "@/lib/github-device";
 import { findCatalogEntry, serverIconUrl } from "@/lib/mcp-catalog";
 import {
-  MODE_MODEL_IDS,
   REASONING_EFFORTS,
   effortLabel,
   modelShortName,
+  resolvedModeIds,
   withEffort,
   type ReasoningEffort,
 } from "@/lib/models";
+import type { GatewayModel } from "@/lib/types";
 import {
   accessSummary,
   createAgentSlackApp,
@@ -146,11 +147,11 @@ function splitModelId(model: string): { base: string; effort: "" | ReasoningEffo
   return { base: model, effort: "" };
 }
 
-/** Chat catalog deduped to base ids — effort is picked separately. */
-const CHAT_MODEL_BASES: string[] = (() => {
+/** Chat catalog (newest release of each line) deduped to base ids — effort is picked separately. */
+function chatModelBases(models: GatewayModel[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const id of MODE_MODEL_IDS.chat) {
+  for (const id of resolvedModeIds(models, "chat")) {
     const base = splitModelId(id).base;
     if (!seen.has(base)) {
       seen.add(base);
@@ -158,7 +159,7 @@ const CHAT_MODEL_BASES: string[] = (() => {
     }
   }
   return out;
-})();
+}
 
 const EFFORT_CHOICES: ReadonlyArray<["" | ReasoningEffort, string]> = [
   ["", "Auto"],
@@ -168,7 +169,7 @@ const EFFORT_CHOICES: ReadonlyArray<["" | ReasoningEffort, string]> = [
 /** Human label for an agent's stored model string. */
 function agentModelLabel(model: string): string {
   if (!model) {
-    return "Default (Grok 4.6)";
+    return "Default (latest Grok)";
   }
   const { base, effort } = splitModelId(model);
   return effort ? `${modelShortName(base)} · ${effortLabel(effort)}` : modelShortName(base);
@@ -313,6 +314,8 @@ export function AgentsPanel({
   slackConfig: ProjectSlackConfig | null;
 }) {
   const queryClient = useQueryClient();
+  const { models } = useAgent();
+  const chatBases = useMemo(() => chatModelBases(models ?? []), [models]);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [viewing, setViewing] = useState<ProjectAgent | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
@@ -863,8 +866,8 @@ export function AgentsPanel({
                     }
                     className="h-10 w-full rounded-xl border border-input bg-background px-3 text-sm outline-none focus:border-foreground/25"
                   >
-                    <option value="">Default (Grok 4.6)</option>
-                    {CHAT_MODEL_BASES.map((id) => (
+                    <option value="">Default (latest Grok)</option>
+                    {chatBases.map((id) => (
                       <option key={id} value={id}>
                         {modelShortName(id)}
                       </option>

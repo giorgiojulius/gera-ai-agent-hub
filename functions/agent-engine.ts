@@ -33,7 +33,7 @@ export const TOOLKIT_URL = "https://toolkit.rork.com";
 
 export const DEFAULT_CHAT_MODEL = "spacexai/grok-4.6:xhigh";
 /** Mirrors the web client's gateway fallback chain. */
-export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.7-flash"] as const;
+export const CHAT_FALLBACKS = ["openai/gpt-5.6-terra", "google/gemini-3.8-flash"] as const;
 export const FAST_MODEL = "alibaba/qwen3.7-flash";
 
 export const SYSTEM_PROMPT = `You are Gera, a precise AI agent studio.

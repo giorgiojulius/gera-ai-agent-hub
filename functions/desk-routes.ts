@@ -99,7 +99,7 @@ const DESK_REPLIES_KEEP = 2_000;
 const DESK_GRADE_BATCH = 24;
 const DESK_CONVERSATIONS_SCAN = 300;
 /** Reply drafts ride Luna — a fixed fast writer; grading keeps the inbox agent's model. */
-const DESK_SUGGEST_MODEL = "openai/gpt-5.6-luna";
+const DESK_SUGGEST_MODEL = "openai/gpt-6-luna";
 const DESK_QUESTION_LIMIT = 600;
 // Desk ↔ Slack awareness: channel-pool sync TTL and caps, ask-run windows.
 const DESK_SLACK_TTL_MS = 150_000;

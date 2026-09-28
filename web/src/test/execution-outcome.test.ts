@@ -215,7 +215,11 @@ describe("cloud automation runner contract", () => {
       significance: { kind: "action", summary: "A requested announcement is ready." },
     });
     let gatewayCalls = 0;
-    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      // The runner first reads the model catalog (model-line upgrade); unreachable → pick unchanged.
+      if (String(input).endsWith("/v1/models")) {
+        return new Response("{}", { status: 503 });
+      }
       gatewayCalls += 1;
       const body = JSON.parse(String(init?.body ?? "{}")) as {
         messages?: Array<{ role?: string; content?: string }>;

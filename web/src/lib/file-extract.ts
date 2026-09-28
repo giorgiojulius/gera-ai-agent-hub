@@ -48,7 +48,7 @@ export function isSupportedKnowledgeFile(file: File): boolean {
 // ------------------------------------------------------------------- OCR
 
 /** Cheap vision model; usage is reported to telemetry by streamCompletion. */
-const OCR_MODEL = "google/gemini-3.7-flash";
+const OCR_MODEL = "google/gemini-3.8-flash";
 const OCR_MAX_PAGES = 40;
 const OCR_BATCH_PAGES = 4;
 /** Target longest edge of a rendered page image — legible without huge payloads. */

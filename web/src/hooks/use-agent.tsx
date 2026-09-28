@@ -38,6 +38,7 @@ import {
   modeForModelType,
   modeOfModelId,
   modelIdForMode,
+  upgradeSettingsModels,
   withStaticModels,
 } from "@/lib/models";
 import type {
@@ -142,10 +143,32 @@ export function AgentProvider({ children }: { children: ReactNode }) {
   const modelsQuery = useQuery({
     queryKey: ["gera-models"],
     queryFn: fetchGatewayModels,
+    // The toolkit catalog is re-read every 30 minutes (and on tab focus once
+    // stale) so new model releases reach the pickers without a reload.
     staleTime: 1000 * 60 * 30,
+    refetchInterval: 1000 * 60 * 30,
+    refetchOnWindowFocus: true,
   });
 
   const models = useMemo(() => withStaticModels(modelsQuery.data ?? []), [modelsQuery.data]);
+
+  // Saved picks follow their model line: when the catalog lists a newer
+  // version (grok-4.6 → grok-4.7), the chat pick, Julius roster and agent
+  // profiles move to it. Effort pins are kept; empty / unknown ids untouched.
+  useEffect(() => {
+    const live = modelsQuery.data ?? [];
+    if (!isHydrated || live.length === 0) {
+      return;
+    }
+    setState((prev) => {
+      const { settings: next, changed } = upgradeSettingsModels(prev.settings, live);
+      if (changed.length === 0) {
+        return prev;
+      }
+      console.info("[models] upgraded to newer releases:", changed.join(", "));
+      return { ...prev, settings: next };
+    });
+  }, [modelsQuery.data, isHydrated]);
 
   useEffect(() => {
     // Keep a legacy credential-bearing settings record intact on first boot

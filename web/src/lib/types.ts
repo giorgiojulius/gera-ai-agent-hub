@@ -45,6 +45,8 @@ export type GatewayModel = {
     input?: string[];
     output?: string[];
   };
+  /** Unix seconds of the public release (gateway `released`); drives model-line upgrades. */
+  released?: number;
 };
 
 export type Attachment = {

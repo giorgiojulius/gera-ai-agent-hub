@@ -11,11 +11,12 @@
 // engine continues a reply the provider default cut instead of capping it.
 
 import { normalizeOutputTokens, parseSelection, TOOLKIT_URL } from "./agent-engine";
+import { latestSelection } from "./model-lineage";
 
 /** How long one fetched catalog is trusted. */
 export const MODEL_CATALOG_TTL_MS = 10 * 60_000;
 
-type CatalogEntry = { id: string; inputs: string[]; maxOutputTokens?: number };
+type CatalogEntry = { id: string; inputs: string[]; maxOutputTokens?: number; type?: string; released?: number };
 type CatalogCache = { fetchedAt: number; byId: Map<string, CatalogEntry> };
 
 const caches = new Map<string, Promise<CatalogCache> | CatalogCache>();
@@ -37,7 +38,13 @@ export function parseModelCatalog(payload: unknown): Map<string, CatalogEntry> {
       ? modalities.input.filter((item): item is string => typeof item === "string").map((item) => item.toLowerCase())
       : [];
     const maxOutputTokens = normalizeOutputTokens(raw.max_tokens);
-    byId.set(raw.id, { id: raw.id, inputs, ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}) });
+    byId.set(raw.id, {
+      id: raw.id,
+      inputs,
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+      ...(typeof raw.type === "string" ? { type: raw.type } : {}),
+      ...(typeof raw.released === "number" && Number.isFinite(raw.released) ? { released: raw.released } : {}),
+    });
   }
   return byId;
 }
@@ -101,6 +108,24 @@ export async function modelMaxOutputTokens(
   const { catalogId } = parseSelection(selectionId);
   const catalog = await catalogFor(options.url ?? `${TOOLKIT_URL}/v2/vercel/v1/models`, options.fetch ?? fetch);
   return catalog?.byId.get(catalogId)?.maxOutputTokens;
+}
+
+/**
+ * The saved selection moved onto the newest release of its model line per
+ * the gateway catalog (`spacexai/grok-4.6:xhigh` → `spacexai/grok-4.7:xhigh`
+ * once the gateway lists it). Background runs (automations, project agents)
+ * use it so a stored pick never sticks to an old version. Unreachable
+ * catalog or unknown line → the selection unchanged.
+ */
+export async function latestModelSelection(selectionId: string, options: ModelCatalogOptions = {}): Promise<string> {
+  if (!selectionId) {
+    return selectionId;
+  }
+  const catalog = await catalogFor(options.url ?? `${TOOLKIT_URL}/v2/vercel/v1/models`, options.fetch ?? fetch);
+  if (!catalog || !catalog.byId.has(parseSelection(selectionId).catalogId)) {
+    return selectionId;
+  }
+  return latestSelection([...catalog.byId.values()], selectionId);
 }
 
 /** Test seam: forgets every cached catalog. */

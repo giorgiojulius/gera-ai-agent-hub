@@ -169,6 +169,16 @@ export const TID = {
   screenDeskPerformanceAnalyze: "screen-desk-performance-analyze",
   /** Clears harvested team-performance results while preserving links. */
   screenDeskPerformanceClear: "screen-desk-performance-clear",
+  /** Deep analytics block: SLA distribution + weekday × hour load heatmap. */
+  screenDeskInsights: "screen-desk-insights",
+  /** "Ask the analyst" chat over the team-performance data (Opus xhigh). */
+  screenDeskAnalyst: "screen-desk-analyst",
+  /** Question input inside the analyst chat. */
+  screenDeskAnalystInput: "screen-desk-analyst-input",
+  /** One ready-made analysis preset chip inside the analyst chat. */
+  screenDeskAnalystPreset: "screen-desk-analyst-preset",
+  /** One analyst answer bubble. */
+  screenDeskAnalystAnswer: "screen-desk-analyst-answer",
   /** "Already in Slack" awareness section inside the desk suggest strip. */
   screenDeskSlack: "screen-desk-slack",
   /** Inline "Ask Gera" investigation card (running / answer) in the strip. */

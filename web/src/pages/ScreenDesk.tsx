@@ -44,6 +44,8 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type React
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
+import { DeskAnalystSection } from "@/components/gera/DeskAnalystSection";
+import { DeskInsightsSection } from "@/components/gera/DeskInsightsSection";
 import { DeskTrendSection } from "@/components/gera/DeskTrendSection";
 import { ExecutionOutcomeCard } from "@/components/gera/ExecutionOutcomeCard";
 import { TeammateTrend } from "@/components/gera/TeammateTrend";
@@ -1744,7 +1746,7 @@ function PerformancePanel({
       const next = await refreshDeskStats(projectId, screenId, range);
       queryClient.setQueryData(statsKey, next);
       toast.success(
-        `Read ${next.analyzedConversations ?? 0} conversations · collected ${next.collected ?? 0} replies · graded ${next.graded ?? 0}`,
+        `Read ${next.analyzedConversations ?? 0} conversations · collected ${next.collected ?? 0} replies · graded ${next.graded ?? 0}${next.gradeModel ? ` by ${next.gradeModel} (xhigh)` : ""}`,
       );
       if (next.gradeError) {
         toast.error(next.gradeError);
@@ -1981,6 +1983,14 @@ function PerformancePanel({
             />
           ) : null}
 
+          {stats && stats.totalReplies > 0 && stats.timeline && stats.timeline.length > 0 ? (
+            <DeskInsightsSection timeline={stats.timeline} />
+          ) : null}
+
+          {stats && stats.totalReplies > 0 ? (
+            <DeskAnalystSection projectId={projectId} screenId={screenId} range={range} />
+          ) : null}
+
           {stats && stats.totalReplies > 0 ? (
             <section className="mb-3 rounded-2xl border border-border/60 bg-card p-3.5">
               <div className="flex items-center gap-2">
@@ -2094,7 +2104,8 @@ function PerformancePanel({
           <p className="mt-4 px-1 pb-4 text-[10px] leading-relaxed text-muted-foreground/70">
             Stats come from real Intercom threads in the selected reply-date range. Collection is
             paginated and bounded at 300 conversations per pass; every grade sees the surrounding
-            transcript, while coaching looks for broader patterns. Admins run analysis on demand;
+            transcript and is written by the newest Claude Opus at xhigh reasoning (up to 48 replies
+            per pass), while coaching looks for broader patterns. Admins run analysis on demand;
             nothing spends model credits in the background.
           </p>
         </div>

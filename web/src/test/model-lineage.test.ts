@@ -2,17 +2,28 @@ import { describe, expect, it } from "vitest";
 
 import {
   isPrereleaseModel,
+  isSameLineAtLeast,
+  keepsMediaCapabilities,
   latestInFamily,
   latestSelection,
   modelFamily,
+  parseVideoCaps,
 } from "../../../functions/model-lineage";
 import {
   groupChatModels,
   chatBaseModels,
+  imageFallbacks,
+  resolveVideoModelForImage,
   resolvedModeIds,
   sanitizeChatModel,
+  sanitizeModeModel,
+  setCachedGatewayModels,
   upgradeChatSelection,
+  upgradeMediaSelection,
   upgradeSettingsModels,
+  videoDurationForModel,
+  videoI2vFallbacks,
+  videoModelTakesLocalFiles,
 } from "@/lib/models";
 import { defaultJuliusSettings } from "@/lib/julius";
 import type { AgentSettings, GatewayModel } from "@/lib/types";
@@ -125,7 +136,7 @@ describe("catalog-driven pickers", () => {
     expect(ids).toContain("openai/gpt-6-luna");
   });
 
-  it("media tabs stay hand-curated", () => {
+  it("media tabs keep their seeds while the catalog lists nothing newer", () => {
     expect(resolvedModeIds(CATALOG, "audio")).toEqual(["spacexai/grok-tts", "openai/tts-1"]);
   });
 
@@ -162,5 +173,88 @@ describe("catalog-driven pickers", () => {
     const again = upgradeSettingsModels(next, CATALOG);
     expect(again.changed).toEqual([]);
     expect(again.settings).toBe(next);
+  });
+});
+
+function video(
+  id: string,
+  released: number,
+  caps: { operations: string[]; imageSources: string[]; durations: number[] },
+  inputs: string[] = ["text", "image"],
+): GatewayModel {
+  return { ...model(id, released, "video"), modalities: { input: inputs }, video: caps } as GatewayModel;
+}
+
+const FULL_I2V = { operations: ["text-to-video", "image-to-video"], imageSources: ["url", "base64"], durations: [5, 6, 10] };
+
+describe("media lineage with capability checks", () => {
+  it("parses the gateway video_capabilities block", () => {
+    expect(
+      parseVideoCaps({
+        supported_operations: ["Text-To-Video", "image-to-video"],
+        input_limits: { image: { supported_sources: ["URL", "base64"] } },
+        supported_durations_seconds: [5, 10, "x"],
+      }),
+    ).toEqual({ operations: ["text-to-video", "image-to-video"], imageSources: ["url", "base64"], durations: [5, 10] });
+    expect(parseVideoCaps(null)).toBeUndefined();
+  });
+
+  it("moves a video pick only onto a successor that keeps every capability", () => {
+    const seed = video("bytedance/seedance-2.5", 100, FULL_I2V);
+    const keeps = video("bytedance/seedance-2.6", 200, FULL_I2V);
+    const dropsBase64 = video("bytedance/seedance-2.7", 300, { ...FULL_I2V, imageSources: ["url"] });
+    const noFiveSeconds = video("bytedance/seedance-2.8", 400, { ...FULL_I2V, durations: [8] });
+    const textOnly = video("bytedance/seedance-2.9", 500, FULL_I2V, ["text"]);
+    expect(keepsMediaCapabilities(seed, keeps)).toBe(true);
+    expect(keepsMediaCapabilities(seed, dropsBase64)).toBe(false);
+    expect(keepsMediaCapabilities(seed, noFiveSeconds)).toBe(false);
+    expect(keepsMediaCapabilities(seed, textOnly)).toBe(false);
+    expect(latestInFamily([seed, keeps, dropsBase64, noFiveSeconds, textOnly], seed.id)).toBe("bytedance/seedance-2.6");
+    expect(latestInFamily([seed, dropsBase64], seed.id)).toBe("bytedance/seedance-2.5");
+  });
+
+  it("treats newer releases of a probed line as the same line", () => {
+    expect(isSameLineAtLeast("bytedance/seedance-2.6", "bytedance/seedance-2.5")).toBe(true);
+    expect(isSameLineAtLeast("bytedance/seedance-2.4", "bytedance/seedance-2.5")).toBe(false);
+    expect(isSameLineAtLeast("bytedance/seedance-2.6-preview", "bytedance/seedance-2.5")).toBe(false);
+    expect(sanitizeModeModel("video", "bytedance/seedance-2.6")).toBe("bytedance/seedance-2.6");
+    expect(sanitizeModeModel("video", "unknown/clip-1")).not.toBe("unknown/clip-1");
+  });
+
+  it("upgrades saved media picks only when the successor is listed and compatible", () => {
+    const catalog = [video("bytedance/seedance-2.5", 100, FULL_I2V), video("bytedance/seedance-2.6", 200, FULL_I2V)];
+    expect(upgradeMediaSelection(catalog, "video", "bytedance/seedance-2.5")).toBe("bytedance/seedance-2.6");
+    expect(upgradeMediaSelection([], "video", "bytedance/seedance-2.5")).toBe("bytedance/seedance-2.5");
+    expect(upgradeMediaSelection(catalog, "video", "custom/model-1")).toBe("custom/model-1");
+  });
+
+  it("image-to-video routing reads live capabilities, then falls back to probed lines", () => {
+    setCachedGatewayModels([
+      video("bytedance/seedance-2.6", 200, { ...FULL_I2V, imageSources: ["url"] }),
+      video("klingai/kling-v3.0-t2v", 100, { operations: ["text-to-video"], imageSources: [], durations: [5] }, ["text"]),
+      video("klingai/kling-v3.0-i2v", 100, FULL_I2V),
+      video("google/veo-4.1", 100, { ...FULL_I2V, durations: [4, 8] }),
+    ]);
+    try {
+      expect(resolveVideoModelForImage("bytedance/seedance-2.6", "url")).toEqual({
+        modelId: "bytedance/seedance-2.6",
+        switched: false,
+      });
+      expect(resolveVideoModelForImage("bytedance/seedance-2.6", "base64").switched).toBe(true);
+      expect(resolveVideoModelForImage("klingai/kling-v3.0-t2v", "base64")).toEqual({
+        modelId: "klingai/kling-v3.0-i2v",
+        switched: true,
+      });
+      expect(videoModelTakesLocalFiles("klingai/kling-v3.0-t2v")).toBe(true);
+      expect(videoModelTakesLocalFiles("bytedance/seedance-2.6")).toBe(false);
+      // Veo normally gets 6 s; this build lists only 4/8 → nearest supported.
+      expect(videoDurationForModel("google/veo-4.1")).toBe(4);
+      expect(videoI2vFallbacks("klingai/kling-v3.0-i2v")).not.toContain("klingai/kling-v3.0-i2v");
+      expect(imageFallbacks("x/y").length).toBeGreaterThan(0);
+    } finally {
+      setCachedGatewayModels([]);
+    }
+    expect(videoDurationForModel("google/veo-4.1")).toBe(6);
+    expect(videoDurationForModel("bytedance/seedance-2.5")).toBe(5);
   });
 });

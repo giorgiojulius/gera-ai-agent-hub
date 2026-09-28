@@ -6,7 +6,7 @@ vi.mock("@/lib/backend", async (importActual) => {
 });
 
 import { authedFetch } from "@/lib/backend";
-import { clearDeskStats, fetchDeskStats, refreshDeskStats } from "@/lib/projects";
+import { askDeskAnalyst, clearDeskStats, fetchDeskStats, refreshDeskStats } from "@/lib/projects";
 
 const authedFetchMock = vi.mocked(authedFetch);
 const emptyStats = {
@@ -61,5 +61,49 @@ describe("desk performance API", () => {
       "/projects/p1/intercom/stats/clear",
       expect.objectContaining({ method: "POST", body: JSON.stringify({ screenId: "s1", from: 100, to: 200 }) }),
     );
+  });
+
+  it("asks the analyst with range, history and the viewer's timezone", async () => {
+    authedFetchMock.mockImplementationOnce(
+      async () =>
+        new Response(
+          JSON.stringify({
+            answer: "Anna needs coaching.",
+            modelId: "anthropic/claude-opus-5.5",
+            basis: { replies: 10, graded: 8, transcripts: 2, scope: "team" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    const result = await askDeskAnalyst("p1", {
+      screenId: "s1",
+      question: "Who needs coaching?",
+      history: [{ role: "user", content: "Hi" }],
+      range: { from: 100, to: 200 },
+    });
+    expect(result.answer).toBe("Anna needs coaching.");
+    const [path, init] = authedFetchMock.mock.calls[0];
+    expect(path).toBe("/projects/p1/intercom/stats/ask");
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      screenId: "s1",
+      question: "Who needs coaching?",
+      history: [{ role: "user", content: "Hi" }],
+      from: 100,
+      to: 200,
+    });
+    expect(typeof body.tzOffsetMinutes).toBe("number");
+  });
+
+  it("surfaces the server's honest analyst error message", async () => {
+    authedFetchMock.mockImplementationOnce(
+      async () =>
+        new Response(JSON.stringify({ error: "no_data", message: "No replies collected for this range yet" }), {
+          status: 409,
+        }),
+    );
+    await expect(
+      askDeskAnalyst("p1", { screenId: "s1", question: "x", history: [], range: { from: 0, to: 0 } }),
+    ).rejects.toThrow("No replies collected for this range yet");
   });
 });

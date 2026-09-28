@@ -8,11 +8,11 @@
 
 import {
   capText,
-  DEFAULT_CHAT_MODEL,
   type EngineMessage,
   streamGatewayCompletion,
 } from "./agent-engine";
 import { asStr, type ChatSql, isRecord, json } from "./chat-shared";
+import { deskAnalystCompletion } from "./desk-analyst";
 import {
   buildGradeMessages,
   buildSuggestMessages,
@@ -96,9 +96,10 @@ export type DeskContext = {
 const DESK_SUGGEST_TTL_MS = 15 * 60 * 1000;
 const DESK_SUGGESTIONS_KEEP = 300;
 const DESK_REPLIES_KEEP = 2_000;
-const DESK_GRADE_BATCH = 24;
+/** Replies graded per Analyze pass — one Opus xhigh call reads them all in context. */
+const DESK_GRADE_BATCH = 48;
 const DESK_CONVERSATIONS_SCAN = 300;
-/** Reply drafts ride Luna — a fixed fast writer; grading keeps the inbox agent's model. */
+/** Reply drafts ride Luna — a fixed fast writer; grading rides the newest Opus at xhigh (desk-analyst.ts). */
 const DESK_SUGGEST_MODEL = "openai/gpt-6-luna";
 const DESK_QUESTION_LIMIT = 600;
 // Desk ↔ Slack awareness: channel-pool sync TTL and caps, ask-run windows.
@@ -525,14 +526,7 @@ function deskAuthKey(ctx: DeskContext): string {
   return ctx.workerEnv.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY ?? ctx.workerEnv.RORK_TOOLKIT_SECRET_KEY ?? "";
 }
 
-/** The inbox widget's agent picks the grading model; suggestions ride DESK_SUGGEST_MODEL. */
-function screenDeskModel(ctx: DeskContext, screen: ScreenRow): string {
-  const inbox = parseWidgets(screen.widgets).find((widget) => widget.kind === "intercom-inbox");
-  const agent = inbox?.agentId ? ctx.loadAgent(inbox.agentId) : undefined;
-  return agent?.model || DEFAULT_CHAT_MODEL;
-}
-
-/** One plain completion for desk intelligence — no tools; suggestions run low effort, grading medium. */
+/** One plain completion for desk intelligence — no tools; reply suggestions run low effort. */
 async function deskCompletion(
   ctx: DeskContext,
   modelId: string,
@@ -1378,6 +1372,7 @@ export async function handleDeskStatsRefresh(ctx: DeskContext, me: MemberRow, bo
     // Grade the newest ungraded replies + refresh coaching — one model call.
     let graded = 0;
     let gradeError = "";
+    let gradeModel = "";
     const gradeConditions = ["screen_id = ?", "grade = ''"];
     const gradeBindings: Array<string | number> = [screen.id];
     if (range.from > 0) {
@@ -1442,13 +1437,9 @@ export async function handleDeskStatsRefresh(ctx: DeskContext, me: MemberRow, bo
             }
           }
         }
-        const raw = await deskCompletion(
-          ctx,
-          screenDeskModel(ctx, screen),
-          buildGradeMessages({ conversations, orphans }),
-          "medium",
-        );
-        const parsed = parseGradePayload(raw);
+        const gradeRun = await deskAnalystCompletion(ctx, buildGradeMessages({ conversations, orphans }));
+        gradeModel = gradeRun.modelId;
+        const parsed = parseGradePayload(gradeRun.content);
         if (!parsed) {
           gradeError = "The model returned an unreadable grading payload — run it again.";
         } else {
@@ -1491,6 +1482,10 @@ export async function handleDeskStatsRefresh(ctx: DeskContext, me: MemberRow, bo
     payload.limitReached = harvest.limitReached;
     payload.added = added;
     payload.graded = graded;
+    if (gradeModel) {
+      payload.gradeModel = gradeModel;
+    }
+    payload.gradeBatch = DESK_GRADE_BATCH;
     if (gradeError) {
       payload.gradeError = gradeError;
     }

@@ -28,6 +28,7 @@ import {
   buildAgentToolset,
 } from "./agent-toolset";
 import { asNum, asStr, isRecord, json, readEmail } from "./chat-shared";
+import { handleDeskAnalystAsk } from "./desk-analyst";
 import { handleProjectGitHubValidate, validateProjectGitHubToken } from "./project-github-credentials";
 import {
   type DeskContext,
@@ -884,6 +885,9 @@ export class ProjectStore extends DurableObject {
       }
       if (request.method === "POST" && path === "/intercom/stats/clear") {
         return handleDeskStatsClear(this.deskContext(), me, await request.json());
+      }
+      if (request.method === "POST" && path === "/intercom/stats/ask") {
+        return handleDeskAnalystAsk(this.deskContext(), me, await request.json());
       }
       if (request.method === "POST" && path === "/intercom/stats/link") {
         return handleDeskLink(this.deskContext(), me, await request.json());

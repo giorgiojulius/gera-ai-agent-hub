@@ -834,8 +834,49 @@ export type DeskStats = {
   analyzedConversations?: number;
   limitReached?: boolean;
   gradeError?: string;
+  /** Model that graded during the latest Analyze pass (newest Opus, xhigh effort). */
+  gradeModel?: string;
+  /** Replies graded per Analyze pass. */
+  gradeBatch?: number;
   now: number;
 };
+
+export type DeskAnalystTurn = { role: "user" | "assistant"; content: string };
+
+export type DeskAnalystAnswer = {
+  answer: string;
+  modelId: string;
+  basis: { replies: number; graded: number; transcripts: number; scope: "team" | "self" };
+};
+
+/**
+ * Asks the team-performance analyst (newest Opus, xhigh) one question about
+ * the desk's harvested replies in `range`. Prior turns ride along so
+ * follow-ups keep context; nothing is stored on the server.
+ */
+export async function askDeskAnalyst(
+  projectId: string,
+  payload: { screenId: string; question: string; history: DeskAnalystTurn[]; range: DeskStatsRange },
+): Promise<DeskAnalystAnswer> {
+  const response = await authedFetch(`/projects/${projectId}/intercom/stats/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      screenId: payload.screenId,
+      question: payload.question,
+      history: payload.history,
+      from: payload.range.from,
+      to: payload.range.to,
+      tzOffsetMinutes: new Date().getTimezoneOffset(),
+    }),
+  });
+  if (!response.ok) {
+    const data = (await response.json().catch(() => null)) as { message?: unknown; error?: unknown } | null;
+    const message = typeof data?.message === "string" && data.message ? data.message : "";
+    throw new Error(message || `The analyst could not answer (${response.status}).`);
+  }
+  return (await response.json()) as DeskAnalystAnswer;
+}
 
 export async function fetchScreenSuggestions(
   projectId: string,

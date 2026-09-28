@@ -51,6 +51,9 @@ const CATALOG: GatewayModel[] = [
   model("anthropic/claude-opus-5.5", 1790035200),
   model("anthropic/claude-opus-5.5-fast", 1790035200),
   model("anthropic/claude-fable-5.1", 1788134400),
+  model("anthropic/claude-sonnet-4.5", 1759104000),
+  model("anthropic/claude-sonnet-5", 1782691200),
+  model("anthropic/claude-sonnet-5.5", 1790553600),
   model("google/gemini-3.7-flash", 1786579200),
   model("google/gemini-3.8-flash", 1788307200),
   model("google/gemini-3.8-flash-tts", 1790121600, "speech"),
@@ -121,6 +124,7 @@ describe("catalog-driven pickers", () => {
     expect(ids).toContain("spacexai/grok-4.7:xhigh");
     expect(ids).toContain("openai/gpt-6-sol");
     expect(ids).toContain("anthropic/claude-opus-5.5");
+    expect(ids).toContain("anthropic/claude-sonnet-5.5");
     expect(ids).not.toContain("spacexai/grok-4.6:xhigh");
     const bases = chatBaseModels(CATALOG).map((item) => item.id);
     expect(bases).toContain("spacexai/grok-4.7");
@@ -148,6 +152,8 @@ describe("catalog-driven pickers", () => {
 
   it("upgrades saved picks, Julius and agent profiles; custom ids stay", () => {
     expect(upgradeChatSelection(CATALOG, "spacexai/grok-4.6:xhigh")).toBe("spacexai/grok-4.7:xhigh");
+    expect(upgradeChatSelection(CATALOG, "anthropic/claude-sonnet-4.5:high")).toBe("anthropic/claude-sonnet-5.5:high");
+    expect(upgradeChatSelection(CATALOG, "anthropic/claude-sonnet-5")).toBe("anthropic/claude-sonnet-5.5");
     expect(upgradeChatSelection(CATALOG, "")).toBe("");
     expect(upgradeChatSelection([], "spacexai/grok-4.6")).toBe("spacexai/grok-4.6");
     const settings = {

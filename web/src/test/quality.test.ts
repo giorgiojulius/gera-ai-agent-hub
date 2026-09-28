@@ -96,8 +96,13 @@ describe("sanitizeChatModel", () => {
     expect(sanitizeChatModel("anthropic/claude-fable-5:xhigh")).toBe("anthropic/claude-fable-5.1:xhigh");
   });
 
+  it("keeps an older Sonnet on its line so the catalog load lifts it to the newest release", () => {
+    expect(sanitizeChatModel("anthropic/claude-sonnet-4.5")).toBe("anthropic/claude-sonnet-4.5");
+    expect(sanitizeChatModel("anthropic/claude-sonnet-5.5:high")).toBe("anthropic/claude-sonnet-5.5:high");
+  });
+
   it("snaps stale or removed chat models to the default", () => {
-    expect(sanitizeChatModel("anthropic/claude-sonnet-4.5")).toBe(DEFAULT_CHAT_MODEL);
+    expect(sanitizeChatModel("anthropic/claude-haiku-4.5")).toBe(DEFAULT_CHAT_MODEL);
     expect(sanitizeChatModel(undefined)).toBe(DEFAULT_CHAT_MODEL);
     expect(sanitizeChatModel("")).toBe(DEFAULT_CHAT_MODEL);
   });
@@ -115,6 +120,10 @@ describe("catalog ids match the live gateway", () => {
     expect(MODE_MODEL_IDS.image).not.toContain("google/imagen-4.0-ultra-generate-001");
     expect(MODE_MODEL_IDS.chat).not.toContain("anthropic/claude-sonnet-4.5");
     expect(MODE_MODEL_IDS.audio).not.toContain("xai/grok-tts");
+  });
+
+  it("sonnet runs the 5.5 generation in the chat catalog", () => {
+    expect(MODE_MODEL_IDS.chat).toContain("anthropic/claude-sonnet-5.5");
   });
 
   it("fable runs the current 5.1 generation in the chat catalog", () => {

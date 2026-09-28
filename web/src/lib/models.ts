@@ -72,6 +72,7 @@ export const MODE_MODEL_IDS: Record<CreateMode, string[]> = {
     "openai/gpt-5.6-luna",
     "anthropic/claude-opus-5",
     "anthropic/claude-fable-5.1",
+    "anthropic/claude-sonnet-5.5",
     "spacexai/grok-4.6:high",
     "spacexai/grok-4.6:xhigh",
     "spacexai/grok-4.20-reasoning",

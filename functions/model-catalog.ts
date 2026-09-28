@@ -11,12 +11,19 @@
 // engine continues a reply the provider default cut instead of capping it.
 
 import { normalizeOutputTokens, parseSelection, TOOLKIT_URL } from "./agent-engine";
-import { latestSelection } from "./model-lineage";
+import { latestInFamily, type LineageVideoCaps, latestSelection, parseVideoCaps } from "./model-lineage";
 
 /** How long one fetched catalog is trusted. */
 export const MODEL_CATALOG_TTL_MS = 10 * 60_000;
 
-type CatalogEntry = { id: string; inputs: string[]; maxOutputTokens?: number; type?: string; released?: number };
+type CatalogEntry = {
+  id: string;
+  inputs: string[];
+  maxOutputTokens?: number;
+  type?: string;
+  released?: number;
+  video?: LineageVideoCaps;
+};
 type CatalogCache = { fetchedAt: number; byId: Map<string, CatalogEntry> };
 
 const caches = new Map<string, Promise<CatalogCache> | CatalogCache>();
@@ -38,7 +45,9 @@ export function parseModelCatalog(payload: unknown): Map<string, CatalogEntry> {
       ? modalities.input.filter((item): item is string => typeof item === "string").map((item) => item.toLowerCase())
       : [];
     const maxOutputTokens = normalizeOutputTokens(raw.max_tokens);
+    const video = parseVideoCaps(raw.video_capabilities);
     byId.set(raw.id, {
+      ...(video ? { video } : {}),
       id: raw.id,
       inputs,
       ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
@@ -126,6 +135,26 @@ export async function latestModelSelection(selectionId: string, options: ModelCa
     return selectionId;
   }
   return latestSelection([...catalog.byId.values()], selectionId);
+}
+
+/**
+ * A media seed (`bytedance/seedance-2.5`) on the newest release of its line
+ * that keeps every capability the seed has (inputs, video operations, image
+ * sources, requested clip length — see keepsMediaCapabilities). Unreachable
+ * catalog or a seed the catalog no longer lists → the seed unchanged.
+ */
+export async function latestMediaModel(seed: string, options: ModelCatalogOptions = {}): Promise<string> {
+  const catalog = await catalogFor(options.url ?? `${TOOLKIT_URL}/v2/vercel/v1/models`, options.fetch ?? fetch);
+  if (!catalog || !catalog.byId.has(seed)) {
+    return seed;
+  }
+  return latestInFamily([...catalog.byId.values()], seed);
+}
+
+/** Clip lengths the catalog lists for a video model; empty when unknown. */
+export async function videoDurationsFor(modelId: string, options: ModelCatalogOptions = {}): Promise<number[]> {
+  const catalog = await catalogFor(options.url ?? `${TOOLKIT_URL}/v2/vercel/v1/models`, options.fetch ?? fetch);
+  return catalog?.byId.get(modelId)?.video?.durations ?? [];
 }
 
 /** Test seam: forgets every cached catalog. */

@@ -3,10 +3,10 @@ import {
   DEFAULT_AUDIO_MODEL,
   DEFAULT_IMAGE_MODEL,
   DEFAULT_VIDEO_MODEL,
-  IMAGE_FALLBACKS,
-  VIDEO_FALLBACKS,
   defaultVoiceForModel,
+  imageFallbacks,
   videoDurationForModel,
+  videoFallbacks,
   videoI2vFallbacks,
   voicesForModel,
 } from "@/lib/models";
@@ -394,7 +394,7 @@ export async function generateImage(
         : {}),
       // Editing pins one model: blind gateway fallbacks would re-bill models
       // that may not accept input images at all.
-      providerOptions: editing ? {} : { gateway: { models: [...IMAGE_FALLBACKS] } },
+      providerOptions: editing ? {} : { gateway: { models: imageFallbacks(modelId) } },
     }),
   });
   const data = await requireJson<{ images?: string[] }>(response);
@@ -448,7 +448,7 @@ export async function generateVideo(
     throw new Error("Describe the video first.");
   }
   // Image runs need same-operation fallbacks; text runs keep the t2v set.
-  const fallbackModels = inputImage ? videoI2vFallbacks(modelId) : [...VIDEO_FALLBACKS];
+  const fallbackModels = inputImage ? videoI2vFallbacks(modelId) : videoFallbacks(modelId);
   const response = await toolkitFetch("/v2/vercel/v3/ai/video-model", {
     method: "POST",
     retry: false,

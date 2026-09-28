@@ -1,5 +1,13 @@
 import { getToolkitUrl } from "@/lib/env";
-import { isPrereleaseModel, latestInFamily, latestSelection, modelFamily } from "../../../functions/model-lineage";
+import {
+  isPrereleaseModel,
+  isSameLineAtLeast,
+  latestInFamily,
+  latestSelection,
+  modelFamily,
+  parseVideoCaps,
+  requestedVideoSeconds,
+} from "../../../functions/model-lineage";
 import type {
   AgentSettings,
   CostTier,
@@ -125,11 +133,12 @@ export const IMAGE_EDIT_MODEL = "openai/gpt-image-2";
  * rerouting the run to another model.
  */
 export function videoModelTakesLocalFiles(modelId: string): boolean {
-  if ((I2V_READY_MODEL_IDS as readonly string[]).includes(modelId)) {
+  if (videoTakesImageFrom(modelId, "base64")) {
     return true;
   }
   // Kling t2v hands the file to its i2v sibling — same family, same look.
-  return modelId === "klingai/kling-v3.0-t2v";
+  const sibling = i2vSibling(modelId);
+  return sibling !== undefined && videoTakesImageFrom(sibling, "base64");
 }
 
 /** Which model actually runs when the user brings an image into video mode. */
@@ -137,24 +146,33 @@ export function resolveVideoModelForImage(
   modelId: string,
   source: VideoImageSource,
 ): { modelId: string; switched: boolean } {
-  const ready = source === "url" ? I2V_URL_READY_MODEL_IDS : I2V_READY_MODEL_IDS;
-  if ((ready as readonly string[]).includes(modelId)) {
+  if (videoTakesImageFrom(modelId, source)) {
     return { modelId, switched: false };
   }
-  if (modelId === "klingai/kling-v3.0-t2v") {
-    return { modelId: "klingai/kling-v3.0-i2v", switched: true };
+  const sibling = i2vSibling(modelId);
+  if (sibling && videoTakesImageFrom(sibling, source)) {
+    return { modelId: sibling, switched: true };
   }
   // Pasted links can stay in the Bytedance family (URL is "always honoured"
-  // there); local files need a base64-capable target.
+  // there); local files need a base64-capable target. Both follow their line.
   return {
-    modelId: source === "url" ? "bytedance/seedance-2.5" : I2V_FALLBACK_TARGET,
+    modelId: lineHead(source === "url" ? "bytedance/seedance-2.5" : I2V_FALLBACK_TARGET),
     switched: true,
   };
 }
 
-/** Veo accepts only 4/6/8-second runs (probed); everything else here takes 5. */
+/**
+ * Clip length per model: Veo takes only 4/6/8 seconds, the rest 5. When the
+ * live catalog lists the model's durations and the usual length is not among
+ * them, the nearest supported length is used instead of a request that fails.
+ */
 export function videoDurationForModel(modelId: string): number {
-  return modelId.startsWith("google/veo") ? 6 : 5;
+  const wanted = requestedVideoSeconds(modelId);
+  const durations = cachedModel(modelId)?.video?.durations ?? [];
+  if (durations.length === 0 || durations.includes(wanted)) {
+    return wanted;
+  }
+  return durations.reduce((best, value) => (Math.abs(value - wanted) < Math.abs(best - wanted) ? value : best), durations[0]);
 }
 
 /**
@@ -162,9 +180,61 @@ export function videoDurationForModel(modelId: string): number {
  * accept BOTH url and base64 input shapes (probed supported_sources), both
  * take 5s and 6s durations and every aspect the picker offers — so one list
  * safely backs either source kind receiving the identical request body.
+ * Each follows its line to the newest capability-compatible release.
  */
 export function videoI2vFallbacks(primary: string): string[] {
-  return ["klingai/kling-v3.0-i2v", I2V_FALLBACK_TARGET].filter((id) => id !== primary);
+  return [lineHead("klingai/kling-v3.0-i2v"), lineHead(I2V_FALLBACK_TARGET)].filter((id) => id !== primary);
+}
+
+/** Text-to-image gateway fallbacks on the newest release of each line. */
+export function imageFallbacks(primary: string): string[] {
+  return IMAGE_FALLBACKS.map(lineHead).filter((id) => id !== primary);
+}
+
+/** Text-to-video gateway fallbacks on the newest release of each line. */
+export function videoFallbacks(primary: string): string[] {
+  return VIDEO_FALLBACKS.map(lineHead).filter((id) => id !== primary);
+}
+
+/** The image editor to retry with — the newest compatible release of the docs-confirmed line. */
+export function imageEditModel(): string {
+  return lineHead(IMAGE_EDIT_MODEL);
+}
+
+/** Newest capability-compatible release of a seed's line per the last loaded catalog. */
+function lineHead(seed: string): string {
+  return latestInFamily(lastGatewayModels, seed);
+}
+
+function cachedModel(id: string): GatewayModel | undefined {
+  return lastGatewayModels.find((model) => model.id === id);
+}
+
+/** `klingai/kling-v3.0-t2v` → `klingai/kling-v3.0-i2v` when the catalog (or the probed list) has it. */
+function i2vSibling(modelId: string): string | undefined {
+  if (!modelId.endsWith("-t2v")) {
+    return undefined;
+  }
+  const sibling = `${modelId.slice(0, -4)}-i2v`;
+  if (lastGatewayModels.length > 0) {
+    return cachedModel(sibling) ? sibling : undefined;
+  }
+  return (I2V_READY_MODEL_IDS as readonly string[]).includes(sibling) ? sibling : undefined;
+}
+
+/**
+ * Whether a video model animates an image delivered as `source`. The live
+ * catalog's `video_capabilities` decides when present (image-to-video
+ * operation + the source in `supported_sources`); otherwise the probed seed
+ * lists apply to the seed and every newer release of its line.
+ */
+function videoTakesImageFrom(modelId: string, source: VideoImageSource): boolean {
+  const caps = cachedModel(modelId)?.video;
+  if (caps && caps.operations.length > 0) {
+    return caps.operations.includes("image-to-video") && caps.imageSources.includes(source);
+  }
+  const ready = source === "url" ? I2V_URL_READY_MODEL_IDS : I2V_READY_MODEL_IDS;
+  return ready.some((seed) => isSameLineAtLeast(modelId, seed));
 }
 
 /** "klingai/kling-v3.0-i2v" → "kling-v3.0-i2v" — short handle for honest notes. */
@@ -176,10 +246,10 @@ export function modelShortName(modelId: string): string {
 export function videoImageSwitchNote(fromId: string, toId: string): string {
   const from = modelShortName(fromId);
   const to = modelShortName(toId);
-  if (fromId === "klingai/kling-v3.0-t2v") {
+  if (fromId.endsWith("-t2v") && toId === `${fromId.slice(0, -4)}-i2v`) {
     return `Animated with ${to} — the image-to-video variant of ${from}.`;
   }
-  if (fromId === "bytedance/seedance-2.5") {
+  if (isSameLineAtLeast(fromId, "bytedance/seedance-2.5")) {
     return `Animated with ${to} — ${from} takes image input only as a public link. Paste the image URL in the prompt to run it on ${from}.`;
   }
   return `Animated with ${to} — ${from} doesn't support image-to-video.`;
@@ -236,18 +306,32 @@ export function defaultModelForMode(mode: CreateMode): string {
   }
 }
 
-/** Keeps only curated model ids; anything old/unknown falls back to the mode default. */
+/**
+ * Keeps only curated model ids — or a newer release of a curated media line
+ * (seedance-2.5 → seedance-2.6 the day the catalog lists it); anything
+ * old/unknown falls back to the mode default.
+ */
 export function sanitizeModeModel(mode: CreateMode, id: string | undefined): string {
   if (mode === "chat") {
     return sanitizeChatModel(id);
   }
-  return id && MODE_MODEL_IDS[mode].includes(id) ? id : defaultModelForMode(mode);
+  return id && isCuratedMediaLine(mode, id) ? id : defaultModelForMode(mode);
+}
+
+/** A media id that is a curated seed or a newer (non-pre-release) release of one. */
+export function isCuratedMediaLine(mode: Exclude<CreateMode, "chat">, id: string): boolean {
+  return MODE_MODEL_IDS[mode].some((seed) => isSameLineAtLeast(id, seed));
 }
 
 /** Which creation tab a curated model id belongs to, if any. */
 export function modeOfModelId(id: string): CreateMode | undefined {
   const modes: CreateMode[] = ["chat", "image", "video", "audio"];
-  return modes.find((mode) => MODE_MODEL_IDS[mode].includes(id));
+  const exact = modes.find((mode) => MODE_MODEL_IDS[mode].includes(id));
+  if (exact) {
+    return exact;
+  }
+  const media: Array<Exclude<CreateMode, "chat">> = ["image", "video", "audio"];
+  return media.find((mode) => isCuratedMediaLine(mode, id));
 }
 
 export function modeForModelType(type: ModelType): CreateMode {
@@ -277,18 +361,19 @@ export function isCuratedChatLine(catalogId: string): boolean {
 }
 
 /**
- * Curated chat ids moved onto the newest version of each line the live
- * catalog lists (grok-4.6 → grok-4.7 the day the gateway ships it). Media
- * tabs stay hand-curated: their image-input and duration rules were probed
- * per exact model. Empty catalog → the seeds as written.
+ * Curated ids moved onto the newest version of each line the live catalog
+ * lists (grok-4.6 → grok-4.7, seedance-2.5 → seedance-2.6 the day the
+ * gateway ships it). Media successors must keep every capability the tab
+ * relies on (inputs, video operations, image sources, clip length) — see
+ * keepsMediaCapabilities. Empty catalog → the seeds as written.
  */
 export function resolvedModeIds(models: GatewayModel[], mode: CreateMode): string[] {
-  if (mode !== "chat" || models.length === 0) {
+  if (models.length === 0) {
     return MODE_MODEL_IDS[mode];
   }
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const id of MODE_MODEL_IDS.chat) {
+  for (const id of MODE_MODEL_IDS[mode]) {
     const next = latestSelection(models, id);
     if (!seen.has(next)) {
       seen.add(next);
@@ -314,9 +399,28 @@ export function upgradeChatSelection(models: GatewayModel[], selectionId: string
 }
 
 /**
- * Every saved chat pick in settings (composer model, Julius roster and
- * council, agent profiles) moved onto the newest release of its line.
- * Returns the same object and an empty `changed` list when nothing moved.
+ * A saved image / video / audio pick on the newest capability-compatible
+ * release of its curated line; unknown line or empty catalog → unchanged.
+ */
+export function upgradeMediaSelection(
+  models: GatewayModel[],
+  mode: Exclude<CreateMode, "chat">,
+  selectionId: string,
+): string {
+  if (!selectionId || models.length === 0 || !isCuratedMediaLine(mode, selectionId)) {
+    return selectionId;
+  }
+  if (!models.some((model) => model.id === selectionId)) {
+    return selectionId;
+  }
+  return latestInFamily(models, selectionId);
+}
+
+/**
+ * Every saved pick in settings (composer chat model, image / video / audio
+ * models, Julius roster and council, agent profiles) moved onto the newest
+ * release of its line. Returns the same object and an empty `changed` list
+ * when nothing moved.
  */
 export function upgradeSettingsModels(
   settings: AgentSettings,
@@ -331,6 +435,16 @@ export function upgradeSettingsModels(
     return next;
   };
   const modelId = up(settings.modelId);
+  const upMedia = (mode: Exclude<CreateMode, "chat">, id: string): string => {
+    const next = upgradeMediaSelection(models, mode, id);
+    if (next !== id) {
+      changed.push(`${id} → ${next}`);
+    }
+    return next;
+  };
+  const imageModelId = upMedia("image", settings.imageModelId);
+  const videoModelId = upMedia("video", settings.videoModelId);
+  const audioModelId = upMedia("audio", settings.audioModelId);
   const julius = settings.julius;
   const nextJulius = julius
     ? {
@@ -349,7 +463,10 @@ export function upgradeSettingsModels(
   if (changed.length === 0) {
     return { settings, changed };
   }
-  return { settings: { ...settings, modelId, julius: nextJulius, agents }, changed };
+  return {
+    settings: { ...settings, modelId, imageModelId, videoModelId, audioModelId, julius: nextJulius, agents },
+    changed,
+  };
 }
 
 /**
@@ -505,11 +622,17 @@ function normalizeModel(raw: Record<string, unknown>): GatewayModel {
     pricing: normalizePricing(raw.pricing),
     modalities,
     released: typeof raw.released === "number" && Number.isFinite(raw.released) ? raw.released : undefined,
+    video: parseVideoCaps(raw.video_capabilities),
   };
 }
 
 /** Last catalog the gateway answered with — lets run config read model facts synchronously. */
 let lastGatewayModels: GatewayModel[] = [];
+
+/** Test seam / hydration hook: the catalog capability checks read synchronously. */
+export function setCachedGatewayModels(models: GatewayModel[]): void {
+  lastGatewayModels = models;
+}
 
 /**
  * Context window (tokens) of a picked model from the last loaded gateway

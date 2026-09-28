@@ -58,7 +58,7 @@ import {
   cachedAcceptsImages,
   cachedContextWindow,
   cachedMaxOutputTokens,
-  IMAGE_EDIT_MODEL,
+  imageEditModel,
   modelIdForMode,
   modelShortName,
   parseModelSelection,
@@ -926,13 +926,14 @@ export async function sendPrompt(params: {
       } catch (error) {
         // The catalog doesn't publish which image models accept input images —
         // when the pick rejects them, retry once with the docs-confirmed editor.
-        if (inputs.length === 0 || modelId === IMAGE_EDIT_MODEL) {
+        const editor = imageEditModel();
+        if (inputs.length === 0 || modelId === editor) {
           throw error;
         }
-        effectiveModelId = IMAGE_EDIT_MODEL;
-        batch = await generateImageBatch(prompt, settings.imageSize, IMAGE_EDIT_MODEL, inputs, count);
+        effectiveModelId = editor;
+        batch = await generateImageBatch(prompt, settings.imageSize, editor, inputs, count);
         notes.push(
-          `Edited with ${modelShortName(IMAGE_EDIT_MODEL)} — ${modelShortName(modelId)} rejected the attached image.`,
+          `Edited with ${modelShortName(editor)} — ${modelShortName(modelId)} rejected the attached image.`,
         );
       }
       if (batch.failed > 0) {

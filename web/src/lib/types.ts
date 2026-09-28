@@ -47,6 +47,12 @@ export type GatewayModel = {
   };
   /** Unix seconds of the public release (gateway `released`); drives model-line upgrades. */
   released?: number;
+  /** Parsed gateway `video_capabilities` (operations, image sources, durations). */
+  video?: {
+    operations: string[];
+    imageSources: string[];
+    durations: number[];
+  };
 };
 
 export type Attachment = {

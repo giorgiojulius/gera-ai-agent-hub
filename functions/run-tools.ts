@@ -18,8 +18,11 @@ import {
   type SurfPage,
 } from "./selfsurf";
 import type { BuiltinToolId, RunSource } from "./run-protocol";
+import { latestMediaModel, videoDurationsFor } from "./model-catalog";
+import { requestedVideoSeconds } from "./model-lineage";
 
-// Media model constants — mirror web/src/lib/models.ts.
+// Media model seeds — mirror web/src/lib/models.ts. Every call moves each
+// seed onto the newest capability-compatible release of its line.
 const DEFAULT_IMAGE_MODEL = "openai/gpt-image-2";
 const IMAGE_FALLBACKS = ["bytedance/seedream-5.0-lite", "spacexai/grok-imagine-image-2.0"];
 const DEFAULT_VIDEO_MODEL = "bytedance/seedance-2.5";
@@ -47,9 +50,20 @@ function voicesForModel(modelId: string): string[] {
   return [];
 }
 
-/** Veo accepts only 4/6/8-second runs (probed); everything else here takes 5. */
-function videoDurationForModel(modelId: string): number {
-  return modelId.startsWith("google/veo") ? 6 : 5;
+/** Veo 4/6/8 s, the rest 5 s; snapped to the nearest length the catalog lists. */
+async function videoDurationForModel(modelId: string): Promise<number> {
+  const wanted = requestedVideoSeconds(modelId);
+  const durations = await videoDurationsFor(modelId);
+  if (durations.length === 0 || durations.includes(wanted)) {
+    return wanted;
+  }
+  return durations.reduce((best, value) => (Math.abs(value - wanted) < Math.abs(best - wanted) ? value : best), durations[0]);
+}
+
+/** Seeds moved onto their line heads, minus the primary itself. */
+async function lineHeads(seeds: readonly string[], primary: string): Promise<string[]> {
+  const heads = await Promise.all(seeds.map((seed) => latestMediaModel(seed)));
+  return heads.filter((id) => id !== primary);
 }
 
 /** Assigns stable citation numbers to sources as tools touch them. */
@@ -541,20 +555,21 @@ export async function generateImageServer(prompt: string, size: string, authKey:
   if (!prompt.trim()) {
     throw new Error("Describe the image first.");
   }
+  const modelId = await latestMediaModel(DEFAULT_IMAGE_MODEL);
   const response = await toolkitPost(
     "/v2/vercel/v3/ai/image-model",
     {
-      model: DEFAULT_IMAGE_MODEL,
+      model: modelId,
       prompt,
       n: 1,
       size,
-      providerOptions: { gateway: { models: [...IMAGE_FALLBACKS] } },
+      providerOptions: { gateway: { models: await lineHeads(IMAGE_FALLBACKS, modelId) } },
     },
     authKey,
     {
       "ai-gateway-protocol-version": "0.0.1",
       "ai-image-model-specification-version": "4",
-      "ai-model-id": DEFAULT_IMAGE_MODEL,
+      "ai-model-id": modelId,
     },
     180_000,
   );
@@ -599,21 +614,22 @@ export async function generateVideoServer(prompt: string, aspectRatio: string, a
   if (!prompt.trim()) {
     throw new Error("Describe the video first.");
   }
+  const modelId = await latestMediaModel(DEFAULT_VIDEO_MODEL);
   const response = await toolkitPost(
     "/v2/vercel/v3/ai/video-model",
     {
-      model: DEFAULT_VIDEO_MODEL,
+      model: modelId,
       prompt,
       n: 1,
       aspectRatio,
-      duration: videoDurationForModel(DEFAULT_VIDEO_MODEL),
-      providerOptions: { gateway: { models: [...VIDEO_FALLBACKS] } },
+      duration: await videoDurationForModel(modelId),
+      providerOptions: { gateway: { models: await lineHeads(VIDEO_FALLBACKS, modelId) } },
     },
     authKey,
     {
       "ai-gateway-protocol-version": "0.0.1",
       "ai-video-model-specification-version": "4",
-      "ai-model-id": DEFAULT_VIDEO_MODEL,
+      "ai-model-id": modelId,
       accept: "text/event-stream",
     },
     480_000,
@@ -668,7 +684,8 @@ export async function generateAudioServer(prompt: string, authKey: string): Prom
   if (!prompt.trim()) {
     throw new Error("Add the text to speak first.");
   }
-  const voice = voicesForModel(DEFAULT_AUDIO_MODEL)[0] ?? "";
+  const audioModelId = await latestMediaModel(DEFAULT_AUDIO_MODEL);
+  const voice = voicesForModel(audioModelId)[0] ?? "";
   const response = await toolkitPost(
     "/v2/vercel/v4/ai/speech-model",
     {
@@ -679,7 +696,7 @@ export async function generateAudioServer(prompt: string, authKey: string): Prom
     authKey,
     {
       "ai-gateway-protocol-version": "0.0.1",
-      "ai-model-id": DEFAULT_AUDIO_MODEL,
+      "ai-model-id": audioModelId,
     },
     120_000,
   );
